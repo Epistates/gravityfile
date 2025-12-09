@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/gravityfile"
@@ -46,10 +46,10 @@ derive_builder = "0.20"
 tempfile = "3"
 
 # Internal crates
-gravityfile-core = { version = "0.1.0", path = "crates/gravityfile-core" }
-gravityfile-scan = { version = "0.1.0", path = "crates/gravityfile-scan" }
-gravityfile-analyze = { version = "0.1.0", path = "crates/gravityfile-analyze" }
-gravityfile-tui = { version = "0.1.0", path = "crates/gravityfile-tui" }
+gravityfile-core = { version = "0.1.2", path = "crates/gravityfile-core" }
+gravityfile-scan = { version = "0.1.2", path = "crates/gravityfile-scan" }
+gravityfile-analyze = { version = "0.1.2", path = "crates/gravityfile-analyze" }
+gravityfile-tui = { version = "0.1.2", path = "crates/gravityfile-tui" }
 
 [package]
 name = "gravityfile"
@@ -62,7 +62,11 @@ categories.workspace = true
 description = "A state-of-the-art file system analyzer with TUI"
 
 [[bin]]
-name = "gf"
+name = "gravityfile"
+path = "src/main.rs"
+
+[[bin]]
+name = "grav"
 path = "src/main.rs"
 
 [dependencies]

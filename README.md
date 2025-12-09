@@ -30,17 +30,21 @@ cargo install gravityfile
 ### From source
 
 ```bash
-git clone https://github.com/nickpaterno/gravityfile
+git clone https://github.com/epistates/gravityfile
 cd gravityfile
 cargo install --path .
 ```
+
+This installs two binaries: `gravityfile` and `grav` (short alias).
 
 ## Usage
 
 ### Interactive TUI (Default)
 
 ```bash
-gf [PATH]
+gravityfile [PATH]
+# or use the short alias:
+grav [PATH]
 ```
 
 Launch the interactive terminal interface to explore disk usage.
@@ -48,7 +52,7 @@ Launch the interactive terminal interface to explore disk usage.
 ### Quick Scan
 
 ```bash
-gf scan [PATH] [-d DEPTH] [-n TOP]
+gravityfile scan [PATH] [-d DEPTH] [-n TOP]
 ```
 
 Quick summary of disk usage with tree output.
@@ -56,7 +60,7 @@ Quick summary of disk usage with tree output.
 ### Find Duplicates
 
 ```bash
-gf duplicates [PATH] [--min-size SIZE] [-n TOP]
+gravityfile duplicates [PATH] [--min-size SIZE] [-n TOP]
 ```
 
 Find duplicate files. Uses a three-phase algorithm:
@@ -67,7 +71,7 @@ Find duplicate files. Uses a three-phase algorithm:
 ### Age Analysis
 
 ```bash
-gf age [PATH] [--stale DURATION]
+gravityfile age [PATH] [--stale DURATION]
 ```
 
 Analyze file ages and find stale directories.
@@ -75,7 +79,7 @@ Analyze file ages and find stale directories.
 ### Export
 
 ```bash
-gf export [PATH] [-o OUTPUT]
+gravityfile export [PATH] [-o OUTPUT]
 ```
 
 Export scan results to JSON.
