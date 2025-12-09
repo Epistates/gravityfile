@@ -1,6 +1,7 @@
 //! UI components and widgets.
 
 mod help;
+pub mod modals;
 mod size_bar;
 mod tree;
 
