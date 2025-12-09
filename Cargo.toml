@@ -61,10 +61,14 @@ keywords.workspace = true
 categories.workspace = true
 description = "A state-of-the-art file system analyzer with TUI"
 autobins = false
-default-run = "gf"
+default-run = "gravityfile"
 
 [[bin]]
-name = "gf"
+name = "gravityfile"
+path = "src/main.rs"
+
+[[bin]]
+name = "grav"
 path = "src/main.rs"
 
 [dependencies]
