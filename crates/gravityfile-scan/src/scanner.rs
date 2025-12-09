@@ -412,7 +412,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-    use gravityfile_core::ScanConfigBuilder;
 
     fn create_test_tree() -> TempDir {
         let temp = TempDir::new().unwrap();
