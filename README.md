@@ -1,11 +1,13 @@
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/gravityfile.svg)](https://crates.io/crates/gravityfile)
+
 # gravityfile
 
 > "Where mass accumulates, attention should follow."
 
 A state-of-the-art file system analyzer with an interactive TUI, built in Rust.
 
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/gravityfile.svg)](https://crates.io/crates/gravityfile)
+![GravityFile](https://github.com/epistates/gravityfile/blob/main/assets/demo.webp)
 
 ## Features
 
