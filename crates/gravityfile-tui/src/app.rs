@@ -38,6 +38,8 @@ pub enum AppMode {
     Help,
     /// Confirming deletion of marked items.
     ConfirmDelete,
+    /// Deletion in progress.
+    Deleting,
     /// Command palette input mode (vim-style :command).
     Command,
     Quit,
@@ -89,6 +91,21 @@ impl View {
     }
 }
 
+/// Progress during deletion operation.
+#[derive(Debug, Clone)]
+struct DeletionProgress {
+    /// Total items to delete.
+    total: usize,
+    /// Items deleted so far.
+    deleted: usize,
+    /// Items that failed to delete.
+    failed: usize,
+    /// Bytes freed so far.
+    bytes_freed: u64,
+    /// Current item being deleted.
+    current: Option<PathBuf>,
+}
+
 /// Result from a background scan operation.
 enum ScanResult {
     Progress(ScanProgress),
@@ -98,6 +115,14 @@ enum ScanResult {
     AnalysisComplete {
         duplicates: DuplicateReport,
         age_report: AgeReport,
+    },
+    /// Progress update during deletion.
+    DeletionProgress(DeletionProgress),
+    /// Deletion completed.
+    DeletionComplete {
+        deleted: usize,
+        failed: usize,
+        bytes_freed: u64,
     },
 }
 
@@ -139,6 +164,8 @@ pub struct App {
     marked_for_deletion: HashSet<PathBuf>,
     /// Last deletion result message.
     deletion_message: Option<(bool, String)>,
+    /// Current deletion progress (during async deletion).
+    deletion_progress: Option<DeletionProgress>,
     /// Current scan progress (for display during scanning).
     scan_progress: Option<ScanProgress>,
     /// Channel for receiving scan results.
@@ -179,6 +206,7 @@ impl App {
             error: None,
             marked_for_deletion: HashSet::new(),
             deletion_message: None,
+            deletion_progress: None,
             scan_progress: None,
             scan_rx: None,
             warnings: Vec::new(),
@@ -361,6 +389,34 @@ impl App {
                 self.analyzing = false;
                 self.scan_rx = None;
             }
+            ScanResult::DeletionProgress(progress) => {
+                self.deletion_progress = Some(progress);
+            }
+            ScanResult::DeletionComplete { deleted, failed, bytes_freed } => {
+                self.deletion_progress = None;
+                self.scan_rx = None;
+
+                let msg = if failed == 0 {
+                    format!(
+                        "Deleted {} items, freed {}",
+                        deleted,
+                        format_size(bytes_freed)
+                    )
+                } else {
+                    format!(
+                        "Deleted {}, failed {} (freed {})",
+                        deleted,
+                        failed,
+                        format_size(bytes_freed)
+                    )
+                };
+
+                self.deletion_message = Some((failed == 0, msg));
+                self.mode = AppMode::Normal;
+
+                // Refresh scan after deletion
+                self.start_scan();
+            }
         }
     }
 
@@ -435,14 +491,19 @@ impl App {
             AppMode::ConfirmDelete => {
                 match action {
                     KeyAction::Confirm => {
+                        // execute_deletion sets mode to Deleting
                         self.execute_deletion();
-                        self.mode = AppMode::Normal;
                     }
                     KeyAction::Quit | KeyAction::Cancel => {
                         self.mode = AppMode::Normal;
                     }
                     _ => {}
                 }
+                return;
+            }
+            AppMode::Deleting => {
+                // During deletion, ignore all input - deletion cannot be cancelled
+                // The UI will update with progress automatically
                 return;
             }
             AppMode::Command => {
@@ -524,7 +585,10 @@ impl App {
 
             // Directory drill-down navigation
             KeyAction::DrillDown => {
-                if self.view == View::Explorer {
+                // If items are marked for deletion, Enter shows confirmation instead of drilling
+                if !self.marked_for_deletion.is_empty() {
+                    self.mode = AppMode::ConfirmDelete;
+                } else if self.view == View::Explorer {
                     self.drill_into_selected();
                 }
             }
@@ -572,19 +636,25 @@ impl App {
                 }
             }
             View::Duplicates => {
-                if let Some(dups) = &self.duplicates {
-                    dups.groups
-                        .get(self.selected_dup_group)
-                        .and_then(|g| g.paths.first().cloned())
+                // Use filtered duplicates for current view
+                if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                    let selected = self.selected_dup_group.min(filtered.len().saturating_sub(1));
+                    filtered.get(selected).and_then(|g| {
+                        // Get first path that's within the current view
+                        g.paths
+                            .iter()
+                            .find(|p| p.starts_with(&self.view_root))
+                            .cloned()
+                    })
                 } else {
                     None
                 }
             }
             View::Age => {
-                if let Some(age) = &self.age_report {
-                    age.stale_directories
-                        .get(self.selected_stale_dir)
-                        .map(|d| d.path.clone())
+                // Use filtered stale directories for current view
+                if let Some(filtered) = self.get_filtered_stale_dirs() {
+                    let selected = self.selected_stale_dir.min(filtered.len().saturating_sub(1));
+                    filtered.get(selected).map(|d| d.path.clone())
                 } else {
                     None
                 }
@@ -607,58 +677,96 @@ impl App {
         }
     }
 
-    /// Execute deletion of all marked items.
+    /// Execute deletion of all marked items asynchronously.
     fn execute_deletion(&mut self) {
-        let mut deleted = 0;
-        let mut failed = 0;
-        let mut bytes_freed: u64 = 0;
-
-        // Collect paths and sizes before draining
+        // Collect paths and sizes before clearing
         let paths_with_sizes: Vec<(PathBuf, u64)> = self
             .marked_for_deletion
             .iter()
             .map(|p| (p.clone(), self.get_path_size(p).unwrap_or(0)))
             .collect();
 
-        self.marked_for_deletion.clear();
-
-        for (path, size) in paths_with_sizes {
-            let result = if path.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-
-            match result {
-                Ok(()) => {
-                    deleted += 1;
-                    bytes_freed += size;
-                }
-                Err(_) => {
-                    failed += 1;
-                }
-            }
+        let total = paths_with_sizes.len();
+        if total == 0 {
+            return;
         }
 
-        let msg = if failed == 0 {
-            format!(
-                "Deleted {} items, freed {}",
-                deleted,
-                format_size(bytes_freed)
-            )
-        } else {
-            format!(
-                "Deleted {}, failed {} (freed {})",
-                deleted,
-                failed,
-                format_size(bytes_freed)
-            )
-        };
+        self.marked_for_deletion.clear();
+        self.mode = AppMode::Deleting;
+        self.deletion_progress = Some(DeletionProgress {
+            total,
+            deleted: 0,
+            failed: 0,
+            bytes_freed: 0,
+            current: paths_with_sizes.first().map(|(p, _)| p.clone()),
+        });
 
-        self.deletion_message = Some((failed == 0, msg));
+        // Create channel for deletion progress
+        let (tx, rx) = mpsc::channel(100);
+        self.scan_rx = Some(rx);
 
-        // Refresh scan after deletion
-        self.start_scan();
+        // Spawn background deletion task
+        tokio::spawn(async move {
+            let mut deleted = 0;
+            let mut failed = 0;
+            let mut bytes_freed: u64 = 0;
+
+            for (i, (path, size)) in paths_with_sizes.iter().enumerate() {
+                // Send progress update
+                let _ = tx
+                    .send(ScanResult::DeletionProgress(DeletionProgress {
+                        total,
+                        deleted,
+                        failed,
+                        bytes_freed,
+                        current: Some(path.clone()),
+                    }))
+                    .await;
+
+                // Perform deletion in blocking task to not block the async runtime
+                let path_clone = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    if path_clone.is_dir() {
+                        fs::remove_dir_all(&path_clone)
+                    } else {
+                        fs::remove_file(&path_clone)
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        deleted += 1;
+                        bytes_freed += size;
+                    }
+                    _ => {
+                        failed += 1;
+                    }
+                }
+
+                // Send updated progress after each deletion
+                if i < total - 1 {
+                    let _ = tx
+                        .send(ScanResult::DeletionProgress(DeletionProgress {
+                            total,
+                            deleted,
+                            failed,
+                            bytes_freed,
+                            current: paths_with_sizes.get(i + 1).map(|(p, _)| p.clone()),
+                        }))
+                        .await;
+                }
+            }
+
+            // Send completion
+            let _ = tx
+                .send(ScanResult::DeletionComplete {
+                    deleted,
+                    failed,
+                    bytes_freed,
+                })
+                .await;
+        });
     }
 
     /// Get the size of a path from the tree.
@@ -706,14 +814,14 @@ impl App {
                 self.tree_state.move_down(1, self.cached_tree_len);
             }
             View::Duplicates => {
-                if let Some(dups) = &self.duplicates {
-                    let max = dups.groups.len().saturating_sub(1);
+                if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                    let max = filtered.len().saturating_sub(1);
                     self.selected_dup_group = (self.selected_dup_group + 1).min(max);
                 }
             }
             View::Age => {
-                if let Some(age) = &self.age_report {
-                    let max = age.stale_directories.len().saturating_sub(1);
+                if let Some(filtered) = self.get_filtered_stale_dirs() {
+                    let max = filtered.len().saturating_sub(1);
                     self.selected_stale_dir = (self.selected_stale_dir + 1).min(max);
                 }
             }
@@ -745,14 +853,14 @@ impl App {
                 self.tree_state.move_down(10, self.cached_tree_len);
             }
             View::Duplicates => {
-                if let Some(dups) = &self.duplicates {
-                    let max = dups.groups.len().saturating_sub(1);
+                if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                    let max = filtered.len().saturating_sub(1);
                     self.selected_dup_group = (self.selected_dup_group + 10).min(max);
                 }
             }
             View::Age => {
-                if let Some(age) = &self.age_report {
-                    let max = age.stale_directories.len().saturating_sub(1);
+                if let Some(filtered) = self.get_filtered_stale_dirs() {
+                    let max = filtered.len().saturating_sub(1);
                     self.selected_stale_dir = (self.selected_stale_dir + 10).min(max);
                 }
             }
@@ -778,13 +886,13 @@ impl App {
                 self.tree_state.jump_to_bottom(self.cached_tree_len);
             }
             View::Duplicates => {
-                if let Some(dups) = &self.duplicates {
-                    self.selected_dup_group = dups.groups.len().saturating_sub(1);
+                if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                    self.selected_dup_group = filtered.len().saturating_sub(1);
                 }
             }
             View::Age => {
-                if let Some(age) = &self.age_report {
-                    self.selected_stale_dir = age.stale_directories.len().saturating_sub(1);
+                if let Some(filtered) = self.get_filtered_stale_dirs() {
+                    self.selected_stale_dir = filtered.len().saturating_sub(1);
                 }
             }
             View::Errors => {
@@ -1200,6 +1308,9 @@ impl Widget for &App {
             AppMode::ConfirmDelete => {
                 self.render_delete_confirmation(area, buf);
             }
+            AppMode::Deleting => {
+                self.render_deletion_progress(area, buf);
+            }
             AppMode::Command => {
                 self.render_command_palette(footer, buf);
             }
@@ -1329,6 +1440,100 @@ impl App {
             Span::styled(" n/Esc ", self.theme.help_key),
             Span::raw("Cancel"),
         ]));
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+
+    fn render_deletion_progress(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup area
+        let popup_width = 50.min(area.width.saturating_sub(4));
+        let popup_height = 10.min(area.height.saturating_sub(4));
+
+        let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
+        let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
+
+        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+        // Clear the popup area
+        Clear.render(popup_area, buf);
+
+        // Draw border
+        let block = Block::default()
+            .title(" Deleting... ")
+            .title_style(Style::default().fg(self.theme.warning).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.warning));
+
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let mut lines = vec![];
+
+        if let Some(progress) = &self.deletion_progress {
+            // Progress bar
+            let pct = if progress.total > 0 {
+                ((progress.deleted + progress.failed) as f64 / progress.total as f64 * 100.0) as u16
+            } else {
+                0
+            };
+            let bar_width = (inner.width as usize).saturating_sub(10);
+            let filled = (pct as usize * bar_width) / 100;
+            let empty = bar_width.saturating_sub(filled);
+
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::raw("  ["),
+                Span::styled("█".repeat(filled), Style::default().fg(self.theme.info)),
+                Span::styled("░".repeat(empty), Style::default().fg(self.theme.muted)),
+                Span::raw(format!("] {}%", pct)),
+            ]));
+
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Progress: ", self.theme.help_desc),
+                Span::raw(format!(
+                    "{}/{} items",
+                    progress.deleted + progress.failed,
+                    progress.total
+                )),
+            ]));
+
+            lines.push(Line::from(vec![
+                Span::styled("  Freed:    ", self.theme.help_desc),
+                Span::raw(format_size(progress.bytes_freed)),
+            ]));
+
+            if progress.failed > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("  Failed:   ", Style::default().fg(self.theme.error)),
+                    Span::styled(
+                        progress.failed.to_string(),
+                        Style::default().fg(self.theme.error),
+                    ),
+                ]));
+            }
+
+            // Current item being deleted
+            if let Some(current) = &progress.current {
+                let name = current
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| current.display().to_string());
+                let max_len = (inner.width as usize).saturating_sub(4);
+                let display_name = if name.len() > max_len {
+                    format!("...{}", &name[name.len().saturating_sub(max_len - 3)..])
+                } else {
+                    name
+                };
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("  {}", display_name),
+                    Style::default().fg(self.theme.muted),
+                ));
+            }
+        } else {
+            lines.push(Line::raw("  Preparing deletion..."));
+        }
 
         Paragraph::new(lines).render(inner, buf);
     }
@@ -1478,28 +1683,39 @@ impl App {
     }
 
     fn render_duplicates(&self, area: Rect, buf: &mut Buffer) {
+        // Build title showing context when drilled in
+        let title = if self.view_root != self.path {
+            let relative = self.view_root
+                .strip_prefix(&self.path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| self.view_root.display().to_string());
+            format!(" Duplicates in {} ", relative)
+        } else {
+            " Duplicates ".to_string()
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border)
-            .title(" Duplicates ")
+            .title(title)
             .title_style(self.theme.title);
 
         let inner = block.inner(area);
         block.render(area, buf);
 
-        if let Some(dups) = &self.duplicates {
-            if dups.groups.is_empty() {
-                let msg = Paragraph::new("No duplicate files found.")
+        if let Some((filtered_groups, total_wasted)) = self.get_filtered_duplicates() {
+            if filtered_groups.is_empty() {
+                let msg = Paragraph::new("No duplicate files found in this directory.")
                     .style(Style::default().fg(self.theme.muted));
                 msg.render(inner, buf);
                 return;
             }
 
-            // Header
+            // Header with filtered stats
             let header = format!(
                 " {} groups, {} wasted",
-                dups.group_count,
-                format_size(dups.total_wasted_space)
+                filtered_groups.len(),
+                format_size(total_wasted)
             );
             let header_line = Line::styled(header, self.theme.title);
             let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
@@ -1509,20 +1725,38 @@ impl App {
             let list_area = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
             let visible_height = list_area.height as usize;
 
+            // Clamp selection to filtered list
+            let selected = self.selected_dup_group.min(filtered_groups.len().saturating_sub(1));
+
             // Calculate scroll offset
-            let scroll_offset = if self.selected_dup_group >= visible_height {
-                self.selected_dup_group - visible_height + 1
+            let scroll_offset = if selected >= visible_height {
+                selected - visible_height + 1
             } else {
                 0
             };
 
-            for (i, group) in dups.groups.iter().enumerate().skip(scroll_offset).take(visible_height) {
+            for (i, group) in filtered_groups.iter().enumerate().skip(scroll_offset).take(visible_height) {
                 let y = list_area.y + (i - scroll_offset) as u16;
-                let is_selected = i == self.selected_dup_group;
+                let is_selected = i == selected;
+
+                // Count how many files are in the current view
+                let files_in_view = group
+                    .paths
+                    .iter()
+                    .filter(|p| p.starts_with(&self.view_root))
+                    .count();
+                let total_files = group.count();
+
+                // Show file count with context if some are outside view
+                let file_info = if files_in_view < total_files {
+                    format!("{}/{} files", files_in_view, total_files)
+                } else {
+                    format!("{} files", total_files)
+                };
 
                 let line = format!(
-                    " {} files, {} each ({} wasted)",
-                    group.count(),
+                    " {}, {} each ({} wasted)",
+                    file_info,
                     format_size(group.size),
                     format_size(group.wasted_bytes)
                 );
@@ -1545,22 +1779,49 @@ impl App {
     }
 
     fn render_age(&self, area: Rect, buf: &mut Buffer) {
+        // Build title showing context when drilled in
+        let title = if self.view_root != self.path {
+            let relative = self.view_root
+                .strip_prefix(&self.path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| self.view_root.display().to_string());
+            format!(" Age Analysis - {} ", relative)
+        } else {
+            " Age Analysis ".to_string()
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border)
-            .title(" Age Analysis ")
+            .title(title)
             .title_style(self.theme.title);
 
         let inner = block.inner(area);
         block.render(area, buf);
 
         if let Some(age) = &self.age_report {
-            // Age distribution chart
+            // Age distribution chart (shows full scan data)
             let max_size = age.buckets.iter().map(|b| b.total_size).max().unwrap_or(1);
             let chart_height = age.buckets.len().min(inner.height as usize / 2);
 
+            // Show note if drilled in that buckets are for full scan
+            let bucket_start_y = if self.view_root != self.path {
+                let note = Line::styled(
+                    " Distribution (full scan):",
+                    Style::default().fg(self.theme.muted),
+                );
+                let note_area = Rect::new(inner.x, inner.y, inner.width, 1);
+                Paragraph::new(note).render(note_area, buf);
+                inner.y + 1
+            } else {
+                inner.y
+            };
+
             for (i, bucket) in age.buckets.iter().enumerate().take(chart_height) {
-                let y = inner.y + i as u16;
+                let y = bucket_start_y + i as u16;
+                if y >= inner.y + inner.height {
+                    break;
+                }
                 let bar_width = if max_size > 0 {
                     ((bucket.total_size as f64 / max_size as f64) * 20.0) as usize
                 } else {
@@ -1580,16 +1841,22 @@ impl App {
                 Paragraph::new(line).render(line_area, buf);
             }
 
+            // Get filtered stale directories
+            let filtered_stale = self.get_filtered_stale_dirs();
+            let stale_dirs: Vec<&gravityfile_analyze::StaleDirectory> = filtered_stale
+                .unwrap_or_default();
+
             // Stale directories header
-            let stale_y = inner.y + chart_height as u16 + 1;
+            let stale_y = bucket_start_y + chart_height as u16 + 1;
             if stale_y < inner.y + inner.height {
-                let stale_header = if age.stale_directories.is_empty() {
+                let total_stale_size: u64 = stale_dirs.iter().map(|d| d.size).sum();
+                let stale_header = if stale_dirs.is_empty() {
                     " No stale directories found.".to_string()
                 } else {
                     format!(
                         " Stale Directories ({}, {} total)",
-                        age.stale_directories.len(),
-                        format_size(age.total_stale_size())
+                        stale_dirs.len(),
+                        format_size(total_stale_size)
                     )
                 };
                 let header_area = Rect::new(inner.x, stale_y, inner.width, 1);
@@ -1599,9 +1866,12 @@ impl App {
                 let list_y = stale_y + 1;
                 let list_height = (inner.y + inner.height).saturating_sub(list_y) as usize;
 
-                for (i, dir) in age.stale_directories.iter().enumerate().take(list_height) {
+                // Clamp selection to filtered list
+                let selected = self.selected_stale_dir.min(stale_dirs.len().saturating_sub(1));
+
+                for (i, dir) in stale_dirs.iter().enumerate().take(list_height) {
                     let y = list_y + i as u16;
-                    let is_selected = i == self.selected_stale_dir;
+                    let is_selected = i == selected;
 
                     let line = format!(
                         "   {} ({}, {} old)",
@@ -1913,5 +2183,61 @@ impl App {
     /// Check if a path is marked for deletion.
     pub fn is_marked(&self, path: &PathBuf) -> bool {
         self.marked_for_deletion.contains(path)
+    }
+
+    /// Get duplicate groups filtered to current view_root.
+    /// Returns (filtered_groups, total_wasted_in_view).
+    fn get_filtered_duplicates(&self) -> Option<(Vec<&gravityfile_analyze::DuplicateGroup>, u64)> {
+        let dups = self.duplicates.as_ref()?;
+
+        // If at scan root, no filtering needed
+        if self.view_root == self.path {
+            let total: u64 = dups.groups.iter().map(|g| g.wasted_bytes).sum();
+            return Some((dups.groups.iter().collect(), total));
+        }
+
+        // Filter groups to those with at least one path in current view
+        let filtered: Vec<&gravityfile_analyze::DuplicateGroup> = dups
+            .groups
+            .iter()
+            .filter(|g| g.paths.iter().any(|p| p.starts_with(&self.view_root)))
+            .collect();
+
+        // Calculate wasted bytes only counting paths in view
+        let total_wasted: u64 = filtered
+            .iter()
+            .map(|g| {
+                let paths_in_view = g.paths.iter().filter(|p| p.starts_with(&self.view_root)).count();
+                if paths_in_view > 1 {
+                    // Wasted = size * (count_in_view - 1)
+                    g.size * (paths_in_view as u64 - 1)
+                } else {
+                    // Only one copy in this view - no waste shown here
+                    // (the duplicate is outside the current view)
+                    0
+                }
+            })
+            .sum();
+
+        Some((filtered, total_wasted))
+    }
+
+    /// Get stale directories filtered to current view_root.
+    fn get_filtered_stale_dirs(&self) -> Option<Vec<&gravityfile_analyze::StaleDirectory>> {
+        let age = self.age_report.as_ref()?;
+
+        // If at scan root, no filtering needed
+        if self.view_root == self.path {
+            return Some(age.stale_directories.iter().collect());
+        }
+
+        // Filter to directories within current view
+        let filtered: Vec<&gravityfile_analyze::StaleDirectory> = age
+            .stale_directories
+            .iter()
+            .filter(|d| d.path.starts_with(&self.view_root))
+            .collect();
+
+        Some(filtered)
     }
 }
