@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/epistates/gravityfile"
+keywords = ["disk", "usage", "analyzer", "tui", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+
+[workspace.dependencies]
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+color-eyre = "0.6"
+compact_str = { version = "0.8", features = ["serde"] }
+
+# Scanning
+jwalk = "0.8"
+rayon = "1.10"
+dashmap = "6"
+
+# Hashing
+blake3 = { version = "1", features = ["rayon", "mmap"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Utilities
+humansize = "2"
+chrono = { version = "0.4", features = ["serde"] }
+strum = { version = "0.26", features = ["derive"] }
+itertools = "0.14"
+derive_builder = "0.20"
+tempfile = "3"
+
+# Internal crates
+gravityfile-core = { version = "0.1.0", path = "crates/gravityfile-core" }
+gravityfile-scan = { version = "0.1.0", path = "crates/gravityfile-scan" }
+gravityfile-analyze = { version = "0.1.0", path = "crates/gravityfile-analyze" }
+gravityfile-tui = { version = "0.1.0", path = "crates/gravityfile-tui" }
+
+[package]
+name = "gravityfile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A state-of-the-art file system analyzer with TUI"
+
+[[bin]]
+name = "gf"
+path = "src/main.rs"
+
+[dependencies]
+gravityfile-core.workspace = true
+gravityfile-scan.workspace = true
+gravityfile-analyze.workspace = true
+gravityfile-tui.workspace = true
+clap.workspace = true
+color-eyre.workspace = true
+tokio.workspace = true
+humansize.workspace = true
+serde_json.workspace = true
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

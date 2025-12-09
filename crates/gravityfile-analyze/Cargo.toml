@@ -1,0 +1,20 @@
+[package]
+name = "gravityfile-analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Analysis algorithms for gravityfile (duplicates, age, trends)"
+
+[dependencies]
+gravityfile-core.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+derive_builder.workspace = true
+serde.workspace = true
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile.workspace = true

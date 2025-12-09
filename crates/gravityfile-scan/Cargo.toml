@@ -1,0 +1,19 @@
+[package]
+name = "gravityfile-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "File system scanning engine for gravityfile"
+
+[dependencies]
+gravityfile-core.workspace = true
+jwalk.workspace = true
+rayon.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+compact_str.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

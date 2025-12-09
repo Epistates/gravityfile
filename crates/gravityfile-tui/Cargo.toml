@@ -1,0 +1,20 @@
+[package]
+name = "gravityfile-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal user interface for gravityfile"
+
+[dependencies]
+gravityfile-core.workspace = true
+gravityfile-scan.workspace = true
+gravityfile-analyze.workspace = true
+ratatui.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+color-eyre.workspace = true
+tokio.workspace = true
+humansize.workspace = true
+strum.workspace = true
+itertools.workspace = true
+futures = "0.3"
