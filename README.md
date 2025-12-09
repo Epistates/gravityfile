@@ -7,7 +7,7 @@
 
 A state-of-the-art file system analyzer with an interactive TUI, built in Rust.
 
-![GravityFile](https://raw.githubusercontent.com/epistates/gravityfile/main/assets/demo.gif)
+<img src="assets/demo.webp" alt="gravityfile" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
 
 ## Features
 
