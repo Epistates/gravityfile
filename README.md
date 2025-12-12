@@ -5,7 +5,7 @@
 
 > "Where mass accumulates, attention should follow."
 
-A state-of-the-art file system analyzer with an interactive TUI, built in Rust.
+A file system analyzer with an interactive TUI, built in Rust.
 
 <img src="assets/video.gif" alt="gravityfile" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
 
