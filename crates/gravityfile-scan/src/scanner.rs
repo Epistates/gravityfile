@@ -1,11 +1,13 @@
 //! JWalk-based parallel directory scanner.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use compact_str::CompactString;
 use jwalk::{Parallelism, WalkDir};
@@ -48,7 +50,7 @@ impl JwalkScanner {
 
         // Get root device for cross-filesystem detection
         let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
-        let root_device = root_metadata.dev();
+        let root_device = get_dev(&root_metadata);
 
         // Set up tracking
         let inode_tracker = InodeTracker::new();
@@ -136,7 +138,7 @@ impl JwalkScanner {
             };
 
             // Check cross-filesystem
-            if !config.cross_filesystems && metadata.dev() != root_device {
+            if !config.cross_filesystems && get_dev(&metadata) != root_device {
                 continue;
             }
 
@@ -162,7 +164,7 @@ impl JwalkScanner {
                             metadata.accessed().ok(),
                             metadata.created().ok(),
                         ),
-                        inode: Some(InodeInfo::new(metadata.ino(), metadata.dev())),
+                        inode: Some(InodeInfo::new(get_ino(&metadata), get_dev(&metadata))),
                     };
 
                     entries_by_parent
@@ -172,19 +174,19 @@ impl JwalkScanner {
                 }
             } else if file_type.is_file() {
                 // Check for hardlinks
-                let inode_info = InodeInfo::new(metadata.ino(), metadata.dev());
+                let inode_info = InodeInfo::new(get_ino(&metadata), get_dev(&metadata));
                 let size = if config.apparent_size {
                     metadata.len()
                 } else {
                     // Only count size for first hardlink
-                    if metadata.nlink() > 1 && !inode_tracker.track(inode_info) {
+                    if get_nlink(&metadata) > 1 && !inode_tracker.track(inode_info) {
                         0 // Already counted this inode
                     } else {
                         metadata.len()
                     }
                 };
 
-                let blocks = metadata.blocks();
+                let blocks = get_blocks(&metadata);
 
                 stats.record_file(
                     path.clone(),
@@ -405,6 +407,53 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+// Cross-platform metadata helpers
+
+/// Get the device ID from metadata.
+#[cfg(unix)]
+fn get_dev(metadata: &std::fs::Metadata) -> u64 {
+    metadata.dev()
+}
+
+#[cfg(not(unix))]
+fn get_dev(_metadata: &std::fs::Metadata) -> u64 {
+    0 // Windows doesn't have device IDs in the same way
+}
+
+/// Get the inode number from metadata.
+#[cfg(unix)]
+fn get_ino(metadata: &std::fs::Metadata) -> u64 {
+    metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn get_ino(_metadata: &std::fs::Metadata) -> u64 {
+    0 // Windows doesn't have inodes
+}
+
+/// Get the number of hard links from metadata.
+#[cfg(unix)]
+fn get_nlink(metadata: &std::fs::Metadata) -> u64 {
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn get_nlink(_metadata: &std::fs::Metadata) -> u64 {
+    1 // Assume single link on Windows
+}
+
+/// Get the number of 512-byte blocks from metadata.
+#[cfg(unix)]
+fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
+    metadata.blocks()
+}
+
+#[cfg(not(unix))]
+fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
+    // Estimate blocks from file size (512-byte blocks, rounded up)
+    (metadata.len() + 511) / 512
 }
 
 #[cfg(test)]
