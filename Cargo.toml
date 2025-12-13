@@ -49,7 +49,12 @@ tempfile = "3"
 gravityfile-core = { version = "0.1.3", path = "crates/gravityfile-core" }
 gravityfile-scan = { version = "0.1.3", path = "crates/gravityfile-scan" }
 gravityfile-analyze = { version = "0.1.3", path = "crates/gravityfile-analyze" }
+gravityfile-ops = { version = "0.1.3", path = "crates/gravityfile-ops" }
 gravityfile-tui = { version = "0.1.3", path = "crates/gravityfile-tui" }
+
+# File operations
+fs_extra = "1.3"
+trash = "5"
 
 [package]
 name = "gravityfile"

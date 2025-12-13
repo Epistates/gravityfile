@@ -6,6 +6,7 @@ use strum::{Display, EnumIter, FromRepr, IntoEnumIterator};
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::FileTree;
+use gravityfile_ops::{Conflict, OperationProgress, OperationType};
 use gravityfile_scan::ScanProgress;
 
 /// Application mode representing the current UI state.
@@ -19,9 +20,99 @@ pub enum AppMode {
     ConfirmDelete,
     /// Deletion in progress.
     Deleting,
+    /// Copy operation in progress.
+    Copying,
+    /// Move operation in progress.
+    Moving,
+    /// Renaming a file or directory (text input mode).
+    Renaming,
+    /// Creating a new file (text input mode).
+    CreatingFile,
+    /// Creating a new directory (text input mode).
+    CreatingDirectory,
+    /// Taking (create directory and cd into it) - text input mode.
+    Taking,
+    /// Waiting for conflict resolution.
+    ConflictResolution,
     /// Command palette input mode (vim-style :command).
     Command,
     Quit,
+}
+
+/// Layout mode for the explorer view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    /// Tree view (default, current behavior).
+    #[default]
+    Tree,
+    /// Miller columns (ranger-style three-pane).
+    Miller,
+}
+
+impl LayoutMode {
+    /// Toggle between layout modes.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Tree => Self::Miller,
+            Self::Miller => Self::Tree,
+        }
+    }
+}
+
+/// Clipboard mode determines paste behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardMode {
+    /// Clipboard is empty.
+    #[default]
+    Empty,
+    /// Items were yanked (copy).
+    Copy,
+    /// Items were cut (move).
+    Cut,
+}
+
+/// Clipboard state for file operations.
+#[derive(Debug, Clone, Default)]
+pub struct ClipboardState {
+    /// Paths currently in the clipboard.
+    pub paths: Vec<PathBuf>,
+    /// The clipboard mode (copy or cut).
+    pub mode: ClipboardMode,
+    /// The root directory where items were copied/cut from.
+    pub source_root: Option<PathBuf>,
+}
+
+impl ClipboardState {
+    /// Yank (copy) paths to the clipboard.
+    pub fn yank(&mut self, paths: impl IntoIterator<Item = PathBuf>, source_root: PathBuf) {
+        self.paths = paths.into_iter().collect();
+        self.mode = ClipboardMode::Copy;
+        self.source_root = Some(source_root);
+    }
+
+    /// Cut (move) paths to the clipboard.
+    pub fn cut(&mut self, paths: impl IntoIterator<Item = PathBuf>, source_root: PathBuf) {
+        self.paths = paths.into_iter().collect();
+        self.mode = ClipboardMode::Cut;
+        self.source_root = Some(source_root);
+    }
+
+    /// Clear the clipboard.
+    pub fn clear(&mut self) {
+        self.paths.clear();
+        self.mode = ClipboardMode::Empty;
+        self.source_root = None;
+    }
+
+    /// Check if the clipboard is empty.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// Get the number of items in the clipboard.
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
 }
 
 /// Active view/tab during normal mode.
@@ -129,6 +220,17 @@ pub enum ScanResult {
         failed: usize,
         bytes_freed: u64,
     },
+    /// Progress update during file operations (copy/move/etc).
+    OperationProgress(OperationProgress),
+    /// A conflict was encountered during file operation.
+    OperationConflict(Conflict),
+    /// File operation completed.
+    OperationComplete {
+        operation_type: OperationType,
+        succeeded: usize,
+        failed: usize,
+        bytes_processed: u64,
+    },
 }
 
 /// Information about the currently selected item.
@@ -141,4 +243,15 @@ pub struct SelectedInfo {
     pub dir_count: u64,
     pub modified: std::time::SystemTime,
     pub is_dir: bool,
+}
+
+/// A pending file operation waiting for conflict resolution.
+#[derive(Debug, Clone)]
+pub enum PendingOperation {
+    /// Paste operation (copy or move).
+    Paste {
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        mode: ClipboardMode,
+    },
 }

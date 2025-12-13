@@ -1,11 +1,13 @@
 //! UI components and widgets.
 
 mod help;
+mod miller;
 pub mod modals;
 mod size_bar;
 mod tree;
 
 pub use help::HelpOverlay;
+pub use miller::{MillerColumns, MillerState};
 pub use size_bar::SizeBar;
 pub use tree::{TreeState, TreeView, VisibleNodeKind};
 

@@ -10,6 +10,7 @@ description = "Terminal user interface for gravityfile"
 gravityfile-core.workspace = true
 gravityfile-scan.workspace = true
 gravityfile-analyze.workspace = true
+gravityfile-ops.workspace = true
 ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 color-eyre.workspace = true

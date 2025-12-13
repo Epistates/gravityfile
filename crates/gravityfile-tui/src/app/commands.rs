@@ -137,6 +137,28 @@ pub enum CommandAction {
     ToggleDetails,
     /// Set theme.
     SetTheme(ThemeCommand),
+    /// Set layout.
+    SetLayout(LayoutCommand),
+
+    // File operations
+    /// Yank (copy) marked items to clipboard.
+    Yank,
+    /// Cut marked items to clipboard.
+    Cut,
+    /// Paste clipboard contents.
+    Paste,
+    /// Delete marked items.
+    Delete,
+    /// Rename current item.
+    Rename(Option<String>),
+    /// Create a new file.
+    CreateFile(Option<String>),
+    /// Create a new directory.
+    CreateDirectory(Option<String>),
+    /// Create a directory and navigate into it (like zsh's `take`).
+    Take(Option<String>),
+    /// Undo last operation.
+    Undo,
 }
 
 /// Theme command variants.
@@ -144,6 +166,14 @@ pub enum CommandAction {
 pub enum ThemeCommand {
     Dark,
     Light,
+    Toggle,
+}
+
+/// Layout command variants.
+#[derive(Debug, Clone, Copy)]
+pub enum LayoutCommand {
+    Tree,
+    Miller,
     Toggle,
 }
 
@@ -206,6 +236,66 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         }
         "dark" => CommandAction::SetTheme(ThemeCommand::Dark),
         "light" => CommandAction::SetTheme(ThemeCommand::Light),
+
+        // Layout commands
+        "layout" | "view" => {
+            if parts.len() > 1 {
+                match parts[1] {
+                    "tree" => CommandAction::SetLayout(LayoutCommand::Tree),
+                    "miller" | "columns" => CommandAction::SetLayout(LayoutCommand::Miller),
+                    "toggle" => CommandAction::SetLayout(LayoutCommand::Toggle),
+                    _ => CommandAction::None,
+                }
+            } else {
+                CommandAction::SetLayout(LayoutCommand::Toggle)
+            }
+        }
+        "miller" | "columns" => CommandAction::SetLayout(LayoutCommand::Miller),
+
+        // File operations
+        "yank" | "y" | "copy" | "cp" => CommandAction::Yank,
+        "cut" | "x" => CommandAction::Cut,
+        "paste" | "p" => CommandAction::Paste,
+        "delete" | "del" | "rm" => CommandAction::Delete,
+
+        // Rename
+        "rename" | "mv" => {
+            if parts.len() > 1 {
+                CommandAction::Rename(Some(parts[1..].join(" ")))
+            } else {
+                CommandAction::Rename(None)
+            }
+        }
+
+        // Create file
+        "touch" | "new" | "create" => {
+            if parts.len() > 1 {
+                CommandAction::CreateFile(Some(parts[1..].join(" ")))
+            } else {
+                CommandAction::CreateFile(None)
+            }
+        }
+
+        // Create directory
+        "mkdir" | "md" => {
+            if parts.len() > 1 {
+                CommandAction::CreateDirectory(Some(parts[1..].join(" ")))
+            } else {
+                CommandAction::CreateDirectory(None)
+            }
+        }
+
+        // Take (create directory and cd into it)
+        "take" => {
+            if parts.len() > 1 {
+                CommandAction::Take(Some(parts[1..].join(" ")))
+            } else {
+                CommandAction::Take(None)
+            }
+        }
+
+        // Undo
+        "undo" | "u" => CommandAction::Undo,
 
         _ => CommandAction::None,
     }

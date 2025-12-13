@@ -8,12 +8,23 @@ use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Widget};
 use strum::IntoEnumIterator;
 
 use gravityfile_analyze::format_age;
+use gravityfile_ops::{Conflict, OperationProgress};
 
 use crate::theme::Theme;
-use crate::ui::modals::{CommandPalette, DeleteConfirmModal, DeletionProgressModal};
-use crate::ui::{format_relative_time, format_size, AppLayout, HelpOverlay, TreeState, TreeView};
+use crate::ui::modals::{
+    CommandPalette, ConflictModal, DeleteConfirmModal, DeletionProgressModal, InputModal,
+    OperationProgressModal,
+};
+use crate::ui::{
+    format_relative_time, format_size, AppLayout, HelpOverlay, MillerColumns, MillerState,
+    TreeState, TreeView,
+};
 
-use super::state::{AppMode, DeletionProgress, ScanView, SelectedInfo, View};
+use super::input::InputState;
+use super::state::{
+    AppMode, ClipboardMode, ClipboardState, DeletionProgress, LayoutMode, ScanView, SelectedInfo,
+    View,
+};
 
 /// Render context containing all the state needed for rendering.
 pub struct RenderContext<'a> {
@@ -26,6 +37,8 @@ pub struct RenderContext<'a> {
     pub show_details: bool,
     pub tree: Option<&'a gravityfile_core::FileTree>,
     pub tree_state: &'a TreeState,
+    pub layout_mode: LayoutMode,
+    pub miller_state: &'a MillerState,
     pub scan_progress: Option<&'a gravityfile_scan::ScanProgress>,
     pub deletion_progress: Option<&'a DeletionProgress>,
     #[allow(dead_code)] // Used indirectly via get_filtered_duplicates
@@ -35,15 +48,22 @@ pub struct RenderContext<'a> {
     pub selected_dup_group: usize,
     pub selected_stale_dir: usize,
     pub selected_warning: usize,
-    pub marked_for_deletion: &'a std::collections::HashSet<std::path::PathBuf>,
+    pub marked: &'a std::collections::HashSet<std::path::PathBuf>,
     pub deletion_message: Option<&'a (bool, String)>,
+    pub operation_message: Option<&'a (bool, String)>,
     pub error: Option<&'a str>,
     pub command_input: &'a str,
     pub command_cursor: usize,
+    pub input_state: Option<&'a InputState>,
+    pub operation_progress: Option<&'a OperationProgress>,
+    pub pending_conflict: Option<&'a Conflict>,
+    pub clipboard: &'a ClipboardState,
     pub get_path_size: Box<dyn Fn(&std::path::PathBuf) -> Option<u64> + 'a>,
     pub get_selected_info: Option<SelectedInfo>,
     pub get_view_root_node:
         Option<(&'a gravityfile_core::FileNode, std::path::PathBuf)>,
+    pub get_parent_node: Option<&'a gravityfile_core::FileNode>,
+    pub current_dir_name: Option<String>,
     pub get_filtered_duplicates:
         Option<(Vec<&'a gravityfile_analyze::DuplicateGroup>, u64)>,
     pub get_filtered_stale_dirs: Option<Vec<&'a gravityfile_analyze::StaleDirectory>>,
@@ -98,11 +118,7 @@ pub fn render_app(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             HelpOverlay::new(ctx.theme).render(area, buf);
         }
         AppMode::ConfirmDelete => {
-            let modal = DeleteConfirmModal::new(
-                ctx.theme,
-                ctx.marked_for_deletion,
-                |p| (ctx.get_path_size)(p),
-            );
+            let modal = DeleteConfirmModal::new(ctx.theme, ctx.marked, |p| (ctx.get_path_size)(p));
             modal.render(area, buf);
         }
         AppMode::Deleting => {
@@ -111,6 +127,39 @@ pub fn render_app(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         AppMode::Command => {
             CommandPalette::new(ctx.theme, ctx.command_input, ctx.command_cursor)
                 .render(footer, buf);
+        }
+        AppMode::Renaming => {
+            if let Some(input) = ctx.input_state {
+                InputModal::new(ctx.theme, input, "Rename", "Enter new name:").render(area, buf);
+            }
+        }
+        AppMode::CreatingFile => {
+            if let Some(input) = ctx.input_state {
+                InputModal::new(ctx.theme, input, "Create File", "Enter file name:")
+                    .render(area, buf);
+            }
+        }
+        AppMode::CreatingDirectory => {
+            if let Some(input) = ctx.input_state {
+                InputModal::new(ctx.theme, input, "Create Directory", "Enter directory name:")
+                    .render(area, buf);
+            }
+        }
+        AppMode::Taking => {
+            if let Some(input) = ctx.input_state {
+                InputModal::new(ctx.theme, input, "Take (mkdir + cd)", "Enter directory name:")
+                    .render(area, buf);
+            }
+        }
+        AppMode::Copying | AppMode::Moving => {
+            if let Some(progress) = ctx.operation_progress {
+                OperationProgressModal::new(ctx.theme, progress).render(area, buf);
+            }
+        }
+        AppMode::ConflictResolution => {
+            if let Some(conflict) = ctx.pending_conflict {
+                ConflictModal::new(ctx.theme, conflict).render(area, buf);
+            }
         }
         _ => {}
     }
@@ -135,33 +184,63 @@ fn render_header(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 
     let stats_span = Span::styled(stats, ctx.theme.header);
 
-    // Show marked items count or deletion message
-    let status = if let Some((success, msg)) = ctx.deletion_message {
+    // Show operation message, deletion message, marked items, or clipboard status
+    let status = if let Some((success, msg)) = ctx.operation_message {
         let color = if *success {
             ctx.theme.success
         } else {
             ctx.theme.warning
         };
         Span::styled(format!(" {} ", msg), Style::default().fg(color))
-    } else if !ctx.marked_for_deletion.is_empty() {
+    } else if let Some((success, msg)) = ctx.deletion_message {
+        let color = if *success {
+            ctx.theme.success
+        } else {
+            ctx.theme.warning
+        };
+        Span::styled(format!(" {} ", msg), Style::default().fg(color))
+    } else if !ctx.marked.is_empty() {
         let total_size: u64 = ctx
-            .marked_for_deletion
+            .marked
             .iter()
             .filter_map(|p| (ctx.get_path_size)(p))
             .sum();
         Span::styled(
             format!(
-                " {} marked ({}) [Enter to delete] ",
-                ctx.marked_for_deletion.len(),
+                " {} selected ({}) ",
+                ctx.marked.len(),
                 format_size(total_size)
             ),
-            Style::default().fg(ctx.theme.warning),
+            Style::default()
+                .fg(ctx.theme.background)
+                .bg(ctx.theme.info),
         )
     } else {
         Span::raw("")
     };
 
-    let line = Line::from(vec![title, Span::raw(" "), stats_span, status]);
+    // Show clipboard status
+    let clipboard_status = if !ctx.clipboard.is_empty() {
+        let mode_str = match ctx.clipboard.mode {
+            ClipboardMode::Copy => "copied",
+            ClipboardMode::Cut => "cut",
+            ClipboardMode::Empty => "",
+        };
+        if !mode_str.is_empty() {
+            Span::styled(
+                format!(" {} {} ", ctx.clipboard.paths.len(), mode_str),
+                Style::default()
+                    .fg(ctx.theme.background)
+                    .bg(ctx.theme.success),
+            )
+        } else {
+            Span::raw("")
+        }
+    } else {
+        Span::raw("")
+    };
+
+    let line = Line::from(vec![title, Span::raw(" "), stats_span, status, clipboard_status]);
 
     Paragraph::new(line)
         .style(ctx.theme.header)
@@ -269,28 +348,62 @@ fn render_explorer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     let layout = AppLayout::new(area, ctx.show_details);
 
     if let Some((view_node, view_path)) = &ctx.get_view_root_node {
-        // Build title showing navigation context
-        let title = if ctx.view_root != ctx.path {
-            let relative = ctx
-                .view_root
-                .strip_prefix(ctx.path)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ctx.view_root.display().to_string());
-            format!(" {} (\u{2190} Backspace) ", relative)
-        } else {
-            format!(" {} ", view_path.display())
-        };
+        match ctx.layout_mode {
+            LayoutMode::Tree => {
+                // Build title showing navigation context
+                let title = if ctx.view_root != ctx.path {
+                    let relative = ctx
+                        .view_root
+                        .strip_prefix(ctx.path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| ctx.view_root.display().to_string());
+                    format!(" {} (\u{2190} Backspace) ", relative)
+                } else {
+                    format!(" {} ", view_path.display())
+                };
 
-        let tree_view = TreeView::new(view_node, view_path, ctx.theme).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(ctx.theme.border)
-                .title(title)
-                .title_style(ctx.theme.title),
-        );
+                let tree_view = TreeView::new(view_node, view_path, ctx.theme, ctx.marked, ctx.clipboard).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(ctx.theme.border)
+                        .title(title)
+                        .title_style(ctx.theme.title),
+                );
 
-        let mut tree_state = ctx.tree_state.clone();
-        ratatui::widgets::StatefulWidget::render(tree_view, layout.main, buf, &mut tree_state);
+                let mut tree_state = ctx.tree_state.clone();
+                ratatui::widgets::StatefulWidget::render(
+                    tree_view,
+                    layout.main,
+                    buf,
+                    &mut tree_state,
+                );
+            }
+            LayoutMode::Miller => {
+                // Render Miller columns view
+                let current_name = ctx
+                    .current_dir_name
+                    .as_deref()
+                    .unwrap_or_else(|| view_path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+
+                let miller = MillerColumns::new(
+                    view_node,
+                    ctx.get_parent_node,
+                    current_name,
+                    view_path,
+                    ctx.marked,
+                    ctx.clipboard,
+                    ctx.theme,
+                );
+
+                let mut miller_state = ctx.miller_state.clone();
+                ratatui::widgets::StatefulWidget::render(
+                    miller,
+                    layout.main,
+                    buf,
+                    &mut miller_state,
+                );
+            }
+        }
     } else if let Some(error) = ctx.error {
         let error_block = Block::default()
             .borders(Borders::ALL)
@@ -712,23 +825,51 @@ fn render_details(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     let mut keys: Vec<(&str, &str)> = match ctx.view {
         View::Explorer => {
-            let mut v = vec![("j/k", "Nav"), ("h/l", "Fold"), ("Enter", "Drill")];
-            if ctx.view_root != ctx.path {
-                v.push(("\u{232B}", "Back"));
+            let mut v = vec![("j/k", "Nav")];
+
+            // File operations - always available (work on highlighted OR marked items)
+            v.push(("y", "Copy"));
+            v.push(("x", "Cut"));
+            v.push(("d", "Del"));
+
+            // Paste if clipboard has content
+            if !ctx.clipboard.is_empty() {
+                v.push(("p", "Paste"));
             }
-            v.push(("d", "Mark"));
+
+            // Esc clears clipboard (if any) then marks (if any)
+            // Show what Esc will do based on current state
+            if !ctx.clipboard.is_empty() {
+                v.push(("Esc", "Unclip"));
+            } else if !ctx.marked.is_empty() {
+                v.push(("Esc", "Unmark"));
+            } else {
+                v.push(("Spc", "+Sel"));
+            }
+
+            // Layout toggle
+            let layout_hint = match ctx.layout_mode {
+                LayoutMode::Tree => "Miller",
+                LayoutMode::Miller => "Tree",
+            };
+            v.push(("v", layout_hint));
             v
         }
-        View::Duplicates | View::Age => vec![("j/k", "Nav"), ("d", "Mark")],
+        View::Duplicates | View::Age => {
+            let mut v = vec![("j/k", "Nav"), ("y", "Copy"), ("d", "Del")];
+            if !ctx.clipboard.is_empty() {
+                v.push(("Esc", "Unclip"));
+            } else if !ctx.marked.is_empty() {
+                v.push(("Esc", "Unmark"));
+            } else {
+                v.push(("Spc", "+Sel"));
+            }
+            v
+        }
         View::Errors => vec![("j/k", "Nav")],
     };
 
-    if !ctx.marked_for_deletion.is_empty() {
-        keys.push(("x", "Clear"));
-        keys.push(("y", "Delete"));
-    }
-
-    keys.extend([(":", "Cmd"), ("Tab", "View"), ("?", "Help"), ("q", "Quit")]);
+    keys.extend([("?", "Help"), ("q", "Quit")]);
 
     let spans: Vec<Span> = keys
         .iter()

@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, StatefulWidget, Widget};
 
 use gravityfile_core::{FileNode, NodeKind};
 
+use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
 use crate::ui::{format_size, SizeBar};
 
@@ -128,17 +129,27 @@ pub struct TreeView<'a> {
     root_path: &'a PathBuf,
     total_size: u64,
     theme: &'a Theme,
+    marked: &'a HashSet<PathBuf>,
+    clipboard: &'a ClipboardState,
     block: Option<Block<'a>>,
 }
 
 impl<'a> TreeView<'a> {
     /// Create a new tree view.
-    pub fn new(root: &'a FileNode, root_path: &'a PathBuf, theme: &'a Theme) -> Self {
+    pub fn new(
+        root: &'a FileNode,
+        root_path: &'a PathBuf,
+        theme: &'a Theme,
+        marked: &'a HashSet<PathBuf>,
+        clipboard: &'a ClipboardState,
+    ) -> Self {
         Self {
             root,
             root_path,
             total_size: root.size,
             theme,
+            marked,
+            clipboard,
             block: None,
         }
     }
@@ -257,6 +268,15 @@ impl StatefulWidget for TreeView<'_> {
             let item = &items[item_idx];
             let y = inner_area.y + row_idx as u16;
             let is_selected = item_idx == state.selected;
+            let is_marked = self.marked.contains(&item.path);
+
+            // Check if item is in clipboard
+            let in_clipboard = self.clipboard.paths.contains(&item.path);
+            let clipboard_mode = if in_clipboard {
+                self.clipboard.mode
+            } else {
+                ClipboardMode::Empty
+            };
 
             // Build tree prefix
             let mut prefix = String::new();
@@ -271,6 +291,19 @@ impl StatefulWidget for TreeView<'_> {
                 });
             }
 
+            // Selection/clipboard indicator
+            // Priority: marked > cut > copied > none
+            let (checkbox, checkbox_style) = if is_marked {
+                ("● ", Style::default().fg(self.theme.info))
+            } else if clipboard_mode == ClipboardMode::Cut {
+                ("✂ ", Style::default().fg(self.theme.warning))
+            } else if clipboard_mode == ClipboardMode::Copy {
+                ("⎘ ", Style::default().fg(self.theme.success))
+            } else {
+                ("  ", Style::default().fg(self.theme.muted))
+            };
+            let checkbox_width: u16 = 2;
+
             // Expand indicator
             let expand_indicator = match item.node.kind {
                 VisibleNodeKind::Directory { expanded } => {
@@ -283,8 +316,8 @@ impl StatefulWidget for TreeView<'_> {
                 _ => "  ",
             };
 
-            // Node style
-            let node_style = match item.node.kind {
+            // Node style - clipboard items get special styling
+            let base_style = match item.node.kind {
                 VisibleNodeKind::Directory { .. } => self.theme.directory,
                 VisibleNodeKind::File { executable: true } => self.theme.executable,
                 VisibleNodeKind::File { executable: false } => self.theme.file,
@@ -295,8 +328,17 @@ impl StatefulWidget for TreeView<'_> {
                 VisibleNodeKind::Other => self.theme.muted.into(),
             };
 
+            // Apply clipboard styling (cut items are dimmed, copied items are italic)
+            let base_style = if clipboard_mode == ClipboardMode::Cut {
+                base_style.add_modifier(Modifier::DIM)
+            } else if clipboard_mode == ClipboardMode::Copy {
+                base_style.add_modifier(Modifier::ITALIC)
+            } else {
+                base_style
+            };
+
             // Calculate available width for name
-            let prefix_width = prefix.len() + expand_indicator.len();
+            let prefix_width = prefix.len() + checkbox_width as usize + expand_indicator.len();
             let available_for_name = inner_area
                 .width
                 .saturating_sub(prefix_width as u16)
@@ -311,10 +353,11 @@ impl StatefulWidget for TreeView<'_> {
                 item.node.name.clone()
             };
 
-            // Build line
+            // Build line with checkbox
             let prefix_span = Span::styled(&prefix, self.theme.tree_lines);
+            let checkbox_span = Span::styled(checkbox, checkbox_style);
             let expand_span = Span::styled(expand_indicator, Style::default().fg(self.theme.muted));
-            let name_span = Span::styled(&name, node_style);
+            let name_span = Span::styled(&name, base_style);
 
             // Pad name to fill space
             let name_padding =
@@ -327,6 +370,7 @@ impl StatefulWidget for TreeView<'_> {
 
             let line = Line::from(vec![
                 prefix_span,
+                checkbox_span,
                 expand_span,
                 name_span,
                 padding_span,
@@ -334,9 +378,12 @@ impl StatefulWidget for TreeView<'_> {
                 size_span,
             ]);
 
-            // Apply selection style
+            // Apply selection style (cursor highlight)
             let line = if is_selected {
                 line.style(self.theme.selected)
+            } else if is_marked {
+                // Marked but not selected - subtle highlight
+                line.style(Style::default().add_modifier(Modifier::BOLD))
             } else {
                 line
             };
