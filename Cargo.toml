@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/gravityfile"
@@ -46,11 +46,11 @@ derive_builder = "0.20"
 tempfile = "3"
 
 # Internal crates
-gravityfile-core = { version = "0.1.3", path = "crates/gravityfile-core" }
-gravityfile-scan = { version = "0.1.3", path = "crates/gravityfile-scan" }
-gravityfile-analyze = { version = "0.1.3", path = "crates/gravityfile-analyze" }
-gravityfile-ops = { version = "0.1.3", path = "crates/gravityfile-ops" }
-gravityfile-tui = { version = "0.1.3", path = "crates/gravityfile-tui" }
+gravityfile-core = { version = "0.2.0", path = "crates/gravityfile-core" }
+gravityfile-scan = { version = "0.2.0", path = "crates/gravityfile-scan" }
+gravityfile-analyze = { version = "0.2.0", path = "crates/gravityfile-analyze" }
+gravityfile-ops = { version = "0.2.0", path = "crates/gravityfile-ops" }
+gravityfile-tui = { version = "0.2.0", path = "crates/gravityfile-tui" }
 
 # File operations
 fs_extra = "1.3"

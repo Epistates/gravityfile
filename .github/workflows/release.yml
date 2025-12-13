@@ -1,0 +1,261 @@
+name: Cross-Platform Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: false
+          # Linux ARM64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: true
+          # macOS x86_64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+          # macOS ARM64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: ${{ matrix.target }}
+
+      # Install cross for Linux ARM builds
+      # Using cargo install from git since there are no recent releases
+      # (last release v0.2.5 was in Feb 2023, but development is active)
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 8633ec65ab914015c2444c732568b414bd3c47cf
+
+      # For Linux ARM, we need proper configuration
+      - name: Create .cargo/config.toml for Linux ARM
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml << 'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          ar = "aarch64-linux-gnu-ar"
+          EOF
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      # macOS Code Signing (optional - requires secrets to be configured)
+      - name: Import Apple Code Signing Certificate
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        uses: Apple-Actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Code sign and notarize macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          CERT_IMPORTED=false
+
+          # Check if certificate was imported (if secrets exist, cert should be imported)
+          if security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
+            CERT_IMPORTED=true
+          fi
+
+          # Sign both binaries
+          for BINARY in gravityfile grav; do
+            BINARY_PATH="target/${{ matrix.target }}/release/$BINARY"
+
+            if [ "$CERT_IMPORTED" = "true" ]; then
+              echo "Signing $BINARY with Developer ID..."
+              codesign --deep --force --verify --verbose \
+                --timestamp --options runtime \
+                --sign "${{ secrets.APPLE_DEVELOPER_ID }}" \
+                "$BINARY_PATH"
+              codesign -v "$BINARY_PATH"
+
+              echo "Notarizing $BINARY with Apple..."
+              ditto -c -k --sequesterRsrc "$BINARY_PATH" "${BINARY}-notarize.zip"
+
+              xcrun notarytool submit "${BINARY}-notarize.zip" \
+                --apple-id "${{ secrets.APPLE_ID }}" \
+                --password "${{ secrets.APPLE_ID_PASSWORD }}" \
+                --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+                --wait \
+                --timeout 30m
+
+              echo "Note: Stapling is not applicable to bare CLI binaries"
+              echo "Binary is notarized server-side - users will be verified online"
+
+              echo "Verifying notarization status..."
+              spctl -a -v "$BINARY_PATH" || true
+              echo "✓ $BINARY signed and notarized"
+            else
+              echo "Developer ID certificate not configured. Using ad-hoc signing for $BINARY..."
+              codesign --remove-signature "$BINARY_PATH" || true
+              codesign -s - "$BINARY_PATH"
+              codesign -v "$BINARY_PATH"
+              echo "⚠ $BINARY ad-hoc signed (users may see Gatekeeper warning)"
+            fi
+          done
+
+
+      - name: Prepare artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # Create artifacts directory
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          $archiveName = "gravityfile-${{ matrix.target }}"
+
+          # Create a directory for the archive contents
+          New-Item -ItemType Directory -Force -Path $archiveName | Out-Null
+
+          # Copy both binaries
+          Copy-Item "target/${{ matrix.target }}/release/gravityfile.exe" "$archiveName/"
+          Copy-Item "target/${{ matrix.target }}/release/grav.exe" "$archiveName/"
+
+          # Create zip for Windows (tar.gz not common on Windows)
+          Compress-Archive -Path $archiveName -DestinationPath "artifacts/$archiveName.zip"
+
+          # Generate SHA256 for the archive
+          $hash = (Get-FileHash "artifacts/$archiveName.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archiveName.zip" | Out-File -FilePath "artifacts/$archiveName.zip.sha256" -Encoding ascii -NoNewline
+
+          Write-Host "Archive contents:"
+          Get-ChildItem $archiveName | Format-List Name, Length
+          Write-Host "SHA256:"
+          Get-Content "artifacts/$archiveName.zip.sha256"
+        shell: pwsh
+
+      - name: Prepare artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p artifacts
+          ARCHIVE_NAME="gravityfile-${{ matrix.target }}"
+
+          # Create a directory for the archive contents
+          mkdir -p "$ARCHIVE_NAME"
+
+          # Copy both binaries
+          cp "target/${{ matrix.target }}/release/gravityfile" "$ARCHIVE_NAME/"
+          cp "target/${{ matrix.target }}/release/grav" "$ARCHIVE_NAME/"
+          chmod +x "$ARCHIVE_NAME/gravityfile" "$ARCHIVE_NAME/grav"
+
+          # Create tar to preserve permissions
+          tar -czf "artifacts/$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
+
+          # Generate SHA256 for the archive
+          cd artifacts
+          sha256sum "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256"
+
+          echo "Archive contents:"
+          tar -tzf "$ARCHIVE_NAME.tar.gz"
+          echo "SHA256:"
+          cat "$ARCHIVE_NAME.tar.gz.sha256"
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p final-release
+
+          # Copy archives directly (tar.gz and zip preserve permissions internally)
+          find release-artifacts -name "*.tar.gz" -type f -exec cp {} final-release/ \;
+          find release-artifacts -name "*.zip" -type f -exec cp {} final-release/ \;
+
+          # Copy individual SHA256 files
+          find release-artifacts -name "*.sha256" -type f -exec cp {} final-release/ \;
+
+          echo "Final release contents:"
+          ls -lah final-release/
+
+          echo "Verifying archive integrity:"
+          cd final-release
+          for archive in *.tar.gz; do
+            [ -f "$archive" ] || continue
+            echo "Testing $archive:"
+            tar -tzf "$archive" | head -10
+          done
+          for archive in *.zip; do
+            [ -f "$archive" ] || continue
+            echo "Testing $archive:"
+            unzip -l "$archive"
+          done
+        shell: bash
+
+      - name: Generate combined checksums
+        run: |
+          cd final-release
+          # Generate SHA256SUMS for archives (not individual binaries)
+          sha256sum *.tar.gz *.zip 2>/dev/null | grep -v "No such file" > SHA256SUMS || true
+          cat SHA256SUMS
+        shell: bash
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            final-release/*.tar.gz
+            final-release/*.zip
+            final-release/*.sha256
+            final-release/SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

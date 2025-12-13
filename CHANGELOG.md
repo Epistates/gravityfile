@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-12-13
+
+### Added
+
+- **Miller Columns Layout** - Ranger-style three-pane view (Parent | Current | Preview), toggle with `v` or `:layout miller`
+- **File Operations** - Full clipboard support with vim-style keybindings:
+  - `y` - Yank (copy) to clipboard
+  - `x` - Cut to clipboard
+  - `p` - Paste from clipboard
+  - `r` - Rename file/directory
+  - `a` - Create new file
+  - `A` - Create new directory
+  - `T` - Take (mkdir + cd into new directory)
+- **Conflict Resolution** - Interactive handling for file conflicts during copy/move operations
+- **Cross-Platform Releases** - GitHub Actions workflow for automated releases:
+  - Linux x86_64 and ARM64
+  - macOS Intel and Apple Silicon (with optional code signing/notarization)
+  - Windows x86_64
+- **CI Pipeline** - Automated build and test on push/PR to main
+
+### Changed
+
+- Improved navigation with history preservation across drill-down operations
+- Enhanced details panel with more file metadata
+
 ## [0.1.2] - 2025-12-09
 
 ### Changed
@@ -40,5 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.2.0]: https://github.com/epistates/gravityfile/releases/tag/v0.2.0
+[0.1.2]: https://github.com/epistates/gravityfile/releases/tag/v0.1.2
 [0.1.1]: https://github.com/epistates/gravityfile/releases/tag/v0.1.1
 [0.1.0]: https://github.com/epistates/gravityfile/releases/tag/v0.1.0
