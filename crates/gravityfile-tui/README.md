@@ -7,13 +7,16 @@ This crate provides a feature-rich TUI for exploring disk usage, finding duplica
 ## Features
 
 - **Interactive Explorer** - Navigate directory trees with vim-style keybindings
+- **Miller Columns Layout** - Ranger-style three-pane view (Parent | Current | Preview)
 - **Multiple Views** - Explorer, Duplicates, Age, and Errors views
 - **Drill-Down Navigation** - Explore subdirectories without rescanning
-- **Deletion Support** - Mark files for deletion with confirmation
+- **File Operations** - Copy, move, rename, create, delete with vim-style keybindings
+- **Clipboard Support** - Yank/cut/paste with conflict resolution
+- **Undo Support** - Undo file operations with `Ctrl-z`
 - **Command Palette** - Vim-style `:` commands for power users
 - **Theming** - Dark and light theme support
 - **Details Panel** - Toggle detailed file information
-- **Async Operations** - Non-blocking scanning and deletion
+- **Async Operations** - Non-blocking scanning and file operations
 
 ## Usage
 
@@ -48,8 +51,8 @@ ratatui::restore();
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
-| `h` / `←` | Collapse directory |
-| `l` / `→` | Expand directory |
+| `h` / `←` | Collapse directory / Move left (Miller) |
+| `l` / `→` | Expand directory / Move right (Miller) |
 | `g` | Jump to top |
 | `G` | Jump to bottom |
 | `Ctrl+d` | Page down |
@@ -60,20 +63,38 @@ ratatui::restore();
 |-----|--------|
 | `Enter` | Drill into directory |
 | `Backspace` / `-` | Navigate back |
-| `Tab` | Switch view |
+| `o` | Toggle expand node |
 
-### Actions
+### Selection & Clipboard
 | Key | Action |
 |-----|--------|
-| `d` | Mark for deletion |
-| `x` | Clear all marks |
-| `y` | Confirm deletion |
+| `Space` | Mark item for multi-select |
+| `y` | Yank (copy) to clipboard |
+| `x` | Cut to clipboard |
+| `p` | Paste from clipboard |
+| `Esc` | Clear clipboard / marks |
+
+### File Operations
+| Key | Action |
+|-----|--------|
+| `d` / `Del` | Delete item(s) |
+| `r` | Rename |
+| `a` | Create file (touch) |
+| `A` | Create directory (mkdir) |
+| `T` | Take (mkdir + cd into new directory) |
+| `Ctrl+z` | Undo |
+
+### Views & Display
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Switch view tab |
+| `v` | Toggle Tree / Miller layout |
 | `i` | Toggle details panel |
 | `t` | Toggle theme |
-| `r` | Refresh / rescan |
+| `R` | Refresh / rescan |
 | `?` | Show help |
 | `:` | Open command palette |
-| `q` / `Esc` | Quit |
+| `q` | Quit |
 
 ## Command Palette
 
@@ -81,27 +102,29 @@ Press `:` to open the command palette:
 
 | Command | Action |
 |---------|--------|
-| `:q` / `:quit` | Quit application |
-| `:r` / `:refresh` | Rescan directory |
-| `:cd <path>` | Navigate to path |
-| `:cd ..` | Go to parent |
-| `:root` | Go to scan root |
-| `:back` | Navigate back |
-| `:explorer` / `:e` | Switch to explorer view |
-| `:duplicates` / `:d` | Switch to duplicates view |
-| `:age` / `:a` | Switch to age view |
-| `:errors` | Switch to errors view |
-| `:theme` / `:t` | Toggle theme |
-| `:dark` | Set dark theme |
-| `:light` | Set light theme |
-| `:details` / `:i` | Toggle details panel |
-| `:clear` | Clear deletion marks |
-| `:help` / `:?` | Show help |
+| `:q` `:quit` | Quit application |
+| `:cd <path>` | Change directory |
+| `:touch <name>` | Create file |
+| `:mkdir <name>` | Create directory |
+| `:take <name>` | Create dir and cd into it |
+| `:yank` `:y` | Copy to clipboard |
+| `:cut` `:x` | Cut to clipboard |
+| `:paste` `:p` | Paste from clipboard |
+| `:delete` `:rm` | Delete marked items |
+| `:rename <name>` | Rename current item |
+| `:clear` | Clear all marks |
+| `:theme dark\|light` | Set theme |
+| `:layout tree\|miller` | Set layout |
+| `:help` | Show help |
 
 ## Views
 
 ### Explorer View
 The default view showing a tree of directories and files sorted by size. The size bar shows relative size compared to the largest item.
+
+Toggle between two layout modes with `v`:
+- **Tree Layout** (default) - Hierarchical tree with expand/collapse
+- **Miller Layout** - Three-column ranger-style view (Parent | Current | Preview)
 
 ### Duplicates View
 Shows groups of duplicate files found via content hashing. Files are grouped by their BLAKE3 hash and sorted by wasted space.
@@ -118,18 +141,21 @@ The TUI is organized into focused modules:
 
 - **app/** - Application state and logic
   - `mod.rs` - Core App struct and event loop
-  - `state.rs` - State types (AppMode, View, etc.)
+  - `state.rs` - State types (AppMode, View, LayoutMode, ClipboardState, etc.)
   - `commands.rs` - Command palette parsing
   - `navigation.rs` - List navigation abstractions
+  - `input.rs` - Text input handling for rename/create modes
   - `render.rs` - All rendering code
   - `scanning.rs` - Background scan operations
   - `deletion.rs` - File deletion logic
 - **ui/** - Widget implementations
   - `tree.rs` - Tree widget for directory display
+  - `miller.rs` - Miller columns (three-pane ranger-style) view
   - `help.rs` - Help overlay
-  - `modals.rs` - Modal dialogs
+  - `modals.rs` - Modal dialogs (confirmation, conflict resolution, etc.)
+  - `size_bar.rs` - Size visualization bars
 - **theme.rs** - Color schemes
-- **event.rs** - Terminal event handling
+- **event.rs** - Terminal event handling and key bindings
 
 ## License
 
