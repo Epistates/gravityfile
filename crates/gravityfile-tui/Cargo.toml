@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Terminal user interface for gravityfile"
 
+[features]
+default = []
+# Enable treemd integration for markdown viewing
+treemd = ["dep:treemd"]
+
 [dependencies]
 gravityfile-core.workspace = true
 gravityfile-scan.workspace = true
@@ -19,3 +24,26 @@ humansize.workspace = true
 strum.workspace = true
 itertools.workspace = true
 futures = "0.3"
+
+# Fuzzy search
+nucleo = "0.5"
+regex = "1"
+
+# File preview / syntax highlighting
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+
+# Path utilities
+dirs = "5"
+
+# Settings persistence
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# File opening in editors
+opensesame = { version = "0.1", features = ["serde"] }
+
+# Optional treemd integration for markdown
+treemd = { version = "0.5", optional = true }
+
+# System open command (for non-editor files)
+open = "5"
