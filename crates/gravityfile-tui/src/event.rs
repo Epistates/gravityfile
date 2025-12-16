@@ -25,6 +25,9 @@ pub enum KeyAction {
     // Directory navigation
     DrillDown,
     NavigateBack,
+    /// Open file with configured opener (Enter on file).
+    #[allow(dead_code)]
+    OpenFile,
 
     // Selection
     /// Toggle mark on current item (Space).
@@ -58,12 +61,19 @@ pub enum KeyAction {
     ToggleTheme,
     /// Toggle between tree and miller layout.
     ToggleLayout,
+    /// Cycle preview mode (auto/text/hex/metadata).
+    CyclePreviewMode,
+    /// Open settings modal.
+    OpenSettings,
 
     // Other actions
     Refresh,
     Search,
     Sort,
+    ReverseSort,
     CommandMode,
+    /// Go to a specific directory (opens path input).
+    GoTo,
 
     // Confirmation
     #[allow(dead_code)]
@@ -72,9 +82,21 @@ pub enum KeyAction {
     #[allow(dead_code)]
     ClearMarks,
 
-    // View switching
-    NextTab,
-    PrevTab,
+    // View switching (for View enum: Explorer, Duplicates, Age, Errors)
+    NextView,
+    PrevView,
+
+    // Directory tabs (multiple directory contexts)
+    /// Create a new directory tab.
+    NewDirTab,
+    /// Close the current directory tab.
+    CloseDirTab,
+    /// Switch to next directory tab.
+    NextDirTab,
+    /// Switch to previous directory tab.
+    PrevDirTab,
+    /// Switch to directory tab 1-9 (Alt+1 through Alt+9).
+    DirTab(u8),
 
     // Application
     Quit,
@@ -101,11 +123,11 @@ impl KeyAction {
             (KeyCode::Char('h'), KeyModifiers::NONE) => KeyAction::MoveLeft,
             (KeyCode::Char('l'), KeyModifiers::NONE) => KeyAction::MoveRight,
 
-            // Navigation - arrow keys
-            (KeyCode::Down, _) => KeyAction::MoveDown,
-            (KeyCode::Up, _) => KeyAction::MoveUp,
-            (KeyCode::Left, _) => KeyAction::MoveLeft,
-            (KeyCode::Right, _) => KeyAction::MoveRight,
+            // Navigation - arrow keys (without modifiers; Ctrl+arrows for tabs)
+            (KeyCode::Down, KeyModifiers::NONE) => KeyAction::MoveDown,
+            (KeyCode::Up, KeyModifiers::NONE) => KeyAction::MoveUp,
+            (KeyCode::Left, KeyModifiers::NONE) => KeyAction::MoveLeft,
+            (KeyCode::Right, KeyModifiers::NONE) => KeyAction::MoveRight,
 
             // Jump
             (KeyCode::Char('g'), KeyModifiers::NONE) => KeyAction::JumpToTop,
@@ -146,7 +168,9 @@ impl KeyAction {
             (KeyCode::Char('i'), KeyModifiers::NONE) => KeyAction::ToggleDetails,
             (KeyCode::Char('?'), KeyModifiers::NONE) => KeyAction::ToggleHelp,
             (KeyCode::Char('t'), KeyModifiers::NONE) => KeyAction::ToggleTheme,
+            (KeyCode::Char('P'), KeyModifiers::SHIFT) => KeyAction::CyclePreviewMode,
             (KeyCode::Char('v'), KeyModifiers::NONE) => KeyAction::ToggleLayout,
+            (KeyCode::Char(','), KeyModifiers::NONE) => KeyAction::OpenSettings,
 
             // Refresh (Shift-R since r is rename)
             (KeyCode::Char('R'), KeyModifiers::SHIFT) => KeyAction::Refresh,
@@ -154,6 +178,7 @@ impl KeyAction {
             // Search and sort
             (KeyCode::Char('/'), KeyModifiers::NONE) => KeyAction::Search,
             (KeyCode::Char('s'), KeyModifiers::NONE) => KeyAction::Sort,
+            (KeyCode::Char('S'), KeyModifiers::SHIFT) => KeyAction::ReverseSort,
 
             // Directory navigation
             (KeyCode::Enter, _) => KeyAction::DrillDown,
@@ -164,13 +189,32 @@ impl KeyAction {
             (KeyCode::Char(':'), KeyModifiers::NONE) => KeyAction::CommandMode,
             (KeyCode::Char(':'), KeyModifiers::SHIFT) => KeyAction::CommandMode,
 
+            // Go to directory
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) => KeyAction::GoTo,
+
             // Confirmation (for dialogs)
             (KeyCode::Char('n'), KeyModifiers::NONE) => KeyAction::Cancel,
             // ClearMarks available via Escape when items are marked, or :clear command
 
-            // View switching
-            (KeyCode::Tab, KeyModifiers::NONE) => KeyAction::NextTab,
-            (KeyCode::BackTab, _) => KeyAction::PrevTab,
+            // View switching (Explorer, Duplicates, Age, Errors)
+            (KeyCode::Tab, KeyModifiers::NONE) => KeyAction::NextView,
+            (KeyCode::BackTab, _) => KeyAction::PrevView,
+
+            // Directory tabs
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => KeyAction::NewDirTab,
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => KeyAction::CloseDirTab,
+            (KeyCode::Char(']'), KeyModifiers::NONE) => KeyAction::NextDirTab,
+            (KeyCode::Char('['), KeyModifiers::NONE) => KeyAction::PrevDirTab,
+            // Direct tab switching: 1-9 keys (only when multiple tabs exist)
+            (KeyCode::Char('1'), KeyModifiers::NONE) => KeyAction::DirTab(1),
+            (KeyCode::Char('2'), KeyModifiers::NONE) => KeyAction::DirTab(2),
+            (KeyCode::Char('3'), KeyModifiers::NONE) => KeyAction::DirTab(3),
+            (KeyCode::Char('4'), KeyModifiers::NONE) => KeyAction::DirTab(4),
+            (KeyCode::Char('5'), KeyModifiers::NONE) => KeyAction::DirTab(5),
+            (KeyCode::Char('6'), KeyModifiers::NONE) => KeyAction::DirTab(6),
+            (KeyCode::Char('7'), KeyModifiers::NONE) => KeyAction::DirTab(7),
+            (KeyCode::Char('8'), KeyModifiers::NONE) => KeyAction::DirTab(8),
+            (KeyCode::Char('9'), KeyModifiers::NONE) => KeyAction::DirTab(9),
 
             _ => KeyAction::None,
         }
@@ -201,6 +245,7 @@ pub fn get_help_sections() -> Vec<HelpSection> {
                 KeyBinding { keys: "Backspace/-", description: "Navigate back" },
                 KeyBinding { keys: "g/G", description: "Jump to top/bottom" },
                 KeyBinding { keys: "Ctrl-u/d", description: "Page up/down" },
+                KeyBinding { keys: "Ctrl-g", description: "Go to directory" },
                 KeyBinding { keys: "o", description: "Toggle expand node" },
             ],
         },
@@ -228,17 +273,40 @@ pub fn get_help_sections() -> Vec<HelpSection> {
         HelpSection {
             title: "Views & Display",
             bindings: vec![
-                KeyBinding { keys: "Tab/S-Tab", description: "Switch view tab" },
+                KeyBinding { keys: "Tab/S-Tab", description: "Switch view (Explorer/Dups/Age)" },
                 KeyBinding { keys: "v", description: "Toggle Tree/Miller" },
+                KeyBinding { keys: "s", description: "Cycle sort mode" },
+                KeyBinding { keys: "S", description: "Reverse sort order" },
                 KeyBinding { keys: "i", description: "Toggle details panel" },
                 KeyBinding { keys: "t", description: "Toggle dark/light theme" },
                 KeyBinding { keys: "R", description: "Refresh/rescan" },
             ],
         },
         HelpSection {
+            title: "Duplicates View",
+            bindings: vec![
+                KeyBinding { keys: "j/k", description: "Navigate groups/files" },
+                KeyBinding { keys: "h/l", description: "Collapse/expand group" },
+                KeyBinding { keys: "d (on group)", description: "Mark all duplicates (keeps 1st)" },
+                KeyBinding { keys: "d (on file)", description: "Mark single file for deletion" },
+                KeyBinding { keys: "Space (group)", description: "Select/deselect all in group" },
+                KeyBinding { keys: "Space (file)", description: "Toggle single file selection" },
+            ],
+        },
+        HelpSection {
+            title: "Directory Tabs",
+            bindings: vec![
+                KeyBinding { keys: "Ctrl-t", description: "New tab (current dir)" },
+                KeyBinding { keys: "Ctrl-w", description: "Close current tab" },
+                KeyBinding { keys: "]/[", description: "Next/prev tab" },
+                KeyBinding { keys: "1-9", description: "Jump to tab N" },
+            ],
+        },
+        HelpSection {
             title: "Commands",
             bindings: vec![
                 KeyBinding { keys: ":", description: "Open command palette" },
+                KeyBinding { keys: ",", description: "Open settings" },
                 KeyBinding { keys: "?", description: "Show this help" },
                 KeyBinding { keys: "q", description: "Quit" },
             ],
@@ -262,6 +330,7 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
         (":clear", "Clear all marks"),
         (":theme dark|light", "Set theme"),
         (":layout tree|miller", "Set layout"),
+        (":sort <mode>", "Set sort (size/name/date/count)"),
         (":help", "Show help"),
     ]
 }

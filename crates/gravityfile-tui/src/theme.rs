@@ -62,6 +62,12 @@ pub struct Theme {
     pub header: Style,
     pub footer: Style,
 
+    // Footer keybinding hints (polished pill/badge style)
+    pub help_key_bg: Color,
+    pub help_key_fg: Color,
+    pub help_desc_fg: Color,
+    pub footer_bg: Color,
+
     // Command palette
     pub command_prompt: Style,
     pub command_input: Style,
@@ -132,6 +138,12 @@ impl Theme {
             header: Style::new().bg(slate_800).fg(slate_100),
             footer: Style::new().bg(slate_800).fg(slate_400),
 
+            // Footer keybinding hints - polished pill/badge style
+            help_key_bg: slate_700,
+            help_key_fg: blue_400,
+            help_desc_fg: slate_400,
+            footer_bg: slate_800,
+
             command_prompt: Style::new().fg(blue_400).add_modifier(Modifier::BOLD),
             command_input: Style::new().fg(slate_100),
             command_cursor: Style::new().add_modifier(Modifier::REVERSED),
@@ -200,6 +212,12 @@ impl Theme {
             header: Style::new().bg(slate_100).fg(slate_800),
             footer: Style::new().bg(slate_100).fg(slate_600),
 
+            // Footer keybinding hints - polished pill/badge style
+            help_key_bg: slate_200,
+            help_key_fg: blue_700,
+            help_desc_fg: slate_600,
+            footer_bg: slate_100,
+
             command_prompt: Style::new().fg(blue_700).add_modifier(Modifier::BOLD),
             command_input: Style::new().fg(slate_900),
             command_cursor: Style::new().add_modifier(Modifier::REVERSED),
@@ -238,6 +256,24 @@ impl Theme {
     /// Get style for a size bar at given ratio.
     pub fn size_bar_style(&self, ratio: f64) -> Style {
         Style::new().fg(self.size_color(ratio))
+    }
+
+    /// Style for keybinding keys in footer (pill/badge style).
+    pub fn help_key_style(&self) -> Style {
+        Style::new()
+            .bg(self.help_key_bg)
+            .fg(self.help_key_fg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Style for keybinding descriptions in footer.
+    pub fn help_desc_style(&self) -> Style {
+        Style::new().fg(self.help_desc_fg)
+    }
+
+    /// Style for footer background.
+    pub fn footer_style(&self) -> Style {
+        Style::new().bg(self.footer_bg)
     }
 }
 
