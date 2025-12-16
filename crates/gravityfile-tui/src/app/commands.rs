@@ -139,6 +139,8 @@ pub enum CommandAction {
     SetTheme(ThemeCommand),
     /// Set layout.
     SetLayout(LayoutCommand),
+    /// Set sort mode.
+    SetSort(SortCommand),
 
     // File operations
     /// Yank (copy) marked items to clipboard.
@@ -175,6 +177,21 @@ pub enum LayoutCommand {
     Tree,
     Miller,
     Toggle,
+}
+
+/// Sort command variants.
+#[derive(Debug, Clone, Copy)]
+pub enum SortCommand {
+    SizeDesc,
+    SizeAsc,
+    NameAsc,
+    NameDesc,
+    DateDesc,
+    DateAsc,
+    CountDesc,
+    CountAsc,
+    Cycle,
+    Reverse,
 }
 
 /// Parse and execute a command string.
@@ -251,6 +268,30 @@ pub fn parse_command(cmd: &str) -> CommandAction {
             }
         }
         "miller" | "columns" => CommandAction::SetLayout(LayoutCommand::Miller),
+
+        // Sort commands
+        "sort" | "s" => {
+            if parts.len() > 1 {
+                match parts[1].to_lowercase().as_str() {
+                    "size" | "sz" => CommandAction::SetSort(SortCommand::SizeDesc),
+                    "size-" | "sz-" | "size-desc" => CommandAction::SetSort(SortCommand::SizeDesc),
+                    "size+" | "sz+" | "size-asc" => CommandAction::SetSort(SortCommand::SizeAsc),
+                    "name" | "nm" => CommandAction::SetSort(SortCommand::NameAsc),
+                    "name-" | "nm-" | "name-desc" => CommandAction::SetSort(SortCommand::NameDesc),
+                    "name+" | "nm+" | "name-asc" => CommandAction::SetSort(SortCommand::NameAsc),
+                    "date" | "dt" | "modified" | "mod" => CommandAction::SetSort(SortCommand::DateDesc),
+                    "date-" | "dt-" | "date-desc" => CommandAction::SetSort(SortCommand::DateDesc),
+                    "date+" | "dt+" | "date-asc" => CommandAction::SetSort(SortCommand::DateAsc),
+                    "count" | "ct" | "children" => CommandAction::SetSort(SortCommand::CountDesc),
+                    "count-" | "ct-" | "count-desc" => CommandAction::SetSort(SortCommand::CountDesc),
+                    "count+" | "ct+" | "count-asc" => CommandAction::SetSort(SortCommand::CountAsc),
+                    "reverse" | "rev" => CommandAction::SetSort(SortCommand::Reverse),
+                    _ => CommandAction::SetSort(SortCommand::Cycle),
+                }
+            } else {
+                CommandAction::SetSort(SortCommand::Cycle)
+            }
+        }
 
         // File operations
         "yank" | "y" | "copy" | "cp" => CommandAction::Yank,
