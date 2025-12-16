@@ -1,0 +1,30 @@
+[package]
+name = "gravityfile-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language-agnostic plugin system for gravityfile"
+
+[dependencies]
+gravityfile-core.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Plugin runtimes
+mlua = { version = "0.10", features = ["lua54", "async", "serialize", "send", "vendored"] }
+rhai = { version = "1.20", features = ["sync", "serde"] }
+
+# Configuration
+toml = "0.8"
+dirs = "5"
+
+# Async utilities
+futures = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true
