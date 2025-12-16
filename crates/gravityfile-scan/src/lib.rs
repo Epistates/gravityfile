@@ -50,7 +50,7 @@ mod scanner;
 
 pub use inode::InodeTracker;
 pub use progress::ScanProgress;
-pub use scanner::JwalkScanner;
+pub use scanner::{quick_list, JwalkScanner};
 
 // Re-export core types for convenience
 pub use gravityfile_core::{

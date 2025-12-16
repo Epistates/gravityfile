@@ -384,6 +384,146 @@ impl Default for JwalkScanner {
     }
 }
 
+/// Create a quick, non-recursive directory listing for immediate display.
+/// This function reads only the immediate children of a directory without
+/// recursing into subdirectories. Directory sizes will be 0 (unknown).
+pub fn quick_list(path: &Path) -> Result<FileTree, ScanError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let root_path = path.canonicalize().map_err(|e| ScanError::io(path, e))?;
+
+    if !root_path.is_dir() {
+        return Err(ScanError::NotADirectory {
+            path: root_path.clone(),
+        });
+    }
+
+    let node_id_counter = AtomicU64::new(0);
+    let mut stats = TreeStats::new();
+
+    // Get root directory metadata
+    let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
+    let root_timestamps = Timestamps::new(
+        root_metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        root_metadata.accessed().ok(),
+        root_metadata.created().ok(),
+    );
+
+    let root_name = root_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root_path.to_string_lossy().to_string());
+
+    let root_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
+    let mut root_node = FileNode::new_directory(root_id, root_name, root_timestamps);
+
+    // Read immediate children
+    let entries = std::fs::read_dir(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
+
+    let mut total_size: u64 = 0;
+    let mut file_count: u64 = 0;
+    let mut dir_count: u64 = 0;
+
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let entry_path = entry.path();
+        let entry_name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files by default
+        if entry_name.starts_with('.') {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let timestamps = Timestamps::new(
+            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            metadata.accessed().ok(),
+            metadata.created().ok(),
+        );
+
+        let child_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
+
+        if metadata.is_dir() {
+            // Directory - size is unknown (0) until full scan
+            let child_node = FileNode::new_directory(child_id, entry_name, timestamps);
+            root_node.children.push(child_node);
+            dir_count += 1;
+            stats.record_dir(1);
+        } else if metadata.is_file() {
+            // File - we know the size
+            let size = metadata.len();
+            let blocks = get_blocks(&metadata);
+            let executable = is_executable(&metadata);
+
+            let mut child_node =
+                FileNode::new_file(child_id, entry_name, size, blocks, timestamps, executable);
+
+            // Set inode info for potential hardlink detection
+            let inode = InodeInfo::new(get_ino(&metadata), get_dev(&metadata));
+            child_node.inode = Some(inode);
+
+            total_size += size;
+            file_count += 1;
+            root_node.children.push(child_node);
+            stats.record_file(entry_path, size, timestamps.modified, 1);
+        } else if metadata.is_symlink() {
+            // Symlink
+            let target = std::fs::read_link(&entry_path)
+                .map(|p| CompactString::new(p.to_string_lossy()))
+                .unwrap_or_default();
+            let broken = !entry_path.exists();
+
+            let child_node = FileNode {
+                id: child_id,
+                name: CompactString::new(entry_name),
+                kind: NodeKind::Symlink { target, broken },
+                size: 0,
+                blocks: 0,
+                timestamps,
+                inode: None,
+                content_hash: None,
+                children: Vec::new(),
+            };
+            root_node.children.push(child_node);
+            stats.record_symlink();
+        }
+    }
+
+    // Update root node with aggregated values
+    root_node.size = total_size;
+    root_node.kind = NodeKind::Directory {
+        file_count,
+        dir_count,
+    };
+
+    // Sort children by name for initial display (scan will re-sort by size later)
+    root_node.children.sort_by(|a, b| a.name.cmp(&b.name));
+
+    stats.record_dir(0);
+
+    let config = ScanConfig::new(&root_path);
+    let scan_duration = start.elapsed();
+
+    Ok(FileTree::new(
+        root_node,
+        root_path,
+        config,
+        stats,
+        scan_duration,
+        Vec::new(),
+    ))
+}
+
 /// Temporary struct for collecting entry information.
 struct EntryInfo {
     name: CompactString,
