@@ -1,12 +1,12 @@
 //! gravityfile - A state-of-the-art file system analyzer with TUI.
 //!
 //! Usage:
-//!   gf [PATH]              Launch interactive TUI
-//!   gf scan [PATH]         Quick scan summary
-//!   gf duplicates [PATH]   Find duplicate files
-//!   gf age [PATH]          Analyze file ages
-//!   gf export [PATH]       Export scan to JSON
-//!   gf --help              Show help
+//!   grav [PATH]              Launch interactive TUI
+//!   grav scan [PATH]         Quick scan summary
+//!   grav duplicates [PATH]   Find duplicate files
+//!   grav age [PATH]          Analyze file ages
+//!   grav export [PATH]       Export scan to JSON
+//!   grav --help              Show help
 
 use std::path::PathBuf;
 
@@ -22,13 +22,17 @@ use gravityfile_scan::{JwalkScanner, ScanConfig};
     version,
     about = "A state-of-the-art file system analyzer",
     long_about = "gravityfile helps you understand where your disk space goes.\n\n\
-                  Launch the interactive TUI by running `gf [PATH]`, or use \
+                  Launch the interactive TUI by running `grav [PATH]`, or use \
                   subcommands for quick operations."
 )]
 struct Cli {
     /// Path to analyze (defaults to current directory)
     #[arg(default_value = ".")]
     path: PathBuf,
+
+    /// Start scanning immediately on startup (default: show quick listing only)
+    #[arg(short = 'S', long)]
+    scan: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -143,7 +147,8 @@ fn main() -> Result<()> {
         None => {
             // Launch TUI
             let path = cli.path.canonicalize().context("Invalid path")?;
-            gravityfile_tui::run(path)?;
+            let config = gravityfile_tui::TuiConfig::new().with_scan_on_startup(cli.scan);
+            gravityfile_tui::run_with_config(path, config)?;
         }
     }
 
