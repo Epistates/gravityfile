@@ -5,17 +5,20 @@
 
 > "Where mass accumulates, attention should follow."
 
-A file system analyzer with an interactive TUI, built in Rust.
+File system explorer and analyzer with an interactive TUI, built in Rust.
 
 <img src="assets/video.gif" alt="gravityfile" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
 
 ## Features
 
 - **Interactive TUI** - Beautiful terminal interface with vim-style navigation
+- **Miller Columns Layout** - Ranger-style three-pane view (toggle with `v`)
+- **File Operations** - Copy, move, rename, create, delete with undo support
 - **Parallel Scanning** - Fast directory traversal using `jwalk`
 - **Duplicate Detection** - Find duplicate files using BLAKE3 hashing with partial-hash optimization
 - **Age Analysis** - Identify stale directories and analyze file age distribution
 - **Drill-Down Navigation** - Explore directories without rescanning
+- **Conflict Resolution** - Interactive handling for file conflicts during copy/move
 - **Command Palette** - Vim-style `:` commands for power users
 - **Multiple Themes** - Dark and light theme support
 - **Library-First Design** - Use as a library or standalone tool
@@ -94,32 +97,62 @@ Export scan results to JSON.
 | `j` / `k` | Move down / up |
 | `h` / `l` | Collapse / expand directory |
 | `g` / `G` | Jump to top / bottom |
+| `Ctrl-u` / `Ctrl-d` | Page up / down |
 | `Enter` | Drill into directory |
 | `Backspace` / `-` | Navigate back |
-| `Tab` | Switch view |
+| `o` | Toggle expand node |
 
-### Actions
+### Selection & Clipboard
 | Key | Action |
 |-----|--------|
-| `d` | Mark for deletion |
-| `x` | Clear all marks |
-| `y` | Confirm deletion |
+| `Space` | Mark item for multi-select |
+| `y` | Yank (copy) to clipboard |
+| `x` | Cut to clipboard |
+| `p` | Paste from clipboard |
+| `Esc` | Clear clipboard / marks |
+
+### File Operations
+| Key | Action |
+|-----|--------|
+| `d` / `Del` | Delete item(s) |
+| `r` | Rename |
+| `a` | Create file (touch) |
+| `A` | Create directory (mkdir) |
+| `T` | Take (mkdir + cd into new directory) |
+| `Ctrl-z` | Undo |
+
+### Views & Display
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift-Tab` | Switch view tab |
+| `v` | Toggle Tree / Miller layout |
 | `i` | Toggle details panel |
 | `t` | Toggle theme |
-| `r` | Refresh / rescan |
+| `R` | Refresh / rescan |
+
+### Commands
+| Key | Action |
+|-----|--------|
+| `:` | Open command palette |
 | `?` | Show help |
-| `:` | Command palette |
 | `q` | Quit |
 
 ### Command Palette
 | Command | Action |
 |---------|--------|
-| `:q` | Quit |
+| `:q` `:quit` | Quit |
 | `:cd <path>` | Change directory |
-| `:cd ..` | Go to parent |
-| `:root` | Go to scan root |
-| `:theme` | Toggle theme |
-| `:dark` / `:light` | Set theme |
+| `:touch <name>` | Create file |
+| `:mkdir <name>` | Create directory |
+| `:take <name>` | Create dir and cd into it |
+| `:yank` `:y` | Copy to clipboard |
+| `:cut` `:x` | Cut to clipboard |
+| `:paste` `:p` | Paste from clipboard |
+| `:delete` `:rm` | Delete marked items |
+| `:rename <name>` | Rename current item |
+| `:clear` | Clear all marks |
+| `:theme dark\|light` | Set theme |
+| `:layout tree\|miller` | Set layout |
 | `:help` | Show help |
 
 ## Library Usage
@@ -152,6 +185,7 @@ println!("Wasted space: {} bytes", report.total_wasted_space);
 - **`gravityfile-core`** - Core types (FileNode, FileTree, etc.)
 - **`gravityfile-scan`** - File system scanning engine
 - **`gravityfile-analyze`** - Analysis algorithms (duplicates, age)
+- **`gravityfile-ops`** - File operations engine (copy, move, rename, delete)
 - **`gravityfile-tui`** - Terminal user interface
 
 ## Performance
