@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use gravityfile_ops::{Conflict, ConflictKind, OperationProgress, OperationType};
 
 use crate::app::input::InputState;
-use crate::app::state::DeletionProgress;
+use crate::app::state::{DeletionProgress, SettingsState};
 use crate::theme::Theme;
 use crate::ui::format_size;
 
@@ -742,6 +742,150 @@ impl Widget for ConflictModal<'_> {
                 ]));
             }
         }
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+/// Settings modal for user preferences.
+pub struct SettingsModal<'a> {
+    theme: &'a Theme,
+    state: &'a SettingsState,
+}
+
+impl<'a> SettingsModal<'a> {
+    /// Create a new settings modal.
+    pub fn new(theme: &'a Theme, state: &'a SettingsState) -> Self {
+        Self { theme, state }
+    }
+
+    fn render_toggle(&self, label: &str, value: bool, selected: bool) -> Line<'static> {
+        let checkbox = if value { "[x]" } else { "[ ]" };
+        let style = if selected {
+            Style::default()
+                .fg(self.theme.info)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        Line::from(vec![
+            Span::styled(
+                if selected { " > " } else { "   " },
+                style,
+            ),
+            Span::styled(checkbox.to_string(), style),
+            Span::styled(format!(" {}", label), style),
+        ])
+    }
+
+    fn render_choice(&self, label: &str, value: &str, selected: bool) -> Line<'static> {
+        let style = if selected {
+            Style::default()
+                .fg(self.theme.info)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        Line::from(vec![
+            Span::styled(
+                if selected { " > " } else { "   " },
+                style,
+            ),
+            Span::styled(format!("{}: ", label), style),
+            Span::styled(
+                value.to_string(),
+                Style::default()
+                    .fg(self.theme.info)
+                    .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+            ),
+        ])
+    }
+}
+
+impl Widget for SettingsModal<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let popup_width = 50.min(area.width.saturating_sub(4));
+        let popup_height = 14.min(area.height.saturating_sub(4));
+
+        let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
+        let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
+
+        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+        Clear.render(popup_area, buf);
+
+        let title = if self.state.dirty {
+            " Settings * "
+        } else {
+            " Settings "
+        };
+
+        let block = Block::default()
+            .title(title)
+            .title_style(
+                Style::default()
+                    .fg(self.theme.info)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_style(self.theme.border);
+
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let mut lines = vec![];
+
+        // Section header
+        lines.push(Line::styled(
+            " Startup",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        lines.push(Line::raw(""));
+
+        // Scan on startup
+        lines.push(self.render_toggle(
+            "Scan on startup",
+            self.state.settings.scan_on_startup,
+            self.state.selected == 0,
+        ));
+
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            " Display",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        lines.push(Line::raw(""));
+
+        // Show hidden files
+        lines.push(self.render_toggle(
+            "Show hidden files",
+            self.state.settings.show_hidden,
+            self.state.selected == 1,
+        ));
+
+        // Default layout
+        lines.push(self.render_choice(
+            "Default layout",
+            &self.state.settings.default_layout,
+            self.state.selected == 2,
+        ));
+
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(""));
+
+        // Help line
+        lines.push(Line::from(vec![
+            Span::styled(" j/k ", self.theme.help_key_style()),
+            Span::styled("Nav ", self.theme.help_desc_style()),
+            Span::styled(" Space/Enter ", self.theme.help_key_style()),
+            Span::styled("Toggle ", self.theme.help_desc_style()),
+            Span::styled(" s ", self.theme.help_key_style()),
+            Span::styled("Save ", self.theme.help_desc_style()),
+            Span::styled(" Esc ", self.theme.help_key_style()),
+            Span::styled("Close", self.theme.help_desc_style()),
+        ]));
 
         Paragraph::new(lines).render(inner, buf);
     }

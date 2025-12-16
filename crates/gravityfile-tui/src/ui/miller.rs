@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, StatefulWidget, Widget};
 use gravityfile_core::{FileNode, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
+use crate::preview::PreviewContent;
 use crate::theme::Theme;
 use crate::ui::{format_size, SizeBar};
 
@@ -118,6 +119,10 @@ pub struct MillerColumns<'a> {
     theme: &'a Theme,
     /// Optional block around the whole widget.
     block: Option<Block<'a>>,
+    /// File preview content (for non-directory items).
+    file_preview: Option<&'a PreviewContent>,
+    /// Current preview mode.
+    preview_mode: crate::preview::PreviewMode,
 }
 
 impl<'a> MillerColumns<'a> {
@@ -140,6 +145,8 @@ impl<'a> MillerColumns<'a> {
             clipboard,
             theme,
             block: None,
+            file_preview: None,
+            preview_mode: crate::preview::PreviewMode::Auto,
         }
     }
 
@@ -147,6 +154,18 @@ impl<'a> MillerColumns<'a> {
     #[allow(dead_code)]
     pub fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
+        self
+    }
+
+    /// Set the file preview content.
+    pub fn file_preview(mut self, preview: &'a PreviewContent) -> Self {
+        self.file_preview = Some(preview);
+        self
+    }
+
+    /// Set the preview mode.
+    pub fn preview_mode(mut self, mode: crate::preview::PreviewMode) -> Self {
+        self.preview_mode = mode;
         self
     }
 
@@ -280,8 +299,12 @@ impl<'a> MillerColumns<'a> {
             let name_padding =
                 " ".repeat(available_for_name.saturating_sub(name.len()));
 
-            // Size text (shorter format)
-            let size_text = format!("{:>7}", format_size(entry.size));
+            // Size text (shorter format) - show "..." for directories with unknown size
+            let size_text = if entry.is_dir && entry.size == 0 {
+                format!("{:>7}", "...")
+            } else {
+                format!("{:>7}", format_size(entry.size))
+            };
 
             // Build line with checkbox
             let checkbox_span = Span::styled(checkbox, checkbox_style);
@@ -344,6 +367,161 @@ impl<'a> MillerColumns<'a> {
 
     /// Render file preview (for non-directory items).
     fn render_file_preview(&self, area: Rect, buf: &mut Buffer, entry: &ColumnEntry) {
+        let title = format!(" Preview [{}] (P) ", self.preview_mode.name());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border)
+            .title(title)
+            .title_style(self.theme.title);
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        // If we have preview content, use it
+        if let Some(preview) = self.file_preview {
+            match preview {
+                PreviewContent::Text { lines, highlighted, .. } => {
+                    // Add header with file name and highlighting indicator
+                    let header = Line::from(vec![
+                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(
+                            if *highlighted { "[highlighted]" } else { "[plain]" },
+                            Style::default().fg(self.theme.muted),
+                        ),
+                    ]);
+
+                    let mut display_lines = vec![header, Line::raw("")];
+                    let max_lines = inner.height.saturating_sub(2) as usize;
+                    for line in lines.iter().take(max_lines) {
+                        display_lines.push(line.clone());
+                    }
+
+                    Paragraph::new(display_lines).render(inner, buf);
+                }
+                PreviewContent::Hex { lines, total_bytes } => {
+                    let header = Line::from(vec![
+                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("[binary: {} bytes]", total_bytes),
+                            Style::default().fg(self.theme.warning),
+                        ),
+                    ]);
+
+                    let mut display_lines = vec![header, Line::raw("")];
+                    let max_lines = inner.height.saturating_sub(2) as usize;
+                    for line in lines.iter().take(max_lines) {
+                        display_lines.push(line.clone());
+                    }
+
+                    Paragraph::new(display_lines).render(inner, buf);
+                }
+                PreviewContent::Directory { entries } => {
+                    let header = Line::from(vec![
+                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("[{} items]", entries.len()),
+                            Style::default().fg(self.theme.muted),
+                        ),
+                    ]);
+
+                    let mut display_lines = vec![header, Line::raw("")];
+                    let max_lines = inner.height.saturating_sub(2) as usize;
+                    for (name, is_dir) in entries.iter().take(max_lines) {
+                        let icon = if *is_dir { "📁 " } else { "📄 " };
+                        let style = if *is_dir {
+                            self.theme.directory
+                        } else {
+                            self.theme.file
+                        };
+                        display_lines.push(Line::styled(format!("{}{}", icon, name), style));
+                    }
+
+                    Paragraph::new(display_lines).render(inner, buf);
+                }
+                PreviewContent::Metadata {
+                    size,
+                    modified,
+                    created,
+                    accessed,
+                    file_type,
+                    permissions,
+                } => {
+                    let mut lines = vec![
+                        Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::styled("Type: ", self.theme.help_desc),
+                            Span::raw(file_type.clone()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("Size: ", self.theme.help_desc),
+                            Span::raw(crate::ui::format_size(*size)),
+                            Span::styled(format!(" ({} bytes)", size), Style::default().fg(self.theme.muted)),
+                        ]),
+                    ];
+
+                    if let Some(perms) = permissions {
+                        lines.push(Line::from(vec![
+                            Span::styled("Permissions: ", self.theme.help_desc),
+                            Span::raw(perms.clone()),
+                        ]));
+                    }
+
+                    if let Some(mtime) = modified {
+                        if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                            let secs = duration.as_secs();
+                            lines.push(Line::from(vec![
+                                Span::styled("Modified: ", self.theme.help_desc),
+                                Span::raw(format_timestamp(secs)),
+                            ]));
+                        }
+                    }
+
+                    if let Some(ctime) = created {
+                        if let Ok(duration) = ctime.duration_since(std::time::UNIX_EPOCH) {
+                            let secs = duration.as_secs();
+                            lines.push(Line::from(vec![
+                                Span::styled("Created: ", self.theme.help_desc),
+                                Span::raw(format_timestamp(secs)),
+                            ]));
+                        }
+                    }
+
+                    if let Some(atime) = accessed {
+                        if let Ok(duration) = atime.duration_since(std::time::UNIX_EPOCH) {
+                            let secs = duration.as_secs();
+                            lines.push(Line::from(vec![
+                                Span::styled("Accessed: ", self.theme.help_desc),
+                                Span::raw(format_timestamp(secs)),
+                            ]));
+                        }
+                    }
+
+                    Paragraph::new(lines).render(inner, buf);
+                }
+                PreviewContent::Error(msg) => {
+                    let lines = vec![
+                        Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Line::raw(""),
+                        Line::styled(msg.clone(), Style::default().fg(self.theme.error)),
+                    ];
+                    Paragraph::new(lines).render(inner, buf);
+                }
+                PreviewContent::Empty => {
+                    self.render_basic_info(inner, buf, entry);
+                }
+            }
+        } else {
+            // Fall back to basic file info
+            self.render_basic_info(inner, buf, entry);
+        }
+    }
+
+    /// Render placeholder for directory not yet scanned.
+    fn render_directory_placeholder(&self, area: Rect, buf: &mut Buffer, entry: &ColumnEntry) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border)
@@ -357,8 +535,34 @@ impl<'a> MillerColumns<'a> {
             Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
             Line::raw(""),
             Line::from(vec![
+                Span::styled("Type: ", self.theme.help_desc),
+                Span::raw("Directory"),
+            ]),
+            Line::raw(""),
+            Line::styled(
+                "Press Enter to navigate",
+                Style::default().fg(self.theme.muted),
+            ),
+        ];
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+
+    /// Render basic file info (no content preview).
+    fn render_basic_info(&self, area: Rect, buf: &mut Buffer, entry: &ColumnEntry) {
+        // Show "calculating..." for directories with unknown size
+        let size_str = if entry.is_dir && entry.size == 0 {
+            "calculating...".to_string()
+        } else {
+            format_size(entry.size)
+        };
+
+        let lines = vec![
+            Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+            Line::raw(""),
+            Line::from(vec![
                 Span::styled("Size: ", self.theme.help_desc),
-                Span::raw(format_size(entry.size)),
+                Span::raw(size_str),
             ]),
             Line::from(vec![
                 Span::styled("Type: ", self.theme.help_desc),
@@ -374,7 +578,7 @@ impl<'a> MillerColumns<'a> {
             ]),
         ];
 
-        Paragraph::new(lines).render(inner, buf);
+        Paragraph::new(lines).render(area, buf);
     }
 }
 
@@ -474,7 +678,8 @@ impl StatefulWidget for MillerColumns<'_> {
                         preview_total_size,
                     );
                 } else {
-                    self.render_file_preview(preview_area, buf, selected_entry);
+                    // Directory children not loaded yet - show placeholder
+                    self.render_directory_placeholder(preview_area, buf, selected_entry);
                 }
             } else {
                 // Show file info preview
@@ -490,6 +695,54 @@ impl StatefulWidget for MillerColumns<'_> {
             block.render(preview_area, buf);
         }
     }
+}
+
+/// Format a Unix timestamp as a human-readable date string.
+fn format_timestamp(secs: u64) -> String {
+    // Simple formatting without chrono dependency
+    let days_since_epoch = secs / 86400;
+    let remaining_secs = secs % 86400;
+    let hours = remaining_secs / 3600;
+    let minutes = (remaining_secs % 3600) / 60;
+    let seconds = remaining_secs % 60;
+
+    // Calculate year/month/day from days since epoch (1970-01-01)
+    let mut days = days_since_epoch as i64;
+    let mut year = 1970i32;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let days_in_months: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1u32;
+    for &dim in &days_in_months {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Get the selected entry from Miller state.

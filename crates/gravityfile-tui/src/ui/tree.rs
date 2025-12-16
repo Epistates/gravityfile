@@ -364,8 +364,14 @@ impl StatefulWidget for TreeView<'_> {
                 " ".repeat(available_for_name.saturating_sub(name.len() as u16) as usize);
             let padding_span = Span::raw(&name_padding);
 
-            // Size text
-            let size_text = format!("{:>10}", format_size(item.node.size));
+            // Size text - show "..." for directories with unknown size (0 bytes)
+            let size_text = if matches!(item.node.kind, VisibleNodeKind::Directory { .. })
+                && item.node.size == 0
+            {
+                format!("{:>10}", "...")
+            } else {
+                format!("{:>10}", format_size(item.node.size))
+            };
             let size_span = Span::styled(&size_text, Style::default().fg(self.theme.muted));
 
             let line = Line::from(vec![
