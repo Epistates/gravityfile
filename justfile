@@ -81,37 +81,25 @@ package:
     cargo package --workspace --allow-dirty
 
 # Publish all crates to crates.io (in dependency order)
+# Requires: cargo install cargo-workspaces
 publish:
-    @echo "Publishing workspace crates to crates.io..."
-    @echo "Step 1/6: gravityfile-core"
-    cargo publish -p gravityfile-core
-    @sleep 15  # Wait for crates.io index to update
-    @echo "Step 2/6: gravityfile-scan"
-    cargo publish -p gravityfile-scan
-    @sleep 15
-    @echo "Step 3/6: gravityfile-analyze"
-    cargo publish -p gravityfile-analyze
-    @sleep 15
-    @echo "Step 4/6: gravityfile-ops"
-    cargo publish -p gravityfile-ops
-    @sleep 15
-    @echo "Step 5/6: gravityfile-tui"
-    cargo publish -p gravityfile-tui
-    @sleep 15
-    @echo "Step 6/6: gravityfile"
-    cargo publish -p gravityfile
-    @echo "✅ All crates published!"
+    cargo workspaces publish --publish-as-is --no-remove-dev-deps --allow-dirty --publish-interval 30
 
-# Publish with dry-run (verify without uploading)
+# Dry-run publish (verify all crates without uploading)
+# Requires: cargo install cargo-workspaces
 publish-dry-run:
-    @echo "Dry-run publishing workspace crates..."
-    cargo publish -p gravityfile-core --dry-run
-    cargo publish -p gravityfile-scan --dry-run
-    cargo publish -p gravityfile-analyze --dry-run
-    cargo publish -p gravityfile-ops --dry-run
-    cargo publish -p gravityfile-tui --dry-run
-    cargo publish -p gravityfile --dry-run
-    @echo "✅ Dry-run complete!"
+    cargo workspaces publish --dry-run --publish-as-is --no-remove-dev-deps --allow-dirty
+
+# List files that would be included in each crate's package
+publish-list:
+    @echo "Files to be published in each crate:"
+    @for crate in gravityfile-core gravityfile-scan gravityfile-analyze gravityfile-ops gravityfile-plugin gravityfile-tui gravityfile; do \
+        echo "\n=== $crate ===" && cargo package -p $crate --list 2>/dev/null || echo "(requires deps published first)"; \
+    done
+
+# Install cargo-workspaces for publishing
+install-cargo-workspaces:
+    cargo install cargo-workspaces
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Release Management
