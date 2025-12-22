@@ -94,13 +94,18 @@ Export scan results to JSON.
 ### Navigation
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move down / up |
-| `h` / `l` | Collapse / expand directory |
-| `g` / `G` | Jump to top / bottom |
-| `Ctrl-u` / `Ctrl-d` | Page up / down |
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `h` / `←` | Collapse directory |
+| `l` / `→` | Expand directory |
+| `g` / `Home` | Jump to top |
+| `G` / `End` | Jump to bottom |
+| `Ctrl-u` / `PgUp` | Page up |
+| `Ctrl-d` / `PgDn` | Page down |
 | `Enter` | Drill into directory |
 | `Backspace` / `-` | Navigate back |
 | `o` | Toggle expand node |
+| `Ctrl-g` | Go to path |
 
 ### Selection & Clipboard
 | Key | Action |
@@ -114,21 +119,38 @@ Export scan results to JSON.
 ### File Operations
 | Key | Action |
 |-----|--------|
-| `d` / `Del` | Delete item(s) |
+| `d` / `D` / `Del` | Delete item(s) |
 | `r` | Rename |
 | `a` | Create file (touch) |
 | `A` | Create directory (mkdir) |
 | `T` | Take (mkdir + cd into new directory) |
-| `Ctrl-z` | Undo |
+| `Ctrl-z` | Undo last operation |
 
 ### Views & Display
 | Key | Action |
 |-----|--------|
-| `Tab` / `Shift-Tab` | Switch view tab |
+| `Tab` / `Shift-Tab` | Switch view tab (Usage, Duplicates, Age) |
 | `v` | Toggle Tree / Miller layout |
 | `i` | Toggle details panel |
-| `t` | Toggle theme |
-| `R` | Refresh / rescan |
+| `P` | Cycle preview mode |
+| `t` | Toggle theme (dark/light) |
+| `,` | Open settings |
+| `R` | **Rescan current directory** |
+
+### Search & Sort
+| Key | Action |
+|-----|--------|
+| `/` | Search |
+| `s` | Sort |
+| `S` | Reverse sort |
+
+### Directory Tabs
+| Key | Action |
+|-----|--------|
+| `Ctrl-t` | New directory tab |
+| `Ctrl-w` | Close current tab |
+| `]` / `[` | Next / previous tab |
+| `1`-`9` | Switch to tab by number |
 
 ### Commands
 | Key | Action |
@@ -136,6 +158,7 @@ Export scan results to JSON.
 | `:` | Open command palette |
 | `?` | Show help |
 | `q` | Quit |
+| `Ctrl-c` | Force quit |
 
 ### Command Palette
 | Command | Action |
