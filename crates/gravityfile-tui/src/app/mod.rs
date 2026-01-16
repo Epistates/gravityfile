@@ -904,7 +904,7 @@ impl App {
 
             // File operations
             KeyAction::Delete => {
-                // If nothing marked, auto-mark items for deletion
+                // If nothing marked, auto-mark items for deletion based on current view
                 if self.marked.is_empty() {
                     if self.view == View::Duplicates {
                         // In duplicates view, special handling
@@ -932,6 +932,14 @@ impl App {
                         };
                         for path in paths_to_mark {
                             self.marked.insert(path);
+                        }
+                    } else if self.view == View::Errors {
+                        // In Errors view, get the selected warning's path
+                        if let Some(warning) = self.warnings.get(self.selected_warning) {
+                            // Only allow deleting broken symlinks, not permission errors etc.
+                            if warning.kind == gravityfile_core::WarningKind::BrokenSymlink {
+                                self.marked.insert(warning.path.clone());
+                            }
                         }
                     } else if let Some(path) = self.get_selected_path() {
                         self.marked.insert(path);
@@ -1104,7 +1112,18 @@ impl App {
                     None
                 }
             }
-            View::Errors => None,
+            View::Errors => {
+                // Only allow marking broken symlinks for deletion
+                if let Some(warning) = self.warnings.get(self.selected_warning) {
+                    if warning.kind == gravityfile_core::WarningKind::BrokenSymlink {
+                        Some(warning.path.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
         };
 
         if let Some(path) = path {

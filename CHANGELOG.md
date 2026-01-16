@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-01-16
+
+### Fixed
+
+- **Critical: Safe Deletion with Trash** - All deletions now move files to system trash instead of permanent deletion, allowing recovery of accidentally deleted files
+- **Critical: Symlink Safety** - Fixed symlink handling across all file operations to prevent accidental deletion of symlink targets:
+  - Uses `symlink_metadata()` instead of `is_dir()` to avoid following symlinks
+  - Symlinks are always removed as files, never following their targets
+  - Applies to delete, copy, move, and undo operations
+- **Critical: Errors View Delete Behavior** - Pressing `d` in Errors view now correctly deletes the selected broken symlink, not items from the Explorer view
+- **Delete Confirmation Modal** - Now shows full paths (truncated from left if needed) instead of just filenames, with type indicators (🔗 for symlinks, 📁 for directories)
+- **Errors View Toggle Mark** - Space key now properly marks/unmarks broken symlinks in Errors view
+
+### Added
+
+- **Errors View Footer Hints** - Shows available actions (`Spc` to select, `d` to delete, `Esc` to clear)
+- **Errors View Delete Hint** - Selected broken symlinks show `[d to delete]` hint
+- **Errors View Mark Indicator** - Marked items show `[x]` prefix
+- **Comprehensive Symlink Tests** - Added tests for deleting symlinks to files, directories, broken symlinks, symlink chains, and directories containing symlinks
+
+### Changed
+
+- Delete confirmation now says "Move to trash?" instead of "cannot be undone"
+- Success messages now say "Moved to trash" instead of "Deleted"
+
 ## [0.2.1] - 2025-12-14
 
 ### Added
@@ -105,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2
 [0.2.1]: https://github.com/epistates/gravityfile/releases/tag/v0.2.1
 [0.2.0]: https://github.com/epistates/gravityfile/releases/tag/v0.2.0
 [0.1.2]: https://github.com/epistates/gravityfile/releases/tag/v0.1.2

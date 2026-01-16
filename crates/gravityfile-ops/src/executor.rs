@@ -236,7 +236,12 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     let _ = tx.send(OperationResult::Progress(progress.clone())).await;
 
                     let result = tokio::task::spawn_blocking(move || {
-                        if path.is_dir() {
+                        // Use symlink_metadata to check type without following symlinks
+                        let metadata = fs::symlink_metadata(&path)?;
+                        if metadata.is_symlink() {
+                            // Symlinks are always removed as files
+                            fs::remove_file(&path)
+                        } else if metadata.is_dir() {
                             fs::remove_dir_all(&path)
                         } else {
                             fs::remove_file(&path)
@@ -347,7 +352,12 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
 
                 let path_clone = path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    if path_clone.is_dir() {
+                    // Use symlink_metadata to check type without following symlinks
+                    let metadata = fs::symlink_metadata(&path_clone)?;
+                    if metadata.is_symlink() {
+                        // Symlinks are always removed as files
+                        fs::remove_file(&path_clone)
+                    } else if metadata.is_dir() {
                         fs::remove_dir_all(&path_clone)
                     } else {
                         fs::remove_file(&path_clone)

@@ -150,11 +150,17 @@ async fn copy_impl(
                     continue;
                 }
                 ConflictResolution::Overwrite | ConflictResolution::OverwriteAll => {
-                    // Remove existing before copy
-                    let _ = if dest_path.is_dir() {
-                        fs::remove_dir_all(&dest_path)
+                    // Remove existing before copy - use symlink_metadata to avoid following symlinks
+                    let _ = if let Ok(metadata) = fs::symlink_metadata(&dest_path) {
+                        if metadata.is_symlink() {
+                            fs::remove_file(&dest_path)
+                        } else if metadata.is_dir() {
+                            fs::remove_dir_all(&dest_path)
+                        } else {
+                            fs::remove_file(&dest_path)
+                        }
                     } else {
-                        fs::remove_file(&dest_path)
+                        Ok(())
                     };
                 }
             }
@@ -184,7 +190,7 @@ async fn copy_impl(
         .await;
 }
 
-/// Copy a single item (file or directory).
+/// Copy a single item (file, directory, or symlink).
 async fn copy_item(
     source: &PathBuf,
     dest: &PathBuf,
@@ -195,7 +201,31 @@ async fn copy_item(
     let dest = dest.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        if source.is_dir() {
+        // Use symlink_metadata to avoid following symlinks
+        let metadata = fs::symlink_metadata(&source)
+            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+        if metadata.is_symlink() {
+            // For symlinks, read the target and recreate at destination
+            let target = fs::read_link(&source)
+                .map_err(|e| format!("Failed to read symlink: {}", e))?;
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, &dest)
+                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
+            }
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dest)
+                        .map_err(|e| format!("Failed to create symlink: {}", e))?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dest)
+                        .map_err(|e| format!("Failed to create symlink: {}", e))?;
+                }
+            }
+            Ok(0u64) // Symlinks have no real size
+        } else if metadata.is_dir() {
             copy_dir_recursive(&source, &dest)
         } else {
             copy_file(&source, &dest)

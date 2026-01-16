@@ -77,7 +77,7 @@ impl Widget for DeleteConfirmModal<'_> {
         let mut lines = vec![
             Line::styled(
                 format!(
-                    "Delete {} items ({})? This cannot be undone!",
+                    "Move {} items ({}) to trash?",
                     self.marked_paths.len(),
                     format_size(total_size)
                 ),
@@ -88,15 +88,31 @@ impl Widget for DeleteConfirmModal<'_> {
             Line::raw(""),
         ];
 
-        // List items (limited)
+        // List items (limited) - show full paths for clarity
         let max_items = (inner.height as usize).saturating_sub(5);
+        let max_path_len = (inner.width as usize).saturating_sub(6);
         for path in self.marked_paths.iter().take(max_items) {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            let prefix = if path.is_dir() { "  " } else { "  " };
-            lines.push(Line::raw(format!("  {}{}", prefix, name)));
+            // Show full path, truncated from the left if too long
+            let full_path = path.display().to_string();
+            let display_path = if full_path.len() > max_path_len {
+                format!("...{}", &full_path[full_path.len().saturating_sub(max_path_len - 3)..])
+            } else {
+                full_path
+            };
+
+            // Add type indicator and style based on file type
+            let (icon, style) = if path.is_symlink() {
+                ("🔗", self.theme.symlink)
+            } else if path.is_dir() {
+                ("📁", self.theme.directory)
+            } else {
+                ("  ", Style::default())
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::raw(icon),
+                Span::styled(format!(" {}", display_path), style),
+            ]));
         }
 
         if self.marked_paths.len() > max_items {

@@ -1110,7 +1110,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "gravityfile"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "color-eyre",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-analyze"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "compact_str",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-ops"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "fs_extra",
  "gravityfile-core",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-plugin"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dirs 5.0.1",
  "futures",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-scan"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "compact_str",
  "dashmap",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-tui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "color-eyre",
  "crossterm 0.28.1",
@@ -1217,8 +1217,10 @@ dependencies = [
  "serde",
  "strum 0.26.3",
  "syntect",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
+ "trash",
  "treemd",
 ]
 

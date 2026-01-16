@@ -1070,17 +1070,23 @@ fn render_errors(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         let base_y = inner.y + ((i - scroll_offset) * lines_per_item) as u16;
         let is_selected = i == ctx.selected_warning;
 
-        let (icon, kind_label) = match warning.kind {
-            gravityfile_core::WarningKind::PermissionDenied => ("\u{1F512}", "Permission Denied"),
-            gravityfile_core::WarningKind::BrokenSymlink => ("\u{1F517}", "Broken Symlink"),
-            gravityfile_core::WarningKind::ReadError => ("\u{26A0}", "Read Error"),
-            gravityfile_core::WarningKind::MetadataError => ("\u{1F4CB}", "Metadata Error"),
-            gravityfile_core::WarningKind::CrossFilesystem => ("\u{1F4BE}", "Cross Filesystem"),
+        let (icon, kind_label, can_delete) = match warning.kind {
+            gravityfile_core::WarningKind::PermissionDenied => ("\u{1F512}", "Permission Denied", false),
+            gravityfile_core::WarningKind::BrokenSymlink => ("\u{1F517}", "Broken Symlink", true),
+            gravityfile_core::WarningKind::ReadError => ("\u{26A0}", "Read Error", false),
+            gravityfile_core::WarningKind::MetadataError => ("\u{1F4CB}", "Metadata Error", false),
+            gravityfile_core::WarningKind::CrossFilesystem => ("\u{1F4BE}", "Cross Filesystem", false),
         };
 
+        // Check if this warning's path is marked for deletion
+        let is_marked = ctx.marked.contains(&warning.path);
+
         let path_str = warning.path.display().to_string();
-        let prefix = format!(" {} {} ", icon, kind_label);
-        let available_width = (inner.width as usize).saturating_sub(prefix.len() + 1);
+        let mark_indicator = if is_marked { "[x] " } else { "    " };
+        let delete_hint = if can_delete && is_selected { " [d to delete]" } else { "" };
+        let prefix = format!("{}{} {} ", mark_indicator, icon, kind_label);
+        let suffix_len = delete_hint.len();
+        let available_width = (inner.width as usize).saturating_sub(prefix.len() + suffix_len + 1);
         let display_path = if path_str.len() > available_width {
             format!(
                 "...{}",
@@ -1092,13 +1098,18 @@ fn render_errors(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 
         let style = if is_selected {
             ctx.theme.selected
+        } else if is_marked {
+            Style::default().fg(ctx.theme.error)
         } else {
             Style::default().fg(ctx.theme.warning)
         };
 
+        let hint_style = Style::default().fg(ctx.theme.muted);
+
         let line1 = Line::from(vec![
             Span::styled(prefix, style),
             Span::styled(display_path, style),
+            Span::styled(delete_hint, hint_style),
         ]);
         let line1_area = Rect::new(inner.x, base_y, inner.width, 1);
         Paragraph::new(line1).render(line1_area, buf);
@@ -1251,7 +1262,16 @@ fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             }
             v
         }
-        View::Errors => vec![("j/k", "Nav")],
+        View::Errors => {
+            let mut v = vec![("j/k", "Nav")];
+            // Show mark/delete hints for broken symlinks
+            v.push(("Spc", "+Sel"));
+            v.push(("d", "Del"));
+            if !ctx.marked.is_empty() {
+                v.push(("Esc", "Clear"));
+            }
+            v
+        }
     };
 
     // Add scan hint - prominent when no full scan has been done

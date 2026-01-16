@@ -147,11 +147,17 @@ async fn move_impl(
                 }
                 ConflictResolution::AutoRename => auto_rename_path(&dest_path),
                 ConflictResolution::Overwrite | ConflictResolution::OverwriteAll => {
-                    // Remove existing before move
-                    let _ = if dest_path.is_dir() {
-                        fs::remove_dir_all(&dest_path)
+                    // Remove existing before move - use symlink_metadata to avoid following symlinks
+                    let _ = if let Ok(metadata) = fs::symlink_metadata(&dest_path) {
+                        if metadata.is_symlink() {
+                            fs::remove_file(&dest_path)
+                        } else if metadata.is_dir() {
+                            fs::remove_dir_all(&dest_path)
+                        } else {
+                            fs::remove_file(&dest_path)
+                        }
                     } else {
-                        fs::remove_file(&dest_path)
+                        Ok(())
                     };
                     dest_path.clone()
                 }
@@ -199,7 +205,7 @@ async fn move_impl(
         .await;
 }
 
-/// Move a single item (file or directory).
+/// Move a single item (file, directory, or symlink).
 fn move_item(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
     // Get size before move
     let size = get_size(source);
@@ -210,7 +216,26 @@ fn move_item(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
     }
 
     // Fall back to copy + delete for cross-filesystem moves
-    if source.is_dir() {
+    // Use symlink_metadata to avoid following symlinks
+    let metadata = fs::symlink_metadata(source).map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+    if metadata.is_symlink() {
+        // For symlinks, read the target and recreate at destination
+        let target = fs::read_link(source).map_err(|e| format!("Failed to read symlink: {}", e))?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, dest).map_err(|e| format!("Failed to create symlink: {}", e))?;
+        }
+        #[cfg(windows)]
+        {
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(&target, dest).map_err(|e| format!("Failed to create symlink: {}", e))?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, dest).map_err(|e| format!("Failed to create symlink: {}", e))?;
+            }
+        }
+        fs::remove_file(source).map_err(|e| format!("Failed to remove source symlink: {}", e))?;
+    } else if metadata.is_dir() {
         copy_dir_recursive(source, dest)?;
         fs::remove_dir_all(source).map_err(|e| format!("Failed to remove source: {}", e))?;
     } else {

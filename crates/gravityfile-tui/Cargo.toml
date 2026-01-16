@@ -47,3 +47,9 @@ treemd = { version = "0.5", optional = true }
 
 # System open command (for non-editor files)
 open = "5"
+
+# Safe deletion (move to trash instead of permanent delete)
+trash.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
