@@ -342,6 +342,7 @@ impl JwalkScanner {
                     timestamps: entry.timestamps,
                     inode: None,
                     content_hash: None,
+                    git_status: None,
                     children: Vec::new(),
                 };
                 node.children.push(child_node);
@@ -492,6 +493,7 @@ pub fn quick_list(path: &Path) -> Result<FileTree, ScanError> {
                 timestamps,
                 inode: None,
                 content_hash: None,
+                git_status: None,
                 children: Vec::new(),
             };
             root_node.children.push(child_node);

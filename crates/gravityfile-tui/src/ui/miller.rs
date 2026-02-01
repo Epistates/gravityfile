@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, StatefulWidget, Widget};
 
-use gravityfile_core::{FileNode, NodeKind};
+use gravityfile_core::{FileNode, GitStatus, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::preview::PreviewContent;
@@ -79,6 +79,7 @@ pub struct ColumnEntry {
     pub is_executable: bool,
     pub is_symlink: bool,
     pub is_broken_symlink: bool,
+    pub git_status: Option<GitStatus>,
 }
 
 impl ColumnEntry {
@@ -97,6 +98,7 @@ impl ColumnEntry {
             is_executable,
             is_symlink,
             is_broken_symlink,
+            git_status: node.git_status,
         }
     }
 }
@@ -287,17 +289,28 @@ impl<'a> MillerColumns<'a> {
                 .saturating_sub(checkbox_width + icon_width + size_width + size_bar_width + 2)
                 as usize;
 
-            // Truncate name if needed
-            let name = if entry.name.len() > available_for_name {
-                let truncated_len = available_for_name.saturating_sub(1);
+            // Git status indicator
+            let (git_indicator, git_style) = match entry.git_status {
+                Some(status) if status.is_displayable() => {
+                    let color = self.theme.git_status_color(status);
+                    (format!(" {}", status.indicator()), Style::default().fg(color))
+                }
+                _ => (String::new(), Style::default()),
+            };
+            let git_len = git_indicator.len();
+
+            // Truncate name if needed (account for git indicator)
+            let name_max_len = available_for_name.saturating_sub(git_len);
+            let name = if entry.name.len() > name_max_len {
+                let truncated_len = name_max_len.saturating_sub(1);
                 format!("{}…", &entry.name[..truncated_len.min(entry.name.len())])
             } else {
                 entry.name.clone()
             };
 
-            // Pad name
+            // Pad name (account for git indicator)
             let name_padding =
-                " ".repeat(available_for_name.saturating_sub(name.len()));
+                " ".repeat(available_for_name.saturating_sub(name.len()).saturating_sub(git_len));
 
             // Size text (shorter format) - show "..." for directories with unknown size
             let size_text = if entry.is_dir && entry.size == 0 {
@@ -308,10 +321,12 @@ impl<'a> MillerColumns<'a> {
 
             // Build line with checkbox
             let checkbox_span = Span::styled(checkbox, checkbox_style);
+            let git_span = Span::styled(&git_indicator, git_style);
             let spans = vec![
                 checkbox_span,
                 Span::styled(icon, base_style),
                 Span::styled(&name, base_style),
+                git_span,
                 Span::raw(&name_padding),
                 Span::styled(&size_text, Style::default().fg(self.theme.muted)),
             ];
@@ -501,6 +516,80 @@ impl<'a> MillerColumns<'a> {
                     }
 
                     Paragraph::new(lines).render(inner, buf);
+                }
+                PreviewContent::Archive {
+                    format,
+                    entry_count,
+                    total_size,
+                    entries,
+                } => {
+                    let header = Line::from(vec![
+                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("[{} archive]", format),
+                            Style::default().fg(self.theme.warning),
+                        ),
+                    ]);
+
+                    let summary = Line::from(vec![
+                        Span::styled(
+                            format!("{} entries, {} uncompressed", entry_count, crate::ui::format_size(*total_size)),
+                            Style::default().fg(self.theme.muted),
+                        ),
+                    ]);
+
+                    let mut display_lines = vec![header, summary, Line::raw("")];
+                    let max_lines = inner.height.saturating_sub(3) as usize;
+
+                    for archive_entry in entries.iter().take(max_lines) {
+                        let icon = if archive_entry.is_symlink {
+                            "🔗 "
+                        } else if archive_entry.is_dir {
+                            "📁 "
+                        } else {
+                            "📄 "
+                        };
+
+                        let size_str = if archive_entry.is_dir || archive_entry.is_symlink {
+                            String::new()
+                        } else {
+                            format!(" ({})", crate::ui::format_size(archive_entry.size))
+                        };
+
+                        let ratio_str = archive_entry.compression_ratio
+                            .map(|r| format!(" [{:.0}%]", r * 100.0))
+                            .unwrap_or_default();
+
+                        // Show symlink target if available
+                        let target_str = archive_entry.link_target.as_ref()
+                            .map(|t| format!(" -> {}", t))
+                            .unwrap_or_default();
+
+                        let style = if archive_entry.is_symlink {
+                            self.theme.symlink
+                        } else if archive_entry.is_dir {
+                            self.theme.directory
+                        } else {
+                            self.theme.file
+                        };
+
+                        display_lines.push(Line::from(vec![
+                            Span::styled(format!("{}{}", icon, archive_entry.path), style),
+                            Span::styled(target_str, self.theme.symlink),
+                            Span::styled(size_str, Style::default().fg(self.theme.muted)),
+                            Span::styled(ratio_str, Style::default().fg(self.theme.success)),
+                        ]));
+                    }
+
+                    if entries.len() > max_lines {
+                        display_lines.push(Line::styled(
+                            format!("... and {} more entries", entry_count - max_lines),
+                            Style::default().fg(self.theme.muted),
+                        ));
+                    }
+
+                    Paragraph::new(display_lines).render(inner, buf);
                 }
                 PreviewContent::Error(msg) => {
                     let lines = vec![

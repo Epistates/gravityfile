@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-01-29
+
+### Added
+
+- **Git Status Integration** - Real-time git status indicators in file listings:
+  - Modified (`M`), Staged (`A`), Untracked (`?`), Ignored (`!`), Conflict (`C`) indicators
+  - Color-coded status using theme colors (modified=yellow, staged=green, etc.)
+  - Automatic detection of git repositories
+  - Works in both Tree and Miller column views
+
+- **Treemap Visualization** - Squarified treemap view for disk usage analysis:
+  - Space-filling rectangular layout showing relative file/directory sizes
+  - Color intensity based on size ratio
+  - Keyboard navigation (arrow keys, Enter to drill down, Backspace to go up)
+  - Directory/file indicators with different border styles
+  - Size labels displayed within rectangles
+
+- **Visual Mode** - Vim-style range selection:
+  - Press `V` to enter visual mode
+  - Use `j`/`k` to extend selection up/down
+  - Selected range highlighted
+  - `Esc` exits and marks the selected range
+  - Works seamlessly with existing mark system
+
+- **Archive Support** - Create and extract archives with full format support:
+  - **Supported formats:** ZIP, TAR, TAR.GZ, TAR.BZ2, TAR.XZ
+  - **Commands:** `:extract [destination]`, `:compress <name.zip|tar|tar.gz|...>`
+  - **Archive preview:** Shows file listing with sizes, compression ratios, and symlink indicators
+  - **Symlink support:** Preserves symlinks in archives (ZIP via Unix mode, TAR via link headers)
+  - **Security hardening:**
+    - Path traversal prevention (rejects `..` and absolute paths)
+    - ZIP bomb detection (compression ratio and size limits)
+    - Symlink escape attack prevention
+    - Permission stripping for safe extraction
+  - **Loop detection:** Prevents infinite recursion when archiving circular symlinks
+
+### Changed
+
+- Archive preview now shows 🔗 icon for symlinks with target path display
+- Improved error messages with sanitized output (no path disclosure)
+
+### Security
+
+- Added comprehensive validation for archive extraction to prevent:
+  - Path traversal attacks via `../` sequences
+  - Absolute path extraction attempts
+  - Symlink-based directory escape attacks
+  - ZIP bomb decompression attacks (100:1 ratio limit, 10GB size limit)
+
 ## [0.2.2] - 2026-01-16
 
 ### Fixed
@@ -130,6 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2
 [0.2.1]: https://github.com/epistates/gravityfile/releases/tag/v0.2.1
 [0.2.0]: https://github.com/epistates/gravityfile/releases/tag/v0.2.0

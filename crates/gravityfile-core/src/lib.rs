@@ -45,5 +45,5 @@ mod tree;
 
 pub use config::{ScanConfig, ScanConfigBuilder};
 pub use error::{ScanError, ScanWarning, WarningKind};
-pub use node::{ContentHash, FileNode, InodeInfo, NodeId, NodeKind, Timestamps};
+pub use node::{ContentHash, FileNode, GitStatus, InodeInfo, NodeId, NodeKind, Timestamps};
 pub use tree::{FileTree, TreeStats};

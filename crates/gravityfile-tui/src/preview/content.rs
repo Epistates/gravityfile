@@ -14,6 +14,14 @@ const MAX_PREVIEW_SIZE: u64 = 10 * 1024 * 1024;
 /// Maximum lines to read for preview.
 const MAX_PREVIEW_LINES: usize = 500;
 
+/// Maximum archive entries to scan for preview.
+/// Prevents hanging on archives with millions of entries.
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+
+/// Maximum archive file size to attempt preview (100 MB).
+/// Larger archives should be extracted to view contents.
+const MAX_ARCHIVE_PREVIEW_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Number of bytes to inspect for binary detection.
 const BINARY_CHECK_BYTES: usize = 1024;
 
@@ -86,6 +94,23 @@ impl PreviewMode {
     }
 }
 
+/// An entry in an archive listing.
+#[derive(Debug, Clone)]
+pub struct ArchiveEntry {
+    /// Path within the archive.
+    pub path: String,
+    /// Uncompressed size in bytes.
+    pub size: u64,
+    /// Whether this is a directory.
+    pub is_dir: bool,
+    /// Whether this is a symbolic link.
+    pub is_symlink: bool,
+    /// Symlink target path, if this is a symlink.
+    pub link_target: Option<String>,
+    /// Compression ratio (compressed/uncompressed), if available.
+    pub compression_ratio: Option<f64>,
+}
+
 /// Content that can be displayed in the preview pane.
 #[derive(Debug, Clone)]
 pub enum PreviewContent {
@@ -113,6 +138,17 @@ pub enum PreviewContent {
     /// Directory listing.
     Directory {
         entries: Vec<(String, bool)>, // (name, is_dir)
+    },
+    /// Archive contents listing.
+    Archive {
+        /// Archive format (zip, tar, tar.gz, etc.).
+        format: String,
+        /// Total number of entries in the archive.
+        entry_count: usize,
+        /// Total uncompressed size.
+        total_size: u64,
+        /// Entries to display (limited for preview).
+        entries: Vec<ArchiveEntry>,
     },
     /// Error message.
     Error(String),
@@ -244,8 +280,251 @@ impl PreviewLoader {
         Self::load_hex(path, metadata.len())
     }
 
+    /// Detect archive format from file extension.
+    fn detect_archive_format(path: &Path) -> Option<&'static str> {
+        let name = path.file_name()?.to_str()?.to_lowercase();
+
+        if name.ends_with(".zip") {
+            Some("zip")
+        } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            Some("tar.gz")
+        } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") {
+            Some("tar.bz2")
+        } else if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+            Some("tar.xz")
+        } else if name.ends_with(".tar") {
+            Some("tar")
+        } else if name.ends_with(".7z") {
+            Some("7z")
+        } else if name.ends_with(".rar") {
+            Some("rar")
+        } else {
+            None
+        }
+    }
+
+    /// Load archive contents as preview.
+    fn load_archive(path: &Path, format: &str) -> Result<PreviewContent, PreviewError> {
+        match format {
+            "zip" => Self::load_zip_archive(path),
+            "tar" => Self::load_tar_archive(path),
+            "tar.gz" => Self::load_tar_gz_archive(path),
+            "tar.bz2" => Self::load_tar_bz2_archive(path),
+            "tar.xz" => Self::load_tar_xz_archive(path),
+            "7z" | "rar" => {
+                // These require external tools - show info message
+                Ok(PreviewContent::Error(format!(
+                    "{} archives require external tools for preview. Use :extract to extract.",
+                    format.to_uppercase()
+                )))
+            }
+            _ => Err(PreviewError::NoPreview),
+        }
+    }
+
+    /// Load ZIP archive contents.
+    fn load_zip_archive(path: &Path) -> Result<PreviewContent, PreviewError> {
+        // Check file size before attempting to parse
+        let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let file_size = file.metadata()
+            .map_err(|e| PreviewError::IoError(e.to_string()))?
+            .len();
+
+        if file_size > MAX_ARCHIVE_PREVIEW_SIZE {
+            return Err(PreviewError::TooLarge(file_size));
+        }
+
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| PreviewError::IoError(format!("Invalid ZIP: {}", e)))?;
+
+        let entry_count = archive.len();
+
+        // Sanity check on entry count to prevent memory exhaustion
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Ok(PreviewContent::Archive {
+                format: format!("ZIP (>{} entries)", MAX_ARCHIVE_ENTRIES),
+                entry_count,
+                total_size: 0, // Can't safely calculate without iterating
+                entries: vec![ArchiveEntry {
+                    path: format!("Archive has {} entries (too many to preview)", entry_count),
+                    size: 0,
+                    is_dir: false,
+                    is_symlink: false,
+                    link_target: None,
+                    compression_ratio: None,
+                }],
+            });
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size: u64 = 0;
+
+        for i in 0..entry_count.min(MAX_PREVIEW_LINES) {
+            if let Ok(entry) = archive.by_index(i) {
+                let size = entry.size();
+                let compressed = entry.compressed_size();
+                let ratio = if size > 0 {
+                    Some(compressed as f64 / size as f64)
+                } else {
+                    None
+                };
+
+                // Check if entry is a symlink by examining Unix mode
+                // S_IFLNK = 0o120000, combined with permissions gives 0o12xxxx
+                let is_symlink = entry.unix_mode()
+                    .map(|mode| (mode & 0o170000) == 0o120000)
+                    .unwrap_or(false);
+
+                entries.push(ArchiveEntry {
+                    path: entry.name().to_string(),
+                    size,
+                    is_dir: entry.is_dir(),
+                    is_symlink,
+                    link_target: None, // ZIP doesn't store target in header, it's in content
+                    compression_ratio: ratio,
+                });
+                total_size = total_size.saturating_add(size);
+            }
+        }
+
+        // Calculate total size for remaining entries (limited iteration)
+        let remaining = entry_count.saturating_sub(MAX_PREVIEW_LINES);
+        for i in MAX_PREVIEW_LINES..entry_count.min(MAX_ARCHIVE_ENTRIES) {
+            if let Ok(entry) = archive.by_index(i) {
+                total_size = total_size.saturating_add(entry.size());
+            }
+        }
+
+        // If we couldn't scan all entries, mark size as approximate
+        let format = if remaining > 0 && entry_count > MAX_ARCHIVE_ENTRIES {
+            format!("ZIP (~{} more entries)", remaining)
+        } else {
+            "ZIP".to_string()
+        };
+
+        Ok(PreviewContent::Archive {
+            format,
+            entry_count,
+            total_size,
+            entries,
+        })
+    }
+
+    /// Load plain TAR archive contents.
+    fn load_tar_archive(path: &Path) -> Result<PreviewContent, PreviewError> {
+        Self::check_archive_size(path)?;
+        let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        Self::load_tar_from_reader(file, "TAR")
+    }
+
+    /// Load TAR.GZ archive contents.
+    fn load_tar_gz_archive(path: &Path) -> Result<PreviewContent, PreviewError> {
+        Self::check_archive_size(path)?;
+        let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        Self::load_tar_from_reader(decoder, "TAR.GZ")
+    }
+
+    /// Load TAR.BZ2 archive contents.
+    fn load_tar_bz2_archive(path: &Path) -> Result<PreviewContent, PreviewError> {
+        Self::check_archive_size(path)?;
+        let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let decoder = bzip2::read::BzDecoder::new(file);
+        Self::load_tar_from_reader(decoder, "TAR.BZ2")
+    }
+
+    /// Load TAR.XZ archive contents.
+    fn load_tar_xz_archive(path: &Path) -> Result<PreviewContent, PreviewError> {
+        Self::check_archive_size(path)?;
+        let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let decoder = xz2::read::XzDecoder::new(file);
+        Self::load_tar_from_reader(decoder, "TAR.XZ")
+    }
+
+    /// Check archive size before attempting to parse.
+    fn check_archive_size(path: &Path) -> Result<(), PreviewError> {
+        let file_size = std::fs::metadata(path)
+            .map_err(|e| PreviewError::IoError(e.to_string()))?
+            .len();
+        if file_size > MAX_ARCHIVE_PREVIEW_SIZE {
+            return Err(PreviewError::TooLarge(file_size));
+        }
+        Ok(())
+    }
+
+    /// Load TAR archive from a reader.
+    fn load_tar_from_reader<R: Read>(reader: R, format: &str) -> Result<PreviewContent, PreviewError> {
+        let mut archive = tar::Archive::new(reader);
+        let entries_iter = archive.entries().map_err(|e| PreviewError::IoError(e.to_string()))?;
+
+        let mut entries = Vec::new();
+        let mut entry_count = 0;
+        let mut total_size: u64 = 0;
+        let mut truncated = false;
+
+        for entry_result in entries_iter {
+            // Stop if we've scanned too many entries (prevent hanging)
+            if entry_count >= MAX_ARCHIVE_ENTRIES {
+                truncated = true;
+                break;
+            }
+
+            let entry = entry_result.map_err(|e| PreviewError::IoError(e.to_string()))?;
+            let size = entry.size();
+            total_size = total_size.saturating_add(size);
+            entry_count += 1;
+
+            if entries.len() < MAX_PREVIEW_LINES {
+                let path = entry
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "<invalid path>".to_string());
+                let entry_type = entry.header().entry_type();
+                let is_dir = entry_type.is_dir();
+                let is_symlink = entry_type.is_symlink() || entry_type.is_hard_link();
+
+                // Get symlink target if available
+                let link_target = if is_symlink {
+                    entry.link_name()
+                        .ok()
+                        .flatten()
+                        .map(|p| p.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+
+                entries.push(ArchiveEntry {
+                    path,
+                    size,
+                    is_dir,
+                    is_symlink,
+                    link_target,
+                    compression_ratio: None, // TAR doesn't have per-file compression info
+                });
+            }
+        }
+
+        let display_format = if truncated {
+            format!("{} (>{} entries)", format, MAX_ARCHIVE_ENTRIES)
+        } else {
+            format.to_string()
+        };
+
+        Ok(PreviewContent::Archive {
+            format: display_format,
+            entry_count,
+            total_size,
+            entries,
+        })
+    }
+
     /// Load preview for a regular file.
     fn load_file(path: &Path) -> Result<PreviewContent, PreviewError> {
+        // Check if it's an archive first
+        if let Some(format) = Self::detect_archive_format(path) {
+            return Self::load_archive(path, format);
+        }
+
         let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
         let metadata = file.metadata().map_err(|e| PreviewError::IoError(e.to_string()))?;
 
@@ -461,6 +740,7 @@ impl PreviewState {
             PreviewContent::Hex { lines, .. } => lines.len(),
             PreviewContent::Metadata { .. } => 10, // Fixed number of metadata lines
             PreviewContent::Directory { entries } => entries.len(),
+            PreviewContent::Archive { entries, .. } => entries.len() + 3, // Header + entries
             PreviewContent::Error(_) => 1,
             PreviewContent::Empty => 0,
         }

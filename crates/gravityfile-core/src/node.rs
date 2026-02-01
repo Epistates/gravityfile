@@ -5,6 +5,43 @@ use std::time::SystemTime;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
+/// Git status for a file or directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GitStatus {
+    /// File/directory has been modified.
+    Modified,
+    /// File/directory is staged for commit.
+    Staged,
+    /// File/directory is not tracked by git.
+    Untracked,
+    /// File/directory is ignored by git.
+    Ignored,
+    /// File/directory has merge conflicts.
+    Conflict,
+    /// File/directory is clean (no changes).
+    #[default]
+    Clean,
+}
+
+impl GitStatus {
+    /// Get a single character indicator for display.
+    pub fn indicator(&self) -> &'static str {
+        match self {
+            GitStatus::Modified => "M",
+            GitStatus::Staged => "A",
+            GitStatus::Untracked => "?",
+            GitStatus::Ignored => "!",
+            GitStatus::Conflict => "C",
+            GitStatus::Clean => " ",
+        }
+    }
+
+    /// Check if this status should be displayed (not clean).
+    pub fn is_displayable(&self) -> bool {
+        !matches!(self, GitStatus::Clean)
+    }
+}
+
 /// Unique identifier for a node within a tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
@@ -153,6 +190,10 @@ pub struct FileNode {
     /// Content hash (computed on demand).
     pub content_hash: Option<ContentHash>,
 
+    /// Git status for this file/directory.
+    #[serde(default)]
+    pub git_status: Option<GitStatus>,
+
     /// Children nodes (directories only), sorted by size descending.
     pub children: Vec<FileNode>,
 }
@@ -176,6 +217,7 @@ impl FileNode {
             timestamps,
             inode: None,
             content_hash: None,
+            git_status: None,
             children: Vec::new(),
         }
     }
@@ -198,6 +240,7 @@ impl FileNode {
             timestamps,
             inode: None,
             content_hash: None,
+            git_status: None,
             children: Vec::new(),
         }
     }

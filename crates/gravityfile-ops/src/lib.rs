@@ -4,6 +4,7 @@
 //! with progress reporting via channels, following the same pattern as the
 //! existing deletion implementation.
 
+pub mod archive;
 mod conflict;
 mod copy;
 mod create;
@@ -14,6 +15,7 @@ mod progress;
 mod rename;
 mod undo;
 
+pub use archive::{create_archive, extract_archive, ArchiveError, ArchiveFormat, ArchiveResult};
 pub use conflict::{Conflict, ConflictKind, ConflictResolution};
 pub use copy::{start_copy, CopyOptions, CopyResult};
 pub use create::{start_create_directory, start_create_file, CreateResult};

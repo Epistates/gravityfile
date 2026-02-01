@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use gravityfile_ops::{Conflict, ConflictKind, OperationProgress, OperationType};
 
 use crate::app::input::InputState;
-use crate::app::state::{DeletionProgress, SettingsState};
+use crate::app::state::{BookmarkListState, Bookmarks, DeletionProgress, SettingsState};
 use crate::theme::Theme;
 use crate::ui::format_size;
 
@@ -902,6 +902,305 @@ impl Widget for SettingsModal<'_> {
             Span::styled(" Esc ", self.theme.help_key_style()),
             Span::styled("Close", self.theme.help_desc_style()),
         ]));
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+/// Bookmark list modal for viewing and selecting bookmarks.
+pub struct BookmarkListModal<'a> {
+    theme: &'a Theme,
+    bookmarks: &'a Bookmarks,
+    state: &'a BookmarkListState,
+}
+
+impl<'a> BookmarkListModal<'a> {
+    /// Create a new bookmark list modal.
+    pub fn new(theme: &'a Theme, bookmarks: &'a Bookmarks, state: &'a BookmarkListState) -> Self {
+        Self {
+            theme,
+            bookmarks,
+            state,
+        }
+    }
+}
+
+impl Widget for BookmarkListModal<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let entries = self.bookmarks.sorted_entries();
+
+        // Calculate popup dimensions
+        let popup_width = 60.min(area.width.saturating_sub(4));
+        let popup_height = ((entries.len() + 6) as u16).min(area.height.saturating_sub(4)).max(8);
+
+        let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
+        let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
+
+        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+        Clear.render(popup_area, buf);
+
+        let block = Block::default()
+            .title(" Bookmarks ")
+            .title_style(
+                Style::default()
+                    .fg(self.theme.info)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_style(self.theme.border);
+
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let mut lines = vec![];
+
+        if entries.is_empty() {
+            lines.push(Line::styled(
+                "  No bookmarks set",
+                Style::default().fg(self.theme.muted),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  Press m<key> to set a bookmark",
+                Style::default().fg(self.theme.muted),
+            ));
+        } else {
+            let max_visible = (inner.height as usize).saturating_sub(3);
+            let max_path_len = (inner.width as usize).saturating_sub(8);
+
+            for (i, (key, path)) in entries.iter().enumerate().take(max_visible) {
+                let is_selected = i == self.state.selected;
+
+                // Truncate path from the left if too long
+                let path_str = path.display().to_string();
+                let display_path = if path_str.len() > max_path_len {
+                    format!("...{}", &path_str[path_str.len().saturating_sub(max_path_len - 3)..])
+                } else {
+                    path_str
+                };
+
+                let style = if is_selected {
+                    Style::default()
+                        .fg(self.theme.info)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                let prefix = if is_selected { " > " } else { "   " };
+
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(
+                        format!("[{}]", key),
+                        Style::default()
+                            .fg(self.theme.info)
+                            .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
+                    ),
+                    Span::styled(format!(" {}", display_path), style),
+                ]));
+            }
+
+            if entries.len() > max_visible {
+                lines.push(Line::styled(
+                    format!("  ... and {} more", entries.len() - max_visible),
+                    Style::default().fg(self.theme.muted),
+                ));
+            }
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(" j/k ", self.theme.help_key_style()),
+            Span::styled("Nav ", self.theme.help_desc_style()),
+            Span::styled(" Enter ", self.theme.help_key_style()),
+            Span::styled("Jump ", self.theme.help_desc_style()),
+            Span::styled(" d ", self.theme.help_key_style()),
+            Span::styled("Delete ", self.theme.help_desc_style()),
+            Span::styled(" Esc ", self.theme.help_key_style()),
+            Span::styled("Close", self.theme.help_desc_style()),
+        ]));
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+/// Small inline prompt for setting/jumping to bookmarks.
+pub struct BookmarkPrompt<'a> {
+    theme: &'a Theme,
+    prompt: &'a str,
+}
+
+impl<'a> BookmarkPrompt<'a> {
+    /// Create a new bookmark prompt.
+    pub fn new(theme: &'a Theme, prompt: &'a str) -> Self {
+        Self { theme, prompt }
+    }
+}
+
+impl Widget for BookmarkPrompt<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Render at the bottom of the screen (footer area)
+        Clear.render(area, buf);
+
+        let line = Line::from(vec![
+            Span::styled(
+                self.prompt,
+                Style::default()
+                    .fg(self.theme.info)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
+        ]);
+
+        Paragraph::new(line)
+            .style(self.theme.footer)
+            .render(area, buf);
+    }
+}
+
+/// Bulk rename confirmation modal showing planned renames.
+pub struct BulkRenameConfirmModal<'a> {
+    theme: &'a Theme,
+    state: &'a crate::app::state::BulkRenameState,
+}
+
+impl<'a> BulkRenameConfirmModal<'a> {
+    /// Create a new bulk rename confirmation modal.
+    pub fn new(theme: &'a Theme, state: &'a crate::app::state::BulkRenameState) -> Self {
+        Self { theme, state }
+    }
+}
+
+impl Widget for BulkRenameConfirmModal<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup dimensions
+        let popup_width = 70.min(area.width.saturating_sub(4));
+        let popup_height = ((self.state.entries.len() + 8) as u16)
+            .min(area.height.saturating_sub(4))
+            .max(10);
+
+        let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
+        let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
+
+        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+        Clear.render(popup_area, buf);
+
+        // Title changes color based on error state
+        let (title, title_color) = if self.state.error.is_some() {
+            (" Bulk Rename - Error ", self.theme.error)
+        } else {
+            (" Confirm Bulk Rename ", self.theme.info)
+        };
+
+        let block = Block::default()
+            .title(title)
+            .title_style(
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(title_color));
+
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let mut lines = vec![];
+
+        // Show error if present
+        if let Some(error) = &self.state.error {
+            lines.push(Line::styled(
+                format!("Error: {}", error),
+                Style::default()
+                    .fg(self.theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(""));
+        }
+
+        // Header
+        lines.push(Line::styled(
+            format!("{} rename{} to perform:", self.state.entries.len(), if self.state.entries.len() == 1 { "" } else { "s" }),
+            Style::default().fg(self.theme.info),
+        ));
+        lines.push(Line::raw(""));
+
+        // List entries
+        let max_visible = (inner.height as usize).saturating_sub(6);
+        let max_name_len = ((inner.width as usize).saturating_sub(8)) / 2;
+        let arrow = " -> ";
+
+        for (i, entry) in self.state.entries.iter().enumerate().take(max_visible) {
+            let is_selected = i == self.state.selected;
+
+            // Truncate names if needed
+            let old_name = entry
+                .original
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let old_display = if old_name.len() > max_name_len {
+                format!("{}...", &old_name[..max_name_len.saturating_sub(3)])
+            } else {
+                old_name
+            };
+
+            let new_display = if entry.new_name.len() > max_name_len {
+                format!("{}...", &entry.new_name[..max_name_len.saturating_sub(3)])
+            } else {
+                entry.new_name.clone()
+            };
+
+            let prefix = if is_selected { " > " } else { "   " };
+            let style = if is_selected {
+                Style::default()
+                    .fg(self.theme.info)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(old_display, Style::default().fg(self.theme.muted)),
+                Span::raw(arrow),
+                Span::styled(new_display, Style::default().fg(self.theme.success)),
+            ]));
+        }
+
+        if self.state.entries.len() > max_visible {
+            lines.push(Line::styled(
+                format!("  ... and {} more", self.state.entries.len() - max_visible),
+                Style::default().fg(self.theme.muted),
+            ));
+        }
+
+        lines.push(Line::raw(""));
+
+        // Help line
+        if self.state.error.is_some() {
+            lines.push(Line::from(vec![
+                Span::styled(" e ", self.theme.help_key_style()),
+                Span::styled("Edit ", self.theme.help_desc_style()),
+                Span::styled(" Esc ", self.theme.help_key_style()),
+                Span::styled("Cancel", self.theme.help_desc_style()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" y/Enter ", self.theme.help_key_style()),
+                Span::styled("Confirm ", self.theme.help_desc_style()),
+                Span::styled(" e ", self.theme.help_key_style()),
+                Span::styled("Edit ", self.theme.help_desc_style()),
+                Span::styled(" n/Esc ", self.theme.help_key_style()),
+                Span::styled("Cancel", self.theme.help_desc_style()),
+            ]));
+        }
 
         Paragraph::new(lines).render(inner, buf);
     }

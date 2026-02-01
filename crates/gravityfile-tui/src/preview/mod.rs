@@ -10,5 +10,5 @@ pub use content::{PreviewContent, PreviewMode, PreviewState};
 
 // Re-export for potential future use
 #[allow(unused_imports)]
-pub use content::{PreviewError, PreviewLoader};
+pub use content::{ArchiveEntry, PreviewError, PreviewLoader};
 pub use syntax::SyntaxHighlighter;

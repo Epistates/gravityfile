@@ -44,10 +44,12 @@
 //! });
 //! ```
 
+mod git;
 mod inode;
 mod progress;
 mod scanner;
 
+pub use git::{apply_git_status, GitStatusCache};
 pub use inode::InodeTracker;
 pub use progress::ScanProgress;
 pub use scanner::{quick_list, JwalkScanner};

@@ -1,5 +1,6 @@
 //! Application state types and enums.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,16 @@ pub enum AppMode {
     Command,
     /// Settings modal.
     Settings,
+    /// Setting a bookmark (waiting for key input).
+    SettingBookmark,
+    /// Jumping to a bookmark (waiting for key input).
+    JumpingToBookmark,
+    /// Viewing the bookmarks list modal.
+    BookmarkList,
+    /// Confirming bulk rename changes.
+    ConfirmBulkRename,
+    /// Visual selection mode (vim-style range selection).
+    Visual,
     Quit,
 }
 
@@ -63,6 +74,80 @@ impl LayoutMode {
         match self {
             Self::Tree => Self::Miller,
             Self::Miller => Self::Tree,
+        }
+    }
+}
+
+/// State for visual selection mode (vim-style range selection).
+#[derive(Debug, Clone, Default)]
+pub struct VisualState {
+    /// Anchor index where visual selection started.
+    pub anchor: usize,
+    /// Current cursor index (selection extends from anchor to cursor).
+    pub cursor: usize,
+}
+
+impl VisualState {
+    /// Create a new visual state starting at the given index.
+    pub fn new(start_index: usize) -> Self {
+        Self {
+            anchor: start_index,
+            cursor: start_index,
+        }
+    }
+
+    /// Get the selection range as (start, end) inclusive.
+    pub fn selection_range(&self) -> (usize, usize) {
+        let start = self.anchor.min(self.cursor);
+        let end = self.anchor.max(self.cursor);
+        (start, end)
+    }
+
+    /// Check if an index is within the selection range.
+    pub fn is_selected(&self, index: usize) -> bool {
+        let (start, end) = self.selection_range();
+        index >= start && index <= end
+    }
+
+    /// Get the number of selected items.
+    pub fn selection_count(&self) -> usize {
+        let (start, end) = self.selection_range();
+        end - start + 1
+    }
+
+    /// Move the cursor up.
+    pub fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor down with a maximum bound.
+    pub fn move_down(&mut self, max: usize) {
+        if max > 0 && self.cursor < max - 1 {
+            self.cursor += 1;
+        }
+    }
+
+    /// Move the cursor up by a page.
+    pub fn page_up(&mut self, page_size: usize) {
+        self.cursor = self.cursor.saturating_sub(page_size);
+    }
+
+    /// Move the cursor down by a page with a maximum bound.
+    pub fn page_down(&mut self, page_size: usize, max: usize) {
+        if max > 0 {
+            self.cursor = (self.cursor + page_size).min(max - 1);
+        }
+    }
+
+    /// Jump cursor to the top.
+    pub fn jump_to_top(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Jump cursor to the bottom.
+    pub fn jump_to_bottom(&mut self, max: usize) {
+        if max > 0 {
+            self.cursor = max - 1;
         }
     }
 }
@@ -198,6 +283,7 @@ pub enum View {
     Duplicates,
     Age,
     Errors,
+    Treemap,
 }
 
 impl View {
@@ -617,6 +703,221 @@ impl TabManager {
     }
 }
 
+/// Directory bookmarks for quick navigation.
+/// Bookmarks are single-character keys mapped to directory paths.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Bookmarks {
+    /// Map of bookmark keys to directory paths.
+    pub marks: HashMap<char, PathBuf>,
+}
+
+impl Bookmarks {
+    /// Create bookmarks with sensible defaults.
+    pub fn with_defaults() -> Self {
+        let mut marks = HashMap::new();
+        if let Some(home) = dirs::home_dir() {
+            marks.insert('h', home);
+        }
+        marks.insert('r', PathBuf::from("/"));
+        if let Some(config) = dirs::config_dir() {
+            marks.insert('c', config);
+        }
+        if let Some(downloads) = dirs::download_dir() {
+            marks.insert('d', downloads);
+        }
+        if let Some(documents) = dirs::document_dir() {
+            marks.insert('o', documents);
+        }
+        Self { marks }
+    }
+
+    /// Set a bookmark.
+    pub fn set(&mut self, key: char, path: PathBuf) {
+        self.marks.insert(key, path);
+    }
+
+    /// Get a bookmark.
+    pub fn get(&self, key: char) -> Option<&PathBuf> {
+        self.marks.get(&key)
+    }
+
+    /// Remove a bookmark.
+    pub fn remove(&mut self, key: char) -> Option<PathBuf> {
+        self.marks.remove(&key)
+    }
+
+    /// Get all bookmarks sorted by key.
+    pub fn sorted_entries(&self) -> Vec<(char, &PathBuf)> {
+        let mut entries: Vec<_> = self.marks.iter().map(|(k, v)| (*k, v)).collect();
+        entries.sort_by_key(|(k, _)| *k);
+        entries
+    }
+
+    /// Check if a bookmark key is valid (alphanumeric).
+    pub fn is_valid_key(key: char) -> bool {
+        key.is_ascii_alphanumeric()
+    }
+}
+
+/// State for the bookmark list modal.
+#[derive(Debug, Clone, Default)]
+pub struct BookmarkListState {
+    /// Currently selected bookmark index.
+    pub selected: usize,
+    /// Cached sorted entries for display.
+    entries_count: usize,
+}
+
+impl BookmarkListState {
+    /// Create a new bookmark list state.
+    pub fn new(bookmarks: &Bookmarks) -> Self {
+        Self {
+            selected: 0,
+            entries_count: bookmarks.marks.len(),
+        }
+    }
+
+    /// Update the entries count.
+    pub fn update_count(&mut self, bookmarks: &Bookmarks) {
+        self.entries_count = bookmarks.marks.len();
+        if self.selected >= self.entries_count && self.entries_count > 0 {
+            self.selected = self.entries_count - 1;
+        }
+    }
+
+    /// Move selection up.
+    pub fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn move_down(&mut self) {
+        if self.entries_count > 0 && self.selected < self.entries_count - 1 {
+            self.selected += 1;
+        }
+    }
+
+    /// Get the number of entries.
+    pub fn len(&self) -> usize {
+        self.entries_count
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries_count == 0
+    }
+}
+
+/// A single rename operation in bulk rename.
+#[derive(Debug, Clone)]
+pub struct RenameEntry {
+    /// Original file path.
+    pub original: PathBuf,
+    /// New name (just the file name, not the full path).
+    pub new_name: String,
+}
+
+/// State for bulk rename confirmation modal.
+#[derive(Debug, Clone, Default)]
+pub struct BulkRenameState {
+    /// List of rename operations to perform.
+    pub entries: Vec<RenameEntry>,
+    /// Currently selected entry in the confirmation modal.
+    pub selected: usize,
+    /// Scroll offset for display.
+    pub offset: usize,
+    /// Error message if validation failed.
+    pub error: Option<String>,
+}
+
+impl BulkRenameState {
+    /// Create a new bulk rename state from original paths and new names.
+    pub fn new(original_paths: Vec<PathBuf>, new_names: Vec<String>) -> Self {
+        let entries: Vec<RenameEntry> = original_paths
+            .into_iter()
+            .zip(new_names)
+            .filter_map(|(original, new_name)| {
+                // Only include entries where the name actually changed
+                let old_name = original.file_name()?.to_string_lossy().to_string();
+                if old_name != new_name && !new_name.is_empty() {
+                    Some(RenameEntry {
+                        original,
+                        new_name,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Self {
+            entries,
+            selected: 0,
+            offset: 0,
+            error: None,
+        }
+    }
+
+    /// Get the number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Move selection up.
+    pub fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn move_down(&mut self) {
+        if !self.entries.is_empty() && self.selected < self.entries.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    /// Validate all rename entries.
+    pub fn validate(&mut self) -> bool {
+        // Check for duplicate new names
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in &self.entries {
+            if seen_names.contains(&entry.new_name) {
+                self.error = Some(format!("Duplicate name: {}", entry.new_name));
+                return false;
+            }
+            seen_names.insert(entry.new_name.clone());
+
+            // Validate the new name
+            if entry.new_name.is_empty() {
+                self.error = Some("Empty name is not allowed".to_string());
+                return false;
+            }
+            if entry.new_name.contains('/') || entry.new_name.contains('\0') {
+                self.error = Some(format!("Invalid characters in: {}", entry.new_name));
+                return false;
+            }
+            if entry.new_name == "." || entry.new_name == ".." {
+                self.error = Some(format!("Reserved name: {}", entry.new_name));
+                return false;
+            }
+            if entry.new_name.len() > 255 {
+                self.error = Some(format!("Name too long: {}", entry.new_name));
+                return false;
+            }
+        }
+        self.error = None;
+        true
+    }
+}
+
 /// Persistent user settings stored in config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -632,6 +933,9 @@ pub struct UserSettings {
     /// Editor configuration for opensesame.
     #[serde(default)]
     pub editor: opensesame::EditorConfig,
+    /// Directory bookmarks.
+    #[serde(default = "Bookmarks::with_defaults")]
+    pub bookmarks: Bookmarks,
 }
 
 impl Default for UserSettings {
@@ -642,6 +946,7 @@ impl Default for UserSettings {
             default_layout: "tree".to_string(),
             openers: FileOpeners::default(),
             editor: opensesame::EditorConfig::default(),
+            bookmarks: Bookmarks::with_defaults(),
         }
     }
 }
@@ -766,5 +1071,132 @@ impl SettingsState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_visual_state_creation() {
+        let state = VisualState::new(5);
+        assert_eq!(state.anchor, 5);
+        assert_eq!(state.cursor, 5);
+    }
+
+    #[test]
+    fn test_visual_state_selection_range() {
+        let mut state = VisualState::new(5);
+        assert_eq!(state.selection_range(), (5, 5));
+
+        state.cursor = 8;
+        assert_eq!(state.selection_range(), (5, 8));
+
+        state.cursor = 2;
+        assert_eq!(state.selection_range(), (2, 5));
+    }
+
+    #[test]
+    fn test_visual_state_is_selected() {
+        let mut state = VisualState::new(3);
+        state.cursor = 7;
+
+        assert!(!state.is_selected(0));
+        assert!(!state.is_selected(2));
+        assert!(state.is_selected(3));
+        assert!(state.is_selected(5));
+        assert!(state.is_selected(7));
+        assert!(!state.is_selected(8));
+    }
+
+    #[test]
+    fn test_visual_state_selection_count() {
+        let mut state = VisualState::new(3);
+        state.cursor = 7;
+        assert_eq!(state.selection_count(), 5); // 3, 4, 5, 6, 7
+
+        state.cursor = 3;
+        assert_eq!(state.selection_count(), 1); // just 3
+    }
+
+    #[test]
+    fn test_visual_state_move_down_bounds() {
+        let mut state = VisualState::new(0);
+
+        // Test with max = 0 (empty list)
+        state.move_down(0);
+        assert_eq!(state.cursor, 0);
+
+        // Test with max = 1 (single item)
+        state.move_down(1);
+        assert_eq!(state.cursor, 0);
+
+        // Test normal movement
+        state.move_down(5);
+        assert_eq!(state.cursor, 1);
+
+        // Test at boundary
+        state.cursor = 4;
+        state.move_down(5);
+        assert_eq!(state.cursor, 4); // Should not exceed max-1
+    }
+
+    #[test]
+    fn test_visual_state_move_up() {
+        let mut state = VisualState::new(5);
+        state.move_up();
+        assert_eq!(state.cursor, 4);
+
+        // Test at zero
+        state.cursor = 0;
+        state.move_up();
+        assert_eq!(state.cursor, 0); // Should not go negative
+    }
+
+    #[test]
+    fn test_visual_state_page_up() {
+        let mut state = VisualState::new(10);
+        state.page_up(5);
+        assert_eq!(state.cursor, 5);
+
+        state.page_up(10);
+        assert_eq!(state.cursor, 0); // Saturating sub
+    }
+
+    #[test]
+    fn test_visual_state_page_down_bounds() {
+        let mut state = VisualState::new(0);
+
+        // Test with max = 0
+        state.page_down(5, 0);
+        assert_eq!(state.cursor, 0);
+
+        // Test with max = 10
+        state.page_down(5, 10);
+        assert_eq!(state.cursor, 5);
+
+        state.page_down(10, 10);
+        assert_eq!(state.cursor, 9); // Max - 1
+    }
+
+    #[test]
+    fn test_visual_state_jump_to_top() {
+        let mut state = VisualState::new(50);
+        state.jump_to_top();
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn test_visual_state_jump_to_bottom_bounds() {
+        let mut state = VisualState::new(0);
+
+        // Test with max = 0
+        state.jump_to_bottom(0);
+        assert_eq!(state.cursor, 0);
+
+        // Test with max = 10
+        state.jump_to_bottom(10);
+        assert_eq!(state.cursor, 9);
     }
 }

@@ -75,6 +75,13 @@ pub struct Theme {
 
     // Marked items
     pub marked: Style,
+
+    // Git status colors
+    pub git_modified: Color,
+    pub git_staged: Color,
+    pub git_untracked: Color,
+    pub git_ignored: Color,
+    pub git_conflict: Color,
 }
 
 impl Theme {
@@ -149,6 +156,13 @@ impl Theme {
             command_cursor: Style::new().add_modifier(Modifier::REVERSED),
 
             marked: Style::new().fg(amber_500).add_modifier(Modifier::BOLD),
+
+            // Git status colors
+            git_modified: orange_500,
+            git_staged: green_500,
+            git_untracked: Color::Rgb(167, 139, 250), // Purple
+            git_ignored: slate_500,
+            git_conflict: red_500,
         }
     }
 
@@ -223,6 +237,13 @@ impl Theme {
             command_cursor: Style::new().add_modifier(Modifier::REVERSED),
 
             marked: Style::new().fg(amber_600).add_modifier(Modifier::BOLD),
+
+            // Git status colors
+            git_modified: orange_600,
+            git_staged: green_600,
+            git_untracked: Color::Rgb(124, 58, 237), // Purple
+            git_ignored: slate_400,
+            git_conflict: red_600,
         }
     }
 
@@ -274,6 +295,19 @@ impl Theme {
     /// Style for footer background.
     pub fn footer_style(&self) -> Style {
         Style::new().bg(self.footer_bg)
+    }
+
+    /// Get color for a git status.
+    pub fn git_status_color(&self, status: gravityfile_core::GitStatus) -> Color {
+        use gravityfile_core::GitStatus;
+        match status {
+            GitStatus::Modified => self.git_modified,
+            GitStatus::Staged => self.git_staged,
+            GitStatus::Untracked => self.git_untracked,
+            GitStatus::Ignored => self.git_ignored,
+            GitStatus::Conflict => self.git_conflict,
+            GitStatus::Clean => self.muted,
+        }
     }
 }
 

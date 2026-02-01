@@ -22,13 +22,13 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
-use gravityfile_core::FileTree;
+use gravityfile_core::{FileNode, FileTree};
 use gravityfile_ops::{
     Conflict, CopyOptions, CopyResult, MoveOptions, MoveResult, OperationProgress, UndoLog,
 };
 use gravityfile_scan::ScanProgress;
 
-use crate::event::KeyAction;
+use crate::event::{KeyAction, MouseAction};
 use crate::preview::PreviewState;
 use crate::search::SearchState;
 use crate::theme::Theme;
@@ -40,7 +40,7 @@ use self::constants::{PAGE_SIZE, TICK_INTERVAL_MS};
 use self::input::{InputResult, InputState};
 use self::render::{render_app, RenderContext};
 use self::state::{
-    AppMode, ClipboardMode, ClipboardState, DeletionProgress, DuplicatesViewState, LayoutMode,
+    AppMode, BookmarkListState, ClipboardMode, ClipboardState, DeletionProgress, DuplicatesViewState, LayoutMode,
     PendingOperation, ScanResult, SelectedInfo, SettingsState, SortMode, TabManager, UserSettings, View,
 };
 
@@ -150,6 +150,8 @@ pub struct App {
     user_settings: UserSettings,
     /// Settings modal state.
     settings_state: Option<SettingsState>,
+    /// Bookmark list modal state.
+    bookmark_list_state: Option<BookmarkListState>,
     /// Cached parent tree for Miller columns when at tree root.
     /// This allows showing the parent column even when navigated beyond the original scan root.
     cached_parent_tree: Option<FileTree>,
@@ -159,6 +161,14 @@ pub struct App {
     /// This preserves scan data when navigating to parent directories and allows
     /// restoring it when navigating back.
     scanned_cache: HashMap<PathBuf, FileTree>,
+    /// Bulk rename state for the confirmation modal.
+    bulk_rename_state: Option<state::BulkRenameState>,
+    /// Treemap view state.
+    treemap_state: crate::ui::TreemapState,
+    /// Cached count of treemap rectangles for navigation.
+    cached_treemap_len: usize,
+    /// Visual selection mode state.
+    visual_state: Option<state::VisualState>,
 }
 
 impl App {
@@ -231,14 +241,20 @@ impl App {
             scan_on_startup,
             user_settings,
             settings_state: None,
+            bookmark_list_state: None,
             cached_parent_tree: None,
             pending_suspend_command: None,
             scanned_cache: HashMap::new(),
+            bulk_rename_state: None,
+            treemap_state: crate::ui::TreemapState::new(),
+            cached_treemap_len: 0,
+            visual_state: None,
         };
 
         // Update cached lengths for immediate navigation
         app.update_cached_tree_len();
         app.update_cached_miller_len();
+        app.update_cached_treemap_len();
         // Cache parent for Miller columns display
         app.update_cached_parent();
 
@@ -267,8 +283,8 @@ impl App {
                 biased;
 
                 Some(Ok(event)) = events.next() => {
-                    if let Event::Key(key_event) = event {
-                        if key_event.kind == crossterm::event::KeyEventKind::Press {
+                    match event {
+                        Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
                             if self.mode == AppMode::Command {
                                 self.handle_command_input(key_event);
                             } else if self.mode == AppMode::Search {
@@ -277,17 +293,33 @@ impl App {
                                 self.handle_input_event(key_event);
                             } else if self.mode == AppMode::ConflictResolution {
                                 self.handle_conflict_key(key_event);
+                            } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
+                                self.handle_bookmark_key(key_event);
+                            } else if self.mode == AppMode::BookmarkList {
+                                self.handle_bookmark_list_input(key_event);
+                            } else if self.mode == AppMode::ConfirmBulkRename {
+                                self.handle_bulk_rename_input(key_event);
+                            } else if self.mode == AppMode::Visual {
+                                self.handle_visual_mode_input(key_event);
                             } else {
                                 let action = KeyAction::from_key_event(key_event);
                                 self.handle_action(action);
                             }
                         }
+                        Event::Mouse(mouse_event) => {
+                            // Only handle mouse events in Normal mode for now
+                            if self.mode == AppMode::Normal {
+                                let action = MouseAction::from_mouse_event(mouse_event);
+                                self.handle_mouse_action(action);
+                            }
+                        }
+                        _ => {}
                     }
 
                     // Drain any additional pending events
                     while crossterm::event::poll(Duration::ZERO)? {
-                        if let Ok(Event::Key(key_event)) = crossterm::event::read() {
-                            if key_event.kind == crossterm::event::KeyEventKind::Press {
+                        match crossterm::event::read() {
+                            Ok(Event::Key(key_event)) if key_event.kind == crossterm::event::KeyEventKind::Press => {
                                 if self.mode == AppMode::Command {
                                     self.handle_command_input(key_event);
                                 } else if self.mode == AppMode::Search {
@@ -296,6 +328,10 @@ impl App {
                                     self.handle_input_event(key_event);
                                 } else if self.mode == AppMode::ConflictResolution {
                                     self.handle_conflict_key(key_event);
+                                } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
+                                    self.handle_bookmark_key(key_event);
+                                } else if self.mode == AppMode::BookmarkList {
+                                    self.handle_bookmark_list_input(key_event);
                                 } else {
                                     let action = KeyAction::from_key_event(key_event);
                                     self.handle_action(action);
@@ -304,6 +340,13 @@ impl App {
                                     break;
                                 }
                             }
+                            Ok(Event::Mouse(mouse_event)) => {
+                                if self.mode == AppMode::Normal {
+                                    let action = MouseAction::from_mouse_event(mouse_event);
+                                    self.handle_mouse_action(action);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     self.needs_redraw = true;
@@ -327,6 +370,9 @@ impl App {
 
             // Handle pending suspend command (opening files in external apps)
             if let Some(mut cmd) = self.pending_suspend_command.take() {
+                // Check if this is a bulk rename operation
+                let is_bulk_rename = self.bulk_rename_state.is_some();
+
                 // Restore terminal before running external command
                 ratatui::restore();
 
@@ -335,11 +381,155 @@ impl App {
 
                 // Reinitialize terminal
                 terminal = ratatui::init();
+
+                // If this was bulk rename, process the edited file
+                if is_bulk_rename {
+                    self.process_bulk_rename_from_editor();
+                }
+
                 self.needs_redraw = true;
             }
         }
 
         Ok(())
+    }
+
+    /// Run the application and return exit data for shell integration.
+    pub async fn run_and_return_exit_data(
+        mut self,
+        mut terminal: DefaultTerminal,
+    ) -> AppResult<crate::ExitData> {
+        // Start scan if configured to do so
+        if self.scan_on_startup {
+            self.start_scan();
+        }
+        // Otherwise quick list is already loaded in new() for immediate display
+
+        let period = Duration::from_millis(TICK_INTERVAL_MS);
+        let mut interval = tokio::time::interval(period);
+        let mut events = EventStream::new();
+
+        while self.mode != AppMode::Quit {
+            if self.needs_redraw {
+                terminal.draw(|frame| self.render(frame))?;
+                self.needs_redraw = false;
+            }
+
+            tokio::select! {
+                biased;
+
+                Some(Ok(event)) = events.next() => {
+                    match event {
+                        Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
+                            if self.mode == AppMode::Command {
+                                self.handle_command_input(key_event);
+                            } else if self.mode == AppMode::Search {
+                                self.handle_search_input(key_event);
+                            } else if matches!(self.mode, AppMode::Renaming | AppMode::CreatingFile | AppMode::CreatingDirectory | AppMode::Taking | AppMode::GoingTo) {
+                                self.handle_input_event(key_event);
+                            } else if self.mode == AppMode::ConflictResolution {
+                                self.handle_conflict_key(key_event);
+                            } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
+                                self.handle_bookmark_key(key_event);
+                            } else if self.mode == AppMode::BookmarkList {
+                                self.handle_bookmark_list_input(key_event);
+                            } else if self.mode == AppMode::ConfirmBulkRename {
+                                self.handle_bulk_rename_input(key_event);
+                            } else if self.mode == AppMode::Visual {
+                                self.handle_visual_mode_input(key_event);
+                            } else {
+                                let action = KeyAction::from_key_event(key_event);
+                                self.handle_action(action);
+                            }
+                        }
+                        Event::Mouse(mouse_event) => {
+                            // Only handle mouse events in Normal mode for now
+                            if self.mode == AppMode::Normal {
+                                let action = MouseAction::from_mouse_event(mouse_event);
+                                self.handle_mouse_action(action);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Drain any additional pending events
+                    while crossterm::event::poll(Duration::ZERO)? {
+                        match crossterm::event::read() {
+                            Ok(Event::Key(key_event)) if key_event.kind == crossterm::event::KeyEventKind::Press => {
+                                if self.mode == AppMode::Command {
+                                    self.handle_command_input(key_event);
+                                } else if self.mode == AppMode::Search {
+                                    self.handle_search_input(key_event);
+                                } else if matches!(self.mode, AppMode::Renaming | AppMode::CreatingFile | AppMode::CreatingDirectory | AppMode::Taking | AppMode::GoingTo) {
+                                    self.handle_input_event(key_event);
+                                } else if self.mode == AppMode::ConflictResolution {
+                                    self.handle_conflict_key(key_event);
+                                } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
+                                    self.handle_bookmark_key(key_event);
+                                } else if self.mode == AppMode::BookmarkList {
+                                    self.handle_bookmark_list_input(key_event);
+                                } else {
+                                    let action = KeyAction::from_key_event(key_event);
+                                    self.handle_action(action);
+                                }
+                                if self.mode == AppMode::Quit {
+                                    break;
+                                }
+                            }
+                            Ok(Event::Mouse(mouse_event)) => {
+                                if self.mode == AppMode::Normal {
+                                    let action = MouseAction::from_mouse_event(mouse_event);
+                                    self.handle_mouse_action(action);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+
+                Some(result) = async {
+                    if let Some(rx) = &mut self.scan_rx {
+                        rx.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    self.handle_scan_result(result);
+                    self.needs_redraw = true;
+                }
+
+                _ = interval.tick() => {
+                    // Periodic tick for background updates
+                }
+            }
+
+            // Handle pending suspend command (opening files in external apps)
+            if let Some(mut cmd) = self.pending_suspend_command.take() {
+                // Check if this is a bulk rename operation
+                let is_bulk_rename = self.bulk_rename_state.is_some();
+
+                // Restore terminal before running external command
+                ratatui::restore();
+
+                // Run the command and wait for it to complete
+                let _ = cmd.status();
+
+                // Reinitialize terminal
+                terminal = ratatui::init();
+
+                // If this was bulk rename, process the edited file
+                if is_bulk_rename {
+                    self.process_bulk_rename_from_editor();
+                }
+
+                self.needs_redraw = true;
+            }
+        }
+
+        Ok(crate::ExitData {
+            last_cwd: self.view_root,
+        })
     }
 
     /// Start a background scan of the current view_root directory.
@@ -527,6 +717,77 @@ impl App {
             self.cached_miller_len = node.children.len();
         } else {
             self.cached_miller_len = 0;
+        }
+    }
+
+    /// Update cached treemap rectangle count.
+    fn update_cached_treemap_len(&mut self) {
+        if let Some((node, _)) = self.get_view_root_node() {
+            self.cached_treemap_len = node.children.len();
+        } else {
+            self.cached_treemap_len = 0;
+        }
+    }
+
+    /// Get the selected treemap item (child node) if any.
+    fn get_selected_treemap_child(&self) -> Option<(&FileNode, PathBuf)> {
+        let (node, root_path) = self.get_view_root_node()?;
+
+        // Sort children by size descending (same order as treemap layout)
+        let mut children: Vec<&FileNode> = node.children.iter().collect();
+        children.sort_by(|a, b| b.size.cmp(&a.size));
+
+        let child = children.get(self.treemap_state.selected)?;
+        let path = root_path.join(&*child.name);
+        Some((*child, path))
+    }
+
+    /// Drill down into selected treemap item if it's a directory.
+    fn drill_into_treemap_selected(&mut self) {
+        // Get selected child info
+        let drill_info = {
+            let Some((child, path)) = self.get_selected_treemap_child() else {
+                return;
+            };
+
+            if child.is_dir() {
+                Some((path, self.view_root.clone(), self.treemap_state.selected))
+            } else {
+                None
+            }
+        };
+
+        if let Some((new_root, old_root, old_selected)) = drill_info {
+            // Save current state to history
+            self.view_history.push((old_root, old_selected, HashSet::new()));
+            self.forward_history.clear();
+
+            // Navigate to the new directory
+            self.view_root = new_root;
+            self.treemap_state.reset();
+            self.update_cached_treemap_len();
+        }
+    }
+
+    /// Navigate back in treemap view.
+    fn navigate_treemap_back(&mut self) {
+        if let Some((prev_root, prev_selected, _)) = self.view_history.pop() {
+            // Save current state to forward history
+            self.forward_history.push((self.view_root.clone(), self.treemap_state.selected, HashSet::new()));
+
+            // Restore previous state
+            self.view_root = prev_root;
+            self.treemap_state.selected = prev_selected;
+            self.update_cached_treemap_len();
+        } else if self.view_root != self.path {
+            // No history, but we can go to parent
+            if let Some(parent) = self.view_root.parent() {
+                let old_selected = self.treemap_state.selected;
+                self.forward_history.push((self.view_root.clone(), old_selected, HashSet::new()));
+                self.view_root = parent.to_path_buf();
+                self.treemap_state.reset();
+                self.update_cached_treemap_len();
+            }
         }
     }
 
@@ -807,9 +1068,17 @@ impl App {
 
             KeyAction::NextView => {
                 self.view = self.view.next();
+                if self.view == View::Treemap {
+                    self.update_cached_treemap_len();
+                    self.treemap_state.reset();
+                }
             }
             KeyAction::PrevView => {
                 self.view = self.view.prev();
+                if self.view == View::Treemap {
+                    self.update_cached_treemap_len();
+                    self.treemap_state.reset();
+                }
             }
 
             // Directory tabs
@@ -860,6 +1129,9 @@ impl App {
                     if !self.duplicates_state.is_expanded(self.duplicates_state.selected_group) {
                         self.duplicates_state.toggle_expand();
                     }
+                } else if self.view == View::Treemap {
+                    // Drill into selected directory
+                    self.drill_into_treemap_selected();
                 }
             }
             KeyAction::MoveLeft | KeyAction::Collapse => {
@@ -873,6 +1145,9 @@ impl App {
                     if self.duplicates_state.is_expanded(self.duplicates_state.selected_group) {
                         self.duplicates_state.toggle_expand();
                     }
+                } else if self.view == View::Treemap {
+                    // Navigate back
+                    self.navigate_treemap_back();
                 }
             }
             KeyAction::ToggleExpand => {
@@ -889,6 +1164,18 @@ impl App {
             }
             KeyAction::ClearMarks => {
                 self.marked.clear();
+            }
+            KeyAction::EnterVisual => {
+                // Enter visual selection mode
+                // Only supported in Explorer view for now
+                if self.view == View::Explorer {
+                    let start_index = match self.layout_mode {
+                        LayoutMode::Tree => self.tree_state.selected,
+                        LayoutMode::Miller => self.miller_state.selected,
+                    };
+                    self.visual_state = Some(state::VisualState::new(start_index));
+                    self.mode = AppMode::Visual;
+                }
             }
 
             // Clipboard operations
@@ -1034,6 +1321,18 @@ impl App {
                 self.start_search();
             }
 
+            // Bookmarks
+            KeyAction::SetBookmark => {
+                self.mode = AppMode::SettingBookmark;
+            }
+            KeyAction::JumpToBookmark => {
+                self.mode = AppMode::JumpingToBookmark;
+            }
+            KeyAction::ShowBookmarkList => {
+                self.bookmark_list_state = Some(BookmarkListState::new(&self.user_settings.bookmarks));
+                self.mode = AppMode::BookmarkList;
+            }
+
             _ => {}
         }
     }
@@ -1120,6 +1419,16 @@ impl App {
                     } else {
                         None
                     }
+                } else {
+                    None
+                }
+            }
+            View::Treemap => {
+                // For treemap, mark is based on what's currently under cursor
+                // This requires the treemap state which we don't have yet
+                // For now, just use the explorer behavior
+                if let Some((node, _)) = self.get_view_root_node() {
+                    node.children.first().map(|child| self.view_root.join(&*child.name))
                 } else {
                     None
                 }
@@ -1854,6 +2163,11 @@ impl App {
             View::Errors => {
                 self.selected_warning = self.selected_warning.saturating_sub(1);
             }
+            View::Treemap => {
+                // Treemap navigation handled differently
+                // For now, use explorer behavior
+                self.miller_state.move_up(1);
+            }
         }
     }
 
@@ -1892,6 +2206,9 @@ impl App {
                 let max = self.warnings.len().saturating_sub(1);
                 self.selected_warning = (self.selected_warning + 1).min(max);
             }
+            View::Treemap => {
+                self.miller_state.move_down(1, self.cached_miller_len);
+            }
         }
     }
 
@@ -1914,6 +2231,12 @@ impl App {
             }
             View::Errors => {
                 self.selected_warning = self.selected_warning.saturating_sub(PAGE_SIZE);
+            }
+            View::Treemap => {
+                // Page up in treemap - move selection backward by PAGE_SIZE
+                for _ in 0..PAGE_SIZE {
+                    self.treemap_state.move_prev();
+                }
             }
         }
     }
@@ -1947,6 +2270,12 @@ impl App {
                 let max = self.warnings.len().saturating_sub(1);
                 self.selected_warning = (self.selected_warning + PAGE_SIZE).min(max);
             }
+            View::Treemap => {
+                // Page down in treemap - move selection forward by PAGE_SIZE
+                for _ in 0..PAGE_SIZE {
+                    self.treemap_state.move_next(self.cached_treemap_len);
+                }
+            }
         }
     }
 
@@ -1962,6 +2291,7 @@ impl App {
             View::Duplicates => self.duplicates_state.reset(),
             View::Age => self.selected_stale_dir = 0,
             View::Errors => self.selected_warning = 0,
+            View::Treemap => self.treemap_state.reset(),
         }
     }
 
@@ -1988,6 +2318,10 @@ impl App {
             }
             View::Errors => {
                 self.selected_warning = self.warnings.len().saturating_sub(1);
+            }
+            View::Treemap => {
+                // Jump to last item in treemap
+                self.treemap_state.selected = self.cached_treemap_len.saturating_sub(1);
             }
         }
     }
@@ -2731,7 +3065,391 @@ impl App {
             CommandAction::Undo => {
                 self.execute_undo();
             }
+            CommandAction::ShowBookmarks => {
+                self.bookmark_list_state = Some(BookmarkListState::new(&self.user_settings.bookmarks));
+                self.mode = AppMode::BookmarkList;
+            }
+            CommandAction::SetBookmark(key) => {
+                if let Some(k) = key {
+                    self.set_bookmark(k);
+                } else {
+                    self.mode = AppMode::SettingBookmark;
+                }
+            }
+            CommandAction::JumpToBookmark(key) => {
+                if let Some(k) = key {
+                    self.jump_to_bookmark(k);
+                } else {
+                    self.mode = AppMode::JumpingToBookmark;
+                }
+            }
+            CommandAction::DeleteBookmark(key) => {
+                self.user_settings.bookmarks.remove(key);
+                let _ = self.user_settings.save();
+            }
+            CommandAction::BulkRename => {
+                self.start_bulk_rename();
+            }
+            CommandAction::Extract(destination) => {
+                self.extract_archive(destination);
+            }
+            CommandAction::Compress(archive_name) => {
+                self.compress_files(&archive_name);
+            }
         }
+    }
+
+    /// Validate a user-provided path for safety.
+    /// Returns error message if path is invalid.
+    fn validate_user_path(path_str: &str) -> Result<PathBuf, String> {
+        // Reject empty paths
+        if path_str.is_empty() {
+            return Err("Path cannot be empty".to_string());
+        }
+
+        // Reject paths with null bytes (security)
+        if path_str.contains('\0') {
+            return Err("Invalid characters in path".to_string());
+        }
+
+        let path = PathBuf::from(path_str);
+
+        // Reject paths with parent directory components (prevents escape attempts)
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("Parent directory references (..) not allowed".to_string());
+        }
+
+        // Reject paths starting with ~ (could expand to home directory unexpectedly)
+        if path_str.starts_with('~') {
+            return Err("Tilde expansion not supported, use absolute path".to_string());
+        }
+
+        Ok(path)
+    }
+
+    /// Sanitize archive error messages to prevent path disclosure.
+    fn sanitize_archive_error(err: &gravityfile_ops::ArchiveError) -> String {
+        use gravityfile_ops::ArchiveError;
+        match err {
+            ArchiveError::Io(e) => {
+                // Extract just the error kind, not the full message which may contain paths
+                let kind = e.kind();
+                match kind {
+                    std::io::ErrorKind::NotFound => "File not found".to_string(),
+                    std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                    std::io::ErrorKind::AlreadyExists => "File already exists".to_string(),
+                    std::io::ErrorKind::InvalidData => "Invalid or corrupted archive".to_string(),
+                    _ => format!("I/O error: {}", kind),
+                }
+            }
+            ArchiveError::Zip(_) => "Invalid or corrupted ZIP archive".to_string(),
+            ArchiveError::UnsupportedFormat(fmt) => format!("Unsupported format: {}", fmt),
+            ArchiveError::NotFound(_) => "Archive file not found".to_string(),
+            ArchiveError::DestinationExists(_) => "Destination already exists".to_string(),
+            ArchiveError::DecompressionBomb(_) => {
+                "Archive rejected: potential decompression bomb detected".to_string()
+            }
+        }
+    }
+
+    /// Extract an archive file to a destination directory.
+    fn extract_archive(&mut self, destination: Option<String>) {
+        // Get the archive path from current selection
+        let Some(archive_path) = self.get_selected_path() else {
+            self.error = Some("No file selected for extraction".to_string());
+            return;
+        };
+
+        // Check if it's actually an archive
+        if gravityfile_ops::ArchiveFormat::from_path(&archive_path).is_none() {
+            self.error = Some("Selected file is not a supported archive format".to_string());
+            return;
+        }
+
+        // Determine destination directory
+        let dest_dir = if let Some(dest) = destination {
+            // Validate user-provided path
+            let dest_path = match Self::validate_user_path(&dest) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.error = Some(format!("Invalid destination: {}", e));
+                    return;
+                }
+            };
+
+            if dest_path.is_absolute() {
+                dest_path
+            } else {
+                // Relative to view root
+                self.view_root.join(&dest_path)
+            }
+        } else {
+            // Extract to current directory by default
+            self.view_root.clone()
+        };
+
+        // Extract the archive
+        match gravityfile_ops::extract_archive(&archive_path, &dest_dir) {
+            Ok(extracted_files) => {
+                self.error = Some(format!(
+                    "Extracted {} files from {} to {}",
+                    extracted_files.len(),
+                    archive_path.file_name().unwrap_or_default().to_string_lossy(),
+                    dest_dir.display()
+                ));
+                // Trigger a rescan to show the extracted files
+                self.start_scan();
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to extract: {}", Self::sanitize_archive_error(&e)));
+            }
+        }
+    }
+
+    /// Compress marked files into an archive.
+    fn compress_files(&mut self, archive_name: &str) {
+        // Get files to compress from marked items, or current selection
+        let files: Vec<PathBuf> = if self.marked.is_empty() {
+            if let Some(path) = self.get_selected_path() {
+                vec![path]
+            } else {
+                self.error = Some("No files selected for compression".to_string());
+                return;
+            }
+        } else {
+            self.marked.iter().cloned().collect()
+        };
+
+        if files.is_empty() {
+            self.error = Some("No files to compress".to_string());
+            return;
+        }
+
+        // Validate archive name
+        let validated_name = match Self::validate_user_path(archive_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error = Some(format!("Invalid archive name: {}", e));
+                return;
+            }
+        };
+
+        // Determine archive path - relative to view root
+        let archive_path = self.view_root.join(&validated_name);
+
+        // Determine format from name
+        let format = match gravityfile_ops::ArchiveFormat::from_path(&archive_path) {
+            Some(f) => f,
+            None => {
+                // Default to zip if no recognized extension
+                gravityfile_ops::ArchiveFormat::Zip
+            }
+        };
+
+        // Adjust path if needed (add extension if missing)
+        let archive_path = if gravityfile_ops::ArchiveFormat::from_path(&archive_path).is_none() {
+            PathBuf::from(format!("{}{}", archive_path.display(), format.extension()))
+        } else {
+            archive_path
+        };
+
+        // Create the archive
+        match gravityfile_ops::create_archive(&files, &archive_path, format) {
+            Ok(()) => {
+                self.error = Some(format!(
+                    "Created archive {} with {} files",
+                    archive_path.file_name().unwrap_or_default().to_string_lossy(),
+                    files.len()
+                ));
+                // Clear marks after successful compression
+                self.marked.clear();
+                // Trigger a rescan to show the new archive
+                self.start_scan();
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to create archive: {}", Self::sanitize_archive_error(&e)));
+            }
+        }
+    }
+
+    /// Start bulk rename by opening editor with marked file names.
+    fn start_bulk_rename(&mut self) {
+        // Collect paths to rename
+        let paths: Vec<PathBuf> = if self.marked.is_empty() {
+            // If nothing marked, use current selection
+            if let Some(path) = self.get_selected_path() {
+                vec![path]
+            } else {
+                return;
+            }
+        } else {
+            self.marked.iter().cloned().collect()
+        };
+
+        if paths.is_empty() {
+            return;
+        }
+
+        // Create temp file with file names
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("gravityfile-rename-{}.txt", std::process::id()));
+
+        let content: String = paths
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if std::fs::write(&temp_file, &content).is_err() {
+            self.error = Some("Failed to create temp file for bulk rename".to_string());
+            return;
+        }
+
+        // Determine editor
+        let editor = std::env::var("EDITOR")
+            .or_else(|_| std::env::var("VISUAL"))
+            .unwrap_or_else(|_| "vi".to_string());
+
+        // Create the command to suspend terminal and run editor
+        let mut cmd = std::process::Command::new(&editor);
+        cmd.arg(&temp_file);
+
+        // Store paths and temp file for later processing
+        self.bulk_rename_state = Some(state::BulkRenameState {
+            entries: paths
+                .iter()
+                .filter_map(|p| {
+                    Some(state::RenameEntry {
+                        original: p.clone(),
+                        new_name: p.file_name()?.to_string_lossy().to_string(),
+                    })
+                })
+                .collect(),
+            selected: 0,
+            offset: 0,
+            error: None,
+        });
+
+        // Store temp file path in error field temporarily (we'll read it after editor closes)
+        if let Some(ref mut bulk_state) = self.bulk_rename_state {
+            bulk_state.error = Some(temp_file.to_string_lossy().to_string());
+        }
+
+        // Set pending command to suspend terminal
+        self.pending_suspend_command = Some(cmd);
+    }
+
+    /// Process bulk rename after editor closes.
+    fn process_bulk_rename_from_editor(&mut self) {
+        let Some(ref bulk_state) = self.bulk_rename_state else {
+            return;
+        };
+
+        // Get temp file path from error field
+        let Some(temp_file_str) = bulk_state.error.as_ref() else {
+            return;
+        };
+        let temp_file = PathBuf::from(temp_file_str);
+
+        // Read the edited file
+        let new_names: Vec<String> = match std::fs::read_to_string(&temp_file) {
+            Ok(content) => content.lines().map(|s| s.to_string()).collect(),
+            Err(_) => {
+                self.error = Some("Failed to read edited file".to_string());
+                self.bulk_rename_state = None;
+                let _ = std::fs::remove_file(&temp_file);
+                return;
+            }
+        };
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(&temp_file);
+
+        // Validate and create new state
+        let original_paths: Vec<PathBuf> = bulk_state.entries.iter().map(|e| e.original.clone()).collect();
+
+        if new_names.len() != original_paths.len() {
+            self.error = Some(format!(
+                "Line count mismatch: expected {}, got {}",
+                original_paths.len(),
+                new_names.len()
+            ));
+            self.bulk_rename_state = None;
+            return;
+        }
+
+        // Create proper state with changes only
+        let mut new_state = state::BulkRenameState::new(original_paths, new_names);
+
+        if new_state.is_empty() {
+            self.error = Some("No changes to apply".to_string());
+            self.bulk_rename_state = None;
+            return;
+        }
+
+        // Validate for conflicts (sets error field if invalid)
+        new_state.validate();
+
+        self.bulk_rename_state = Some(new_state);
+        self.mode = AppMode::ConfirmBulkRename;
+    }
+
+    /// Execute the bulk rename operations.
+    fn execute_bulk_rename(&mut self) {
+        let Some(bulk_state) = self.bulk_rename_state.take() else {
+            return;
+        };
+
+        let mut success_count = 0;
+        let mut error_messages: Vec<String> = Vec::new();
+
+        for entry in &bulk_state.entries {
+            let new_path = entry.original.parent().map(|p| p.join(&entry.new_name));
+            if let Some(new_path) = new_path {
+                match std::fs::rename(&entry.original, &new_path) {
+                    Ok(_) => {
+                        success_count += 1;
+                        // Update marks if this path was marked
+                        if self.marked.remove(&entry.original) {
+                            self.marked.insert(new_path);
+                        }
+                    }
+                    Err(e) => {
+                        error_messages.push(format!(
+                            "{}: {}",
+                            entry.original.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Show result message
+        if error_messages.is_empty() {
+            self.operation_message = Some((true, format!("Renamed {} items", success_count)));
+        } else {
+            self.operation_message = Some((
+                false,
+                format!(
+                    "Renamed {} items, {} failed: {}",
+                    success_count,
+                    error_messages.len(),
+                    error_messages.first().unwrap_or(&String::new())
+                ),
+            ));
+        }
+
+        // Clear marks after successful bulk rename
+        self.marked.clear();
+
+        // Refresh the view
+        self.mode = AppMode::Normal;
+        self.start_scan();
     }
 
     /// Go to the scan root.
@@ -2788,6 +3506,560 @@ impl App {
     /// Check if a path is marked for deletion.
     pub fn is_marked(&self, path: &PathBuf) -> bool {
         self.marked.contains(path)
+    }
+
+    /// Handle a key event when in bookmark mode (setting or jumping).
+    fn handle_bookmark_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char(c) if state::Bookmarks::is_valid_key(c) => {
+                match self.mode {
+                    AppMode::SettingBookmark => {
+                        self.set_bookmark(c);
+                    }
+                    AppMode::JumpingToBookmark => {
+                        self.jump_to_bookmark(c);
+                    }
+                    _ => {}
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {
+                // Invalid key, return to normal mode
+                self.mode = AppMode::Normal;
+            }
+        }
+    }
+
+    /// Set a bookmark for the current directory.
+    fn set_bookmark(&mut self, key: char) {
+        self.user_settings.bookmarks.set(key, self.view_root.clone());
+        let _ = self.user_settings.save();
+    }
+
+    /// Jump to a bookmark.
+    fn jump_to_bookmark(&mut self, key: char) {
+        if let Some(path) = self.user_settings.bookmarks.get(key).cloned() {
+            if path.is_dir() {
+                // Save current state to history
+                let saved_expanded = self.tree_state.expanded.clone();
+                let saved_selected = self.tree_state.selected;
+                self.view_history
+                    .push((self.view_root.clone(), saved_selected, saved_expanded));
+
+                // Check if we need to rescan (jumping outside current tree)
+                let needs_rescan = !path.starts_with(&self.path);
+
+                self.view_root = path.clone();
+                self.forward_history.clear();
+                self.tree_state.selected = 0;
+                self.tree_state.offset = 0;
+                self.miller_state.reset();
+
+                if needs_rescan {
+                    // We're jumping outside the scanned tree, need to rescan
+                    self.path = path;
+                    self.tree = gravityfile_scan::quick_list(&self.path).ok();
+                    self.tree_state = TreeState::new(self.path.clone());
+                    self.tree_state.expand(&self.path);
+                    self.duplicates = None;
+                    self.age_report = None;
+                    self.has_full_scan = false;
+                    // Start a background scan of the new location
+                    if self.scan_on_startup {
+                        self.start_scan();
+                    }
+                } else {
+                    self.tree_state.expand(&self.view_root);
+                }
+
+                self.update_cached_tree_len();
+                self.update_cached_miller_len();
+                self.sync_to_active_tab();
+            }
+        }
+    }
+
+    /// Handle input in the bookmark list modal.
+    fn handle_bookmark_list_input(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.bookmark_list_state = None;
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(state) = &mut self.bookmark_list_state {
+                    state.update_count(&self.user_settings.bookmarks);
+                    state.move_down();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(state) = &mut self.bookmark_list_state {
+                    state.move_up();
+                }
+            }
+            KeyCode::Enter => {
+                // Jump to selected bookmark
+                if let Some(state) = &self.bookmark_list_state {
+                    let entries = self.user_settings.bookmarks.sorted_entries();
+                    if let Some((key, _)) = entries.get(state.selected) {
+                        let key = *key;
+                        self.bookmark_list_state = None;
+                        self.mode = AppMode::Normal;
+                        self.jump_to_bookmark(key);
+                    }
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                // Delete selected bookmark
+                if let Some(state) = &self.bookmark_list_state {
+                    let entries = self.user_settings.bookmarks.sorted_entries();
+                    if let Some((key, _)) = entries.get(state.selected) {
+                        let key = *key;
+                        self.user_settings.bookmarks.remove(key);
+                        let _ = self.user_settings.save();
+                    }
+                }
+                // Update state after deletion
+                if let Some(state) = &mut self.bookmark_list_state {
+                    state.update_count(&self.user_settings.bookmarks);
+                }
+            }
+            // Allow jumping directly by pressing the bookmark key
+            KeyCode::Char(c) if state::Bookmarks::is_valid_key(c) => {
+                if self.user_settings.bookmarks.get(c).is_some() {
+                    self.bookmark_list_state = None;
+                    self.mode = AppMode::Normal;
+                    self.jump_to_bookmark(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle input in bulk rename confirmation modal.
+    fn handle_bulk_rename_input(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                // Cancel bulk rename
+                self.bulk_rename_state = None;
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(state) = &mut self.bulk_rename_state {
+                    state.move_down();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(state) = &mut self.bulk_rename_state {
+                    state.move_up();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                // Check for validation errors before executing
+                if let Some(state) = &self.bulk_rename_state {
+                    if state.error.is_some() {
+                        // Can't execute with errors
+                        return;
+                    }
+                }
+                // Execute the bulk rename
+                self.execute_bulk_rename();
+            }
+            KeyCode::Char('e') => {
+                // Re-edit the names
+                if let Some(state) = &self.bulk_rename_state {
+                    // Create temp file with current names
+                    let temp_dir = std::env::temp_dir();
+                    let temp_file = temp_dir.join(format!("gravityfile-rename-{}.txt", std::process::id()));
+
+                    let content: String = state
+                        .entries
+                        .iter()
+                        .map(|e| e.new_name.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    if std::fs::write(&temp_file, &content).is_ok() {
+                        let editor = std::env::var("EDITOR")
+                            .or_else(|_| std::env::var("VISUAL"))
+                            .unwrap_or_else(|_| "vi".to_string());
+
+                        let mut cmd = std::process::Command::new(&editor);
+                        cmd.arg(&temp_file);
+
+                        // Store temp file path
+                        if let Some(state) = &mut self.bulk_rename_state {
+                            state.error = Some(temp_file.to_string_lossy().to_string());
+                        }
+
+                        self.pending_suspend_command = Some(cmd);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle input in visual selection mode.
+    fn handle_visual_mode_input(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Get the max count based on current layout
+        let max_count = match self.layout_mode {
+            LayoutMode::Tree => self.cached_tree_len,
+            LayoutMode::Miller => self.cached_miller_len,
+        };
+
+        match (key.code, key.modifiers) {
+            // Exit visual mode with Esc - cancel selection
+            (KeyCode::Esc, _) => {
+                self.visual_state = None;
+                self.mode = AppMode::Normal;
+            }
+            // Exit visual mode with Enter or V - apply selection as marks
+            (KeyCode::Enter, _) | (KeyCode::Char('V'), KeyModifiers::SHIFT) => {
+                self.apply_visual_selection_as_marks();
+                self.visual_state = None;
+                self.mode = AppMode::Normal;
+            }
+            // Navigation - vim style
+            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
+                if let Some(state) = &mut self.visual_state {
+                    state.move_down(max_count);
+                    // Sync the visual cursor with the actual selection state
+                    self.sync_visual_cursor_to_view();
+                }
+            }
+            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
+                if let Some(state) = &mut self.visual_state {
+                    state.move_up();
+                    self.sync_visual_cursor_to_view();
+                }
+            }
+            // Page navigation
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => {
+                if let Some(state) = &mut self.visual_state {
+                    state.page_up(constants::PAGE_SIZE);
+                    self.sync_visual_cursor_to_view();
+                }
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => {
+                if let Some(state) = &mut self.visual_state {
+                    state.page_down(constants::PAGE_SIZE, max_count);
+                    self.sync_visual_cursor_to_view();
+                }
+            }
+            // Jump to top/bottom
+            (KeyCode::Char('g'), KeyModifiers::NONE) | (KeyCode::Home, _) => {
+                if let Some(state) = &mut self.visual_state {
+                    state.jump_to_top();
+                    self.sync_visual_cursor_to_view();
+                }
+            }
+            (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => {
+                if let Some(state) = &mut self.visual_state {
+                    state.jump_to_bottom(max_count);
+                    self.sync_visual_cursor_to_view();
+                }
+            }
+            // Quick actions while in visual mode
+            (KeyCode::Char('d'), KeyModifiers::NONE) | (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
+                // Delete selected range
+                self.apply_visual_selection_as_marks();
+                self.visual_state = None;
+                self.mode = AppMode::Normal;
+                // Now trigger delete confirmation
+                if !self.marked.is_empty() {
+                    self.mode = AppMode::ConfirmDelete;
+                }
+            }
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                // Yank (copy) selected range
+                self.apply_visual_selection_as_marks();
+                self.visual_state = None;
+                self.mode = AppMode::Normal;
+                self.yank_selection();
+            }
+            (KeyCode::Char('x'), KeyModifiers::NONE) => {
+                // Cut selected range
+                self.apply_visual_selection_as_marks();
+                self.visual_state = None;
+                self.mode = AppMode::Normal;
+                self.cut_selection();
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Sync the visual cursor position to the actual view selection state.
+    fn sync_visual_cursor_to_view(&mut self) {
+        if let Some(state) = &self.visual_state {
+            match self.layout_mode {
+                LayoutMode::Tree => self.tree_state.selected = state.cursor,
+                LayoutMode::Miller => self.miller_state.selected = state.cursor,
+            }
+        }
+    }
+
+    /// Apply the visual selection range as marks.
+    fn apply_visual_selection_as_marks(&mut self) {
+        let Some(state) = &self.visual_state else {
+            return;
+        };
+
+        let (start, end) = state.selection_range();
+
+        // Collect paths first to avoid borrow issues
+        let paths_to_mark: Vec<PathBuf> = match self.layout_mode {
+            LayoutMode::Tree => {
+                // Get flattened tree items
+                if let Some((node, root_path)) = self.get_view_root_node() {
+                    let items = crate::ui::TreeView::new(
+                        node,
+                        &root_path,
+                        &self.theme,
+                        &self.marked,
+                        &self.clipboard,
+                    )
+                    .flatten(&self.tree_state);
+
+                    (start..=end)
+                        .filter_map(|i| items.get(i).map(|item| item.path.clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            LayoutMode::Miller => {
+                // Get direct children of current view
+                if let Some((node, _)) = self.get_view_root_node() {
+                    // Sort children same way as Miller columns display
+                    let mut children: Vec<_> = node.children.iter().collect();
+                    let sort_mode = self.sort_mode;
+                    children.sort_by(|a, b| {
+                        match sort_mode {
+                            SortMode::SizeDescending => b.size.cmp(&a.size),
+                            SortMode::SizeAscending => a.size.cmp(&b.size),
+                            SortMode::NameAscending => a.name.cmp(&b.name),
+                            SortMode::NameDescending => b.name.cmp(&a.name),
+                            SortMode::ModifiedDescending => b.timestamps.modified.cmp(&a.timestamps.modified),
+                            SortMode::ModifiedAscending => a.timestamps.modified.cmp(&b.timestamps.modified),
+                            SortMode::CountDescending => b.children.len().cmp(&a.children.len()),
+                            SortMode::CountAscending => a.children.len().cmp(&b.children.len()),
+                        }
+                    });
+
+                    let view_root = self.view_root.clone();
+                    (start..=end)
+                        .filter_map(|i| {
+                            children.get(i).map(|child| view_root.join(&*child.name))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+
+        // Now mark all the collected paths
+        for path in paths_to_mark {
+            self.marked.insert(path);
+        }
+    }
+
+    /// Handle a mouse action.
+    fn handle_mouse_action(&mut self, action: MouseAction) {
+        // Store the last content area dimensions for hit testing
+        // In a real implementation, we would track the rendered areas from the last frame
+        // For now, we implement basic scroll wheel and click functionality
+
+        match action {
+            MouseAction::ScrollUp { .. } => {
+                // Scroll up - move selection up
+                match self.view {
+                    View::Explorer => {
+                        for _ in 0..3 {
+                            self.move_up();
+                        }
+                    }
+                    View::Duplicates => {
+                        // Collect group info to avoid borrow issues
+                        let group_info: Vec<usize> = self.get_filtered_duplicates()
+                            .map(|(filtered, _)| filtered.iter().map(|g| g.paths.len()).collect())
+                            .unwrap_or_default();
+                        let group_count = group_info.len();
+                        for _ in 0..3 {
+                            self.duplicates_state.move_up(group_count, |i| {
+                                group_info.get(i).copied().unwrap_or(0)
+                            });
+                        }
+                    }
+                    View::Age => {
+                        for _ in 0..3 {
+                            if self.selected_stale_dir > 0 {
+                                self.selected_stale_dir -= 1;
+                            }
+                        }
+                    }
+                    View::Errors => {
+                        for _ in 0..3 {
+                            if self.selected_warning > 0 {
+                                self.selected_warning -= 1;
+                            }
+                        }
+                    }
+                    View::Treemap => {
+                        for _ in 0..3 {
+                            self.treemap_state.move_prev();
+                        }
+                    }
+                }
+            }
+            MouseAction::ScrollDown { .. } => {
+                // Scroll down - move selection down
+                match self.view {
+                    View::Explorer => {
+                        for _ in 0..3 {
+                            self.move_down();
+                        }
+                    }
+                    View::Duplicates => {
+                        // Collect group info to avoid borrow issues
+                        let group_info: Vec<usize> = self.get_filtered_duplicates()
+                            .map(|(filtered, _)| filtered.iter().map(|g| g.paths.len()).collect())
+                            .unwrap_or_default();
+                        let group_count = group_info.len();
+                        for _ in 0..3 {
+                            self.duplicates_state.move_down(group_count, |i| {
+                                group_info.get(i).copied().unwrap_or(0)
+                            });
+                        }
+                    }
+                    View::Age => {
+                        let max = self.get_filtered_stale_dirs()
+                            .map(|dirs| dirs.len().saturating_sub(1))
+                            .unwrap_or(0);
+                        for _ in 0..3 {
+                            if self.selected_stale_dir < max {
+                                self.selected_stale_dir += 1;
+                            }
+                        }
+                    }
+                    View::Errors => {
+                        let max = self.warnings.len().saturating_sub(1);
+                        for _ in 0..3 {
+                            if self.selected_warning < max {
+                                self.selected_warning += 1;
+                            }
+                        }
+                    }
+                    View::Treemap => {
+                        for _ in 0..3 {
+                            self.treemap_state.move_next(self.cached_treemap_len);
+                        }
+                    }
+                }
+            }
+            MouseAction::Click { y, .. } => {
+                // For now, simple click-to-select functionality
+                // Calculate which item was clicked based on the Y position
+                // This is a simplified implementation - a more complete version would
+                // track rendered areas from the last frame
+
+                if self.view == View::Explorer {
+                    // Estimate header height (path bar + tabs)
+                    let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                    let _footer_height: u16 = 1; // Reserved for future use in click calculation
+
+                    if y > header_height {
+                        let relative_y = (y - header_height) as usize;
+
+                        match self.layout_mode {
+                            LayoutMode::Tree => {
+                                let new_selected = self.tree_state.offset + relative_y;
+                                if new_selected < self.cached_tree_len {
+                                    self.tree_state.selected = new_selected;
+                                }
+                            }
+                            LayoutMode::Miller => {
+                                // In Miller mode, the middle column starts after the left column
+                                // This is a simplified version - we just select by row
+                                let new_selected = self.miller_state.offset + relative_y;
+                                if new_selected < self.cached_miller_len {
+                                    self.miller_state.selected = new_selected;
+                                    self.update_preview();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            MouseAction::DoubleClick { y, .. } => {
+                // Double-click to enter directory
+                if self.view == View::Explorer {
+                    let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+
+                    if y > header_height {
+                        let relative_y = (y - header_height) as usize;
+
+                        match self.layout_mode {
+                            LayoutMode::Tree => {
+                                let new_selected = self.tree_state.offset + relative_y;
+                                if new_selected < self.cached_tree_len {
+                                    self.tree_state.selected = new_selected;
+                                    self.drill_into_selected();
+                                }
+                            }
+                            LayoutMode::Miller => {
+                                let new_selected = self.miller_state.offset + relative_y;
+                                if new_selected < self.cached_miller_len {
+                                    self.miller_state.selected = new_selected;
+                                    self.drill_into_miller_selected();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            MouseAction::RightClick { y, .. } => {
+                // Right-click to toggle mark
+                if self.view == View::Explorer {
+                    let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+
+                    if y > header_height {
+                        let relative_y = (y - header_height) as usize;
+
+                        match self.layout_mode {
+                            LayoutMode::Tree => {
+                                let new_selected = self.tree_state.offset + relative_y;
+                                if new_selected < self.cached_tree_len {
+                                    self.tree_state.selected = new_selected;
+                                    self.toggle_mark();
+                                }
+                            }
+                            LayoutMode::Miller => {
+                                let new_selected = self.miller_state.offset + relative_y;
+                                if new_selected < self.cached_miller_len {
+                                    self.miller_state.selected = new_selected;
+                                    self.toggle_mark();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Cycle to the next sort mode and apply sorting.
@@ -3212,6 +4484,11 @@ impl Widget for &App {
             preview_mode: self.preview_state.mode,
             has_full_scan: self.has_full_scan,
             settings_state: self.settings_state.as_ref(),
+            bookmark_list_state: self.bookmark_list_state.as_ref(),
+            bookmarks: &self.user_settings.bookmarks,
+            bulk_rename_state: self.bulk_rename_state.as_ref(),
+            treemap_selected: self.treemap_state.selected,
+            visual_state: self.visual_state.as_ref(),
         };
 
         render_app(&ctx, area, buf);

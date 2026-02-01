@@ -15,6 +15,8 @@ pub enum DeletionMode {
     #[default]
     Trash,
     /// Permanently delete files (not recoverable).
+    /// Reserved for future implementation of permanent deletion option.
+    #[allow(dead_code)]
     Permanent,
 }
 

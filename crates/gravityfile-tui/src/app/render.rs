@@ -13,18 +13,18 @@ use gravityfile_ops::{Conflict, OperationProgress};
 use crate::preview::PreviewContent;
 use crate::theme::Theme;
 use crate::ui::modals::{
-    CommandPalette, ConflictModal, DeleteConfirmModal, DeletionProgressModal, InputModal,
-    OperationProgressModal, SettingsModal,
+    BookmarkListModal, BookmarkPrompt, BulkRenameConfirmModal, CommandPalette, ConflictModal,
+    DeleteConfirmModal, DeletionProgressModal, InputModal, OperationProgressModal, SettingsModal,
 };
 use crate::ui::{
     format_relative_time, format_size, AppLayout, HelpOverlay, MillerColumns, MillerState,
-    TreeState, TreeView,
+    TreeState, TreeView, TreemapView,
 };
 
 use super::input::InputState;
 use super::state::{
-    AppMode, ClipboardMode, ClipboardState, DeletionProgress, LayoutMode, SelectedInfo,
-    SettingsState, SortMode, View,
+    AppMode, BookmarkListState, Bookmarks, ClipboardMode, ClipboardState, DeletionProgress,
+    LayoutMode, SelectedInfo, SettingsState, SortMode, View,
 };
 
 /// Item in the duplicates list (either a group header or a file within a group).
@@ -97,6 +97,16 @@ pub struct RenderContext<'a> {
     pub has_full_scan: bool,
     /// Settings modal state.
     pub settings_state: Option<&'a SettingsState>,
+    /// Bookmark list modal state.
+    pub bookmark_list_state: Option<&'a BookmarkListState>,
+    /// User bookmarks.
+    pub bookmarks: &'a Bookmarks,
+    /// Bulk rename state for confirmation modal.
+    pub bulk_rename_state: Option<&'a super::state::BulkRenameState>,
+    /// Treemap selected index.
+    pub treemap_selected: usize,
+    /// Visual selection state.
+    pub visual_state: Option<&'a super::state::VisualState>,
 }
 
 /// Main render function for the application.
@@ -150,6 +160,7 @@ pub fn render_app(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         View::Duplicates => render_duplicates(ctx, content, buf),
         View::Age => render_age(ctx, content, buf),
         View::Errors => render_errors(ctx, content, buf),
+        View::Treemap => render_treemap(ctx, content, buf),
     }
 
     // Render footer
@@ -216,6 +227,26 @@ pub fn render_app(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         AppMode::Settings => {
             if let Some(state) = ctx.settings_state {
                 SettingsModal::new(ctx.theme, state).render(area, buf);
+            }
+        }
+        AppMode::BookmarkList => {
+            if let Some(state) = ctx.bookmark_list_state {
+                BookmarkListModal::new(ctx.theme, ctx.bookmarks, state).render(area, buf);
+            }
+        }
+        AppMode::SettingBookmark => {
+            // Render prompt in footer area
+            let footer_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+            BookmarkPrompt::new(ctx.theme, "Set bookmark:").render(footer_area, buf);
+        }
+        AppMode::JumpingToBookmark => {
+            // Render prompt in footer area
+            let footer_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+            BookmarkPrompt::new(ctx.theme, "Jump to bookmark:").render(footer_area, buf);
+        }
+        AppMode::ConfirmBulkRename => {
+            if let Some(state) = ctx.bulk_rename_state {
+                BulkRenameConfirmModal::new(ctx.theme, state).render(area, buf);
             }
         }
         _ => {}
@@ -1135,6 +1166,44 @@ fn render_errors(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     }
 }
 
+fn render_treemap(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
+    let Some(tree) = ctx.tree else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(ctx.theme.border)
+            .title(" Treemap ")
+            .title_style(ctx.theme.title);
+        let inner = block.inner(area);
+        block.render(area, buf);
+        Paragraph::new("No data. Press R to scan.").render(inner, buf);
+        return;
+    };
+
+    // Get the current view root node
+    let (view_node, view_path) = match &ctx.get_view_root_node {
+        Some((node, path)) => (*node, path.clone()),
+        None => (&tree.root, tree.root_path.clone()),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(ctx.theme.border)
+        .title(format!(" Treemap: {} ", view_path.display()))
+        .title_style(ctx.theme.title);
+
+    let treemap = TreemapView::new(
+        view_node,
+        &view_path,
+        ctx.theme,
+        ctx.marked,
+        ctx.clipboard,
+    )
+    .block(block)
+    .selected(ctx.treemap_selected);
+
+    treemap.render(area, buf);
+}
+
 fn render_details(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1193,7 +1262,29 @@ fn render_details(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
-    let mut keys: Vec<(&str, &str)> = match ctx.view {
+    // Check if we're in visual mode
+    let in_visual_mode = ctx.mode == AppMode::Visual;
+
+    let mut keys: Vec<(&str, &str)> = if in_visual_mode {
+        // Visual mode specific keys
+        let _selection_count = ctx.visual_state
+            .map(|s| s.selection_count())
+            .unwrap_or(0);
+
+        let mut v = vec![
+            ("j/k", "Extend"),
+            ("Enter", "Apply"),
+            ("Esc", "Cancel"),
+            ("y", "Yank"),
+            ("d", "Delete"),
+        ];
+
+        // Show VISUAL mode indicator
+        v.insert(0, ("V", "VISUAL"));
+
+        v
+    } else {
+        match ctx.view {
         View::Explorer => {
             let mut v = vec![("j/k", "Nav")];
 
@@ -1216,6 +1307,9 @@ fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             } else {
                 v.push(("Spc", "+Sel"));
             }
+
+            // Visual mode hint
+            v.push(("V", "Visual"));
 
             // Layout toggle
             let layout_hint = match ctx.layout_mode {
@@ -1272,7 +1366,19 @@ fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             }
             v
         }
-    };
+        View::Treemap => {
+            let mut v = vec![
+                ("Enter", "Drill"),
+                ("Bksp", "Back"),
+                ("Spc", "+Sel"),
+                ("d", "Del"),
+            ];
+            if !ctx.marked.is_empty() {
+                v.push(("Esc", "Clear"));
+            }
+            v
+        }
+    }};
 
     // Add scan hint - prominent when no full scan has been done
     // Use Shift+R format to make it clear it's Shift+R not lowercase r

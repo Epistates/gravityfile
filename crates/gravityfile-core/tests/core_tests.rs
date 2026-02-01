@@ -319,6 +319,7 @@ fn test_symlink_node() {
         timestamps: Timestamps::with_modified(now),
         inode: None,
         content_hash: None,
+        git_status: None,
         children: Vec::new(),
     };
 
@@ -344,6 +345,7 @@ fn test_symlink_node() {
         timestamps: Timestamps::with_modified(now),
         inode: None,
         content_hash: None,
+        git_status: None,
         children: Vec::new(),
     };
 

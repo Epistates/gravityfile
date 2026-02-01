@@ -34,6 +34,14 @@ struct Cli {
     #[arg(short = 'S', long)]
     scan: bool,
 
+    /// Write the last working directory to this file on exit (for shell integration)
+    #[arg(long = "cwd-file")]
+    cwd_file: Option<PathBuf>,
+
+    /// Print the last working directory to stdout on exit (for shell integration)
+    #[arg(long = "print-cwd")]
+    print_cwd: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -147,7 +155,10 @@ fn main() -> Result<()> {
         None => {
             // Launch TUI
             let path = cli.path.canonicalize().context("Invalid path")?;
-            let config = gravityfile_tui::TuiConfig::new().with_scan_on_startup(cli.scan);
+            let config = gravityfile_tui::TuiConfig::new()
+                .with_scan_on_startup(cli.scan)
+                .with_cwd_file(cli.cwd_file)
+                .with_print_cwd(cli.print_cwd);
             gravityfile_tui::run_with_config(path, config)?;
         }
     }

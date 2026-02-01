@@ -16,5 +16,12 @@ serde.workspace = true
 fs_extra = "1.3"
 trash = "5"
 
+# Archive support
+zip.workspace = true
+tar.workspace = true
+flate2.workspace = true
+xz2.workspace = true
+bzip2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

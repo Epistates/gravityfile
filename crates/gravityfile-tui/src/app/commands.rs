@@ -142,6 +142,16 @@ pub enum CommandAction {
     /// Set sort mode.
     SetSort(SortCommand),
 
+    // Bookmarks
+    /// Show bookmark list.
+    ShowBookmarks,
+    /// Set a bookmark with the given key.
+    SetBookmark(Option<char>),
+    /// Jump to a bookmark with the given key.
+    JumpToBookmark(Option<char>),
+    /// Delete a bookmark.
+    DeleteBookmark(char),
+
     // File operations
     /// Yank (copy) marked items to clipboard.
     Yank,
@@ -161,6 +171,14 @@ pub enum CommandAction {
     Take(Option<String>),
     /// Undo last operation.
     Undo,
+    /// Bulk rename marked items.
+    BulkRename,
+
+    // Archive operations
+    /// Extract archive to destination.
+    Extract(Option<String>),
+    /// Compress files to archive.
+    Compress(String),
 }
 
 /// Theme command variants.
@@ -269,6 +287,39 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         }
         "miller" | "columns" => CommandAction::SetLayout(LayoutCommand::Miller),
 
+        // Bookmark commands
+        "bookmark" | "mark" | "bm" => {
+            if parts.len() > 1 {
+                // :bookmark <key> - set bookmark with key
+                let key = parts[1].chars().next();
+                CommandAction::SetBookmark(key)
+            } else {
+                // :bookmark - show bookmark list
+                CommandAction::ShowBookmarks
+            }
+        }
+        "bookmarks" | "marks" | "bms" => CommandAction::ShowBookmarks,
+        "delmark" | "delbookmark" | "unbookmark" => {
+            if parts.len() > 1 {
+                if let Some(key) = parts[1].chars().next() {
+                    CommandAction::DeleteBookmark(key)
+                } else {
+                    CommandAction::None
+                }
+            } else {
+                CommandAction::None
+            }
+        }
+        // Jump to a bookmark: :go h or :' h
+        "go" | "'" => {
+            if parts.len() > 1 {
+                let key = parts[1].chars().next();
+                CommandAction::JumpToBookmark(key)
+            } else {
+                CommandAction::JumpToBookmark(None)
+            }
+        }
+
         // Sort commands
         "sort" | "s" => {
             if parts.len() > 1 {
@@ -337,6 +388,28 @@ pub fn parse_command(cmd: &str) -> CommandAction {
 
         // Undo
         "undo" | "u" => CommandAction::Undo,
+
+        // Bulk rename
+        "rename-bulk" | "bulk-rename" | "bulkrename" | "brn" => CommandAction::BulkRename,
+
+        // Archive operations
+        "extract" | "unzip" | "untar" | "decompress" => {
+            if parts.len() > 1 {
+                // :extract <destination> - extract to specified location
+                CommandAction::Extract(Some(parts[1..].join(" ")))
+            } else {
+                // :extract - extract to current directory
+                CommandAction::Extract(None)
+            }
+        }
+        "compress" | "zip" | "archive" => {
+            if parts.len() > 1 {
+                // :compress <archive_name> - create archive with name
+                CommandAction::Compress(parts[1..].join(" "))
+            } else {
+                CommandAction::None // Name is required
+            }
+        }
 
         _ => CommandAction::None,
     }

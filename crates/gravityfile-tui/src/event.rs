@@ -1,6 +1,6 @@
 //! Event handling for the TUI.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 /// Key action that can be performed in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,10 @@ pub enum KeyAction {
     // Selection
     /// Toggle mark on current item (Space).
     ToggleMark,
+    /// Enter visual selection mode (Shift+V).
+    EnterVisual,
+    /// Clear all marks.
+    ClearMarks,
 
     // Clipboard operations (vim-style)
     /// Yank (copy) marked/current to clipboard.
@@ -79,12 +83,18 @@ pub enum KeyAction {
     #[allow(dead_code)]
     Confirm,
     Cancel,
-    #[allow(dead_code)]
-    ClearMarks,
 
     // View switching (for View enum: Explorer, Duplicates, Age, Errors)
     NextView,
     PrevView,
+
+    // Bookmarks
+    /// Set a bookmark (m<key>).
+    SetBookmark,
+    /// Jump to a bookmark ('<key>).
+    JumpToBookmark,
+    /// Show bookmark list modal.
+    ShowBookmarkList,
 
     // Directory tabs (multiple directory contexts)
     /// Create a new directory tab.
@@ -104,6 +114,51 @@ pub enum KeyAction {
 
     // No action
     None,
+}
+
+/// Mouse action that can be performed in the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    /// Left click at a position.
+    Click { x: u16, y: u16 },
+    /// Double click at a position.
+    /// Reserved for future double-click detection with timing logic.
+    #[allow(dead_code)]
+    DoubleClick { x: u16, y: u16 },
+    /// Right click at a position.
+    RightClick { x: u16, y: u16 },
+    /// Scroll up at a position.
+    ScrollUp { x: u16, y: u16 },
+    /// Scroll down at a position.
+    ScrollDown { x: u16, y: u16 },
+    /// Drag started at a position.
+    /// Reserved for future drag-and-drop support.
+    #[allow(dead_code)]
+    DragStart { x: u16, y: u16 },
+    /// Drag continued to a position.
+    DragTo { x: u16, y: u16 },
+    /// Drag ended.
+    DragEnd,
+    /// No action.
+    None,
+}
+
+impl MouseAction {
+    /// Convert a mouse event to an action.
+    pub fn from_mouse_event(event: MouseEvent) -> Self {
+        let x = event.column;
+        let y = event.row;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => MouseAction::Click { x, y },
+            MouseEventKind::Down(MouseButton::Right) => MouseAction::RightClick { x, y },
+            MouseEventKind::Up(_) => MouseAction::DragEnd,
+            MouseEventKind::Drag(MouseButton::Left) => MouseAction::DragTo { x, y },
+            MouseEventKind::ScrollUp => MouseAction::ScrollUp { x, y },
+            MouseEventKind::ScrollDown => MouseAction::ScrollDown { x, y },
+            _ => MouseAction::None,
+        }
+    }
 }
 
 impl KeyAction {
@@ -143,6 +198,8 @@ impl KeyAction {
 
             // Selection and marking
             (KeyCode::Char(' '), KeyModifiers::NONE) => KeyAction::ToggleMark,
+            (KeyCode::Char('V'), KeyModifiers::SHIFT) => KeyAction::EnterVisual,
+            (KeyCode::Char('u'), KeyModifiers::NONE) => KeyAction::ClearMarks,
 
             // Tree expand/collapse with 'o'
             (KeyCode::Char('o'), KeyModifiers::NONE) => KeyAction::ToggleExpand,
@@ -191,6 +248,12 @@ impl KeyAction {
 
             // Go to directory
             (KeyCode::Char('g'), KeyModifiers::CONTROL) => KeyAction::GoTo,
+
+            // Bookmarks
+            (KeyCode::Char('m'), KeyModifiers::NONE) => KeyAction::SetBookmark,
+            (KeyCode::Char('\''), KeyModifiers::NONE) => KeyAction::JumpToBookmark,
+            (KeyCode::Char('`'), KeyModifiers::NONE) => KeyAction::JumpToBookmark,
+            (KeyCode::Char('B'), KeyModifiers::SHIFT) => KeyAction::ShowBookmarkList,
 
             // Confirmation (for dialogs)
             (KeyCode::Char('n'), KeyModifiers::NONE) => KeyAction::Cancel,
@@ -294,6 +357,23 @@ pub fn get_help_sections() -> Vec<HelpSection> {
             ],
         },
         HelpSection {
+            title: "Bookmarks",
+            bindings: vec![
+                KeyBinding { keys: "m<key>", description: "Set bookmark" },
+                KeyBinding { keys: "'<key>", description: "Jump to bookmark" },
+                KeyBinding { keys: "B", description: "Show bookmark list" },
+            ],
+        },
+        HelpSection {
+            title: "Mouse",
+            bindings: vec![
+                KeyBinding { keys: "Click", description: "Select item" },
+                KeyBinding { keys: "Double-click", description: "Enter directory" },
+                KeyBinding { keys: "Right-click", description: "Toggle mark" },
+                KeyBinding { keys: "Scroll", description: "Move up/down" },
+            ],
+        },
+        HelpSection {
             title: "Directory Tabs",
             bindings: vec![
                 KeyBinding { keys: "Ctrl-t", description: "New tab (current dir)" },
@@ -327,10 +407,14 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
         (":paste :p", "Paste from clipboard"),
         (":delete :rm", "Delete marked items"),
         (":rename <name>", "Rename current item"),
+        (":rename-bulk :brn", "Bulk rename marked items"),
         (":clear", "Clear all marks"),
         (":theme dark|light", "Set theme"),
         (":layout tree|miller", "Set layout"),
         (":sort <mode>", "Set sort (size/name/date/count)"),
+        (":bookmark [key]", "Set bookmark (or list all)"),
+        (":bookmarks", "Show bookmark list"),
+        (":delmark <key>", "Delete a bookmark"),
         (":help", "Show help"),
     ]
 }

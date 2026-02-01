@@ -51,5 +51,12 @@ open = "5"
 # Safe deletion (move to trash instead of permanent delete)
 trash.workspace = true
 
+# Archive support for preview
+zip.workspace = true
+tar.workspace = true
+flate2.workspace = true
+xz2.workspace = true
+bzip2.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

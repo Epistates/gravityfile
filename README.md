@@ -13,7 +13,11 @@ File system explorer and analyzer with an interactive TUI, built in Rust.
 
 - **Interactive TUI** - Beautiful terminal interface with vim-style navigation
 - **Miller Columns Layout** - Ranger-style three-pane view (toggle with `v`)
+- **Treemap Visualization** - Space-filling treemap view for disk usage analysis
+- **Git Status Integration** - Real-time git status indicators (modified, staged, untracked)
+- **Visual Mode** - Vim-style range selection with `V`
 - **File Operations** - Copy, move, rename, create, delete with undo support
+- **Archive Support** - Create and extract ZIP, TAR, TAR.GZ, TAR.BZ2, TAR.XZ archives
 - **Parallel Scanning** - Fast directory traversal using `jwalk`
 - **Duplicate Detection** - Find duplicate files using BLAKE3 hashing with partial-hash optimization
 - **Age Analysis** - Identify stale directories and analyze file age distribution
@@ -111,10 +115,11 @@ Export scan results to JSON.
 | Key | Action |
 |-----|--------|
 | `Space` | Mark item for multi-select |
+| `V` | Enter visual mode (range select) |
 | `y` | Yank (copy) to clipboard |
 | `x` | Cut to clipboard |
 | `p` | Paste from clipboard |
-| `Esc` | Clear clipboard / marks |
+| `Esc` | Clear clipboard / marks / exit visual mode |
 
 ### File Operations
 | Key | Action |
@@ -130,7 +135,7 @@ Export scan results to JSON.
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift-Tab` | Switch view tab (Usage, Duplicates, Age) |
-| `v` | Toggle Tree / Miller layout |
+| `v` | Cycle layout (Tree → Miller → Treemap) |
 | `i` | Toggle details panel |
 | `P` | Cycle preview mode |
 | `t` | Toggle theme (dark/light) |
@@ -173,9 +178,11 @@ Export scan results to JSON.
 | `:paste` `:p` | Paste from clipboard |
 | `:delete` `:rm` | Delete marked items |
 | `:rename <name>` | Rename current item |
+| `:extract [dest]` | Extract archive to destination |
+| `:compress <name>` | Create archive from marked items |
 | `:clear` | Clear all marks |
 | `:theme dark\|light` | Set theme |
-| `:layout tree\|miller` | Set layout |
+| `:layout tree\|miller\|treemap` | Set layout |
 | `:help` | Show help |
 
 ## Library Usage

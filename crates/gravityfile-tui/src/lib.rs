@@ -53,6 +53,11 @@ pub struct TuiConfig {
     /// If false (default), only a quick directory listing is shown
     /// and the user must press 'R' to start a full scan.
     pub scan_on_startup: bool,
+    /// Path to a file where the last working directory will be written on exit.
+    /// This enables shell integration for `cd` on exit functionality.
+    pub cwd_file: Option<std::path::PathBuf>,
+    /// Whether to print the last working directory to stdout on exit.
+    pub print_cwd: bool,
 }
 
 impl TuiConfig {
@@ -66,6 +71,25 @@ impl TuiConfig {
         self.scan_on_startup = scan;
         self
     }
+
+    /// Set the cwd file path for shell integration.
+    pub fn with_cwd_file(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.cwd_file = path;
+        self
+    }
+
+    /// Enable printing cwd on exit.
+    pub fn with_print_cwd(mut self, print: bool) -> Self {
+        self.print_cwd = print;
+        self
+    }
+}
+
+/// Data collected at exit for shell integration.
+#[derive(Debug, Clone)]
+pub struct ExitData {
+    /// The last working directory when the app exited.
+    pub last_cwd: std::path::PathBuf,
 }
 
 /// Run the TUI application with default configuration.
@@ -75,15 +99,46 @@ pub fn run(path: std::path::PathBuf) -> AppResult<()> {
 
 /// Run the TUI application with custom configuration.
 pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult<()> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::execute;
+
     // Create tokio runtime for async operations
     let rt = tokio::runtime::Runtime::new()?;
 
+    // Store config options we need after the app runs
+    let cwd_file = config.cwd_file.clone();
+    let print_cwd = config.print_cwd;
+
     let terminal = ratatui::init();
-    let result = rt.block_on(App::with_config(path, config).run(terminal));
+
+    // Enable mouse capture
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+
+    let app = App::with_config(path, config);
+    let result = rt.block_on(async {
+        let exit_data = app.run_and_return_exit_data(terminal).await;
+        exit_data
+    });
+
+    // Disable mouse capture before restoring terminal
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
     // Shutdown runtime immediately to cancel background tasks
     rt.shutdown_timeout(std::time::Duration::from_millis(100));
 
-    result
+    // Handle exit data for shell integration
+    if let Ok(exit_data) = &result {
+        // Write cwd to file if requested
+        if let Some(cwd_path) = cwd_file {
+            let _ = std::fs::write(&cwd_path, exit_data.last_cwd.to_string_lossy().as_bytes());
+        }
+
+        // Print cwd if requested
+        if print_cwd {
+            println!("{}", exit_data.last_cwd.display());
+        }
+    }
+
+    result.map(|_| ())
 }

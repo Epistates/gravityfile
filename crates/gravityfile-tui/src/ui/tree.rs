@@ -9,7 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, StatefulWidget, Widget};
 
-use gravityfile_core::{FileNode, NodeKind};
+use gravityfile_core::{FileNode, GitStatus, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
@@ -113,6 +113,7 @@ pub struct VisibleNode {
     pub name: String,
     pub size: u64,
     pub kind: VisibleNodeKind,
+    pub git_status: Option<GitStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +205,7 @@ impl<'a> TreeView<'a> {
                 name: node.name.to_string(),
                 size: node.size,
                 kind,
+                git_status: node.git_status,
             },
             depth,
             is_last_sibling: is_last,
@@ -359,9 +361,23 @@ impl StatefulWidget for TreeView<'_> {
             let expand_span = Span::styled(expand_indicator, Style::default().fg(self.theme.muted));
             let name_span = Span::styled(&name, base_style);
 
-            // Pad name to fill space
-            let name_padding =
-                " ".repeat(available_for_name.saturating_sub(name.len() as u16) as usize);
+            // Git status indicator
+            let (git_indicator, git_style) = match item.node.git_status {
+                Some(status) if status.is_displayable() => {
+                    let color = self.theme.git_status_color(status);
+                    (format!(" {}", status.indicator()), Style::default().fg(color))
+                }
+                _ => (String::new(), Style::default()),
+            };
+            let git_span = Span::styled(&git_indicator, git_style);
+
+            // Pad name to fill space (accounting for git indicator)
+            let git_len = git_indicator.len() as u16;
+            let name_padding = " ".repeat(
+                available_for_name
+                    .saturating_sub(name.len() as u16)
+                    .saturating_sub(git_len) as usize,
+            );
             let padding_span = Span::raw(&name_padding);
 
             // Size text - show "..." for directories with unknown size (0 bytes)
@@ -379,6 +395,7 @@ impl StatefulWidget for TreeView<'_> {
                 checkbox_span,
                 expand_span,
                 name_span,
+                git_span,
                 padding_span,
                 Span::raw(" "),
                 size_span,
