@@ -219,7 +219,12 @@ impl AgeAnalyzer {
         // Find median bucket (bucket containing cumulative 50% of files)
         let half_files = total_files / 2;
         let mut cumulative = 0u64;
-        let mut median_bucket = self.config.buckets.first().map(|b| b.name.clone()).unwrap_or_default();
+        let mut median_bucket = self
+            .config
+            .buckets
+            .first()
+            .map(|b| b.name.clone())
+            .unwrap_or_default();
         for stats in &bucket_stats {
             cumulative += stats.file_count;
             if cumulative >= half_files {
@@ -275,7 +280,11 @@ impl AgeAnalyzer {
                 // Find the appropriate bucket
                 for collector in bucket_stats.iter_mut() {
                     if age <= collector.bucket.max_age {
-                        collector.add_file(current_path.to_path_buf(), node.size, node.timestamps.modified);
+                        collector.add_file(
+                            current_path.to_path_buf(),
+                            node.size,
+                            node.timestamps.modified,
+                        );
                         break;
                     }
                 }

@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::conflict::ConflictResolution;
-use crate::copy::{start_copy, CopyOptions, CopyResult};
-use crate::create::{start_create_directory, start_create_file, CreateResult};
-use crate::move_op::{start_move, MoveOptions, MoveResult};
+use crate::copy::{CopyOptions, CopyResult, start_copy};
+use crate::create::{CreateResult, start_create_directory, start_create_file};
+use crate::move_op::{MoveOptions, MoveResult, start_move};
 use crate::progress::{OperationComplete, OperationProgress};
-use crate::rename::{start_rename, RenameResult};
+use crate::rename::{RenameResult, start_rename};
 use crate::undo::UndoableOperation;
 use crate::{Conflict, OPERATION_CHANNEL_SIZE};
 
@@ -200,7 +200,8 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     conflict_resolution: Some(ConflictResolution::Overwrite),
                 };
 
-                let sources: Vec<PathBuf> = reverse_moves.iter().map(|(from, _)| from.clone()).collect();
+                let sources: Vec<PathBuf> =
+                    reverse_moves.iter().map(|(from, _)| from.clone()).collect();
                 let mut move_rx = start_move(
                     sources,
                     reverse_moves
@@ -291,7 +292,8 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                 }
 
                 // Move files back from trash
-                let mut progress = OperationProgress::new(OperationType::Move, trash_entries.len(), 0);
+                let mut progress =
+                    OperationProgress::new(OperationType::Move, trash_entries.len(), 0);
                 let mut succeeded = 0;
                 let mut failed = 0;
 
@@ -299,8 +301,9 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     progress.set_current_file(Some(trash.clone()));
                     let _ = tx.send(OperationResult::Progress(progress.clone())).await;
 
-                    let result = tokio::task::spawn_blocking(move || std::fs::rename(&trash, &original))
-                        .await;
+                    let result =
+                        tokio::task::spawn_blocking(move || std::fs::rename(&trash, &original))
+                            .await;
 
                     match result {
                         Ok(Ok(())) => {
@@ -341,7 +344,8 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     }
                 }
             }
-            UndoableOperation::FileCreated { path } | UndoableOperation::DirectoryCreated { path } => {
+            UndoableOperation::FileCreated { path }
+            | UndoableOperation::DirectoryCreated { path } => {
                 // Delete the created item
                 use crate::progress::OperationType;
                 use std::fs;

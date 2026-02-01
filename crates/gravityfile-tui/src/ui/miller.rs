@@ -16,7 +16,7 @@ use gravityfile_core::{FileNode, GitStatus, NodeKind};
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::preview::PreviewContent;
 use crate::theme::Theme;
-use crate::ui::{format_size, SizeBar};
+use crate::ui::{SizeBar, format_size};
 
 /// State for Miller columns view.
 #[derive(Debug, Clone, Default)]
@@ -223,8 +223,7 @@ impl<'a> MillerColumns<'a> {
             let y = inner.y + row_idx as u16;
 
             let is_selected = selected == Some(entry_idx);
-            let is_highlighted =
-                highlight_name.map_or(false, |name| name == entry.name);
+            let is_highlighted = highlight_name.map_or(false, |name| name == entry.name);
 
             // Check if this entry is marked
             let entry_path = base_path.map(|bp| bp.join(&entry.name));
@@ -293,7 +292,10 @@ impl<'a> MillerColumns<'a> {
             let (git_indicator, git_style) = match entry.git_status {
                 Some(status) if status.is_displayable() => {
                     let color = self.theme.git_status_color(status);
-                    (format!(" {}", status.indicator()), Style::default().fg(color))
+                    (
+                        format!(" {}", status.indicator()),
+                        Style::default().fg(color),
+                    )
                 }
                 _ => (String::new(), Style::default()),
             };
@@ -309,8 +311,11 @@ impl<'a> MillerColumns<'a> {
             };
 
             // Pad name (account for git indicator)
-            let name_padding =
-                " ".repeat(available_for_name.saturating_sub(name.len()).saturating_sub(git_len));
+            let name_padding = " ".repeat(
+                available_for_name
+                    .saturating_sub(name.len())
+                    .saturating_sub(git_len),
+            );
 
             // Size text (shorter format) - show "..." for directories with unknown size
             let size_text = if entry.is_dir && entry.size == 0 {
@@ -358,12 +363,7 @@ impl<'a> MillerColumns<'a> {
                 0.0
             };
 
-            let bar_area = Rect::new(
-                inner.x + inner.width - size_bar_width,
-                y,
-                size_bar_width,
-                1,
-            );
+            let bar_area = Rect::new(inner.x + inner.width - size_bar_width, y, size_bar_width, 1);
 
             let bar = SizeBar::new(ratio)
                 .filled_style(self.theme.size_bar_style(ratio))
@@ -395,13 +395,19 @@ impl<'a> MillerColumns<'a> {
         // If we have preview content, use it
         if let Some(preview) = self.file_preview {
             match preview {
-                PreviewContent::Text { lines, highlighted, .. } => {
+                PreviewContent::Text {
+                    lines, highlighted, ..
+                } => {
                     // Add header with file name and highlighting indicator
                     let header = Line::from(vec![
                         Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
                         Span::raw(" "),
                         Span::styled(
-                            if *highlighted { "[highlighted]" } else { "[plain]" },
+                            if *highlighted {
+                                "[highlighted]"
+                            } else {
+                                "[plain]"
+                            },
                             Style::default().fg(self.theme.muted),
                         ),
                     ]);
@@ -474,7 +480,10 @@ impl<'a> MillerColumns<'a> {
                         Line::from(vec![
                             Span::styled("Size: ", self.theme.help_desc),
                             Span::raw(crate::ui::format_size(*size)),
-                            Span::styled(format!(" ({} bytes)", size), Style::default().fg(self.theme.muted)),
+                            Span::styled(
+                                format!(" ({} bytes)", size),
+                                Style::default().fg(self.theme.muted),
+                            ),
                         ]),
                     ];
 
@@ -532,12 +541,14 @@ impl<'a> MillerColumns<'a> {
                         ),
                     ]);
 
-                    let summary = Line::from(vec![
-                        Span::styled(
-                            format!("{} entries, {} uncompressed", entry_count, crate::ui::format_size(*total_size)),
-                            Style::default().fg(self.theme.muted),
+                    let summary = Line::from(vec![Span::styled(
+                        format!(
+                            "{} entries, {} uncompressed",
+                            entry_count,
+                            crate::ui::format_size(*total_size)
                         ),
-                    ]);
+                        Style::default().fg(self.theme.muted),
+                    )]);
 
                     let mut display_lines = vec![header, summary, Line::raw("")];
                     let max_lines = inner.height.saturating_sub(3) as usize;
@@ -557,12 +568,15 @@ impl<'a> MillerColumns<'a> {
                             format!(" ({})", crate::ui::format_size(archive_entry.size))
                         };
 
-                        let ratio_str = archive_entry.compression_ratio
+                        let ratio_str = archive_entry
+                            .compression_ratio
                             .map(|r| format!(" [{:.0}%]", r * 100.0))
                             .unwrap_or_default();
 
                         // Show symlink target if available
-                        let target_str = archive_entry.link_target.as_ref()
+                        let target_str = archive_entry
+                            .link_target
+                            .as_ref()
                             .map(|t| format!(" -> {}", t))
                             .unwrap_or_default();
 
@@ -836,9 +850,6 @@ fn is_leap_year(year: i32) -> bool {
 
 /// Get the selected entry from Miller state.
 #[allow(dead_code)]
-pub fn get_selected_entry<'a>(
-    state: &MillerState,
-    node: &'a FileNode,
-) -> Option<&'a FileNode> {
+pub fn get_selected_entry<'a>(state: &MillerState, node: &'a FileNode) -> Option<&'a FileNode> {
     node.children.get(state.selected)
 }

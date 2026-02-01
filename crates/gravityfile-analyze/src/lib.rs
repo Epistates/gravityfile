@@ -53,10 +53,12 @@
 pub mod age;
 mod duplicates;
 
-pub use age::{AgeBucket, AgeConfig, AgeReport, AgeBucketStats, StaleDirectory, AgeAnalyzer, format_age};
+pub use age::{
+    AgeAnalyzer, AgeBucket, AgeBucketStats, AgeConfig, AgeReport, StaleDirectory, format_age,
+};
 pub use duplicates::{
     DuplicateConfig, DuplicateFinder, DuplicateGroup, DuplicateReport, HashProgress,
 };
 
 // Re-export core types
-pub use gravityfile_core::{FileNode, FileTree, ContentHash};
+pub use gravityfile_core::{ContentHash, FileNode, FileTree};

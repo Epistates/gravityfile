@@ -124,21 +124,20 @@ impl ArchiveFormat {
 /// println!("Extracted {} files", extracted.len());
 /// # Ok::<(), gravityfile_ops::ArchiveError>(())
 /// ```
-pub fn extract_archive(
-    archive_path: &Path,
-    destination: &Path,
-) -> ArchiveResult<Vec<PathBuf>> {
+pub fn extract_archive(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<PathBuf>> {
     if !archive_path.exists() {
         return Err(ArchiveError::NotFound(archive_path.to_path_buf()));
     }
 
-    let format = ArchiveFormat::from_path(archive_path)
-        .ok_or_else(|| ArchiveError::UnsupportedFormat(
-            archive_path.extension()
+    let format = ArchiveFormat::from_path(archive_path).ok_or_else(|| {
+        ArchiveError::UnsupportedFormat(
+            archive_path
+                .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("unknown")
-                .to_string()
-        ))?;
+                .to_string(),
+        )
+    })?;
 
     // Create destination directory if it doesn't exist
     std::fs::create_dir_all(destination)?;
@@ -163,7 +162,9 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
     let file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
     let mut extracted_files = Vec::new();
-    let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+    let canonical_dest = destination
+        .canonicalize()
+        .unwrap_or_else(|_| destination.to_path_buf());
 
     // Security: Check for decompression bombs before extraction
     let mut total_uncompressed: u64 = 0;
@@ -193,18 +194,18 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
     if total_uncompressed > MAX_TOTAL_EXTRACTED_SIZE {
         return Err(ArchiveError::DecompressionBomb(format!(
             "Archive would extract to {} bytes (max {} bytes)",
-            total_uncompressed,
-            MAX_TOTAL_EXTRACTED_SIZE
+            total_uncompressed, MAX_TOTAL_EXTRACTED_SIZE
         )));
     }
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let entry_path = entry.enclosed_name()
-            .ok_or_else(|| std::io::Error::new(
+        let entry_path = entry.enclosed_name().ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid file path in archive"
-            ))?;
+                "Invalid file path in archive",
+            )
+        })?;
 
         // Security: Reject absolute paths
         if entry_path.is_absolute() {
@@ -221,7 +222,10 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
         {
             return Err(ArchiveError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Path traversal attempt in archive: {}", entry_path.display()),
+                format!(
+                    "Path traversal attempt in archive: {}",
+                    entry_path.display()
+                ),
             )));
         }
 
@@ -390,7 +394,9 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
     archive.set_unpack_xattrs(false);
 
     let mut extracted_files = Vec::new();
-    let canonical_dest = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+    let canonical_dest = destination
+        .canonicalize()
+        .unwrap_or_else(|_| destination.to_path_buf());
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
@@ -411,7 +417,10 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
         {
             return Err(ArchiveError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Path traversal attempt in archive: {}", entry_path.display()),
+                format!(
+                    "Path traversal attempt in archive: {}",
+                    entry_path.display()
+                ),
             )));
         }
 
@@ -553,7 +562,12 @@ fn create_zip(files: &[PathBuf], archive_path: &Path) -> ArchiveResult<()> {
         .compression_method(zip::CompressionMethod::Deflated);
 
     for path in files {
-        add_path_to_zip(&mut archive, path, path.file_name().and_then(|n| n.to_str()).unwrap_or(""), &options)?;
+        add_path_to_zip(
+            &mut archive,
+            path,
+            path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+            &options,
+        )?;
     }
 
     archive.finish()?;
@@ -612,9 +626,7 @@ fn add_path_to_zip_with_visited<W: Write + std::io::Seek>(
         {
             // Unix symlink mode: S_IFLNK (0o120000) | 0o777
             let symlink_mode = 0o120777;
-            let unix_options = options
-                .clone()
-                .unix_permissions(symlink_mode);
+            let unix_options = options.clone().unix_permissions(symlink_mode);
 
             archive.start_file(name, unix_options)?;
             // Write the target path as the file content
@@ -782,10 +794,7 @@ mod tests {
             ArchiveFormat::from_path(Path::new("test.tar")),
             Some(ArchiveFormat::Tar)
         );
-        assert_eq!(
-            ArchiveFormat::from_path(Path::new("test.txt")),
-            None
-        );
+        assert_eq!(ArchiveFormat::from_path(Path::new("test.txt")), None);
     }
 
     #[test]
@@ -801,11 +810,7 @@ mod tests {
 
         // Create archive
         let archive_path = temp_dir.path().join("test.zip");
-        create_archive(
-            &[source_dir.clone()],
-            &archive_path,
-            ArchiveFormat::Zip,
-        ).unwrap();
+        create_archive(&[source_dir.clone()], &archive_path, ArchiveFormat::Zip).unwrap();
 
         assert!(archive_path.exists());
 
@@ -829,11 +834,7 @@ mod tests {
 
         // Create archive
         let archive_path = temp_dir.path().join("test.tar.gz");
-        create_archive(
-            &[source_dir.clone()],
-            &archive_path,
-            ArchiveFormat::TarGz,
-        ).unwrap();
+        create_archive(&[source_dir.clone()], &archive_path, ArchiveFormat::TarGz).unwrap();
 
         assert!(archive_path.exists());
 

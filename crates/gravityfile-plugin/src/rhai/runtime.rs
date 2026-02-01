@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rhai::{Dynamic, Engine, Scope, AST};
+use rhai::{AST, Dynamic, Engine, Scope};
 
 use crate::config::{PluginConfig, PluginMetadata};
 use crate::hooks::{Hook, HookContext, HookResult};
@@ -87,28 +87,24 @@ impl RhaiRuntime {
         });
 
         // Register filesystem functions
-        self.engine
-            .register_fn("fs_exists", |path: &str| -> bool {
-                std::path::Path::new(path).exists()
-            });
+        self.engine.register_fn("fs_exists", |path: &str| -> bool {
+            std::path::Path::new(path).exists()
+        });
 
-        self.engine
-            .register_fn("fs_is_dir", |path: &str| -> bool {
-                std::path::Path::new(path).is_dir()
-            });
+        self.engine.register_fn("fs_is_dir", |path: &str| -> bool {
+            std::path::Path::new(path).is_dir()
+        });
 
-        self.engine
-            .register_fn("fs_is_file", |path: &str| -> bool {
-                std::path::Path::new(path).is_file()
-            });
+        self.engine.register_fn("fs_is_file", |path: &str| -> bool {
+            std::path::Path::new(path).is_file()
+        });
 
-        self.engine
-            .register_fn("fs_read", |path: &str| -> Dynamic {
-                match std::fs::read_to_string(path) {
-                    Ok(content) => Dynamic::from(content),
-                    Err(_) => Dynamic::UNIT,
-                }
-            });
+        self.engine.register_fn("fs_read", |path: &str| -> Dynamic {
+            match std::fs::read_to_string(path) {
+                Ok(content) => Dynamic::from(content),
+                Err(_) => Dynamic::UNIT,
+            }
+        });
 
         self.engine
             .register_fn("fs_extension", |path: &str| -> Dynamic {
@@ -137,32 +133,30 @@ impl RhaiRuntime {
                 }
             });
 
-        self.engine
-            .register_fn("fs_size", |path: &str| -> Dynamic {
-                match std::fs::metadata(path) {
-                    Ok(meta) => Dynamic::from(meta.len() as i64),
-                    Err(_) => Dynamic::from(-1_i64),
-                }
-            });
+        self.engine.register_fn("fs_size", |path: &str| -> Dynamic {
+            match std::fs::metadata(path) {
+                Ok(meta) => Dynamic::from(meta.len() as i64),
+                Err(_) => Dynamic::from(-1_i64),
+            }
+        });
 
         // Register UI helper functions
-        self.engine.register_fn(
-            "ui_span",
-            |text: &str, fg: &str| -> rhai::Map {
+        self.engine
+            .register_fn("ui_span", |text: &str, fg: &str| -> rhai::Map {
                 let mut map = rhai::Map::new();
                 map.insert("type".into(), Dynamic::from("span"));
                 map.insert("text".into(), Dynamic::from(text.to_string()));
                 map.insert("fg".into(), Dynamic::from(fg.to_string()));
                 map
-            },
-        );
+            });
 
-        self.engine.register_fn("ui_line", |spans: rhai::Array| -> rhai::Map {
-            let mut map = rhai::Map::new();
-            map.insert("type".into(), Dynamic::from("line"));
-            map.insert("spans".into(), Dynamic::from(spans));
-            map
-        });
+        self.engine
+            .register_fn("ui_line", |spans: rhai::Array| -> rhai::Map {
+                let mut map = rhai::Map::new();
+                map.insert("type".into(), Dynamic::from("line"));
+                map.insert("spans".into(), Dynamic::from(spans));
+                map
+            });
 
         Ok(())
     }
@@ -283,10 +277,13 @@ impl PluginRuntime for RhaiRuntime {
         // Read and compile the plugin
         let code = std::fs::read_to_string(source)?;
 
-        let ast = self.engine.compile(&code).map_err(|e| PluginError::LoadError {
-            name: id.to_string(),
-            message: e.to_string(),
-        })?;
+        let ast = self
+            .engine
+            .compile(&code)
+            .map_err(|e| PluginError::LoadError {
+                name: id.to_string(),
+                message: e.to_string(),
+            })?;
 
         // Detect hooks by looking for function definitions
         let mut hooks = vec![];
@@ -341,9 +338,12 @@ impl PluginRuntime for RhaiRuntime {
         hook: &Hook,
         _ctx: &HookContext,
     ) -> PluginResult<HookResult> {
-        let plugin = self.plugins.get(&handle).ok_or_else(|| PluginError::NotFound {
-            path: std::path::PathBuf::new(),
-        })?;
+        let plugin = self
+            .plugins
+            .get(&handle)
+            .ok_or_else(|| PluginError::NotFound {
+                path: std::path::PathBuf::new(),
+            })?;
 
         let hook_name = hook.name();
         if !plugin.hooks.contains(&hook_name.to_string()) {
@@ -402,9 +402,12 @@ impl PluginRuntime for RhaiRuntime {
         args: Vec<Value>,
     ) -> BoxFuture<'a, PluginResult<Value>> {
         Box::pin(async move {
-            let plugin = self.plugins.get(&handle).ok_or_else(|| PluginError::NotFound {
-                path: std::path::PathBuf::new(),
-            })?;
+            let plugin = self
+                .plugins
+                .get(&handle)
+                .ok_or_else(|| PluginError::NotFound {
+                    path: std::path::PathBuf::new(),
+                })?;
 
             let mut scope = Scope::new();
 
@@ -488,12 +491,13 @@ impl IsolatedContext for RhaiIsolatedContext {
                 message: format!("Invalid UTF-8: {}", e),
             })?;
 
-            let result = self.engine.eval::<Dynamic>(code_str).map_err(|e| {
-                PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                }
-            })?;
+            let result =
+                self.engine
+                    .eval::<Dynamic>(code_str)
+                    .map_err(|e| PluginError::ExecutionError {
+                        name: "isolate".into(),
+                        message: e.to_string(),
+                    })?;
 
             Ok(RhaiRuntime::dynamic_to_value(&result))
         })
@@ -526,12 +530,13 @@ impl IsolatedContext for RhaiIsolatedContext {
 
             let code = format!("{}({})", name, args_str.join(", "));
 
-            let result = self.engine.eval::<Dynamic>(&code).map_err(|e| {
-                PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                }
-            })?;
+            let result =
+                self.engine
+                    .eval::<Dynamic>(&code)
+                    .map_err(|e| PluginError::ExecutionError {
+                        name: "isolate".into(),
+                        message: e.to_string(),
+                    })?;
 
             Ok(RhaiRuntime::dynamic_to_value(&result))
         })

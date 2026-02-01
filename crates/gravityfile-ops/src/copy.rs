@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
-use crate::conflict::{auto_rename_path, Conflict, ConflictKind, ConflictResolution};
+use crate::conflict::{Conflict, ConflictKind, ConflictResolution, auto_rename_path};
 use crate::progress::{OperationComplete, OperationProgress, OperationType};
-use crate::{OperationError, OPERATION_CHANNEL_SIZE};
+use crate::{OPERATION_CHANNEL_SIZE, OperationError};
 
 /// Result sent through the channel during copy operations.
 #[derive(Debug)]
@@ -202,13 +202,13 @@ async fn copy_item(
 
     let result = tokio::task::spawn_blocking(move || {
         // Use symlink_metadata to avoid following symlinks
-        let metadata = fs::symlink_metadata(&source)
-            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        let metadata =
+            fs::symlink_metadata(&source).map_err(|e| format!("Failed to read metadata: {}", e))?;
 
         if metadata.is_symlink() {
             // For symlinks, read the target and recreate at destination
-            let target = fs::read_link(&source)
-                .map_err(|e| format!("Failed to read symlink: {}", e))?;
+            let target =
+                fs::read_link(&source).map_err(|e| format!("Failed to read symlink: {}", e))?;
             #[cfg(unix)]
             {
                 std::os::unix::fs::symlink(&target, &dest)
@@ -260,8 +260,7 @@ fn copy_dir_recursive(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
 
     let mut total_bytes = 0u64;
 
-    let entries =
-        fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))?;
+    let entries = fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;

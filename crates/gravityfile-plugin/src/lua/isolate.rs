@@ -136,11 +136,10 @@ impl IsolatedContext for LuaIsolatedContext {
                 });
             }
 
-            let code_str =
-                std::str::from_utf8(code).map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: format!("Invalid UTF-8 in code: {}", e),
-                })?;
+            let code_str = std::str::from_utf8(code).map_err(|e| PluginError::ExecutionError {
+                name: "isolate".into(),
+                message: format!("Invalid UTF-8 in code: {}", e),
+            })?;
 
             // Set up instruction hook for cancellation and timeout
             let cancel_clone = cancel.clone();
@@ -163,28 +162,24 @@ impl IsolatedContext for LuaIsolatedContext {
             );
 
             // Execute the code
-            let result = self
-                .lua
-                .load(code_str)
-                .eval::<LuaValue>()
-                .map_err(|e| {
-                    let msg = e.to_string();
-                    if msg.contains("Cancelled") {
-                        PluginError::Cancelled {
-                            name: "isolate".into(),
-                        }
-                    } else if msg.contains("Timeout") {
-                        PluginError::Timeout {
-                            name: "isolate".into(),
-                            timeout_ms: self.sandbox.timeout_ms,
-                        }
-                    } else {
-                        PluginError::ExecutionError {
-                            name: "isolate".into(),
-                            message: msg,
-                        }
+            let result = self.lua.load(code_str).eval::<LuaValue>().map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("Cancelled") {
+                    PluginError::Cancelled {
+                        name: "isolate".into(),
                     }
-                })?;
+                } else if msg.contains("Timeout") {
+                    PluginError::Timeout {
+                        name: "isolate".into(),
+                        timeout_ms: self.sandbox.timeout_ms,
+                    }
+                } else {
+                    PluginError::ExecutionError {
+                        name: "isolate".into(),
+                        message: msg,
+                    }
+                }
+            })?;
 
             // Remove hook
             self.lua.remove_hook();
@@ -207,10 +202,11 @@ impl IsolatedContext for LuaIsolatedContext {
             }
 
             let globals = self.lua.globals();
-            let func: mlua::Function = globals.get(name).map_err(|e| PluginError::ExecutionError {
-                name: "isolate".into(),
-                message: format!("Function '{}' not found: {}", name, e),
-            })?;
+            let func: mlua::Function =
+                globals.get(name).map_err(|e| PluginError::ExecutionError {
+                    name: "isolate".into(),
+                    message: format!("Function '{}' not found: {}", name, e),
+                })?;
 
             // Convert args
             let lua_args: Vec<LuaValue> = args
@@ -222,24 +218,24 @@ impl IsolatedContext for LuaIsolatedContext {
                     message: e.to_string(),
                 })?;
 
-            let result: LuaValue = func
-                .call(mlua::MultiValue::from_vec(lua_args))
-                .map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                })?;
+            let result: LuaValue =
+                func.call(mlua::MultiValue::from_vec(lua_args))
+                    .map_err(|e| PluginError::ExecutionError {
+                        name: "isolate".into(),
+                        message: e.to_string(),
+                    })?;
 
             Ok(Self::lua_to_value(result))
         })
     }
 
     fn set_global(&mut self, name: &str, value: Value) -> PluginResult<()> {
-        let lua_val = self.value_to_lua(&self.lua, &value).map_err(|e| {
-            PluginError::ExecutionError {
-                name: "isolate".into(),
-                message: e.to_string(),
-            }
-        })?;
+        let lua_val =
+            self.value_to_lua(&self.lua, &value)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: "isolate".into(),
+                    message: e.to_string(),
+                })?;
 
         self.lua
             .globals()
@@ -253,12 +249,14 @@ impl IsolatedContext for LuaIsolatedContext {
     }
 
     fn get_global(&self, name: &str) -> PluginResult<Value> {
-        let val: LuaValue = self.lua.globals().get(name).map_err(|e| {
-            PluginError::ExecutionError {
-                name: "isolate".into(),
-                message: e.to_string(),
-            }
-        })?;
+        let val: LuaValue =
+            self.lua
+                .globals()
+                .get(name)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: "isolate".into(),
+                    message: e.to_string(),
+                })?;
 
         Ok(Self::lua_to_value(val))
     }

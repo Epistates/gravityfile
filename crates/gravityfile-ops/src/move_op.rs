@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
-use crate::conflict::{auto_rename_path, Conflict, ConflictKind, ConflictResolution};
+use crate::conflict::{Conflict, ConflictKind, ConflictResolution, auto_rename_path};
 use crate::progress::{OperationComplete, OperationProgress, OperationType};
-use crate::{OperationError, OPERATION_CHANNEL_SIZE};
+use crate::{OPERATION_CHANNEL_SIZE, OperationError};
 
 /// Result sent through the channel during move operations.
 #[derive(Debug)]
@@ -217,21 +217,25 @@ fn move_item(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
 
     // Fall back to copy + delete for cross-filesystem moves
     // Use symlink_metadata to avoid following symlinks
-    let metadata = fs::symlink_metadata(source).map_err(|e| format!("Failed to read metadata: {}", e))?;
+    let metadata =
+        fs::symlink_metadata(source).map_err(|e| format!("Failed to read metadata: {}", e))?;
 
     if metadata.is_symlink() {
         // For symlinks, read the target and recreate at destination
         let target = fs::read_link(source).map_err(|e| format!("Failed to read symlink: {}", e))?;
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&target, dest).map_err(|e| format!("Failed to create symlink: {}", e))?;
+            std::os::unix::fs::symlink(&target, dest)
+                .map_err(|e| format!("Failed to create symlink: {}", e))?;
         }
         #[cfg(windows)]
         {
             if target.is_dir() {
-                std::os::windows::fs::symlink_dir(&target, dest).map_err(|e| format!("Failed to create symlink: {}", e))?;
+                std::os::windows::fs::symlink_dir(&target, dest)
+                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
             } else {
-                std::os::windows::fs::symlink_file(&target, dest).map_err(|e| format!("Failed to create symlink: {}", e))?;
+                std::os::windows::fs::symlink_file(&target, dest)
+                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
             }
         }
         fs::remove_file(source).map_err(|e| format!("Failed to remove source symlink: {}", e))?;
@@ -275,8 +279,7 @@ fn get_dir_size(dir: &PathBuf) -> u64 {
 fn copy_dir_recursive(source: &PathBuf, dest: &PathBuf) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| format!("Failed to create directory: {}", e))?;
 
-    let entries =
-        fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))?;
+    let entries = fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;

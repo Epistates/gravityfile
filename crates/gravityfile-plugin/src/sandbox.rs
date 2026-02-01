@@ -81,7 +81,7 @@ impl Default for SandboxConfig {
             allow_network: false,
             allow_env: false,
             timeout_ms: 5000,
-            max_memory: 256 * 1024 * 1024, // 256 MB
+            max_memory: 256 * 1024 * 1024,   // 256 MB
             max_read_size: 10 * 1024 * 1024, // 10 MB
             permissions,
         }

@@ -248,7 +248,10 @@ impl Hook {
     pub fn is_lifecycle(&self) -> bool {
         matches!(
             self,
-            Self::OnStartup | Self::OnShutdown | Self::OnPluginLoad { .. } | Self::OnPluginUnload { .. }
+            Self::OnStartup
+                | Self::OnShutdown
+                | Self::OnPluginLoad { .. }
+                | Self::OnPluginUnload { .. }
         )
     }
 

@@ -41,8 +41,7 @@ impl Widget for DeleteConfirmModal<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Calculate popup area
         let popup_width = 60.min(area.width.saturating_sub(4));
-        let popup_height =
-            (self.marked_paths.len() as u16 + 8).min(area.height.saturating_sub(4));
+        let popup_height = (self.marked_paths.len() as u16 + 8).min(area.height.saturating_sub(4));
 
         let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
         let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
@@ -95,7 +94,10 @@ impl Widget for DeleteConfirmModal<'_> {
             // Show full path, truncated from the left if too long
             let full_path = path.display().to_string();
             let display_path = if full_path.len() > max_path_len {
-                format!("...{}", &full_path[full_path.len().saturating_sub(max_path_len - 3)..])
+                format!(
+                    "...{}",
+                    &full_path[full_path.len().saturating_sub(max_path_len - 3)..]
+                )
             } else {
                 full_path
             };
@@ -117,10 +119,7 @@ impl Widget for DeleteConfirmModal<'_> {
 
         if self.marked_paths.len() > max_items {
             lines.push(Line::styled(
-                format!(
-                    "  ... and {} more",
-                    self.marked_paths.len() - max_items
-                ),
+                format!("  ... and {} more", self.marked_paths.len() - max_items),
                 Style::default().fg(self.theme.muted),
             ));
         }
@@ -641,7 +640,11 @@ impl Widget for ConflictModal<'_> {
 
         let block = Block::default()
             .title(title)
-            .title_style(Style::default().fg(title_color).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(title_color));
 
@@ -786,10 +789,7 @@ impl<'a> SettingsModal<'a> {
         };
 
         Line::from(vec![
-            Span::styled(
-                if selected { " > " } else { "   " },
-                style,
-            ),
+            Span::styled(if selected { " > " } else { "   " }, style),
             Span::styled(checkbox.to_string(), style),
             Span::styled(format!(" {}", label), style),
         ])
@@ -805,16 +805,17 @@ impl<'a> SettingsModal<'a> {
         };
 
         Line::from(vec![
-            Span::styled(
-                if selected { " > " } else { "   " },
-                style,
-            ),
+            Span::styled(if selected { " > " } else { "   " }, style),
             Span::styled(format!("{}: ", label), style),
             Span::styled(
                 value.to_string(),
                 Style::default()
                     .fg(self.theme.info)
-                    .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
         ])
     }
@@ -931,7 +932,9 @@ impl Widget for BookmarkListModal<'_> {
 
         // Calculate popup dimensions
         let popup_width = 60.min(area.width.saturating_sub(4));
-        let popup_height = ((entries.len() + 6) as u16).min(area.height.saturating_sub(4)).max(8);
+        let popup_height = ((entries.len() + 6) as u16)
+            .min(area.height.saturating_sub(4))
+            .max(8);
 
         let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
         let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
@@ -975,7 +978,10 @@ impl Widget for BookmarkListModal<'_> {
                 // Truncate path from the left if too long
                 let path_str = path.display().to_string();
                 let display_path = if path_str.len() > max_path_len {
-                    format!("...{}", &path_str[path_str.len().saturating_sub(max_path_len - 3)..])
+                    format!(
+                        "...{}",
+                        &path_str[path_str.len().saturating_sub(max_path_len - 3)..]
+                    )
                 } else {
                     path_str
                 };
@@ -996,7 +1002,11 @@ impl Widget for BookmarkListModal<'_> {
                         format!("[{}]", key),
                         Style::default()
                             .fg(self.theme.info)
-                            .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
+                            .add_modifier(if is_selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ),
                     Span::styled(format!(" {}", display_path), style),
                 ]));
@@ -1051,10 +1061,7 @@ impl Widget for BookmarkPrompt<'_> {
                     .fg(self.theme.info)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " ",
-                Style::default().add_modifier(Modifier::REVERSED),
-            ),
+            Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
         ]);
 
         Paragraph::new(line)
@@ -1126,7 +1133,15 @@ impl Widget for BulkRenameConfirmModal<'_> {
 
         // Header
         lines.push(Line::styled(
-            format!("{} rename{} to perform:", self.state.entries.len(), if self.state.entries.len() == 1 { "" } else { "s" }),
+            format!(
+                "{} rename{} to perform:",
+                self.state.entries.len(),
+                if self.state.entries.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
             Style::default().fg(self.theme.info),
         ));
         lines.push(Line::raw(""));

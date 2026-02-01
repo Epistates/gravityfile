@@ -227,9 +227,11 @@ impl DuplicateFinder {
             NodeKind::File { .. } => {
                 // Check exclusions
                 let name = node.name.as_str();
-                let should_exclude = self.config.exclude_patterns.iter().any(|p| {
-                    name.contains(p) || current_path.to_string_lossy().contains(p)
-                });
+                let should_exclude = self
+                    .config
+                    .exclude_patterns
+                    .iter()
+                    .any(|p| name.contains(p) || current_path.to_string_lossy().contains(p));
 
                 if !should_exclude && node.size > 0 {
                     files.push(FileInfo {

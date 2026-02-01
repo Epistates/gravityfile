@@ -147,12 +147,10 @@ impl LuaRuntime {
             })?;
         gf.set("notify", notify).ok();
 
-        globals
-            .set("gf", gf)
-            .map_err(|e| PluginError::LoadError {
-                name: "lua".into(),
-                message: e.to_string(),
-            })?;
+        globals.set("gf", gf).map_err(|e| PluginError::LoadError {
+            name: "lua".into(),
+            message: e.to_string(),
+        })?;
 
         // Create the 'fs' namespace (filesystem API)
         let fs = bindings::create_fs_api(&self.lua)?;
@@ -360,12 +358,13 @@ impl PluginRuntime for LuaRuntime {
         }
 
         // Store in registry
-        let key = self.lua.create_registry_value(module).map_err(|e| {
-            PluginError::LoadError {
+        let key = self
+            .lua
+            .create_registry_value(module)
+            .map_err(|e| PluginError::LoadError {
                 name: id.to_string(),
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
         let handle = PluginHandle::new(self.next_handle);
         self.next_handle += 1;
@@ -414,16 +413,20 @@ impl PluginRuntime for LuaRuntime {
         hook: &Hook,
         _ctx: &HookContext,
     ) -> PluginResult<HookResult> {
-        let plugin = self.plugins.get(&handle).ok_or_else(|| PluginError::NotFound {
-            path: std::path::PathBuf::new(),
-        })?;
+        let plugin = self
+            .plugins
+            .get(&handle)
+            .ok_or_else(|| PluginError::NotFound {
+                path: std::path::PathBuf::new(),
+            })?;
 
-        let module: Table = self.lua.registry_value(&plugin.module).map_err(|e| {
-            PluginError::ExecutionError {
-                name: plugin.name.clone(),
-                message: e.to_string(),
-            }
-        })?;
+        let module: Table =
+            self.lua
+                .registry_value(&plugin.module)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: plugin.name.clone(),
+                    message: e.to_string(),
+                })?;
 
         let hook_name = hook.name();
         let func: Function = match module.get(hook_name) {
@@ -432,20 +435,20 @@ impl PluginRuntime for LuaRuntime {
         };
 
         // Convert hook and context to Lua
-        let hook_table = self.hook_to_lua(&self.lua, hook).map_err(|e| {
-            PluginError::ExecutionError {
-                name: plugin.name.clone(),
-                message: e.to_string(),
-            }
-        })?;
+        let hook_table =
+            self.hook_to_lua(&self.lua, hook)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: plugin.name.clone(),
+                    message: e.to_string(),
+                })?;
 
         // Call the function
-        let result: LuaValue = func.call((module.clone(), hook_table)).map_err(|e| {
-            PluginError::ExecutionError {
-                name: plugin.name.clone(),
-                message: e.to_string(),
-            }
-        })?;
+        let result: LuaValue =
+            func.call((module.clone(), hook_table))
+                .map_err(|e| PluginError::ExecutionError {
+                    name: plugin.name.clone(),
+                    message: e.to_string(),
+                })?;
 
         // Convert result
         let mut hook_result = HookResult::ok();
@@ -486,9 +489,12 @@ impl PluginRuntime for LuaRuntime {
         args: Vec<Value>,
     ) -> BoxFuture<'a, PluginResult<Value>> {
         Box::pin(async move {
-            let plugin = self.plugins.get(&handle).ok_or_else(|| PluginError::NotFound {
-                path: std::path::PathBuf::new(),
-            })?;
+            let plugin = self
+                .plugins
+                .get(&handle)
+                .ok_or_else(|| PluginError::NotFound {
+                    path: std::path::PathBuf::new(),
+                })?;
 
             let module: Table = self.lua.registry_value(&plugin.module).map_err(|e| {
                 PluginError::ExecutionError {
@@ -497,10 +503,12 @@ impl PluginRuntime for LuaRuntime {
                 }
             })?;
 
-            let func: Function = module.get(method).map_err(|e| PluginError::ExecutionError {
-                name: plugin.name.clone(),
-                message: format!("Method '{}' not found: {}", method, e),
-            })?;
+            let func: Function = module
+                .get(method)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: plugin.name.clone(),
+                    message: format!("Method '{}' not found: {}", method, e),
+                })?;
 
             // Convert args to Lua
             let lua_args: Vec<LuaValue> = args

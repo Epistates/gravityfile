@@ -28,7 +28,11 @@ pub fn start_scan(path: PathBuf) -> mpsc::Receiver<ScanResult> {
         let tx_progress = tx.clone();
         let progress_task = tokio::spawn(async move {
             while let Ok(progress) = progress_rx.recv().await {
-                if tx_progress.send(ScanResult::Progress(progress)).await.is_err() {
+                if tx_progress
+                    .send(ScanResult::Progress(progress))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

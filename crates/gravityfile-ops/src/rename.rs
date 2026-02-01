@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use crate::progress::{OperationComplete, OperationProgress, OperationType};
-use crate::{OperationError, OPERATION_CHANNEL_SIZE};
+use crate::{OPERATION_CHANNEL_SIZE, OperationError};
 
 /// Result sent through the channel during rename operations.
 #[derive(Debug)]

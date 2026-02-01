@@ -94,7 +94,10 @@ pub trait PluginRuntime: Send + Sync {
     ///
     /// Isolated contexts have limited API access and their own Lua/Rhai state,
     /// making them safe to run in background tasks.
-    fn create_isolated_context(&self, sandbox: &SandboxConfig) -> PluginResult<Box<dyn IsolatedContext>>;
+    fn create_isolated_context(
+        &self,
+        sandbox: &SandboxConfig,
+    ) -> PluginResult<Box<dyn IsolatedContext>>;
 
     /// Get the list of loaded plugin handles.
     fn loaded_plugins(&self) -> Vec<PluginHandle>;
@@ -231,8 +234,10 @@ impl PluginManager {
 
             // Parse metadata
             let toml_content = std::fs::read_to_string(&toml_path)?;
-            let metadata: PluginMetadata = toml::from_str(&toml_content)
-                .map_err(|e| PluginError::ConfigError { message: e.to_string() })?;
+            let metadata: PluginMetadata =
+                toml::from_str(&toml_content).map_err(|e| PluginError::ConfigError {
+                    message: e.to_string(),
+                })?;
 
             // Find the appropriate runtime
             let runtime_name = &metadata.runtime;
@@ -289,8 +294,10 @@ impl PluginManager {
         // Parse metadata
         let toml_path = path.join("plugin.toml");
         let toml_content = std::fs::read_to_string(&toml_path)?;
-        let metadata: PluginMetadata = toml::from_str(&toml_content)
-            .map_err(|e| PluginError::ConfigError { message: e.to_string() })?;
+        let metadata: PluginMetadata =
+            toml::from_str(&toml_content).map_err(|e| PluginError::ConfigError {
+                message: e.to_string(),
+            })?;
 
         // Find runtime
         let runtime = self.runtimes.get_mut(&metadata.runtime).ok_or_else(|| {
@@ -385,7 +392,9 @@ impl PluginManager {
 
     /// Get plugins of a specific kind.
     pub fn plugins_of_kind(&self, kind: PluginKind) -> impl Iterator<Item = &LoadedPlugin> {
-        self.plugins.values().filter(move |p| p.metadata.kind == kind)
+        self.plugins
+            .values()
+            .filter(move |p| p.metadata.kind == kind)
     }
 
     /// Shutdown all runtimes.

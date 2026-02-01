@@ -193,7 +193,14 @@ fn run_scan(path: &PathBuf, max_depth: Option<u32>, top_n: usize) -> Result<()> 
     println!();
 
     // Print tree
-    print_node(&tree.root, &path, 0, max_depth.unwrap_or(u32::MAX), top_n, tree.root.size);
+    print_node(
+        &tree.root,
+        &path,
+        0,
+        max_depth.unwrap_or(u32::MAX),
+        top_n,
+        tree.root.size,
+    );
 
     if !tree.warnings.is_empty() {
         println!();
@@ -204,7 +211,12 @@ fn run_scan(path: &PathBuf, max_depth: Option<u32>, top_n: usize) -> Result<()> 
 }
 
 /// Run duplicate detection.
-fn run_duplicates(path: &PathBuf, min_size: &str, top_n: usize, format: OutputFormat) -> Result<()> {
+fn run_duplicates(
+    path: &PathBuf,
+    min_size: &str,
+    top_n: usize,
+    format: OutputFormat,
+) -> Result<()> {
     let path = path.canonicalize().context("Invalid path")?;
     let min_bytes = parse_size(min_size)?;
 
@@ -238,8 +250,7 @@ fn run_duplicates(path: &PathBuf, min_size: &str, top_n: usize, format: OutputFo
             } else {
                 println!(
                     " Found {} duplicate groups ({} files)",
-                    report.group_count,
-                    report.files_with_duplicates
+                    report.group_count, report.files_with_duplicates
                 );
                 println!(
                     " Total wasted space: {}",
@@ -301,7 +312,12 @@ fn run_age(path: &PathBuf, stale_threshold: &str, format: OutputFormat) -> Resul
 
             // Age buckets
             println!(" Age Distribution:");
-            let max_size = report.buckets.iter().map(|b| b.total_size).max().unwrap_or(1);
+            let max_size = report
+                .buckets
+                .iter()
+                .map(|b| b.total_size)
+                .max()
+                .unwrap_or(1);
             for bucket in &report.buckets {
                 let bar_len = ((bucket.total_size as f64 / max_size as f64) * 30.0) as usize;
                 let bar = "█".repeat(bar_len);
@@ -317,14 +333,8 @@ fn run_age(path: &PathBuf, stale_threshold: &str, format: OutputFormat) -> Resul
 
             // Stale directories
             if !report.stale_directories.is_empty() {
-                println!(
-                    " Stale Directories (no changes in {}):",
-                    stale_threshold
-                );
-                println!(
-                    " Total stale: {}",
-                    format_size(report.total_stale_size())
-                );
+                println!(" Stale Directories (no changes in {}):", stale_threshold);
+                println!(" Total stale: {}", format_size(report.total_stale_size()));
                 println!();
 
                 for dir in &report.stale_directories {
@@ -451,16 +461,24 @@ fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim().to_uppercase();
 
     let (num, multiplier) = if s.ends_with("GB") || s.ends_with("G") {
-        let num: f64 = s.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.').parse()?;
+        let num: f64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .parse()?;
         (num, 1024 * 1024 * 1024)
     } else if s.ends_with("MB") || s.ends_with("M") {
-        let num: f64 = s.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.').parse()?;
+        let num: f64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .parse()?;
         (num, 1024 * 1024)
     } else if s.ends_with("KB") || s.ends_with("K") {
-        let num: f64 = s.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.').parse()?;
+        let num: f64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .parse()?;
         (num, 1024)
     } else if s.ends_with('B') {
-        let num: f64 = s.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.').parse()?;
+        let num: f64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .parse()?;
         (num, 1)
     } else {
         let num: f64 = s.parse()?;

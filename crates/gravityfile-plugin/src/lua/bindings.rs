@@ -65,9 +65,7 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
 
     // fs.exists(path) - Check if path exists
     let exists = lua
-        .create_function(|_, path: String| {
-            Ok(std::path::Path::new(&path).exists())
-        })
+        .create_function(|_, path: String| Ok(std::path::Path::new(&path).exists()))
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -76,9 +74,7 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
 
     // fs.is_dir(path) - Check if path is a directory
     let is_dir = lua
-        .create_function(|_, path: String| {
-            Ok(std::path::Path::new(&path).is_dir())
-        })
+        .create_function(|_, path: String| Ok(std::path::Path::new(&path).is_dir()))
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -87,9 +83,7 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
 
     // fs.is_file(path) - Check if path is a file
     let is_file = lua
-        .create_function(|_, path: String| {
-            Ok(std::path::Path::new(&path).is_file())
-        })
+        .create_function(|_, path: String| Ok(std::path::Path::new(&path).is_file()))
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),

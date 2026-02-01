@@ -49,10 +49,10 @@ mod inode;
 mod progress;
 mod scanner;
 
-pub use git::{apply_git_status, GitStatusCache};
+pub use git::{GitStatusCache, apply_git_status};
 pub use inode::InodeTracker;
 pub use progress::ScanProgress;
-pub use scanner::{quick_list, JwalkScanner};
+pub use scanner::{JwalkScanner, quick_list};
 
 // Re-export core types for convenience
 pub use gravityfile_core::{

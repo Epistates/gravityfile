@@ -6,8 +6,8 @@ mod deletion;
 pub mod input;
 mod navigation;
 mod render;
-pub mod state;
 mod scanning;
+pub mod state;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,20 +28,24 @@ use gravityfile_ops::{
 };
 use gravityfile_scan::ScanProgress;
 
+use crate::TuiConfig;
 use crate::event::{KeyAction, MouseAction};
 use crate::preview::PreviewState;
 use crate::search::SearchState;
 use crate::theme::Theme;
 use crate::ui::{TreeState, TreeView};
-use crate::TuiConfig;
 
-use self::commands::{parse_command, CommandAction, CommandInput, CommandKeyResult, LayoutCommand, SortCommand, ThemeCommand};
+use self::commands::{
+    CommandAction, CommandInput, CommandKeyResult, LayoutCommand, SortCommand, ThemeCommand,
+    parse_command,
+};
 use self::constants::{PAGE_SIZE, TICK_INTERVAL_MS};
 use self::input::{InputResult, InputState};
-use self::render::{render_app, RenderContext};
+use self::render::{RenderContext, render_app};
 use self::state::{
-    AppMode, BookmarkListState, ClipboardMode, ClipboardState, DeletionProgress, DuplicatesViewState, LayoutMode,
-    PendingOperation, ScanResult, SelectedInfo, SettingsState, SortMode, TabManager, UserSettings, View,
+    AppMode, BookmarkListState, ClipboardMode, ClipboardState, DeletionProgress,
+    DuplicatesViewState, LayoutMode, PendingOperation, ScanResult, SelectedInfo, SettingsState,
+    SortMode, TabManager, UserSettings, View,
 };
 
 /// Application result type.
@@ -601,7 +605,11 @@ impl App {
                 // Preserve tree state (selection, expanded) across rescans
                 // Only reset if this is a different root path
                 if self.tree_state.expanded.is_empty()
-                    || !self.tree_state.expanded.iter().any(|p| p.starts_with(&root_path))
+                    || !self
+                        .tree_state
+                        .expanded
+                        .iter()
+                        .any(|p| p.starts_with(&root_path))
                 {
                     self.tree_state = TreeState::new(root_path);
                 } else {
@@ -704,7 +712,8 @@ impl App {
     /// Update cached tree item count.
     fn update_cached_tree_len(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                .flatten(&self.tree_state);
             self.cached_tree_len = items.len();
         } else {
             self.cached_tree_len = 0;
@@ -759,7 +768,8 @@ impl App {
 
         if let Some((new_root, old_root, old_selected)) = drill_info {
             // Save current state to history
-            self.view_history.push((old_root, old_selected, HashSet::new()));
+            self.view_history
+                .push((old_root, old_selected, HashSet::new()));
             self.forward_history.clear();
 
             // Navigate to the new directory
@@ -773,7 +783,11 @@ impl App {
     fn navigate_treemap_back(&mut self) {
         if let Some((prev_root, prev_selected, _)) = self.view_history.pop() {
             // Save current state to forward history
-            self.forward_history.push((self.view_root.clone(), self.treemap_state.selected, HashSet::new()));
+            self.forward_history.push((
+                self.view_root.clone(),
+                self.treemap_state.selected,
+                HashSet::new(),
+            ));
 
             // Restore previous state
             self.view_root = prev_root;
@@ -783,7 +797,8 @@ impl App {
             // No history, but we can go to parent
             if let Some(parent) = self.view_root.parent() {
                 let old_selected = self.treemap_state.selected;
-                self.forward_history.push((self.view_root.clone(), old_selected, HashSet::new()));
+                self.forward_history
+                    .push((self.view_root.clone(), old_selected, HashSet::new()));
                 self.view_root = parent.to_path_buf();
                 self.treemap_state.reset();
                 self.update_cached_treemap_len();
@@ -860,10 +875,18 @@ impl App {
         match self.layout_mode {
             LayoutMode::Tree => {
                 // Get the currently selected path in tree view
-                let items = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard)
-                    .flatten(&self.tree_state);
+                let items = TreeView::new(
+                    view_node,
+                    &view_path,
+                    &self.theme,
+                    &self.marked,
+                    &self.clipboard,
+                )
+                .flatten(&self.tree_state);
 
-                let selected_path = items.get(self.tree_state.selected).map(|item| item.path.clone());
+                let selected_path = items
+                    .get(self.tree_state.selected)
+                    .map(|item| item.path.clone());
 
                 let Some(selected) = selected_path else {
                     return Some(LayoutSyncData {
@@ -897,7 +920,10 @@ impl App {
                 if is_direct_child {
                     // Direct child - find it in miller
                     let name = selected.file_name()?.to_string_lossy();
-                    let miller_index = view_node.children.iter().position(|c| c.name.as_str() == name);
+                    let miller_index = view_node
+                        .children
+                        .iter()
+                        .position(|c| c.name.as_str() == name);
                     Some(LayoutSyncData {
                         view_path: view_path.clone(),
                         miller_index,
@@ -914,8 +940,12 @@ impl App {
 
                     // We need to find the node at new_view_root to get its children
                     let tree = self.tree.as_ref()?;
-                    let new_view_node = Self::find_node_at_path(&tree.root, &new_view_root, &tree.root_path)?;
-                    let miller_index = new_view_node.children.iter().position(|c| c.name.as_str() == selected_name);
+                    let new_view_node =
+                        Self::find_node_at_path(&tree.root, &new_view_root, &tree.root_path)?;
+                    let miller_index = new_view_node
+                        .children
+                        .iter()
+                        .position(|c| c.name.as_str() == selected_name);
 
                     Some(LayoutSyncData {
                         view_path: view_path.clone(),
@@ -937,12 +967,18 @@ impl App {
                 let mut tree_state_for_search = self.tree_state.clone();
                 tree_state_for_search.expand(&view_path);
 
-                let items = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard)
-                    .flatten(&tree_state_for_search);
+                let items = TreeView::new(
+                    view_node,
+                    &view_path,
+                    &self.theme,
+                    &self.marked,
+                    &self.clipboard,
+                )
+                .flatten(&tree_state_for_search);
 
-                let tree_index = target_path.as_ref().and_then(|target| {
-                    items.iter().position(|item| &item.path == target)
-                });
+                let tree_index = target_path
+                    .as_ref()
+                    .and_then(|target| items.iter().position(|item| &item.path == target));
 
                 Some(LayoutSyncData {
                     view_path: view_path.clone(),
@@ -1126,7 +1162,10 @@ impl App {
                     }
                 } else if self.view == View::Duplicates {
                     // l expands group in duplicates view
-                    if !self.duplicates_state.is_expanded(self.duplicates_state.selected_group) {
+                    if !self
+                        .duplicates_state
+                        .is_expanded(self.duplicates_state.selected_group)
+                    {
                         self.duplicates_state.toggle_expand();
                     }
                 } else if self.view == View::Treemap {
@@ -1142,7 +1181,10 @@ impl App {
                     }
                 } else if self.view == View::Duplicates {
                     // h collapses expanded group in duplicates view
-                    if self.duplicates_state.is_expanded(self.duplicates_state.selected_group) {
+                    if self
+                        .duplicates_state
+                        .is_expanded(self.duplicates_state.selected_group)
+                    {
                         self.duplicates_state.toggle_expand();
                     }
                 } else if self.view == View::Treemap {
@@ -1196,27 +1238,33 @@ impl App {
                     if self.view == View::Duplicates {
                         // In duplicates view, special handling
                         // Collect paths first to avoid borrow issues
-                        let paths_to_mark: Vec<PathBuf> = if let Some((filtered, _)) = self.get_filtered_duplicates() {
-                            let is_header = !self.duplicates_state.is_expanded(self.duplicates_state.selected_group)
-                                || self.duplicates_state.selected_item(self.duplicates_state.selected_group) == 0;
+                        let paths_to_mark: Vec<PathBuf> =
+                            if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                                let is_header = !self
+                                    .duplicates_state
+                                    .is_expanded(self.duplicates_state.selected_group)
+                                    || self
+                                        .duplicates_state
+                                        .selected_item(self.duplicates_state.selected_group)
+                                        == 0;
 
-                            if is_header {
-                                // Mark all duplicates except the first (the "original")
-                                filtered
-                                    .get(self.duplicates_state.selected_group)
-                                    .map(|g| g.paths.iter().skip(1).cloned().collect())
-                                    .unwrap_or_default()
+                                if is_header {
+                                    // Mark all duplicates except the first (the "original")
+                                    filtered
+                                        .get(self.duplicates_state.selected_group)
+                                        .map(|g| g.paths.iter().skip(1).cloned().collect())
+                                        .unwrap_or_default()
+                                } else {
+                                    // Mark the selected file
+                                    self.duplicates_state
+                                        .selected_file_path(&filtered)
+                                        .cloned()
+                                        .into_iter()
+                                        .collect()
+                                }
                             } else {
-                                // Mark the selected file
-                                self.duplicates_state
-                                    .selected_file_path(&filtered)
-                                    .cloned()
-                                    .into_iter()
-                                    .collect()
-                            }
-                        } else {
-                            Vec::new()
-                        };
+                                Vec::new()
+                            };
                         for path in paths_to_mark {
                             self.marked.insert(path);
                         }
@@ -1329,7 +1377,8 @@ impl App {
                 self.mode = AppMode::JumpingToBookmark;
             }
             KeyAction::ShowBookmarkList => {
-                self.bookmark_list_state = Some(BookmarkListState::new(&self.user_settings.bookmarks));
+                self.bookmark_list_state =
+                    Some(BookmarkListState::new(&self.user_settings.bookmarks));
                 self.mode = AppMode::BookmarkList;
             }
 
@@ -1344,15 +1393,20 @@ impl App {
                 if let Some((node, root_path)) = self.get_view_root_node() {
                     match self.layout_mode {
                         LayoutMode::Tree => {
-                            let items =
-                                TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+                            let items = TreeView::new(
+                                node,
+                                &root_path,
+                                &self.theme,
+                                &self.marked,
+                                &self.clipboard,
+                            )
+                            .flatten(&self.tree_state);
                             items.get(self.tree_state.selected).map(|i| i.path.clone())
                         }
-                        LayoutMode::Miller => {
-                            node.children.get(self.miller_state.selected).map(|child| {
-                                self.view_root.join(&*child.name)
-                            })
-                        }
+                        LayoutMode::Miller => node
+                            .children
+                            .get(self.miller_state.selected)
+                            .map(|child| self.view_root.join(&*child.name)),
                     }
                 } else {
                     None
@@ -1360,25 +1414,31 @@ impl App {
             }
             View::Duplicates => {
                 // Collect data first to avoid borrow issues
-                let (is_on_header, group_paths, selected_file) = if let Some((filtered, _)) = self.get_filtered_duplicates() {
-                    let is_on_header = !self.duplicates_state.is_expanded(self.duplicates_state.selected_group)
-                        || self.duplicates_state.selected_item(self.duplicates_state.selected_group) == 0;
+                let (is_on_header, group_paths, selected_file) =
+                    if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                        let is_on_header = !self
+                            .duplicates_state
+                            .is_expanded(self.duplicates_state.selected_group)
+                            || self
+                                .duplicates_state
+                                .selected_item(self.duplicates_state.selected_group)
+                                == 0;
 
-                    let group_paths: Vec<PathBuf> = filtered
-                        .get(self.duplicates_state.selected_group)
-                        .map(|g| g.paths.clone())
-                        .unwrap_or_default();
+                        let group_paths: Vec<PathBuf> = filtered
+                            .get(self.duplicates_state.selected_group)
+                            .map(|g| g.paths.clone())
+                            .unwrap_or_default();
 
-                    let selected_file = if !is_on_header {
-                        self.duplicates_state.selected_file_path(&filtered).cloned()
+                        let selected_file = if !is_on_header {
+                            self.duplicates_state.selected_file_path(&filtered).cloned()
+                        } else {
+                            None
+                        };
+
+                        (is_on_header, group_paths, selected_file)
                     } else {
-                        None
+                        return;
                     };
-
-                    (is_on_header, group_paths, selected_file)
-                } else {
-                    return;
-                };
 
                 if is_on_header {
                     // Header selected - toggle ALL files in the group
@@ -1405,7 +1465,9 @@ impl App {
             }
             View::Age => {
                 if let Some(filtered) = self.get_filtered_stale_dirs() {
-                    let selected = self.selected_stale_dir.min(filtered.len().saturating_sub(1));
+                    let selected = self
+                        .selected_stale_dir
+                        .min(filtered.len().saturating_sub(1));
                     filtered.get(selected).map(|d| d.path.clone())
                 } else {
                     None
@@ -1428,7 +1490,9 @@ impl App {
                 // This requires the treemap state which we don't have yet
                 // For now, just use the explorer behavior
                 if let Some((node, _)) = self.get_view_root_node() {
-                    node.children.first().map(|child| self.view_root.join(&*child.name))
+                    node.children
+                        .first()
+                        .map(|child| self.view_root.join(&*child.name))
                 } else {
                     None
                 }
@@ -1583,7 +1647,7 @@ impl App {
 
     /// Check if pasting would cause a conflict with an existing file.
     fn check_paste_conflict(&self, sources: &[PathBuf], destination: &PathBuf) -> Option<Conflict> {
-        use gravityfile_ops::{ConflictKind};
+        use gravityfile_ops::ConflictKind;
 
         for source in sources {
             if let Some(filename) = source.file_name() {
@@ -1601,11 +1665,7 @@ impl App {
                         ConflictKind::FileExists
                     };
 
-                    return Some(Conflict::new(
-                        source.clone(),
-                        dest_path,
-                        kind,
-                    ));
+                    return Some(Conflict::new(source.clone(), dest_path, kind));
                 }
             }
         }
@@ -1685,7 +1745,8 @@ impl App {
         use gravityfile_ops::ConflictResolution;
 
         // Check if this is a SameFile conflict - only Skip and Abort are valid
-        let is_same_file = self.pending_conflict
+        let is_same_file = self
+            .pending_conflict
             .as_ref()
             .map(|c| matches!(c.kind, gravityfile_ops::ConflictKind::SameFile))
             .unwrap_or(false);
@@ -1708,7 +1769,10 @@ impl App {
             // For SourceIsAncestor, Enter also acknowledges
             KeyCode::Enter => {
                 if let Some(conflict) = &self.pending_conflict {
-                    if matches!(conflict.kind, gravityfile_ops::ConflictKind::SourceIsAncestor) {
+                    if matches!(
+                        conflict.kind,
+                        gravityfile_ops::ConflictKind::SourceIsAncestor
+                    ) {
                         Some(ConflictResolution::Abort)
                     } else {
                         None
@@ -1728,7 +1792,10 @@ impl App {
             let pending = self.pending_operation.take();
 
             // If aborting or skipping, cancel the operation and return to normal mode
-            if matches!(res, ConflictResolution::Abort | ConflictResolution::Skip | ConflictResolution::SkipAll) {
+            if matches!(
+                res,
+                ConflictResolution::Abort | ConflictResolution::Skip | ConflictResolution::SkipAll
+            ) {
                 self.mode = AppMode::Normal;
                 self.scan_rx = None;
                 self.operation_progress = None;
@@ -1740,7 +1807,11 @@ impl App {
             // Resume the pending operation with the chosen resolution
             if let Some(pending_op) = pending {
                 match pending_op {
-                    PendingOperation::Paste { sources, destination: _, mode } => {
+                    PendingOperation::Paste {
+                        sources,
+                        destination: _,
+                        mode,
+                    } => {
                         // Temporarily set clipboard to resume the paste
                         let old_clipboard = self.clipboard.clone();
                         self.clipboard.paths = sources;
@@ -1883,7 +1954,8 @@ impl App {
                 if let Some(tab) = self.tab_manager.active_tab_mut() {
                     tab.path = self.path.clone();
                     tab.view_root = self.view_root.clone();
-                    tab.label = self.path
+                    tab.label = self
+                        .path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| self.path.to_string_lossy().to_string());
@@ -2058,16 +2130,21 @@ impl App {
         if path.exists() {
             if path.is_dir() {
                 // Directory exists - just navigate into it
-                self.operation_message = Some((true, format!("Directory {} already exists, navigating...", name)));
+                self.operation_message = Some((
+                    true,
+                    format!("Directory {} already exists, navigating...", name),
+                ));
             } else {
                 // File exists with same name
-                self.operation_message = Some((false, format!("A file named {} already exists", name)));
+                self.operation_message =
+                    Some((false, format!("A file named {} already exists", name)));
                 return;
             }
         } else {
             // Create the directory synchronously (it's a simple operation)
             if let Err(e) = std::fs::create_dir(&path) {
-                self.operation_message = Some((false, format!("Failed to create directory: {}", e)));
+                self.operation_message =
+                    Some((false, format!("Failed to create directory: {}", e)));
                 return;
             }
             self.operation_message = Some((true, format!("Created and entered {}", name)));
@@ -2080,7 +2157,8 @@ impl App {
             LayoutMode::Tree => self.tree_state.selected,
             LayoutMode::Miller => self.miller_state.selected,
         };
-        self.view_history.push((self.view_root.clone(), saved_selected, saved_expanded));
+        self.view_history
+            .push((self.view_root.clone(), saved_selected, saved_expanded));
 
         // Update view root to the new directory
         self.view_root = path;
@@ -2145,12 +2223,13 @@ impl App {
             },
             View::Duplicates => {
                 // Get counts first to avoid borrow issues
-                let (group_count, file_counts) = if let Some((filtered, _)) = self.get_filtered_duplicates() {
-                    let counts: Vec<usize> = filtered.iter().map(|g| g.paths.len()).collect();
-                    (filtered.len(), counts)
-                } else {
-                    (0, Vec::new())
-                };
+                let (group_count, file_counts) =
+                    if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                        let counts: Vec<usize> = filtered.iter().map(|g| g.paths.len()).collect();
+                        (filtered.len(), counts)
+                    } else {
+                        (0, Vec::new())
+                    };
                 if group_count > 0 {
                     self.duplicates_state.move_up(group_count, |idx| {
                         file_counts.get(idx).copied().unwrap_or(0)
@@ -2184,12 +2263,13 @@ impl App {
             },
             View::Duplicates => {
                 // Get counts first to avoid borrow issues
-                let (group_count, file_counts) = if let Some((filtered, _)) = self.get_filtered_duplicates() {
-                    let counts: Vec<usize> = filtered.iter().map(|g| g.paths.len()).collect();
-                    (filtered.len(), counts)
-                } else {
-                    (0, Vec::new())
-                };
+                let (group_count, file_counts) =
+                    if let Some((filtered, _)) = self.get_filtered_duplicates() {
+                        let counts: Vec<usize> = filtered.iter().map(|g| g.paths.len()).collect();
+                        (filtered.len(), counts)
+                    } else {
+                        (0, Vec::new())
+                    };
                 if group_count > 0 {
                     self.duplicates_state.move_down(group_count, |idx| {
                         file_counts.get(idx).copied().unwrap_or(0)
@@ -2223,8 +2303,10 @@ impl App {
             },
             View::Duplicates => {
                 // Page up - move multiple groups up
-                self.duplicates_state.selected_group =
-                    self.duplicates_state.selected_group.saturating_sub(PAGE_SIZE);
+                self.duplicates_state.selected_group = self
+                    .duplicates_state
+                    .selected_group
+                    .saturating_sub(PAGE_SIZE);
             }
             View::Age => {
                 self.selected_stale_dir = self.selected_stale_dir.saturating_sub(PAGE_SIZE);
@@ -2248,7 +2330,8 @@ impl App {
                     self.tree_state.move_down(PAGE_SIZE, self.cached_tree_len);
                 }
                 LayoutMode::Miller => {
-                    self.miller_state.move_down(PAGE_SIZE, self.cached_miller_len);
+                    self.miller_state
+                        .move_down(PAGE_SIZE, self.cached_miller_len);
                     self.update_preview();
                 }
             },
@@ -2328,12 +2411,15 @@ impl App {
 
     fn expand_selected(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                .flatten(&self.tree_state);
             if let Some(item) = items.get(self.tree_state.selected) {
                 // Lazy load directory contents if directory has no children
                 if matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. }) {
                     let needs_lazy_load = if let Some(tree) = &self.tree {
-                        if let Some(node) = Self::find_node_at_path(&tree.root, &item.path, &tree.root_path) {
+                        if let Some(node) =
+                            Self::find_node_at_path(&tree.root, &item.path, &tree.root_path)
+                        {
                             node.children.is_empty()
                         } else {
                             false
@@ -2355,7 +2441,8 @@ impl App {
     /// This provides vim-style navigation where 'h' goes up when there's nothing to collapse.
     fn collapse_selected(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                .flatten(&self.tree_state);
             if let Some(item) = items.get(self.tree_state.selected) {
                 // Check if this is an expanded directory
                 let is_expanded_dir = matches!(
@@ -2377,7 +2464,8 @@ impl App {
 
     fn toggle_selected(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                .flatten(&self.tree_state);
             if let Some(item) = items.get(self.tree_state.selected) {
                 self.tree_state.toggle_expand(&item.path);
                 self.update_cached_tree_len();
@@ -2391,7 +2479,14 @@ impl App {
 
         match self.layout_mode {
             LayoutMode::Tree => {
-                let items = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+                let items = TreeView::new(
+                    view_node,
+                    &view_path,
+                    &self.theme,
+                    &self.marked,
+                    &self.clipboard,
+                )
+                .flatten(&self.tree_state);
                 let item = items.get(self.tree_state.selected)?;
                 let node = Self::find_node_at_path(&tree.root, &item.path, &tree.root_path)?;
 
@@ -2427,10 +2522,19 @@ impl App {
         match self.layout_mode {
             LayoutMode::Tree => {
                 if let Some((view_node, view_path)) = self.get_view_root_node() {
-                    let items = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard)
-                        .flatten(&self.tree_state);
+                    let items = TreeView::new(
+                        view_node,
+                        &view_path,
+                        &self.theme,
+                        &self.marked,
+                        &self.clipboard,
+                    )
+                    .flatten(&self.tree_state);
                     if let Some(item) = items.get(self.tree_state.selected) {
-                        return !matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. });
+                        return !matches!(
+                            item.node.kind,
+                            crate::ui::VisibleNodeKind::Directory { .. }
+                        );
                     }
                 }
                 false
@@ -2451,9 +2555,17 @@ impl App {
         match self.layout_mode {
             LayoutMode::Tree => {
                 if let Some((view_node, view_path)) = self.get_view_root_node() {
-                    let items = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard)
-                        .flatten(&self.tree_state);
-                    return items.get(self.tree_state.selected).map(|item| item.path.clone());
+                    let items = TreeView::new(
+                        view_node,
+                        &view_path,
+                        &self.theme,
+                        &self.marked,
+                        &self.clipboard,
+                    )
+                    .flatten(&self.tree_state);
+                    return items
+                        .get(self.tree_state.selected)
+                        .map(|item| item.path.clone());
                 }
                 None
             }
@@ -2509,15 +2621,19 @@ impl App {
             return;
         };
 
-        let items = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard).flatten(&self.tree_state);
+        let items = TreeView::new(
+            view_node,
+            &view_path,
+            &self.theme,
+            &self.marked,
+            &self.clipboard,
+        )
+        .flatten(&self.tree_state);
         let Some(item) = items.get(self.tree_state.selected) else {
             return;
         };
 
-        if !matches!(
-            item.node.kind,
-            crate::ui::VisibleNodeKind::Directory { .. }
-        ) {
+        if !matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. }) {
             return;
         }
 
@@ -2551,7 +2667,11 @@ impl App {
         let target_path = item.path.clone();
 
         // Check if forward history has this path - if so, restore that state
-        if let Some(forward_idx) = self.forward_history.iter().rposition(|(p, _, _)| p == &target_path) {
+        if let Some(forward_idx) = self
+            .forward_history
+            .iter()
+            .rposition(|(p, _, _)| p == &target_path)
+        {
             let (_, fwd_selected, fwd_expanded) = self.forward_history.remove(forward_idx);
             // Clear any forward history entries after this one
             self.forward_history.truncate(forward_idx);
@@ -2607,7 +2727,11 @@ impl App {
             .push((self.view_root.clone(), saved_selected, saved_expanded));
 
         // Check if forward history has this path - if so, restore that state
-        if let Some(forward_idx) = self.forward_history.iter().rposition(|(p, _, _)| p == &target_path) {
+        if let Some(forward_idx) = self
+            .forward_history
+            .iter()
+            .rposition(|(p, _, _)| p == &target_path)
+        {
             let (_, fwd_selected, fwd_expanded) = self.forward_history.remove(forward_idx);
             // Clear any forward history entries after this one
             self.forward_history.truncate(forward_idx);
@@ -2753,11 +2877,16 @@ impl App {
 
     /// Navigate to a parent directory that's outside the current scan root.
     /// This extends the tree by lazy-loading the parent.
-    fn navigate_to_parent_beyond_scan_root(&mut self, parent: &PathBuf, dir_we_came_from: &PathBuf) {
+    fn navigate_to_parent_beyond_scan_root(
+        &mut self,
+        parent: &PathBuf,
+        dir_we_came_from: &PathBuf,
+    ) {
         // Cache current tree before navigating away (if we have scan data)
         if let Some(tree) = &self.tree {
             if self.has_full_scan {
-                self.scanned_cache.insert(tree.root_path.clone(), tree.clone());
+                self.scanned_cache
+                    .insert(tree.root_path.clone(), tree.clone());
             }
         }
 
@@ -2793,7 +2922,11 @@ impl App {
     /// Merge cached scan data into a tree node's children.
     /// For each child directory in the node, if we have cached scan data,
     /// replace the placeholder child with the fully scanned version.
-    fn merge_cached_scans_into_tree(&self, node: &mut gravityfile_core::FileNode, node_path: &PathBuf) {
+    fn merge_cached_scans_into_tree(
+        &self,
+        node: &mut gravityfile_core::FileNode,
+        node_path: &PathBuf,
+    ) {
         for child in &mut node.children {
             if child.is_dir() {
                 let child_path = node_path.join(&*child.name);
@@ -2816,8 +2949,9 @@ impl App {
             LayoutMode::Tree => {
                 // In tree view, find the index of the target in flattened list
                 if let Some((node, root_path)) = self.get_view_root_node() {
-                    let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                        .flatten(&self.tree_state);
+                    let items =
+                        TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                            .flatten(&self.tree_state);
                     if let Some(idx) = items.iter().position(|item| {
                         item.path.file_name().and_then(|n| n.to_str()) == Some(dir_name)
                     }) {
@@ -3066,7 +3200,8 @@ impl App {
                 self.execute_undo();
             }
             CommandAction::ShowBookmarks => {
-                self.bookmark_list_state = Some(BookmarkListState::new(&self.user_settings.bookmarks));
+                self.bookmark_list_state =
+                    Some(BookmarkListState::new(&self.user_settings.bookmarks));
                 self.mode = AppMode::BookmarkList;
             }
             CommandAction::SetBookmark(key) => {
@@ -3197,14 +3332,20 @@ impl App {
                 self.error = Some(format!(
                     "Extracted {} files from {} to {}",
                     extracted_files.len(),
-                    archive_path.file_name().unwrap_or_default().to_string_lossy(),
+                    archive_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
                     dest_dir.display()
                 ));
                 // Trigger a rescan to show the extracted files
                 self.start_scan();
             }
             Err(e) => {
-                self.error = Some(format!("Failed to extract: {}", Self::sanitize_archive_error(&e)));
+                self.error = Some(format!(
+                    "Failed to extract: {}",
+                    Self::sanitize_archive_error(&e)
+                ));
             }
         }
     }
@@ -3261,7 +3402,10 @@ impl App {
             Ok(()) => {
                 self.error = Some(format!(
                     "Created archive {} with {} files",
-                    archive_path.file_name().unwrap_or_default().to_string_lossy(),
+                    archive_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
                     files.len()
                 ));
                 // Clear marks after successful compression
@@ -3270,7 +3414,10 @@ impl App {
                 self.start_scan();
             }
             Err(e) => {
-                self.error = Some(format!("Failed to create archive: {}", Self::sanitize_archive_error(&e)));
+                self.error = Some(format!(
+                    "Failed to create archive: {}",
+                    Self::sanitize_archive_error(&e)
+                ));
             }
         }
     }
@@ -3370,7 +3517,11 @@ impl App {
         let _ = std::fs::remove_file(&temp_file);
 
         // Validate and create new state
-        let original_paths: Vec<PathBuf> = bulk_state.entries.iter().map(|e| e.original.clone()).collect();
+        let original_paths: Vec<PathBuf> = bulk_state
+            .entries
+            .iter()
+            .map(|e| e.original.clone())
+            .collect();
 
         if new_names.len() != original_paths.len() {
             self.error = Some(format!(
@@ -3421,7 +3572,11 @@ impl App {
                     Err(e) => {
                         error_messages.push(format!(
                             "{}: {}",
-                            entry.original.file_name().unwrap_or_default().to_string_lossy(),
+                            entry
+                                .original
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
                             e
                         ));
                     }
@@ -3537,7 +3692,9 @@ impl App {
 
     /// Set a bookmark for the current directory.
     fn set_bookmark(&mut self, key: char) {
-        self.user_settings.bookmarks.set(key, self.view_root.clone());
+        self.user_settings
+            .bookmarks
+            .set(key, self.view_root.clone());
         let _ = self.user_settings.save();
     }
 
@@ -3679,7 +3836,8 @@ impl App {
                 if let Some(state) = &self.bulk_rename_state {
                     // Create temp file with current names
                     let temp_dir = std::env::temp_dir();
-                    let temp_file = temp_dir.join(format!("gravityfile-rename-{}.txt", std::process::id()));
+                    let temp_file =
+                        temp_dir.join(format!("gravityfile-rename-{}.txt", std::process::id()));
 
                     let content: String = state
                         .entries
@@ -3772,7 +3930,8 @@ impl App {
                 }
             }
             // Quick actions while in visual mode
-            (KeyCode::Char('d'), KeyModifiers::NONE) | (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
+            (KeyCode::Char('d'), KeyModifiers::NONE)
+            | (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
                 // Delete selected range
                 self.apply_visual_selection_as_marks();
                 self.visual_state = None;
@@ -3846,24 +4005,24 @@ impl App {
                     // Sort children same way as Miller columns display
                     let mut children: Vec<_> = node.children.iter().collect();
                     let sort_mode = self.sort_mode;
-                    children.sort_by(|a, b| {
-                        match sort_mode {
-                            SortMode::SizeDescending => b.size.cmp(&a.size),
-                            SortMode::SizeAscending => a.size.cmp(&b.size),
-                            SortMode::NameAscending => a.name.cmp(&b.name),
-                            SortMode::NameDescending => b.name.cmp(&a.name),
-                            SortMode::ModifiedDescending => b.timestamps.modified.cmp(&a.timestamps.modified),
-                            SortMode::ModifiedAscending => a.timestamps.modified.cmp(&b.timestamps.modified),
-                            SortMode::CountDescending => b.children.len().cmp(&a.children.len()),
-                            SortMode::CountAscending => a.children.len().cmp(&b.children.len()),
+                    children.sort_by(|a, b| match sort_mode {
+                        SortMode::SizeDescending => b.size.cmp(&a.size),
+                        SortMode::SizeAscending => a.size.cmp(&b.size),
+                        SortMode::NameAscending => a.name.cmp(&b.name),
+                        SortMode::NameDescending => b.name.cmp(&a.name),
+                        SortMode::ModifiedDescending => {
+                            b.timestamps.modified.cmp(&a.timestamps.modified)
                         }
+                        SortMode::ModifiedAscending => {
+                            a.timestamps.modified.cmp(&b.timestamps.modified)
+                        }
+                        SortMode::CountDescending => b.children.len().cmp(&a.children.len()),
+                        SortMode::CountAscending => a.children.len().cmp(&b.children.len()),
                     });
 
                     let view_root = self.view_root.clone();
                     (start..=end)
-                        .filter_map(|i| {
-                            children.get(i).map(|child| view_root.join(&*child.name))
-                        })
+                        .filter_map(|i| children.get(i).map(|child| view_root.join(&*child.name)))
                         .collect()
                 } else {
                     Vec::new()
@@ -3894,14 +4053,14 @@ impl App {
                     }
                     View::Duplicates => {
                         // Collect group info to avoid borrow issues
-                        let group_info: Vec<usize> = self.get_filtered_duplicates()
+                        let group_info: Vec<usize> = self
+                            .get_filtered_duplicates()
                             .map(|(filtered, _)| filtered.iter().map(|g| g.paths.len()).collect())
                             .unwrap_or_default();
                         let group_count = group_info.len();
                         for _ in 0..3 {
-                            self.duplicates_state.move_up(group_count, |i| {
-                                group_info.get(i).copied().unwrap_or(0)
-                            });
+                            self.duplicates_state
+                                .move_up(group_count, |i| group_info.get(i).copied().unwrap_or(0));
                         }
                     }
                     View::Age => {
@@ -3935,7 +4094,8 @@ impl App {
                     }
                     View::Duplicates => {
                         // Collect group info to avoid borrow issues
-                        let group_info: Vec<usize> = self.get_filtered_duplicates()
+                        let group_info: Vec<usize> = self
+                            .get_filtered_duplicates()
                             .map(|(filtered, _)| filtered.iter().map(|g| g.paths.len()).collect())
                             .unwrap_or_default();
                         let group_count = group_info.len();
@@ -3946,7 +4106,8 @@ impl App {
                         }
                     }
                     View::Age => {
-                        let max = self.get_filtered_stale_dirs()
+                        let max = self
+                            .get_filtered_stale_dirs()
                             .map(|dirs| dirs.len().saturating_sub(1))
                             .unwrap_or(0);
                         for _ in 0..3 {
@@ -4078,7 +4239,8 @@ impl App {
     fn sync_to_active_tab(&mut self) {
         if let Some(tab) = self.tab_manager.active_tab_mut() {
             tab.view_root = self.view_root.clone();
-            tab.label = self.view_root
+            tab.label = self
+                .view_root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| self.view_root.to_string_lossy().to_string());
@@ -4117,12 +4279,7 @@ impl App {
         let mut paths = Vec::new();
 
         if let Some(tree) = &self.tree {
-            Self::collect_paths_recursive(
-                &tree.root,
-                &tree.root_path,
-                &self.view_root,
-                &mut paths,
-            );
+            Self::collect_paths_recursive(&tree.root, &tree.root_path, &self.view_root, &mut paths);
         }
 
         self.search_state.update_paths(paths);
@@ -4232,7 +4389,8 @@ impl App {
                 LayoutMode::Tree => self.tree_state.selected,
                 LayoutMode::Miller => self.miller_state.selected,
             };
-            self.view_history.push((self.view_root.clone(), saved_selected, saved_expanded));
+            self.view_history
+                .push((self.view_root.clone(), saved_selected, saved_expanded));
 
             // Navigate to directory
             self.view_root = target.clone();
@@ -4255,14 +4413,18 @@ impl App {
                     LayoutMode::Tree => self.tree_state.selected,
                     LayoutMode::Miller => self.miller_state.selected,
                 };
-                self.view_history.push((self.view_root.clone(), saved_selected, saved_expanded));
+                self.view_history
+                    .push((self.view_root.clone(), saved_selected, saved_expanded));
 
                 // Navigate to parent
                 self.view_root = parent.to_path_buf();
                 self.tree_state.expand(&self.view_root);
 
                 // Get file name before borrowing for position search
-                let file_name = target.file_name().and_then(|n| n.to_str()).map(|s| s.to_string());
+                let file_name = target
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string());
                 let target_clone = target.clone();
 
                 match self.layout_mode {
@@ -4273,8 +4435,14 @@ impl App {
 
                         // Find position in flattened tree
                         if let Some((node, _)) = self.get_view_root_node() {
-                            let items = TreeView::new(node, &self.view_root, &self.theme, &self.marked, &self.clipboard)
-                                .flatten(&self.tree_state);
+                            let items = TreeView::new(
+                                node,
+                                &self.view_root,
+                                &self.theme,
+                                &self.marked,
+                                &self.clipboard,
+                            )
+                            .flatten(&self.tree_state);
                             if let Some(pos) = items.iter().position(|i| i.path == target_clone) {
                                 self.tree_state.selected = pos;
                             }
@@ -4282,7 +4450,9 @@ impl App {
                     }
                     LayoutMode::Miller => {
                         // Find the index of the file in the parent's children
-                        if let (Some(file_name), Some((node, _))) = (&file_name, self.get_view_root_node()) {
+                        if let (Some(file_name), Some((node, _))) =
+                            (&file_name, self.get_view_root_node())
+                        {
                             let idx = node
                                 .children
                                 .iter()
@@ -4358,24 +4528,22 @@ impl App {
     /// Recursively sort a node and all its children.
     fn sort_node_recursive(node: &mut gravityfile_core::FileNode, mode: SortMode) {
         // Sort children based on mode
-        node.children.sort_by(|a, b| {
-            match mode {
-                SortMode::SizeDescending => b.size.cmp(&a.size),
-                SortMode::SizeAscending => a.size.cmp(&b.size),
-                SortMode::NameAscending => a.name.cmp(&b.name),
-                SortMode::NameDescending => b.name.cmp(&a.name),
-                SortMode::ModifiedDescending => b.timestamps.modified.cmp(&a.timestamps.modified),
-                SortMode::ModifiedAscending => a.timestamps.modified.cmp(&b.timestamps.modified),
-                SortMode::CountDescending => {
-                    let a_count = a.children.len();
-                    let b_count = b.children.len();
-                    b_count.cmp(&a_count)
-                }
-                SortMode::CountAscending => {
-                    let a_count = a.children.len();
-                    let b_count = b.children.len();
-                    a_count.cmp(&b_count)
-                }
+        node.children.sort_by(|a, b| match mode {
+            SortMode::SizeDescending => b.size.cmp(&a.size),
+            SortMode::SizeAscending => a.size.cmp(&b.size),
+            SortMode::NameAscending => a.name.cmp(&b.name),
+            SortMode::NameDescending => b.name.cmp(&a.name),
+            SortMode::ModifiedDescending => b.timestamps.modified.cmp(&a.timestamps.modified),
+            SortMode::ModifiedAscending => a.timestamps.modified.cmp(&b.timestamps.modified),
+            SortMode::CountDescending => {
+                let a_count = a.children.len();
+                let b_count = b.children.len();
+                b_count.cmp(&a_count)
+            }
+            SortMode::CountAscending => {
+                let a_count = a.children.len();
+                let b_count = b.children.len();
+                a_count.cmp(&b_count)
             }
         });
 
@@ -4386,9 +4554,7 @@ impl App {
     }
 
     /// Get duplicate groups filtered to current view_root.
-    fn get_filtered_duplicates(
-        &self,
-    ) -> Option<(Vec<&gravityfile_analyze::DuplicateGroup>, u64)> {
+    fn get_filtered_duplicates(&self) -> Option<(Vec<&gravityfile_analyze::DuplicateGroup>, u64)> {
         let dups = self.duplicates.as_ref()?;
 
         if self.view_root == self.path {

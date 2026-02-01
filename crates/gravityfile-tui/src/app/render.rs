@@ -17,8 +17,8 @@ use crate::ui::modals::{
     DeleteConfirmModal, DeletionProgressModal, InputModal, OperationProgressModal, SettingsModal,
 };
 use crate::ui::{
-    format_relative_time, format_size, AppLayout, HelpOverlay, MillerColumns, MillerState,
-    TreeState, TreeView, TreemapView,
+    AppLayout, HelpOverlay, MillerColumns, MillerState, TreeState, TreeView, TreemapView,
+    format_relative_time, format_size,
 };
 
 use super::input::InputState;
@@ -80,12 +80,10 @@ pub struct RenderContext<'a> {
     pub clipboard: &'a ClipboardState,
     pub get_path_size: Box<dyn Fn(&std::path::PathBuf) -> Option<u64> + 'a>,
     pub get_selected_info: Option<SelectedInfo>,
-    pub get_view_root_node:
-        Option<(&'a gravityfile_core::FileNode, std::path::PathBuf)>,
+    pub get_view_root_node: Option<(&'a gravityfile_core::FileNode, std::path::PathBuf)>,
     pub get_parent_node: Option<&'a gravityfile_core::FileNode>,
     pub current_dir_name: Option<String>,
-    pub get_filtered_duplicates:
-        Option<(Vec<&'a gravityfile_analyze::DuplicateGroup>, u64)>,
+    pub get_filtered_duplicates: Option<(Vec<&'a gravityfile_analyze::DuplicateGroup>, u64)>,
     pub get_filtered_stale_dirs: Option<Vec<&'a gravityfile_analyze::StaleDirectory>>,
     pub sort_mode: SortMode,
     pub search_state: &'a crate::search::SearchState,
@@ -195,14 +193,24 @@ pub fn render_app(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         }
         AppMode::CreatingDirectory => {
             if let Some(input) = ctx.input_state {
-                InputModal::new(ctx.theme, input, "Create Directory", "Enter directory name:")
-                    .render(area, buf);
+                InputModal::new(
+                    ctx.theme,
+                    input,
+                    "Create Directory",
+                    "Enter directory name:",
+                )
+                .render(area, buf);
             }
         }
         AppMode::Taking => {
             if let Some(input) = ctx.input_state {
-                InputModal::new(ctx.theme, input, "Take (mkdir + cd)", "Enter directory name:")
-                    .render(area, buf);
+                InputModal::new(
+                    ctx.theme,
+                    input,
+                    "Take (mkdir + cd)",
+                    "Enter directory name:",
+                )
+                .render(area, buf);
             }
         }
         AppMode::GoingTo => {
@@ -273,7 +281,11 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().bg(ctx.theme.background).fg(ctx.theme.foreground))
+        .style(
+            Style::default()
+                .bg(ctx.theme.background)
+                .fg(ctx.theme.foreground),
+        )
         .border_style(ctx.theme.border);
     let inner = block.inner(popup_area);
     block.render(popup_area, buf);
@@ -290,20 +302,32 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     let query = &ctx.search_state.query;
     let cursor = ctx.search_state.cursor;
 
-    let mut spans = vec![
-        Span::styled("/", ctx.theme.help_key),
-    ];
+    let mut spans = vec![Span::styled("/", ctx.theme.help_key)];
 
     // Display query with cursor
     if query.is_empty() {
-        spans.push(Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)));
+        spans.push(Span::styled(
+            "_",
+            Style::default().add_modifier(Modifier::SLOW_BLINK),
+        ));
     } else {
         let before_cursor = &query[..cursor];
-        let at_cursor = query.chars().nth(cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
-        let after_cursor = if cursor < query.len() { &query[cursor + 1..] } else { "" };
+        let at_cursor = query
+            .chars()
+            .nth(cursor)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| " ".to_string());
+        let after_cursor = if cursor < query.len() {
+            &query[cursor + 1..]
+        } else {
+            ""
+        };
 
         spans.push(Span::raw(before_cursor));
-        spans.push(Span::styled(at_cursor, Style::default().add_modifier(Modifier::REVERSED)));
+        spans.push(Span::styled(
+            at_cursor,
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
         spans.push(Span::raw(after_cursor));
     }
 
@@ -330,8 +354,8 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 
     if results.is_empty() {
         if !query.is_empty() {
-            let msg = Paragraph::new("No matches found")
-                .style(Style::default().fg(ctx.theme.muted));
+            let msg =
+                Paragraph::new("No matches found").style(Style::default().fg(ctx.theme.muted));
             msg.render(results_area, buf);
         }
     } else {
@@ -373,7 +397,12 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         if results.len() > max_visible {
             let count_str = format!("[{}/{}]", selected + 1, results.len());
             let x = results_area.x + results_area.width.saturating_sub(count_str.len() as u16);
-            buf.set_string(x, results_area.y + results_area.height - 1, &count_str, Style::default().fg(ctx.theme.muted));
+            buf.set_string(
+                x,
+                results_area.y + results_area.height - 1,
+                &count_str,
+                Style::default().fg(ctx.theme.muted),
+            );
         }
     }
 }
@@ -450,9 +479,7 @@ fn render_header(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                 ctx.marked.len(),
                 format_size(total_size)
             ),
-            Style::default()
-                .fg(ctx.theme.background)
-                .bg(ctx.theme.info),
+            Style::default().fg(ctx.theme.background).bg(ctx.theme.info),
         )
     } else {
         Span::raw("")
@@ -638,13 +665,15 @@ fn render_explorer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                     format!(" {} ", view_path.display())
                 };
 
-                let tree_view = TreeView::new(view_node, view_path, ctx.theme, ctx.marked, ctx.clipboard).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(ctx.theme.border)
-                        .title(title)
-                        .title_style(ctx.theme.title),
-                );
+                let tree_view =
+                    TreeView::new(view_node, view_path, ctx.theme, ctx.marked, ctx.clipboard)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(ctx.theme.border)
+                                .title(title)
+                                .title_style(ctx.theme.title),
+                        );
 
                 let mut tree_state = ctx.tree_state.clone();
                 ratatui::widgets::StatefulWidget::render(
@@ -656,10 +685,9 @@ fn render_explorer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             }
             LayoutMode::Miller => {
                 // Render Miller columns view
-                let current_name = ctx
-                    .current_dir_name
-                    .as_deref()
-                    .unwrap_or_else(|| view_path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+                let current_name = ctx.current_dir_name.as_deref().unwrap_or_else(|| {
+                    view_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                });
 
                 let miller = MillerColumns::new(
                     view_node,
@@ -807,10 +835,13 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         }
 
         // Calculate scroll offset based on selected item
-        let selected_item_idx = items.iter().position(|item| match item {
-            DuplicateListItem::GroupHeader { is_selected, .. } => *is_selected,
-            DuplicateListItem::File { is_selected, .. } => *is_selected,
-        }).unwrap_or(0);
+        let selected_item_idx = items
+            .iter()
+            .position(|item| match item {
+                DuplicateListItem::GroupHeader { is_selected, .. } => *is_selected,
+                DuplicateListItem::File { is_selected, .. } => *is_selected,
+            })
+            .unwrap_or(0);
 
         let scroll_offset = if selected_item_idx >= visible_height {
             selected_item_idx - visible_height + 1
@@ -819,14 +850,28 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         };
 
         // Render visible items
-        for (render_idx, item) in items.iter().enumerate().skip(scroll_offset).take(visible_height) {
+        for (render_idx, item) in items
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
+        {
             let y = list_area.y + (render_idx - scroll_offset) as u16;
             let line_area = Rect::new(list_area.x, y, list_area.width, 1);
 
             match item {
-                DuplicateListItem::GroupHeader { group, is_expanded, is_selected, .. } => {
+                DuplicateListItem::GroupHeader {
+                    group,
+                    is_expanded,
+                    is_selected,
+                    ..
+                } => {
                     let expand_icon = if *is_expanded { "▼" } else { "▶" };
-                    let files_in_view = group.paths.iter().filter(|p| p.starts_with(ctx.view_root)).count();
+                    let files_in_view = group
+                        .paths
+                        .iter()
+                        .filter(|p| p.starts_with(ctx.view_root))
+                        .count();
                     let total_files = group.count();
 
                     let file_info = if files_in_view < total_files {
@@ -836,7 +881,11 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                     };
 
                     // Calculate heat ratio (relative to max wasted in this view)
-                    let max_wasted = filtered_groups.iter().map(|g| g.wasted_bytes).max().unwrap_or(1);
+                    let max_wasted = filtered_groups
+                        .iter()
+                        .map(|g| g.wasted_bytes)
+                        .max()
+                        .unwrap_or(1);
                     let heat_ratio = group.wasted_bytes as f64 / max_wasted as f64;
 
                     // Build heat bar (8 chars wide)
@@ -846,29 +895,40 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                     let heat_color = ctx.theme.size_color(heat_ratio);
 
                     // Render with colored heat bar
-                    let expand_style = if *is_selected { ctx.theme.selected } else { Style::default() };
+                    let expand_style = if *is_selected {
+                        ctx.theme.selected
+                    } else {
+                        Style::default()
+                    };
                     let line = Line::from(vec![
                         Span::styled(format!(" {} ", expand_icon), expand_style),
                         Span::styled(heat_bar, Style::default().fg(heat_color)),
                         Span::styled(
-                            format!(" {} × {} = {}",
+                            format!(
+                                " {} × {} = {}",
                                 file_info,
                                 format_size(group.size),
                                 format_size(group.wasted_bytes)
                             ),
-                            if *is_selected { ctx.theme.selected } else { Style::default().fg(ctx.theme.warning) }
+                            if *is_selected {
+                                ctx.theme.selected
+                            } else {
+                                Style::default().fg(ctx.theme.warning)
+                            },
                         ),
                     ]);
 
                     Paragraph::new(line).render(line_area, buf);
                 }
-                DuplicateListItem::File { file_idx, path, is_selected, is_marked, .. } => {
+                DuplicateListItem::File {
+                    file_idx,
+                    path,
+                    is_selected,
+                    is_marked,
+                    ..
+                } => {
                     // First file (index 0) is the "keep" original, rest are duplicates
-                    let prefix = if *file_idx == 0 {
-                        "keep"
-                    } else {
-                        " dup"
-                    };
+                    let prefix = if *file_idx == 0 { "keep" } else { " dup" };
                     let mark = if *is_marked { "●" } else { " " };
                     let display_path = path
                         .strip_prefix(ctx.view_root)
@@ -881,11 +941,11 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                     let style = if *is_selected {
                         ctx.theme.selected
                     } else if *is_marked {
-                        Style::default().fg(ctx.theme.error)  // Marked for deletion = red
+                        Style::default().fg(ctx.theme.error) // Marked for deletion = red
                     } else if *file_idx == 0 {
-                        Style::default().fg(ctx.theme.success)  // Keep file = green
+                        Style::default().fg(ctx.theme.success) // Keep file = green
                     } else {
-                        Style::default().fg(ctx.theme.muted)  // Duplicates = muted
+                        Style::default().fg(ctx.theme.muted) // Duplicates = muted
                     };
 
                     Paragraph::new(Line::styled(line, style)).render(line_area, buf);
@@ -899,7 +959,12 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             let hint = format!(" ({}/{})", scroll_offset + 1, total);
             let hint_x = list_area.x + list_area.width.saturating_sub(hint.len() as u16 + 1);
             if hint_x > list_area.x {
-                let hint_area = Rect::new(hint_x, list_area.y + visible_height as u16 - 1, hint.len() as u16, 1);
+                let hint_area = Rect::new(
+                    hint_x,
+                    list_area.y + visible_height as u16 - 1,
+                    hint.len() as u16,
+                    1,
+                );
                 if hint_area.y < area.y + area.height - 1 {
                     Paragraph::new(Line::styled(hint, Style::default().fg(ctx.theme.muted)))
                         .render(hint_area, buf);
@@ -907,8 +972,9 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             }
         }
     } else {
-        let msg = Paragraph::new("Analyzing duplicates...\n\nTip: Press Tab to switch views, R to scan.")
-            .style(Style::default().fg(ctx.theme.muted));
+        let msg =
+            Paragraph::new("Analyzing duplicates...\n\nTip: Press Tab to switch views, R to scan.")
+                .style(Style::default().fg(ctx.theme.muted));
         msg.render(inner, buf);
     }
 }
@@ -974,7 +1040,10 @@ fn render_age(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             Paragraph::new(line).render(line_area, buf);
         }
 
-        let stale_dirs = ctx.get_filtered_stale_dirs.as_ref().map_or(vec![], |v| v.clone());
+        let stale_dirs = ctx
+            .get_filtered_stale_dirs
+            .as_ref()
+            .map_or(vec![], |v| v.clone());
 
         let stale_y = bucket_start_y + chart_height as u16 + 1;
         if stale_y < inner.y + inner.height {
@@ -1023,8 +1092,8 @@ fn render_age(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             }
         }
     } else {
-        let msg = Paragraph::new("Analyzing file ages...")
-            .style(Style::default().fg(ctx.theme.muted));
+        let msg =
+            Paragraph::new("Analyzing file ages...").style(Style::default().fg(ctx.theme.muted));
         msg.render(inner, buf);
     }
 }
@@ -1102,11 +1171,15 @@ fn render_errors(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         let is_selected = i == ctx.selected_warning;
 
         let (icon, kind_label, can_delete) = match warning.kind {
-            gravityfile_core::WarningKind::PermissionDenied => ("\u{1F512}", "Permission Denied", false),
+            gravityfile_core::WarningKind::PermissionDenied => {
+                ("\u{1F512}", "Permission Denied", false)
+            }
             gravityfile_core::WarningKind::BrokenSymlink => ("\u{1F517}", "Broken Symlink", true),
             gravityfile_core::WarningKind::ReadError => ("\u{26A0}", "Read Error", false),
             gravityfile_core::WarningKind::MetadataError => ("\u{1F4CB}", "Metadata Error", false),
-            gravityfile_core::WarningKind::CrossFilesystem => ("\u{1F4BE}", "Cross Filesystem", false),
+            gravityfile_core::WarningKind::CrossFilesystem => {
+                ("\u{1F4BE}", "Cross Filesystem", false)
+            }
         };
 
         // Check if this warning's path is marked for deletion
@@ -1114,7 +1187,11 @@ fn render_errors(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 
         let path_str = warning.path.display().to_string();
         let mark_indicator = if is_marked { "[x] " } else { "    " };
-        let delete_hint = if can_delete && is_selected { " [d to delete]" } else { "" };
+        let delete_hint = if can_delete && is_selected {
+            " [d to delete]"
+        } else {
+            ""
+        };
         let prefix = format!("{}{} {} ", mark_indicator, icon, kind_label);
         let suffix_len = delete_hint.len();
         let available_width = (inner.width as usize).saturating_sub(prefix.len() + suffix_len + 1);
@@ -1191,15 +1268,9 @@ fn render_treemap(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         .title(format!(" Treemap: {} ", view_path.display()))
         .title_style(ctx.theme.title);
 
-    let treemap = TreemapView::new(
-        view_node,
-        &view_path,
-        ctx.theme,
-        ctx.marked,
-        ctx.clipboard,
-    )
-    .block(block)
-    .selected(ctx.treemap_selected);
+    let treemap = TreemapView::new(view_node, &view_path, ctx.theme, ctx.marked, ctx.clipboard)
+        .block(block)
+        .selected(ctx.treemap_selected);
 
     treemap.render(area, buf);
 }
@@ -1267,9 +1338,7 @@ fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
 
     let mut keys: Vec<(&str, &str)> = if in_visual_mode {
         // Visual mode specific keys
-        let _selection_count = ctx.visual_state
-            .map(|s| s.selection_count())
-            .unwrap_or(0);
+        let _selection_count = ctx.visual_state.map(|s| s.selection_count()).unwrap_or(0);
 
         let mut v = vec![
             ("j/k", "Extend"),
@@ -1285,100 +1354,106 @@ fn render_footer(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
         v
     } else {
         match ctx.view {
-        View::Explorer => {
-            let mut v = vec![("j/k", "Nav")];
+            View::Explorer => {
+                let mut v = vec![("j/k", "Nav")];
 
-            // File operations - always available (work on highlighted OR marked items)
-            v.push(("y", "Copy"));
-            v.push(("x", "Cut"));
-            v.push(("d", "Del"));
+                // File operations - always available (work on highlighted OR marked items)
+                v.push(("y", "Copy"));
+                v.push(("x", "Cut"));
+                v.push(("d", "Del"));
 
-            // Paste if clipboard has content
-            if !ctx.clipboard.is_empty() {
-                v.push(("p", "Paste"));
+                // Paste if clipboard has content
+                if !ctx.clipboard.is_empty() {
+                    v.push(("p", "Paste"));
+                }
+
+                // Esc clears clipboard (if any) then marks (if any)
+                // Show what Esc will do based on current state
+                if !ctx.clipboard.is_empty() {
+                    v.push(("Esc", "Unclip"));
+                } else if !ctx.marked.is_empty() {
+                    v.push(("Esc", "Unmark"));
+                } else {
+                    v.push(("Spc", "+Sel"));
+                }
+
+                // Visual mode hint
+                v.push(("V", "Visual"));
+
+                // Layout toggle
+                let layout_hint = match ctx.layout_mode {
+                    LayoutMode::Tree => "Miller",
+                    LayoutMode::Miller => "Tree",
+                };
+                v.push(("v", layout_hint));
+
+                // Sort mode
+                v.push(("s", ctx.sort_mode.short_label()));
+
+                v
             }
+            View::Duplicates => {
+                // Context-aware hints based on selection
+                let is_on_header = !ctx
+                    .duplicates_state
+                    .is_expanded(ctx.duplicates_state.selected_group)
+                    || ctx
+                        .duplicates_state
+                        .selected_item(ctx.duplicates_state.selected_group)
+                        == 0;
 
-            // Esc clears clipboard (if any) then marks (if any)
-            // Show what Esc will do based on current state
-            if !ctx.clipboard.is_empty() {
-                v.push(("Esc", "Unclip"));
-            } else if !ctx.marked.is_empty() {
-                v.push(("Esc", "Unmark"));
-            } else {
+                let mut v = vec![("j/k", "Nav"), ("h/l", "±Grp")];
+
+                if is_on_header {
+                    // On group header - actions affect all duplicates
+                    v.push(("d", "Del Dups"));
+                    v.push(("Spc", "Sel All"));
+                } else {
+                    // On individual file
+                    v.push(("d", "Del File"));
+                    v.push(("Spc", "Toggle"));
+                }
+
+                if !ctx.marked.is_empty() {
+                    v.push(("Esc", "Clear"));
+                }
+                v
+            }
+            View::Age => {
+                let mut v = vec![("j/k", "Nav"), ("y", "Copy"), ("d", "Del")];
+                if !ctx.clipboard.is_empty() {
+                    v.push(("Esc", "Unclip"));
+                } else if !ctx.marked.is_empty() {
+                    v.push(("Esc", "Unmark"));
+                } else {
+                    v.push(("Spc", "+Sel"));
+                }
+                v
+            }
+            View::Errors => {
+                let mut v = vec![("j/k", "Nav")];
+                // Show mark/delete hints for broken symlinks
                 v.push(("Spc", "+Sel"));
+                v.push(("d", "Del"));
+                if !ctx.marked.is_empty() {
+                    v.push(("Esc", "Clear"));
+                }
+                v
             }
-
-            // Visual mode hint
-            v.push(("V", "Visual"));
-
-            // Layout toggle
-            let layout_hint = match ctx.layout_mode {
-                LayoutMode::Tree => "Miller",
-                LayoutMode::Miller => "Tree",
-            };
-            v.push(("v", layout_hint));
-
-            // Sort mode
-            v.push(("s", ctx.sort_mode.short_label()));
-
-            v
+            View::Treemap => {
+                let mut v = vec![
+                    ("Enter", "Drill"),
+                    ("Bksp", "Back"),
+                    ("Spc", "+Sel"),
+                    ("d", "Del"),
+                ];
+                if !ctx.marked.is_empty() {
+                    v.push(("Esc", "Clear"));
+                }
+                v
+            }
         }
-        View::Duplicates => {
-            // Context-aware hints based on selection
-            let is_on_header = !ctx.duplicates_state.is_expanded(ctx.duplicates_state.selected_group)
-                || ctx.duplicates_state.selected_item(ctx.duplicates_state.selected_group) == 0;
-
-            let mut v = vec![("j/k", "Nav"), ("h/l", "±Grp")];
-
-            if is_on_header {
-                // On group header - actions affect all duplicates
-                v.push(("d", "Del Dups"));
-                v.push(("Spc", "Sel All"));
-            } else {
-                // On individual file
-                v.push(("d", "Del File"));
-                v.push(("Spc", "Toggle"));
-            }
-
-            if !ctx.marked.is_empty() {
-                v.push(("Esc", "Clear"));
-            }
-            v
-        }
-        View::Age => {
-            let mut v = vec![("j/k", "Nav"), ("y", "Copy"), ("d", "Del")];
-            if !ctx.clipboard.is_empty() {
-                v.push(("Esc", "Unclip"));
-            } else if !ctx.marked.is_empty() {
-                v.push(("Esc", "Unmark"));
-            } else {
-                v.push(("Spc", "+Sel"));
-            }
-            v
-        }
-        View::Errors => {
-            let mut v = vec![("j/k", "Nav")];
-            // Show mark/delete hints for broken symlinks
-            v.push(("Spc", "+Sel"));
-            v.push(("d", "Del"));
-            if !ctx.marked.is_empty() {
-                v.push(("Esc", "Clear"));
-            }
-            v
-        }
-        View::Treemap => {
-            let mut v = vec![
-                ("Enter", "Drill"),
-                ("Bksp", "Back"),
-                ("Spc", "+Sel"),
-                ("d", "Del"),
-            ];
-            if !ctx.marked.is_empty() {
-                v.push(("Esc", "Clear"));
-            }
-            v
-        }
-    }};
+    };
 
     // Add scan hint - prominent when no full scan has been done
     // Use Shift+R format to make it clear it's Shift+R not lowercase r

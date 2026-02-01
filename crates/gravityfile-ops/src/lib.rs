@@ -15,15 +15,15 @@ mod progress;
 mod rename;
 mod undo;
 
-pub use archive::{create_archive, extract_archive, ArchiveError, ArchiveFormat, ArchiveResult};
+pub use archive::{ArchiveError, ArchiveFormat, ArchiveResult, create_archive, extract_archive};
 pub use conflict::{Conflict, ConflictKind, ConflictResolution};
-pub use copy::{start_copy, CopyOptions, CopyResult};
-pub use create::{start_create_directory, start_create_file, CreateResult};
-pub use executor::{execute_undo, OperationExecutor, OperationResult};
-pub use move_op::{start_move, MoveOptions, MoveResult};
+pub use copy::{CopyOptions, CopyResult, start_copy};
+pub use create::{CreateResult, start_create_directory, start_create_file};
+pub use executor::{OperationExecutor, OperationResult, execute_undo};
+pub use move_op::{MoveOptions, MoveResult, start_move};
 pub use operation::{FileOperation, OperationError};
 pub use progress::{OperationComplete, OperationProgress, OperationType};
-pub use rename::{start_rename, RenameResult};
+pub use rename::{RenameResult, start_rename};
 pub use undo::{UndoEntry, UndoLog, UndoableOperation};
 
 /// Default channel buffer size for operation progress updates.

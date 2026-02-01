@@ -13,7 +13,7 @@ use gravityfile_core::{FileNode, GitStatus, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
-use crate::ui::{format_size, SizeBar};
+use crate::ui::{SizeBar, format_size};
 
 /// State for the tree view.
 #[derive(Debug, Default, Clone)]
@@ -365,7 +365,10 @@ impl StatefulWidget for TreeView<'_> {
             let (git_indicator, git_style) = match item.node.git_status {
                 Some(status) if status.is_displayable() => {
                     let color = self.theme.git_status_color(status);
-                    (format!(" {}", status.indicator()), Style::default().fg(color))
+                    (
+                        format!(" {}", status.indicator()),
+                        Style::default().fg(color),
+                    )
                 }
                 _ => (String::new(), Style::default()),
             };
@@ -450,6 +453,9 @@ impl StatefulWidget for TreeView<'_> {
 
 /// Get the selected item from a tree state and flattened items.
 #[allow(dead_code)]
-pub fn get_selected_item<'a>(state: &TreeState, items: &'a [VisibleItem]) -> Option<&'a VisibleItem> {
+pub fn get_selected_item<'a>(
+    state: &TreeState,
+    items: &'a [VisibleItem],
+) -> Option<&'a VisibleItem> {
     items.get(state.selected)
 }

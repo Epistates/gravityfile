@@ -303,7 +303,6 @@ impl View {
     }
 }
 
-
 /// Progress during deletion operation.
 #[derive(Debug, Clone)]
 pub struct DeletionProgress {
@@ -435,7 +434,10 @@ impl DuplicatesViewState {
 
     /// Get the selected item within a group (0 = header, 1+ = file index).
     pub fn selected_item(&self, group_index: usize) -> usize {
-        self.selected_in_group.get(&group_index).copied().unwrap_or(0)
+        self.selected_in_group
+            .get(&group_index)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Move selection up.
@@ -444,7 +446,8 @@ impl DuplicatesViewState {
             let selected = self.selected_item(self.selected_group);
             if selected > 0 {
                 // Move within group
-                self.selected_in_group.insert(self.selected_group, selected - 1);
+                self.selected_in_group
+                    .insert(self.selected_group, selected - 1);
                 return;
             }
         }
@@ -454,7 +457,8 @@ impl DuplicatesViewState {
             // If previous group is expanded, select its last item
             if self.is_expanded(self.selected_group) {
                 let file_count = get_file_count(self.selected_group);
-                self.selected_in_group.insert(self.selected_group, file_count);
+                self.selected_in_group
+                    .insert(self.selected_group, file_count);
             }
         }
     }
@@ -466,7 +470,8 @@ impl DuplicatesViewState {
             let selected = self.selected_item(self.selected_group);
             if selected < file_count {
                 // Move within group
-                self.selected_in_group.insert(self.selected_group, selected + 1);
+                self.selected_in_group
+                    .insert(self.selected_group, selected + 1);
                 return;
             }
         }
@@ -842,10 +847,7 @@ impl BulkRenameState {
                 // Only include entries where the name actually changed
                 let old_name = original.file_name()?.to_string_lossy().to_string();
                 if old_name != new_name && !new_name.is_empty() {
-                    Some(RenameEntry {
-                        original,
-                        new_name,
-                    })
+                    Some(RenameEntry { original, new_name })
                 } else {
                     None
                 }
@@ -941,7 +943,7 @@ pub struct UserSettings {
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
-            scan_on_startup: true,  // Enabled by default
+            scan_on_startup: true, // Enabled by default
             show_hidden: false,
             default_layout: "tree".to_string(),
             openers: FileOpeners::default(),

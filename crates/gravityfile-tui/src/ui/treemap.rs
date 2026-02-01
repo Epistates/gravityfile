@@ -128,20 +128,11 @@ impl<'a> TreemapView<'a> {
         }
 
         // Prepare items sorted by size (descending)
-        let mut items: Vec<(&FileNode, u64)> = children
-            .iter()
-            .map(|n| (*n, n.size))
-            .collect();
+        let mut items: Vec<(&FileNode, u64)> = children.iter().map(|n| (*n, n.size)).collect();
         items.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Apply squarified algorithm
-        self.squarify(
-            &items,
-            area,
-            self.root.size,
-            0,
-            &mut rects,
-        );
+        self.squarify(&items, area, self.root.size, 0, &mut rects);
 
         rects
     }
@@ -185,7 +176,8 @@ impl<'a> TreemapView<'a> {
 
         for (i, (_, size)) in items.iter().enumerate() {
             let candidate_row_size = row_size + size;
-            let candidate_area = (area_size as f64) * (candidate_row_size as f64 / total_size as f64);
+            let candidate_area =
+                (area_size as f64) * (candidate_row_size as f64 / total_size as f64);
 
             // Calculate aspect ratio of this row
             let row_items = i + 1;
@@ -402,7 +394,10 @@ impl Widget for TreemapView<'_> {
             if rect.width >= 4 && rect.height >= 2 {
                 let available_width = (rect.width as usize).saturating_sub(2);
                 let label = if treemap_rect.name.len() > available_width {
-                    format!("{}…", &treemap_rect.name[..available_width.saturating_sub(1)])
+                    format!(
+                        "{}…",
+                        &treemap_rect.name[..available_width.saturating_sub(1)]
+                    )
                 } else {
                     treemap_rect.name.clone()
                 };

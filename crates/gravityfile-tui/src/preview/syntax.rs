@@ -82,7 +82,10 @@ impl SyntaxHighlighter {
     }
 
     /// Convert syntect highlight regions to a ratatui Line.
-    fn regions_to_line(regions: Vec<(highlighting::Style, &str)>, tab_replacement: &str) -> Line<'static> {
+    fn regions_to_line(
+        regions: Vec<(highlighting::Style, &str)>,
+        tab_replacement: &str,
+    ) -> Line<'static> {
         let spans: Vec<Span<'static>> = regions
             .into_iter()
             .map(|(style, text)| {
@@ -93,7 +96,10 @@ impl SyntaxHighlighter {
                 if style.font_style.contains(highlighting::FontStyle::ITALIC) {
                     modifier |= Modifier::ITALIC;
                 }
-                if style.font_style.contains(highlighting::FontStyle::UNDERLINE) {
+                if style
+                    .font_style
+                    .contains(highlighting::FontStyle::UNDERLINE)
+                {
                     modifier |= Modifier::UNDERLINED;
                 }
 

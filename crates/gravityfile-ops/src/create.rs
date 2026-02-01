@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::progress::{OperationComplete, OperationProgress, OperationType};
 use crate::rename::validate_filename;
-use crate::{OperationError, OPERATION_CHANNEL_SIZE};
+use crate::{OPERATION_CHANNEL_SIZE, OperationError};
 
 /// Result sent through the channel during create operations.
 #[derive(Debug)]
@@ -124,7 +124,10 @@ async fn create_file_impl(path: PathBuf, tx: mpsc::Sender<CreateResult>) {
                 .await;
         }
         Ok(Err(e)) => {
-            progress.add_error(OperationError::new(path, format!("Failed to create file: {}", e)));
+            progress.add_error(OperationError::new(
+                path,
+                format!("Failed to create file: {}", e),
+            ));
             let _ = tx
                 .send(CreateResult::Complete(OperationComplete {
                     operation_type: OperationType::CreateFile,

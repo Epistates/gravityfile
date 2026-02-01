@@ -51,14 +51,9 @@ impl<'a> HelpOverlay<'a> {
                     break;
                 }
 
-                let key_span = Span::styled(
-                    format!("{:>12}", binding.keys),
-                    self.theme.help_key,
-                );
-                let desc_span = Span::styled(
-                    format!(" {}", binding.description),
-                    self.theme.help_desc,
-                );
+                let key_span = Span::styled(format!("{:>12}", binding.keys), self.theme.help_key);
+                let desc_span =
+                    Span::styled(format!(" {}", binding.description), self.theme.help_desc);
                 let line = Line::from(vec![key_span, desc_span]);
                 buf.set_line(area.x, y, &line, area.width);
                 y += 1;
@@ -95,11 +90,9 @@ impl Widget for HelpOverlay<'_> {
         block.render(popup_area, buf);
 
         // Split into two columns
-        let [left_col, right_col] = Layout::horizontal([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
-        .areas(inner);
+        let [left_col, right_col] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(inner);
 
         // Get sections
         let sections = get_help_sections();
@@ -151,14 +144,9 @@ impl Widget for HelpOverlay<'_> {
                     break;
                 }
 
-                let key_span = Span::styled(
-                    format!("{:>12}", binding.keys),
-                    self.theme.help_key,
-                );
-                let desc_span = Span::styled(
-                    format!(" {}", binding.description),
-                    self.theme.help_desc,
-                );
+                let key_span = Span::styled(format!("{:>12}", binding.keys), self.theme.help_key);
+                let desc_span =
+                    Span::styled(format!(" {}", binding.description), self.theme.help_desc);
                 let line = Line::from(vec![key_span, desc_span]);
                 buf.set_line(right_col.x, y, &line, right_col.width);
                 y += 1;
@@ -184,14 +172,8 @@ impl Widget for HelpOverlay<'_> {
                     break;
                 }
 
-                let cmd_span = Span::styled(
-                    format!("{:>14}", cmd),
-                    self.theme.help_key,
-                );
-                let desc_span = Span::styled(
-                    format!(" {}", desc),
-                    self.theme.help_desc,
-                );
+                let cmd_span = Span::styled(format!("{:>14}", cmd), self.theme.help_key);
+                let desc_span = Span::styled(format!(" {}", desc), self.theme.help_desc);
                 let line = Line::from(vec![cmd_span, desc_span]);
                 buf.set_line(right_col.x, y, &line, right_col.width);
                 y += 1;

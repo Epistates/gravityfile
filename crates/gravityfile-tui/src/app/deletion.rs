@@ -59,10 +59,7 @@ pub fn start_deletion_with_mode(
 
             // Perform deletion in blocking task to not block the async runtime
             let path_clone = path.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                delete_path(&path_clone, mode)
-            })
-            .await;
+            let result = tokio::task::spawn_blocking(move || delete_path(&path_clone, mode)).await;
 
             match result {
                 Ok(Ok(())) => {
@@ -269,7 +266,10 @@ mod tests {
 
         // Symlink should be gone, but target should remain
         assert!(!link_path.exists());
-        assert!(file_path.exists(), "Target file should NOT be deleted when deleting symlink");
+        assert!(
+            file_path.exists(),
+            "Target file should NOT be deleted when deleting symlink"
+        );
     }
 
     #[cfg(unix)]
@@ -294,7 +294,10 @@ mod tests {
 
         // Symlink should be gone, but target directory and contents should remain
         assert!(!link_path.exists());
-        assert!(dir_path.exists(), "Target directory should NOT be deleted when deleting symlink");
+        assert!(
+            dir_path.exists(),
+            "Target directory should NOT be deleted when deleting symlink"
+        );
         assert!(
             dir_path.join("file.txt").exists(),
             "Files in target directory should NOT be deleted"
@@ -369,7 +372,10 @@ mod tests {
         // Directory and symlink should be gone
         assert!(!dir_path.exists());
         // But the outside file should remain
-        assert!(outside_file.exists(), "File outside directory should NOT be deleted");
+        assert!(
+            outside_file.exists(),
+            "File outside directory should NOT be deleted"
+        );
     }
 
     #[test]

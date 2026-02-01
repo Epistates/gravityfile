@@ -330,11 +330,15 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                     "name" | "nm" => CommandAction::SetSort(SortCommand::NameAsc),
                     "name-" | "nm-" | "name-desc" => CommandAction::SetSort(SortCommand::NameDesc),
                     "name+" | "nm+" | "name-asc" => CommandAction::SetSort(SortCommand::NameAsc),
-                    "date" | "dt" | "modified" | "mod" => CommandAction::SetSort(SortCommand::DateDesc),
+                    "date" | "dt" | "modified" | "mod" => {
+                        CommandAction::SetSort(SortCommand::DateDesc)
+                    }
                     "date-" | "dt-" | "date-desc" => CommandAction::SetSort(SortCommand::DateDesc),
                     "date+" | "dt+" | "date-asc" => CommandAction::SetSort(SortCommand::DateAsc),
                     "count" | "ct" | "children" => CommandAction::SetSort(SortCommand::CountDesc),
-                    "count-" | "ct-" | "count-desc" => CommandAction::SetSort(SortCommand::CountDesc),
+                    "count-" | "ct-" | "count-desc" => {
+                        CommandAction::SetSort(SortCommand::CountDesc)
+                    }
                     "count+" | "ct+" | "count-asc" => CommandAction::SetSort(SortCommand::CountAsc),
                     "reverse" | "rev" => CommandAction::SetSort(SortCommand::Reverse),
                     _ => CommandAction::SetSort(SortCommand::Cycle),

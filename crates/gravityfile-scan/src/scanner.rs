@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -41,7 +41,10 @@ impl JwalkScanner {
     /// Perform a scan of the given path.
     pub fn scan(&self, config: &ScanConfig) -> Result<FileTree, ScanError> {
         let start = Instant::now();
-        let root_path = config.root.canonicalize().map_err(|e| ScanError::io(&config.root, e))?;
+        let root_path = config
+            .root
+            .canonicalize()
+            .map_err(|e| ScanError::io(&config.root, e))?;
 
         // Verify root is a directory
         if !root_path.is_dir() {
@@ -49,7 +52,8 @@ impl JwalkScanner {
         }
 
         // Get root device for cross-filesystem detection
-        let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
+        let root_metadata =
+            std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
         let root_device = get_dev(&root_metadata);
 
         // Set up tracking
@@ -59,7 +63,14 @@ impl JwalkScanner {
         let mut warnings = Vec::new();
 
         // Collect all entries first
-        let entries = self.collect_entries(config, &root_path, root_device, &inode_tracker, &mut stats, &mut warnings)?;
+        let entries = self.collect_entries(
+            config,
+            &root_path,
+            root_device,
+            &inode_tracker,
+            &mut stats,
+            &mut warnings,
+        )?;
 
         // Build tree from collected entries
         let root_node = self.build_tree(&root_path, entries, &node_id_counter, &mut stats);
@@ -87,7 +98,9 @@ impl JwalkScanner {
         warnings: &mut Vec<ScanWarning>,
     ) -> Result<HashMap<PathBuf, Vec<EntryInfo>>, ScanError> {
         let parallelism = match config.threads {
-            0 => Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_millis(100) },
+            0 => Parallelism::RayonDefaultPool {
+                busy_timeout: std::time::Duration::from_millis(100),
+            },
             n => Parallelism::RayonNewPool(n),
         };
 
@@ -320,7 +333,8 @@ impl JwalkScanner {
         for entry in children_entries {
             if entry.is_dir {
                 // Recursively build directory
-                let child_node = self.build_node(&entry.path, entries_by_parent, node_id_counter, stats);
+                let child_node =
+                    self.build_node(&entry.path, entries_by_parent, node_id_counter, stats);
                 total_size += child_node.size;
                 file_count += child_node.file_count();
                 dir_count += child_node.dir_count() + 1;
@@ -663,10 +677,6 @@ mod tests {
         let tree = scanner.scan(&config).unwrap();
 
         // dir2 should be ignored
-        assert!(!tree
-            .root
-            .children
-            .iter()
-            .any(|c| c.name.as_str() == "dir2"));
+        assert!(!tree.root.children.iter().any(|c| c.name.as_str() == "dir2"));
     }
 }

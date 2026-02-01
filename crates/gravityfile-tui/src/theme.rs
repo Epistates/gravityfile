@@ -114,7 +114,10 @@ impl Theme {
             foreground: slate_100,
             muted: slate_500,
 
-            selected: Style::new().bg(slate_700).fg(slate_50).add_modifier(Modifier::BOLD),
+            selected: Style::new()
+                .bg(slate_700)
+                .fg(slate_50)
+                .add_modifier(Modifier::BOLD),
             hover: Style::new().bg(slate_800),
 
             size_huge: red_500,
@@ -195,7 +198,10 @@ impl Theme {
             foreground: slate_900,
             muted: slate_500,
 
-            selected: Style::new().bg(slate_200).fg(slate_900).add_modifier(Modifier::BOLD),
+            selected: Style::new()
+                .bg(slate_200)
+                .fg(slate_900)
+                .add_modifier(Modifier::BOLD),
             hover: Style::new().bg(slate_100),
 
             size_huge: red_600,

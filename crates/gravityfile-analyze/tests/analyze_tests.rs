@@ -124,7 +124,11 @@ fn test_find_duplicates_with_no_actual_duplicates() {
     fs::write(root.join("file3.txt"), "content three").unwrap();
 
     let finder = DuplicateFinder::new();
-    let mut tree = create_test_tree_with_files(&[root.join("file1.txt"), root.join("file2.txt"), root.join("file3.txt")]);
+    let mut tree = create_test_tree_with_files(&[
+        root.join("file1.txt"),
+        root.join("file2.txt"),
+        root.join("file3.txt"),
+    ]);
 
     let report = finder.find_duplicates(&tree);
 
@@ -144,7 +148,11 @@ fn test_find_duplicates_with_exact_duplicates() {
     fs::write(root.join("file3.txt"), content).unwrap();
 
     let finder = DuplicateFinder::new();
-    let mut tree = create_test_tree_with_files(&[root.join("file1.txt"), root.join("file2.txt"), root.join("file3.txt")]);
+    let mut tree = create_test_tree_with_files(&[
+        root.join("file1.txt"),
+        root.join("file2.txt"),
+        root.join("file3.txt"),
+    ]);
 
     let report = finder.find_duplicates(&tree);
 
@@ -320,7 +328,9 @@ fn create_test_tree_with_files(paths: &[std::path::PathBuf]) -> FileTree {
             use blake3::Hasher;
             let mut hasher = Hasher::new();
             hasher.update(&content);
-            node.content_hash = Some(gravityfile_core::ContentHash::new(*hasher.finalize().as_bytes()));
+            node.content_hash = Some(gravityfile_core::ContentHash::new(
+                *hasher.finalize().as_bytes(),
+            ));
         }
 
         root.children.push(node);
@@ -372,7 +382,11 @@ fn create_test_tree_with_nested_files(paths: &[(std::path::PathBuf, &str)]) -> F
                 );
                 current.children.push(dir_node);
             }
-            current = current.children.iter_mut().find(|c| c.name == parent_name_str).unwrap();
+            current = current
+                .children
+                .iter_mut()
+                .find(|c| c.name == parent_name_str)
+                .unwrap();
         }
 
         // Add the file
@@ -389,7 +403,9 @@ fn create_test_tree_with_nested_files(paths: &[(std::path::PathBuf, &str)]) -> F
             use blake3::Hasher;
             let mut hasher = Hasher::new();
             hasher.update(&content);
-            node.content_hash = Some(gravityfile_core::ContentHash::new(*hasher.finalize().as_bytes()));
+            node.content_hash = Some(gravityfile_core::ContentHash::new(
+                *hasher.finalize().as_bytes(),
+            ));
         }
 
         current.children.push(node);

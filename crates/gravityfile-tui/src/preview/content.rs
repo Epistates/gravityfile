@@ -229,7 +229,9 @@ impl PreviewLoader {
     /// Force load as text (even if binary).
     fn load_text(path: &Path) -> Result<PreviewContent, PreviewError> {
         let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
-        let metadata = file.metadata().map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         if metadata.len() > MAX_PREVIEW_SIZE {
             return Err(PreviewError::TooLarge(metadata.len()));
@@ -326,7 +328,8 @@ impl PreviewLoader {
     fn load_zip_archive(path: &Path) -> Result<PreviewContent, PreviewError> {
         // Check file size before attempting to parse
         let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
-        let file_size = file.metadata()
+        let file_size = file
+            .metadata()
             .map_err(|e| PreviewError::IoError(e.to_string()))?
             .len();
 
@@ -371,7 +374,8 @@ impl PreviewLoader {
 
                 // Check if entry is a symlink by examining Unix mode
                 // S_IFLNK = 0o120000, combined with permissions gives 0o12xxxx
-                let is_symlink = entry.unix_mode()
+                let is_symlink = entry
+                    .unix_mode()
                     .map(|mode| (mode & 0o170000) == 0o120000)
                     .unwrap_or(false);
 
@@ -453,9 +457,14 @@ impl PreviewLoader {
     }
 
     /// Load TAR archive from a reader.
-    fn load_tar_from_reader<R: Read>(reader: R, format: &str) -> Result<PreviewContent, PreviewError> {
+    fn load_tar_from_reader<R: Read>(
+        reader: R,
+        format: &str,
+    ) -> Result<PreviewContent, PreviewError> {
         let mut archive = tar::Archive::new(reader);
-        let entries_iter = archive.entries().map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let entries_iter = archive
+            .entries()
+            .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         let mut entries = Vec::new();
         let mut entry_count = 0;
@@ -485,7 +494,8 @@ impl PreviewLoader {
 
                 // Get symlink target if available
                 let link_target = if is_symlink {
-                    entry.link_name()
+                    entry
+                        .link_name()
                         .ok()
                         .flatten()
                         .map(|p| p.to_string_lossy().to_string())
@@ -526,7 +536,9 @@ impl PreviewLoader {
         }
 
         let file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
-        let metadata = file.metadata().map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         // Check file size
         if metadata.len() > MAX_PREVIEW_SIZE {
@@ -540,14 +552,20 @@ impl PreviewLoader {
         }
 
         // Seek back to start
-        reader.seek(SeekFrom::Start(0)).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         // Read lines
         let mut lines = Vec::new();
         let mut line_buf = String::new();
         let mut line_count = 0;
 
-        while reader.read_line(&mut line_buf).map_err(|e| PreviewError::IoError(e.to_string()))? > 0 {
+        while reader
+            .read_line(&mut line_buf)
+            .map_err(|e| PreviewError::IoError(e.to_string()))?
+            > 0
+        {
             // Normalize line endings
             let line = line_buf.trim_end_matches(['\r', '\n']).to_string();
 
@@ -584,7 +602,9 @@ impl PreviewLoader {
     /// Check if file content appears to be binary.
     fn is_binary(reader: &mut BufReader<File>) -> Result<bool, PreviewError> {
         let mut buf = [0u8; BINARY_CHECK_BYTES];
-        let bytes_read = reader.read(&mut buf).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let bytes_read = reader
+            .read(&mut buf)
+            .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         // Check for null bytes (common binary indicator)
         Ok(buf[..bytes_read].iter().any(|&b| b == 0))
@@ -594,7 +614,9 @@ impl PreviewLoader {
     fn load_hex(path: &Path, total_bytes: u64) -> Result<PreviewContent, PreviewError> {
         let mut file = File::open(path).map_err(|e| PreviewError::IoError(e.to_string()))?;
         let mut buf = vec![0u8; (MAX_PREVIEW_LINES * 16).min(total_bytes as usize)];
-        let bytes_read = file.read(&mut buf).map_err(|e| PreviewError::IoError(e.to_string()))?;
+        let bytes_read = file
+            .read(&mut buf)
+            .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         let lines: Vec<Line<'static>> = buf[..bytes_read]
             .chunks(16)
@@ -637,12 +659,10 @@ impl PreviewLoader {
             .collect();
 
         // Sort: directories first, then by name
-        entries.sort_by(|(a_name, a_dir), (b_name, b_dir)| {
-            match (a_dir, b_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a_name.cmp(b_name),
-            }
+        entries.sort_by(|(a_name, a_dir), (b_name, b_dir)| match (a_dir, b_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a_name.cmp(b_name),
         });
 
         // Limit entries
@@ -653,7 +673,9 @@ impl PreviewLoader {
 
     /// Load preview content asynchronously (for use in TUI event loop).
     #[allow(dead_code)]
-    pub fn load_async(path: PathBuf) -> std::thread::JoinHandle<Result<PreviewContent, PreviewError>> {
+    pub fn load_async(
+        path: PathBuf,
+    ) -> std::thread::JoinHandle<Result<PreviewContent, PreviewError>> {
         std::thread::spawn(move || Self::load(&path))
     }
 }

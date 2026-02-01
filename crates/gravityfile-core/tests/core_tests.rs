@@ -126,11 +126,8 @@ fn test_file_node_creation_and_properties() {
 #[test]
 fn test_directory_node_creation_and_properties() {
     let now = SystemTime::now();
-    let mut node = FileNode::new_directory(
-        NodeId::new(1),
-        "test_dir",
-        Timestamps::with_modified(now),
-    );
+    let mut node =
+        FileNode::new_directory(NodeId::new(1), "test_dir", Timestamps::with_modified(now));
 
     assert!(node.is_dir());
     assert!(!node.is_file());
@@ -151,7 +148,8 @@ fn test_directory_node_creation_and_properties() {
         Timestamps::with_modified(now),
         false,
     );
-    let mut child_dir = FileNode::new_directory(NodeId::new(3), "subdir", Timestamps::with_modified(now));
+    let mut child_dir =
+        FileNode::new_directory(NodeId::new(3), "subdir", Timestamps::with_modified(now));
     child_dir.kind = NodeKind::Directory {
         file_count: 1,
         dir_count: 0,

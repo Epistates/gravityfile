@@ -67,9 +67,7 @@ impl Widget for SizeBar {
                 (self.empty_char, self.empty_style)
             };
 
-            buf[(area.x + x, area.y)]
-                .set_char(char)
-                .set_style(style);
+            buf[(area.x + x, area.y)].set_char(char).set_style(style);
         }
     }
 }
@@ -121,7 +119,9 @@ impl Widget for CompactSizeBar {
                 ' '
             };
 
-            buf[(area.x + x, area.y)].set_char(char).set_style(self.style);
+            buf[(area.x + x, area.y)]
+                .set_char(char)
+                .set_style(self.style);
         }
     }
 }

@@ -302,93 +302,234 @@ pub fn get_help_sections() -> Vec<HelpSection> {
         HelpSection {
             title: "Navigation",
             bindings: vec![
-                KeyBinding { keys: "j/k ↑/↓", description: "Move up/down" },
-                KeyBinding { keys: "h/l ←/→", description: "Collapse/expand" },
-                KeyBinding { keys: "Enter", description: "Drill into directory" },
-                KeyBinding { keys: "Backspace/-", description: "Navigate back" },
-                KeyBinding { keys: "g/G", description: "Jump to top/bottom" },
-                KeyBinding { keys: "Ctrl-u/d", description: "Page up/down" },
-                KeyBinding { keys: "Ctrl-g", description: "Go to directory" },
-                KeyBinding { keys: "o", description: "Toggle expand node" },
+                KeyBinding {
+                    keys: "j/k ↑/↓",
+                    description: "Move up/down",
+                },
+                KeyBinding {
+                    keys: "h/l ←/→",
+                    description: "Collapse/expand",
+                },
+                KeyBinding {
+                    keys: "Enter",
+                    description: "Drill into directory",
+                },
+                KeyBinding {
+                    keys: "Backspace/-",
+                    description: "Navigate back",
+                },
+                KeyBinding {
+                    keys: "g/G",
+                    description: "Jump to top/bottom",
+                },
+                KeyBinding {
+                    keys: "Ctrl-u/d",
+                    description: "Page up/down",
+                },
+                KeyBinding {
+                    keys: "Ctrl-g",
+                    description: "Go to directory",
+                },
+                KeyBinding {
+                    keys: "o",
+                    description: "Toggle expand node",
+                },
             ],
         },
         HelpSection {
             title: "Selection & Clipboard",
             bindings: vec![
-                KeyBinding { keys: "Space", description: "Mark item for multi-select" },
-                KeyBinding { keys: "y", description: "Yank (copy) to clipboard" },
-                KeyBinding { keys: "x", description: "Cut to clipboard" },
-                KeyBinding { keys: "p", description: "Paste from clipboard" },
-                KeyBinding { keys: "Esc", description: "Clear clipboard/marks" },
+                KeyBinding {
+                    keys: "Space",
+                    description: "Mark item for multi-select",
+                },
+                KeyBinding {
+                    keys: "y",
+                    description: "Yank (copy) to clipboard",
+                },
+                KeyBinding {
+                    keys: "x",
+                    description: "Cut to clipboard",
+                },
+                KeyBinding {
+                    keys: "p",
+                    description: "Paste from clipboard",
+                },
+                KeyBinding {
+                    keys: "Esc",
+                    description: "Clear clipboard/marks",
+                },
             ],
         },
         HelpSection {
             title: "File Operations",
             bindings: vec![
-                KeyBinding { keys: "d/Del", description: "Delete item(s)" },
-                KeyBinding { keys: "r", description: "Rename" },
-                KeyBinding { keys: "a", description: "Create file (touch)" },
-                KeyBinding { keys: "A", description: "Create directory (mkdir)" },
-                KeyBinding { keys: "T", description: "Take (mkdir + cd)" },
-                KeyBinding { keys: "Ctrl-z", description: "Undo" },
+                KeyBinding {
+                    keys: "d/Del",
+                    description: "Delete item(s)",
+                },
+                KeyBinding {
+                    keys: "r",
+                    description: "Rename",
+                },
+                KeyBinding {
+                    keys: "a",
+                    description: "Create file (touch)",
+                },
+                KeyBinding {
+                    keys: "A",
+                    description: "Create directory (mkdir)",
+                },
+                KeyBinding {
+                    keys: "T",
+                    description: "Take (mkdir + cd)",
+                },
+                KeyBinding {
+                    keys: "Ctrl-z",
+                    description: "Undo",
+                },
             ],
         },
         HelpSection {
             title: "Views & Display",
             bindings: vec![
-                KeyBinding { keys: "Tab/S-Tab", description: "Switch view (Explorer/Dups/Age)" },
-                KeyBinding { keys: "v", description: "Toggle Tree/Miller" },
-                KeyBinding { keys: "s", description: "Cycle sort mode" },
-                KeyBinding { keys: "S", description: "Reverse sort order" },
-                KeyBinding { keys: "i", description: "Toggle details panel" },
-                KeyBinding { keys: "t", description: "Toggle dark/light theme" },
-                KeyBinding { keys: "R", description: "Refresh/rescan" },
+                KeyBinding {
+                    keys: "Tab/S-Tab",
+                    description: "Switch view (Explorer/Dups/Age)",
+                },
+                KeyBinding {
+                    keys: "v",
+                    description: "Toggle Tree/Miller",
+                },
+                KeyBinding {
+                    keys: "s",
+                    description: "Cycle sort mode",
+                },
+                KeyBinding {
+                    keys: "S",
+                    description: "Reverse sort order",
+                },
+                KeyBinding {
+                    keys: "i",
+                    description: "Toggle details panel",
+                },
+                KeyBinding {
+                    keys: "t",
+                    description: "Toggle dark/light theme",
+                },
+                KeyBinding {
+                    keys: "R",
+                    description: "Refresh/rescan",
+                },
             ],
         },
         HelpSection {
             title: "Duplicates View",
             bindings: vec![
-                KeyBinding { keys: "j/k", description: "Navigate groups/files" },
-                KeyBinding { keys: "h/l", description: "Collapse/expand group" },
-                KeyBinding { keys: "d (on group)", description: "Mark all duplicates (keeps 1st)" },
-                KeyBinding { keys: "d (on file)", description: "Mark single file for deletion" },
-                KeyBinding { keys: "Space (group)", description: "Select/deselect all in group" },
-                KeyBinding { keys: "Space (file)", description: "Toggle single file selection" },
+                KeyBinding {
+                    keys: "j/k",
+                    description: "Navigate groups/files",
+                },
+                KeyBinding {
+                    keys: "h/l",
+                    description: "Collapse/expand group",
+                },
+                KeyBinding {
+                    keys: "d (on group)",
+                    description: "Mark all duplicates (keeps 1st)",
+                },
+                KeyBinding {
+                    keys: "d (on file)",
+                    description: "Mark single file for deletion",
+                },
+                KeyBinding {
+                    keys: "Space (group)",
+                    description: "Select/deselect all in group",
+                },
+                KeyBinding {
+                    keys: "Space (file)",
+                    description: "Toggle single file selection",
+                },
             ],
         },
         HelpSection {
             title: "Bookmarks",
             bindings: vec![
-                KeyBinding { keys: "m<key>", description: "Set bookmark" },
-                KeyBinding { keys: "'<key>", description: "Jump to bookmark" },
-                KeyBinding { keys: "B", description: "Show bookmark list" },
+                KeyBinding {
+                    keys: "m<key>",
+                    description: "Set bookmark",
+                },
+                KeyBinding {
+                    keys: "'<key>",
+                    description: "Jump to bookmark",
+                },
+                KeyBinding {
+                    keys: "B",
+                    description: "Show bookmark list",
+                },
             ],
         },
         HelpSection {
             title: "Mouse",
             bindings: vec![
-                KeyBinding { keys: "Click", description: "Select item" },
-                KeyBinding { keys: "Double-click", description: "Enter directory" },
-                KeyBinding { keys: "Right-click", description: "Toggle mark" },
-                KeyBinding { keys: "Scroll", description: "Move up/down" },
+                KeyBinding {
+                    keys: "Click",
+                    description: "Select item",
+                },
+                KeyBinding {
+                    keys: "Double-click",
+                    description: "Enter directory",
+                },
+                KeyBinding {
+                    keys: "Right-click",
+                    description: "Toggle mark",
+                },
+                KeyBinding {
+                    keys: "Scroll",
+                    description: "Move up/down",
+                },
             ],
         },
         HelpSection {
             title: "Directory Tabs",
             bindings: vec![
-                KeyBinding { keys: "Ctrl-t", description: "New tab (current dir)" },
-                KeyBinding { keys: "Ctrl-w", description: "Close current tab" },
-                KeyBinding { keys: "]/[", description: "Next/prev tab" },
-                KeyBinding { keys: "1-9", description: "Jump to tab N" },
+                KeyBinding {
+                    keys: "Ctrl-t",
+                    description: "New tab (current dir)",
+                },
+                KeyBinding {
+                    keys: "Ctrl-w",
+                    description: "Close current tab",
+                },
+                KeyBinding {
+                    keys: "]/[",
+                    description: "Next/prev tab",
+                },
+                KeyBinding {
+                    keys: "1-9",
+                    description: "Jump to tab N",
+                },
             ],
         },
         HelpSection {
             title: "Commands",
             bindings: vec![
-                KeyBinding { keys: ":", description: "Open command palette" },
-                KeyBinding { keys: ",", description: "Open settings" },
-                KeyBinding { keys: "?", description: "Show this help" },
-                KeyBinding { keys: "q", description: "Quit" },
+                KeyBinding {
+                    keys: ":",
+                    description: "Open command palette",
+                },
+                KeyBinding {
+                    keys: ",",
+                    description: "Open settings",
+                },
+                KeyBinding {
+                    keys: "?",
+                    description: "Show this help",
+                },
+                KeyBinding {
+                    keys: "q",
+                    description: "Quit",
+                },
             ],
         },
     ]
