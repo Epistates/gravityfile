@@ -145,7 +145,7 @@ impl IsolatedContext for LuaIsolatedContext {
             let max_instructions = self.sandbox.timeout_ms * 10000; // Rough estimate
 
             let ic = instruction_count.clone();
-            self.lua.set_hook(
+            let _ = self.lua.set_hook(
                 mlua::HookTriggers::new().every_nth_instruction(1000),
                 move |_lua, _debug| {
                     let count = ic.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
