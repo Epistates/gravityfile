@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-02
+
+### Added
+
+- **WASM Plugin Runtime** - Full WebAssembly plugin support via Extism:
+  - Load `.wasm` plugins alongside Lua and Rhai scripts
+  - Hook dispatch, method invocation, and isolated execution contexts
+  - Automatic hook discovery by inspecting WASM exports
+- **Plugin System Integration** - TUI now initializes and dispatches lifecycle hooks:
+  - `OnStartup`, `OnShutdown`, `OnNavigate`, `OnScanComplete` hooks
+  - Plugin manager with Lua, Rhai, and WASM runtimes registered at startup
+  - Non-blocking hook dispatch via `tokio::spawn` for scan-complete events
+- **Lua Sandbox Enforcement** - Filesystem API now respects sandbox read permissions:
+  - `fs.read`, `fs.read_bytes`, `fs.exists`, `fs.is_dir`, `fs.is_file`, `fs.metadata` all check `SandboxConfig.can_read()`
+  - Sandboxed contexts hide file existence for disallowed paths
+
+### Changed
+
+- **API Modernization** - ~25 function signatures changed from `&PathBuf` to `&Path` across all crates, following Rust idioms for borrowed path parameters
+- **Clippy Clean** - Eliminated all 84 clippy warnings across the workspace:
+  - Collapsed ~35 nested `if` statements using Rust let-chains
+  - Replaced 3 manual `Default` impls with `#[derive(Default)]`
+  - Removed ~6 redundant closures in `map_err` chains
+  - Replaced `.min().max()` chains with `.clamp()`
+  - Replaced manual prefix stripping with `strip_prefix()`
+  - Replaced `iter().any(|&b| b == 0)` with `.contains(&0)`
+  - Removed `trim()` before `split_whitespace()` (redundant)
+  - Replaced `vec![]; push()` patterns with `vec![initial]`
+  - Used `.is_some_and()` over `.map_or(false, ...)`
+  - Used `.is_multiple_of()` over `% N == 0`
+  - Used `.flatten()` on fallible iterators
+- **Undo System Simplification** - `FilesDeleted` variant simplified:
+  - Now stores `paths: Vec<PathBuf>` instead of `trash_entries: Vec<(PathBuf, PathBuf)>`
+  - `can_undo()` always returns `false` for deletions (trash restore removed)
+- **HookResult Serialization** - Added `Serialize`/`Deserialize` derives for WASM interop
+- **README Rewrite** - Modernized with SOTA performance metrics, plugin system showcase, and condensed keybinding reference
+- **Dependencies Updated** - All workspace dependencies brought to latest versions
+
+### Fixed
+
+- Broken doc comment continuation in plugin crate module docs
+- Test assertions updated to match actual `ScanConfig` defaults
+- `ContentHash` test helpers updated for `Box<ContentHash>` optimization
+- Duplicate finder tests fixed for correct file count assertions
+
 ## [0.3.0] - 2026-01-29
 
 ### Added
@@ -179,6 +224,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.4.0]: https://github.com/epistates/gravityfile/releases/tag/v0.4.0
 [0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2
 [0.2.1]: https://github.com/epistates/gravityfile/releases/tag/v0.2.1

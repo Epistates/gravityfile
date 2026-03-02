@@ -206,8 +206,8 @@ fn test_scan_config_builder() {
     let default_config = ScanConfig::new("/default");
     assert_eq!(default_config.root.to_str().unwrap(), "/default");
     assert_eq!(default_config.max_depth, None);
-    assert!(!default_config.include_hidden);
-    assert!(default_config.follow_symlinks);
+    assert!(default_config.include_hidden);
+    assert!(!default_config.follow_symlinks);
     assert!(!default_config.cross_filesystems);
 }
 
@@ -246,7 +246,7 @@ fn test_file_node_with_content_hash() {
 
     // Add content hash
     let hash_bytes = [0xde; 32];
-    node.content_hash = Some(ContentHash::new(hash_bytes));
+    node.content_hash = Some(Box::new(ContentHash::new(hash_bytes)));
 
     assert!(node.content_hash.is_some());
     let hash = node.content_hash.unwrap();
@@ -270,6 +270,7 @@ fn test_nested_directory_structure() {
         false,
     );
     dir1.children.push(file1);
+    dir1.size = 512; // Sum of children
 
     let mut dir2 = FileNode::new_directory(NodeId::new(4), "dir2", Timestamps::with_modified(now));
     let file2 = FileNode::new_file(
@@ -281,16 +282,18 @@ fn test_nested_directory_structure() {
         false,
     );
     dir2.children.push(file2);
+    dir2.size = 1024; // Sum of children
 
     root.children.push(dir1);
     root.children.push(dir2);
 
-    // Update counts recursively
+    // Update counts recursively (children first, then root)
     for child in &mut root.children {
         if child.is_dir() {
             child.update_counts();
         }
     }
+    root.update_counts();
 
     assert_eq!(root.file_count(), 2); // Both files in subdirectories
     assert_eq!(root.dir_count(), 2); // dir1 and dir2

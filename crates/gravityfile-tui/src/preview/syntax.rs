@@ -37,24 +37,24 @@ impl SyntaxHighlighter {
         let (syntaxes, _) = Self::init();
 
         // Try by filename first
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(syntax) = syntaxes.find_syntax_by_extension(name) {
-                return Some(syntax);
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && let Some(syntax) = syntaxes.find_syntax_by_extension(name)
+        {
+            return Some(syntax);
         }
 
         // Try by extension
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if let Some(syntax) = syntaxes.find_syntax_by_extension(ext) {
-                return Some(syntax);
-            }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && let Some(syntax) = syntaxes.find_syntax_by_extension(ext)
+        {
+            return Some(syntax);
         }
 
         // Try by first line (shebang detection)
-        if let Some(line) = first_line {
-            if let Some(syntax) = syntaxes.find_syntax_by_first_line(line) {
-                return Some(syntax);
-            }
+        if let Some(line) = first_line
+            && let Some(syntax) = syntaxes.find_syntax_by_first_line(line)
+        {
+            return Some(syntax);
         }
 
         None

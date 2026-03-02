@@ -48,20 +48,20 @@ async fn create_file_impl(path: PathBuf, tx: mpsc::Sender<CreateResult>) {
     let _ = tx.send(CreateResult::Progress(progress.clone())).await;
 
     // Validate the filename
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if let Err(e) = validate_filename(name) {
-            progress.add_error(OperationError::new(path.clone(), e));
-            let _ = tx
-                .send(CreateResult::Complete(OperationComplete {
-                    operation_type: OperationType::CreateFile,
-                    succeeded: 0,
-                    failed: 1,
-                    bytes_processed: 0,
-                    errors: progress.errors,
-                }))
-                .await;
-            return;
-        }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && let Err(e) = validate_filename(name)
+    {
+        progress.add_error(OperationError::new(path.clone(), e));
+        let _ = tx
+            .send(CreateResult::Complete(OperationComplete {
+                operation_type: OperationType::CreateFile,
+                succeeded: 0,
+                failed: 1,
+                bytes_processed: 0,
+                errors: progress.errors,
+            }))
+            .await;
+        return;
     }
 
     // Check if file already exists
@@ -83,25 +83,24 @@ async fn create_file_impl(path: PathBuf, tx: mpsc::Sender<CreateResult>) {
     }
 
     // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                progress.add_error(OperationError::new(
-                    path.clone(),
-                    format!("Failed to create parent directory: {}", e),
-                ));
-                let _ = tx
-                    .send(CreateResult::Complete(OperationComplete {
-                        operation_type: OperationType::CreateFile,
-                        succeeded: 0,
-                        failed: 1,
-                        bytes_processed: 0,
-                        errors: progress.errors,
-                    }))
-                    .await;
-                return;
-            }
-        }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        progress.add_error(OperationError::new(
+            path.clone(),
+            format!("Failed to create parent directory: {}", e),
+        ));
+        let _ = tx
+            .send(CreateResult::Complete(OperationComplete {
+                operation_type: OperationType::CreateFile,
+                succeeded: 0,
+                failed: 1,
+                bytes_processed: 0,
+                errors: progress.errors,
+            }))
+            .await;
+        return;
     }
 
     // Create the file
@@ -161,20 +160,20 @@ async fn create_directory_impl(path: PathBuf, tx: mpsc::Sender<CreateResult>) {
     let _ = tx.send(CreateResult::Progress(progress.clone())).await;
 
     // Validate the directory name
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if let Err(e) = validate_filename(name) {
-            progress.add_error(OperationError::new(path.clone(), e));
-            let _ = tx
-                .send(CreateResult::Complete(OperationComplete {
-                    operation_type: OperationType::CreateDirectory,
-                    succeeded: 0,
-                    failed: 1,
-                    bytes_processed: 0,
-                    errors: progress.errors,
-                }))
-                .await;
-            return;
-        }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && let Err(e) = validate_filename(name)
+    {
+        progress.add_error(OperationError::new(path.clone(), e));
+        let _ = tx
+            .send(CreateResult::Complete(OperationComplete {
+                operation_type: OperationType::CreateDirectory,
+                succeeded: 0,
+                failed: 1,
+                bytes_processed: 0,
+                errors: progress.errors,
+            }))
+            .await;
+        return;
     }
 
     // Check if directory already exists

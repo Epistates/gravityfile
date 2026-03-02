@@ -116,11 +116,10 @@ impl ScanConfig {
                     return true;
                 }
             }
-            if pattern.starts_with('*') {
-                let suffix = &pattern[1..];
-                if name.ends_with(suffix) {
-                    return true;
-                }
+            if let Some(suffix) = pattern.strip_prefix('*')
+                && name.ends_with(suffix)
+            {
+                return true;
             }
         }
         false

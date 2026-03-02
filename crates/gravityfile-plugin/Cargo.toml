@@ -25,6 +25,7 @@ dirs = "5"
 
 # Async utilities
 futures = "0.3"
+extism = "1.13.0"
 
 [dev-dependencies]
 tempfile.workspace = true

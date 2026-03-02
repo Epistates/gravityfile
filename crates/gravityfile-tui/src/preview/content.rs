@@ -112,7 +112,7 @@ pub struct ArchiveEntry {
 }
 
 /// Content that can be displayed in the preview pane.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum PreviewContent {
     /// Syntax-highlighted text lines.
     Text {
@@ -153,13 +153,8 @@ pub enum PreviewContent {
     /// Error message.
     Error(String),
     /// Empty preview.
+    #[default]
     Empty,
-}
-
-impl Default for PreviewContent {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 /// Loads preview content for files.
@@ -607,7 +602,7 @@ impl PreviewLoader {
             .map_err(|e| PreviewError::IoError(e.to_string()))?;
 
         // Check for null bytes (common binary indicator)
-        Ok(buf[..bytes_read].iter().any(|&b| b == 0))
+        Ok(buf[..bytes_read].contains(&0))
     }
 
     /// Load hex preview for binary file.

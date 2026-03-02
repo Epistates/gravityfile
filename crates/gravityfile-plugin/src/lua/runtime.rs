@@ -153,7 +153,7 @@ impl LuaRuntime {
         })?;
 
         // Create the 'fs' namespace (filesystem API)
-        let fs = bindings::create_fs_api(&self.lua)?;
+        let fs = bindings::create_fs_api(&self.lua, None)?;
         globals.set("fs", fs).map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -206,10 +206,8 @@ impl LuaRuntime {
                     Value::Array(arr)
                 } else {
                     let mut obj = std::collections::HashMap::new();
-                    for pair in t.pairs::<String, LuaValue>() {
-                        if let Ok((k, v)) = pair {
-                            obj.insert(k, Self::lua_to_value(v));
-                        }
+                    for (k, v) in t.pairs::<String, LuaValue>().flatten() {
+                        obj.insert(k, Self::lua_to_value(v));
                     }
                     Value::Object(obj)
                 }
@@ -249,9 +247,9 @@ impl LuaRuntime {
         let table = lua.create_table()?;
 
         // Serialize hook to JSON then to Lua table
-        let json = serde_json::to_string(hook).map_err(|e| mlua::Error::external(e))?;
+        let json = serde_json::to_string(hook).map_err(mlua::Error::external)?;
         let json_val: serde_json::Value =
-            serde_json::from_str(&json).map_err(|e| mlua::Error::external(e))?;
+            serde_json::from_str(&json).map_err(mlua::Error::external)?;
 
         fn json_to_lua(lua: &Lua, val: &serde_json::Value) -> mlua::Result<LuaValue> {
             match val {
@@ -453,15 +451,15 @@ impl PluginRuntime for LuaRuntime {
         // Convert result
         let mut hook_result = HookResult::ok();
         if let LuaValue::Table(t) = result {
-            if let Ok(prevent) = t.get::<bool>("prevent_default") {
-                if prevent {
-                    hook_result = hook_result.prevent_default();
-                }
+            if let Ok(prevent) = t.get::<bool>("prevent_default")
+                && prevent
+            {
+                hook_result = hook_result.prevent_default();
             }
-            if let Ok(stop) = t.get::<bool>("stop_propagation") {
-                if stop {
-                    hook_result = hook_result.stop_propagation();
-                }
+            if let Ok(stop) = t.get::<bool>("stop_propagation")
+                && stop
+            {
+                hook_result = hook_result.stop_propagation();
             }
             if let Ok(val) = t.get::<LuaValue>("value") {
                 hook_result.value = Some(Self::lua_to_value(val));

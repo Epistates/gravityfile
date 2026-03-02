@@ -218,7 +218,7 @@ impl PluginManager {
         let mut loaded = vec![];
 
         // Read plugin directories
-        let entries = std::fs::read_dir(&plugin_dir).map_err(|e| PluginError::Io(e))?;
+        let entries = std::fs::read_dir(&plugin_dir).map_err(PluginError::Io)?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -337,10 +337,10 @@ impl PluginManager {
 
     /// Unload a plugin.
     pub fn unload_plugin(&mut self, handle: PluginHandle) -> PluginResult<()> {
-        if let Some(plugin) = self.plugins.remove(&handle) {
-            if let Some(runtime) = self.runtimes.get_mut(&plugin.metadata.runtime) {
-                runtime.unload_plugin(handle)?;
-            }
+        if let Some(plugin) = self.plugins.remove(&handle)
+            && let Some(runtime) = self.runtimes.get_mut(&plugin.metadata.runtime)
+        {
+            runtime.unload_plugin(handle)?;
         }
         Ok(())
     }

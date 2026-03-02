@@ -234,7 +234,7 @@ impl JwalkScanner {
 
                 // Update progress periodically
                 let count = progress_counter.fetch_add(1, Ordering::Relaxed);
-                if count % 1000 == 0 {
+                if count.is_multiple_of(1000) {
                     let _ = self.progress_tx.send(ScanProgress {
                         files_scanned: stats.total_files,
                         dirs_scanned: stats.total_dirs,
@@ -290,9 +290,9 @@ impl JwalkScanner {
         root_path: &Path,
         mut entries_by_parent: HashMap<PathBuf, Vec<EntryInfo>>,
         node_id_counter: &AtomicU64,
-        stats: &mut TreeStats,
+        _stats: &mut TreeStats,
     ) -> FileNode {
-        self.build_node(root_path, &mut entries_by_parent, node_id_counter, stats)
+        self.build_node(root_path, &mut entries_by_parent, node_id_counter)
     }
 
     /// Recursively build a node and its children.
@@ -301,7 +301,6 @@ impl JwalkScanner {
         path: &Path,
         entries_by_parent: &mut HashMap<PathBuf, Vec<EntryInfo>>,
         node_id_counter: &AtomicU64,
-        stats: &mut TreeStats,
     ) -> FileNode {
         let id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
         let name = path
@@ -333,8 +332,7 @@ impl JwalkScanner {
         for entry in children_entries {
             if entry.is_dir {
                 // Recursively build directory
-                let child_node =
-                    self.build_node(&entry.path, entries_by_parent, node_id_counter, stats);
+                let child_node = self.build_node(&entry.path, entries_by_parent, node_id_counter);
                 total_size += child_node.size;
                 file_count += child_node.file_count();
                 dir_count += child_node.dir_count() + 1;

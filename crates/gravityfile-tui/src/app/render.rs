@@ -1,5 +1,7 @@
 //! Application rendering.
 
+use std::path::Path;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -78,7 +80,8 @@ pub struct RenderContext<'a> {
     pub operation_progress: Option<&'a OperationProgress>,
     pub pending_conflict: Option<&'a Conflict>,
     pub clipboard: &'a ClipboardState,
-    pub get_path_size: Box<dyn Fn(&std::path::PathBuf) -> Option<u64> + 'a>,
+    #[allow(clippy::type_complexity)]
+    pub get_path_size: Box<dyn Fn(&Path) -> Option<u64> + 'a>,
     pub get_selected_info: Option<SelectedInfo>,
     pub get_view_root_node: Option<(&'a gravityfile_core::FileNode, std::path::PathBuf)>,
     pub get_parent_node: Option<&'a gravityfile_core::FileNode>,
@@ -266,8 +269,8 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     use ratatui::widgets::Clear;
 
     // Create a centered popup
-    let popup_width = area.width.min(60).max(30);
-    let popup_height = area.height.min(20).max(10);
+    let popup_width = area.width.clamp(30, 60);
+    let popup_height = area.height.clamp(10, 20);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 3; // Slightly above center
 
@@ -554,7 +557,7 @@ fn render_dir_tabs(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
     let max_tab_width = if tabs.is_empty() {
         10
     } else {
-        (area.width as usize / tabs.len()).max(8).min(20)
+        (area.width as usize / tabs.len()).clamp(8, 20)
     };
 
     // Build tab titles with index prefix
@@ -891,7 +894,8 @@ fn render_duplicates(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                     // Build heat bar (8 chars wide)
                     let bar_width = 8;
                     let filled = (heat_ratio * bar_width as f64).round() as usize;
-                    let heat_bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+                    let mut heat_bar = "█".repeat(filled);
+                    heat_bar.push_str(&"░".repeat(bar_width - filled));
                     let heat_color = ctx.theme.size_color(heat_ratio);
 
                     // Render with colored heat bar

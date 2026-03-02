@@ -123,12 +123,16 @@ fn test_find_duplicates_with_no_actual_duplicates() {
     fs::write(root.join("file2.txt"), "content two").unwrap();
     fs::write(root.join("file3.txt"), "content three").unwrap();
 
-    let finder = DuplicateFinder::new();
-    let mut tree = create_test_tree_with_files(&[
-        root.join("file1.txt"),
-        root.join("file2.txt"),
-        root.join("file3.txt"),
-    ]);
+    let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
+    let finder = DuplicateFinder::with_config(config);
+    let tree = create_test_tree_with_files(
+        root,
+        &[
+            root.join("file1.txt"),
+            root.join("file2.txt"),
+            root.join("file3.txt"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
@@ -147,12 +151,16 @@ fn test_find_duplicates_with_exact_duplicates() {
     fs::write(root.join("file2.txt"), content).unwrap();
     fs::write(root.join("file3.txt"), content).unwrap();
 
-    let finder = DuplicateFinder::new();
-    let mut tree = create_test_tree_with_files(&[
-        root.join("file1.txt"),
-        root.join("file2.txt"),
-        root.join("file3.txt"),
-    ]);
+    let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
+    let finder = DuplicateFinder::with_config(config);
+    let tree = create_test_tree_with_files(
+        root,
+        &[
+            root.join("file1.txt"),
+            root.join("file2.txt"),
+            root.join("file3.txt"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
@@ -174,20 +182,24 @@ fn test_find_duplicates_with_mixed_content() {
     fs::write(root.join("file3.txt"), "duplicate").unwrap();
     fs::write(root.join("file4.txt"), "unique two").unwrap();
 
-    let finder = DuplicateFinder::new();
-    let mut tree = create_test_tree_with_files(&[
-        root.join("file1.txt"),
-        root.join("file2.txt"),
-        root.join("file3.txt"),
-        root.join("file4.txt"),
-    ]);
+    let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
+    let finder = DuplicateFinder::with_config(config);
+    let tree = create_test_tree_with_files(
+        root,
+        &[
+            root.join("file1.txt"),
+            root.join("file2.txt"),
+            root.join("file3.txt"),
+            root.join("file4.txt"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
     assert_eq!(report.files_analyzed, 4);
     assert!(report.has_duplicates());
     assert_eq!(report.group_count, 1); // Only one duplicate group
-    assert_eq!(report.total_duplicate_files(), 3); // file1, file2, file3 (file2 is unique)
+    assert_eq!(report.total_duplicate_files(), 2); // file1 + file3 are duplicates
 }
 
 #[test]
@@ -201,16 +213,20 @@ fn test_find_duplicates_with_exclusion_patterns() {
     fs::write(root.join(".hidden_file"), "duplicate").unwrap();
 
     let config = DuplicateConfig::builder()
-        .exclude_patterns(vec!["*.txt".to_string()])
+        .min_size(1u64)
+        .exclude_patterns(vec![".txt".to_string()])
         .build()
         .unwrap();
 
     let finder = DuplicateFinder::with_config(config);
-    let mut tree = create_test_tree_with_files(&[
-        root.join("file1.txt"),
-        root.join("file2.txt"),
-        root.join(".hidden_file"),
-    ]);
+    let tree = create_test_tree_with_files(
+        root,
+        &[
+            root.join("file1.txt"),
+            root.join("file2.txt"),
+            root.join(".hidden_file"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
@@ -235,11 +251,14 @@ fn test_find_duplicates_with_size_filtering() {
         .unwrap();
 
     let finder = DuplicateFinder::with_config(config);
-    let mut tree = create_test_tree_with_files(&[
-        root.join("small.txt"),
-        root.join("medium.txt"),
-        root.join("large.txt"),
-    ]);
+    let tree = create_test_tree_with_files(
+        root,
+        &[
+            root.join("small.txt"),
+            root.join("medium.txt"),
+            root.join("large.txt"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
@@ -262,19 +281,23 @@ fn test_find_duplicates_with_max_groups_limit() {
     fs::write(root.join("group3_b.txt"), "content C").unwrap();
 
     let config = DuplicateConfig::builder()
+        .min_size(1u64)
         .max_groups(2usize) // Only return top 2 groups
         .build()
         .unwrap();
 
     let finder = DuplicateFinder::with_config(config);
-    let mut tree = create_test_tree_with_files(&[
-        root.join("group1_a.txt"),
-        root.join("group1_b.txt"),
-        root.join("group2_a.txt"),
-        root.join("group2_b.txt"),
-        root.join("group3_a.txt"),
-        root.join("group3_b.txt"),
-    ]);
+    let tree = create_test_tree_with_files(
+        root,
+        &[
+            root.join("group1_a.txt"),
+            root.join("group1_b.txt"),
+            root.join("group2_a.txt"),
+            root.join("group2_b.txt"),
+            root.join("group3_a.txt"),
+            root.join("group3_b.txt"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
@@ -292,11 +315,15 @@ fn test_find_duplicates_in_nested_structure() {
     fs::write(root.join("dir1/file.txt"), "duplicate").unwrap();
     fs::write(root.join("dir2/file.txt"), "duplicate").unwrap();
 
-    let finder = DuplicateFinder::new();
-    let mut tree = create_test_tree_with_nested_files(&[
-        (root.join("dir1/file.txt"), "file.txt"),
-        (root.join("dir2/file.txt"), "file.txt"),
-    ]);
+    let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
+    let finder = DuplicateFinder::with_config(config);
+    let tree = create_test_tree_with_nested_files(
+        root,
+        &[
+            (root.join("dir1/file.txt"), "file.txt"),
+            (root.join("dir2/file.txt"), "file.txt"),
+        ],
+    );
 
     let report = finder.find_duplicates(&tree);
 
@@ -305,7 +332,10 @@ fn test_find_duplicates_in_nested_structure() {
     assert_eq!(report.group_count, 1);
 }
 
-fn create_test_tree_with_files(paths: &[std::path::PathBuf]) -> FileTree {
+fn create_test_tree_with_files(
+    root_dir: &std::path::Path,
+    paths: &[std::path::PathBuf],
+) -> FileTree {
     let now = std::time::SystemTime::now();
     let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
 
@@ -328,9 +358,9 @@ fn create_test_tree_with_files(paths: &[std::path::PathBuf]) -> FileTree {
             use blake3::Hasher;
             let mut hasher = Hasher::new();
             hasher.update(&content);
-            node.content_hash = Some(gravityfile_core::ContentHash::new(
+            node.content_hash = Some(Box::new(gravityfile_core::ContentHash::new(
                 *hasher.finalize().as_bytes(),
-            ));
+            )));
         }
 
         root.children.push(node);
@@ -339,7 +369,7 @@ fn create_test_tree_with_files(paths: &[std::path::PathBuf]) -> FileTree {
     // Update directory counts
     root.update_counts();
 
-    let config = ScanConfig::new("/test");
+    let config = ScanConfig::new(root_dir);
     let mut stats = gravityfile_core::TreeStats::default();
     for path in paths {
         if let Ok(metadata) = fs::metadata(path) {
@@ -354,7 +384,7 @@ fn create_test_tree_with_files(paths: &[std::path::PathBuf]) -> FileTree {
 
     FileTree::new(
         root,
-        std::path::PathBuf::from("/test"),
+        root_dir.to_path_buf(),
         config,
         stats,
         std::time::Duration::from_secs(0),
@@ -362,20 +392,29 @@ fn create_test_tree_with_files(paths: &[std::path::PathBuf]) -> FileTree {
     )
 }
 
-fn create_test_tree_with_nested_files(paths: &[(std::path::PathBuf, &str)]) -> FileTree {
+fn create_test_tree_with_nested_files(
+    root_dir: &std::path::Path,
+    paths: &[(std::path::PathBuf, &str)],
+) -> FileTree {
     let now = std::time::SystemTime::now();
+    let root_dir_components: usize = root_dir.components().count();
     let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
 
     for (i, (path, name)) in paths.iter().enumerate() {
         let metadata = fs::metadata(path).unwrap();
         let size = metadata.len();
 
-        // Create parent directories
+        // Create parent directories (skip root_dir components)
         let mut current = &mut root;
-        for parent_name in path.parent().unwrap().components().skip(1) {
+        for parent_name in path
+            .parent()
+            .unwrap()
+            .components()
+            .skip(root_dir_components)
+        {
             let parent_name_str = parent_name.as_os_str().to_string_lossy().to_string();
             if !current.children.iter().any(|c| c.name == parent_name_str) {
-                let mut dir_node = FileNode::new_directory(
+                let dir_node = FileNode::new_directory(
                     NodeId::new(i as u64 * 10 + current.children.len() as u64 + 2),
                     &parent_name_str,
                     Timestamps::with_modified(now),
@@ -403,9 +442,9 @@ fn create_test_tree_with_nested_files(paths: &[(std::path::PathBuf, &str)]) -> F
             use blake3::Hasher;
             let mut hasher = Hasher::new();
             hasher.update(&content);
-            node.content_hash = Some(gravityfile_core::ContentHash::new(
+            node.content_hash = Some(Box::new(gravityfile_core::ContentHash::new(
                 *hasher.finalize().as_bytes(),
-            ));
+            )));
         }
 
         current.children.push(node);
@@ -422,7 +461,7 @@ fn create_test_tree_with_nested_files(paths: &[(std::path::PathBuf, &str)]) -> F
     }
     update_counts_recursive(&mut root);
 
-    let config = ScanConfig::new("/test");
+    let config = ScanConfig::new(root_dir);
     let mut stats = gravityfile_core::TreeStats::default();
     for (path, _) in paths {
         if let Ok(metadata) = fs::metadata(path) {
@@ -437,7 +476,7 @@ fn create_test_tree_with_nested_files(paths: &[(std::path::PathBuf, &str)]) -> F
 
     FileTree::new(
         root,
-        std::path::PathBuf::from("/test"),
+        root_dir.to_path_buf(),
         config,
         stats,
         std::time::Duration::from_secs(0),

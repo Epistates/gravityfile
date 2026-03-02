@@ -1,7 +1,7 @@
 //! Directory tree widget.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -44,21 +44,21 @@ impl TreeState {
     }
 
     /// Toggle expansion of a path.
-    pub fn toggle_expand(&mut self, path: &PathBuf) {
+    pub fn toggle_expand(&mut self, path: &Path) {
         if self.expanded.contains(path) {
             self.expanded.remove(path);
         } else {
-            self.expanded.insert(path.clone());
+            self.expanded.insert(path.to_path_buf());
         }
     }
 
     /// Expand a path.
-    pub fn expand(&mut self, path: &PathBuf) {
-        self.expanded.insert(path.clone());
+    pub fn expand(&mut self, path: &Path) {
+        self.expanded.insert(path.to_path_buf());
     }
 
     /// Collapse a path.
-    pub fn collapse(&mut self, path: &PathBuf) {
+    pub fn collapse(&mut self, path: &Path) {
         self.expanded.remove(path);
     }
 
@@ -176,6 +176,7 @@ impl<'a> TreeView<'a> {
         items
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flatten_node(
         &self,
         node: &FileNode,

@@ -321,7 +321,7 @@ impl HookContext {
 }
 
 /// Result returned by a plugin hook handler.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HookResult {
     /// Whether the hook was handled.
     pub handled: bool,

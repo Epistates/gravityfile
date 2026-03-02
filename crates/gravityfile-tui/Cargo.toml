@@ -16,6 +16,7 @@ gravityfile-core.workspace = true
 gravityfile-scan.workspace = true
 gravityfile-analyze.workspace = true
 gravityfile-ops.workspace = true
+gravityfile-plugin.workspace = true
 ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 color-eyre.workspace = true
@@ -57,6 +58,7 @@ tar.workspace = true
 flate2.workspace = true
 xz2.workspace = true
 bzip2.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

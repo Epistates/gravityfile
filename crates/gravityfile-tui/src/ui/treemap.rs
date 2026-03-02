@@ -382,11 +382,11 @@ impl Widget for TreemapView<'_> {
                 if let Some(cell) = buf.cell_mut((rect.x, rect.y)) {
                     cell.set_char('┌');
                 }
-                if rect.width > 1 {
-                    if let Some(cell) = buf.cell_mut((rect.x + rect.width - 1, rect.y)) {
-                        cell.set_char('┐');
-                        cell.set_style(style);
-                    }
+                if rect.width > 1
+                    && let Some(cell) = buf.cell_mut((rect.x + rect.width - 1, rect.y))
+                {
+                    cell.set_char('┐');
+                    cell.set_style(style);
                 }
             }
 
@@ -407,11 +407,11 @@ impl Widget for TreemapView<'_> {
 
                 for (i, ch) in label.chars().enumerate() {
                     let x = label_x + i as u16;
-                    if x < rect.x + rect.width - 1 {
-                        if let Some(cell) = buf.cell_mut((x, label_y)) {
-                            cell.set_char(ch);
-                            cell.set_style(style.add_modifier(Modifier::BOLD));
-                        }
+                    if x < rect.x + rect.width - 1
+                        && let Some(cell) = buf.cell_mut((x, label_y))
+                    {
+                        cell.set_char(ch);
+                        cell.set_style(style.add_modifier(Modifier::BOLD));
                     }
                 }
             }
@@ -424,11 +424,11 @@ impl Widget for TreemapView<'_> {
 
                 for (i, ch) in size_str.chars().enumerate() {
                     let x = size_x + i as u16;
-                    if x < rect.x + rect.width - 1 {
-                        if let Some(cell) = buf.cell_mut((x, size_y)) {
-                            cell.set_char(ch);
-                            cell.set_style(Style::default().fg(self.theme.muted));
-                        }
+                    if x < rect.x + rect.width - 1
+                        && let Some(cell) = buf.cell_mut((x, size_y))
+                    {
+                        cell.set_char(ch);
+                        cell.set_style(Style::default().fg(self.theme.muted));
                     }
                 }
             }

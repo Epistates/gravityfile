@@ -2,26 +2,34 @@
 
 use mlua::{Lua, Table, Value as LuaValue};
 
+use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginResult};
 
 /// Create the 'fs' (filesystem) namespace.
-pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
+pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<Table> {
     let fs = lua.create_table().map_err(|e| PluginError::LoadError {
         name: "lua".into(),
         message: format!("Failed to create fs table: {}", e),
     })?;
 
     // fs.read(path, limit?) - Read file contents
+    let sb_clone1 = sandbox.clone();
     let read = lua
-        .create_function(|lua, (path, limit): (String, Option<usize>)| {
+        .create_function(move |lua, (path, limit): (String, Option<usize>)| {
             let limit = limit.unwrap_or(1024 * 1024); // 1MB default
             let path = std::path::Path::new(&path);
+
+            if let Some(sb) = &sb_clone1
+                && !sb.can_read(path)
+            {
+                return Err(mlua::Error::external("Read denied by sandbox policy"));
+            }
 
             if !path.exists() {
                 return Ok(LuaValue::Nil);
             }
 
-            let content = std::fs::read_to_string(path).map_err(|e| mlua::Error::external(e))?;
+            let content = std::fs::read_to_string(path).map_err(mlua::Error::external)?;
 
             let truncated = if content.len() > limit {
                 &content[..limit]
@@ -38,16 +46,23 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
     fs.set("read", read).ok();
 
     // fs.read_bytes(path, limit?) - Read file as bytes
+    let sb_clone2 = sandbox.clone();
     let read_bytes = lua
-        .create_function(|lua, (path, limit): (String, Option<usize>)| {
+        .create_function(move |lua, (path, limit): (String, Option<usize>)| {
             let limit = limit.unwrap_or(1024 * 1024);
             let path = std::path::Path::new(&path);
+
+            if let Some(sb) = &sb_clone2
+                && !sb.can_read(path)
+            {
+                return Err(mlua::Error::external("Read denied by sandbox policy"));
+            }
 
             if !path.exists() {
                 return Ok(LuaValue::Nil);
             }
 
-            let content = std::fs::read(path).map_err(|e| mlua::Error::external(e))?;
+            let content = std::fs::read(path).map_err(mlua::Error::external)?;
 
             let truncated = if content.len() > limit {
                 &content[..limit]
@@ -64,8 +79,17 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
     fs.set("read_bytes", read_bytes).ok();
 
     // fs.exists(path) - Check if path exists
+    let sb_clone3 = sandbox.clone();
     let exists = lua
-        .create_function(|_, path: String| Ok(std::path::Path::new(&path).exists()))
+        .create_function(move |_, path: String| {
+            let path = std::path::Path::new(&path);
+            if let Some(sb) = &sb_clone3
+                && !sb.can_read(path)
+            {
+                return Ok(false); // Hide existence if not allowed to read
+            }
+            Ok(path.exists())
+        })
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -73,8 +97,17 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
     fs.set("exists", exists).ok();
 
     // fs.is_dir(path) - Check if path is a directory
+    let sb_clone4 = sandbox.clone();
     let is_dir = lua
-        .create_function(|_, path: String| Ok(std::path::Path::new(&path).is_dir()))
+        .create_function(move |_, path: String| {
+            let path = std::path::Path::new(&path);
+            if let Some(sb) = &sb_clone4
+                && !sb.can_read(path)
+            {
+                return Ok(false);
+            }
+            Ok(path.is_dir())
+        })
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -82,8 +115,17 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
     fs.set("is_dir", is_dir).ok();
 
     // fs.is_file(path) - Check if path is a file
+    let sb_clone5 = sandbox.clone();
     let is_file = lua
-        .create_function(|_, path: String| Ok(std::path::Path::new(&path).is_file()))
+        .create_function(move |_, path: String| {
+            let path = std::path::Path::new(&path);
+            if let Some(sb) = &sb_clone5
+                && !sb.can_read(path)
+            {
+                return Ok(false);
+            }
+            Ok(path.is_file())
+        })
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -91,15 +133,22 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
     fs.set("is_file", is_file).ok();
 
     // fs.metadata(path) - Get file metadata
+    let sb_clone6 = sandbox.clone();
     let metadata = lua
-        .create_function(|lua, path: String| {
+        .create_function(move |lua, path: String| {
             let path = std::path::Path::new(&path);
+
+            if let Some(sb) = &sb_clone6
+                && !sb.can_read(path)
+            {
+                return Err(mlua::Error::external("Read denied by sandbox policy"));
+            }
 
             if !path.exists() {
                 return Ok(LuaValue::Nil);
             }
 
-            let meta = std::fs::metadata(path).map_err(|e| mlua::Error::external(e))?;
+            let meta = std::fs::metadata(path).map_err(mlua::Error::external)?;
 
             let table = lua.create_table()?;
             table.set("size", meta.len())?;
@@ -108,16 +157,16 @@ pub fn create_fs_api(lua: &Lua) -> PluginResult<Table> {
             table.set("is_symlink", meta.is_symlink())?;
             table.set("readonly", meta.permissions().readonly())?;
 
-            if let Ok(modified) = meta.modified() {
-                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    table.set("modified", duration.as_secs())?;
-                }
+            if let Ok(modified) = meta.modified()
+                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                table.set("modified", duration.as_secs())?;
             }
 
-            if let Ok(created) = meta.created() {
-                if let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH) {
-                    table.set("created", duration.as_secs())?;
-                }
+            if let Ok(created) = meta.created()
+                && let Ok(duration) = created.duration_since(std::time::UNIX_EPOCH)
+            {
+                table.set("created", duration.as_secs())?;
             }
 
             Ok(LuaValue::Table(table))
@@ -255,10 +304,10 @@ pub fn create_ui_api(lua: &Lua) -> PluginResult<Table> {
 
             // Copy style options
             for key in ["fg", "bg", "bold", "italic", "underline", "dim"] {
-                if let Ok(val) = opts.get::<LuaValue>(key) {
-                    if val != LuaValue::Nil {
-                        table.set(key, val)?;
-                    }
+                if let Ok(val) = opts.get::<LuaValue>(key)
+                    && val != LuaValue::Nil
+                {
+                    table.set(key, val)?;
                 }
             }
 

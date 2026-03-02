@@ -10,7 +10,7 @@ use crate::error::ScanWarning;
 use crate::node::FileNode;
 
 /// Summary statistics for a scanned tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TreeStats {
     /// Total size in bytes.
     pub total_size: u64,
@@ -28,21 +28,6 @@ pub struct TreeStats {
     pub oldest_file: Option<(PathBuf, SystemTime)>,
     /// Newest file (path, time).
     pub newest_file: Option<(PathBuf, SystemTime)>,
-}
-
-impl Default for TreeStats {
-    fn default() -> Self {
-        Self {
-            total_size: 0,
-            total_files: 0,
-            total_dirs: 0,
-            total_symlinks: 0,
-            max_depth: 0,
-            largest_file: None,
-            oldest_file: None,
-            newest_file: None,
-        }
-    }
 }
 
 impl TreeStats {

@@ -179,7 +179,7 @@ impl SandboxConfig {
     }
 
     /// Check if reading a path is allowed.
-    pub fn can_read(&self, path: &PathBuf) -> bool {
+    pub fn can_read(&self, path: &std::path::Path) -> bool {
         if !self.has_permission(Permission::Read) {
             return false;
         }
@@ -192,7 +192,7 @@ impl SandboxConfig {
     }
 
     /// Check if writing to a path is allowed.
-    pub fn can_write(&self, path: &PathBuf) -> bool {
+    pub fn can_write(&self, path: &std::path::Path) -> bool {
         if !self.has_permission(Permission::Write) {
             return false;
         }

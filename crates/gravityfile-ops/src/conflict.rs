@@ -1,6 +1,6 @@
 //! Conflict detection and resolution for file operations.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -110,7 +110,7 @@ impl ConflictResolution {
 /// Generate an auto-renamed path to avoid conflicts.
 ///
 /// For "file.txt", tries "file (1).txt", "file (2).txt", etc.
-pub fn auto_rename_path(path: &PathBuf) -> PathBuf {
+pub fn auto_rename_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or(std::path::Path::new(""));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let extension = path.extension().and_then(|e| e.to_str());

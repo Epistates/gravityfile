@@ -1,7 +1,7 @@
 //! Language-agnostic plugin system for gravityfile.
 //!
 //! This crate provides a trait-based plugin architecture that supports multiple
-//! scripting language runtimes (Lua, Rhai, and potentially WASM in the future).
+//! scripting language runtimes (Lua, Rhai, and WASM).
 //!
 //! # Architecture
 //!
@@ -40,6 +40,7 @@ pub mod rhai;
 mod runtime;
 mod sandbox;
 mod types;
+pub mod wasm;
 
 pub use config::{PluginConfig, PluginMetadata};
 pub use hooks::{Hook, HookContext, HookResult};

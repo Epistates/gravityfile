@@ -1,7 +1,7 @@
 //! Async copy operation with progress reporting.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 
@@ -77,23 +77,23 @@ async fn copy_impl(
     let mut failed = 0;
 
     // Ensure destination exists and is a directory
-    if !destination.exists() {
-        if let Err(e) = fs::create_dir_all(&destination) {
-            progress.add_error(OperationError::new(
-                destination.clone(),
-                format!("Failed to create destination: {}", e),
-            ));
-            let _ = tx
-                .send(CopyResult::Complete(OperationComplete {
-                    operation_type: OperationType::Copy,
-                    succeeded: 0,
-                    failed: sources.len(),
-                    bytes_processed: 0,
-                    errors: progress.errors.clone(),
-                }))
-                .await;
-            return;
-        }
+    if !destination.exists()
+        && let Err(e) = fs::create_dir_all(&destination)
+    {
+        progress.add_error(OperationError::new(
+            destination.clone(),
+            format!("Failed to create destination: {}", e),
+        ));
+        let _ = tx
+            .send(CopyResult::Complete(OperationComplete {
+                operation_type: OperationType::Copy,
+                succeeded: 0,
+                failed: sources.len(),
+                bytes_processed: 0,
+                errors: progress.errors.clone(),
+            }))
+            .await;
+        return;
     }
 
     for source in sources {
@@ -192,13 +192,13 @@ async fn copy_impl(
 
 /// Copy a single item (file, directory, or symlink).
 async fn copy_item(
-    source: &PathBuf,
-    dest: &PathBuf,
+    source: &Path,
+    dest: &Path,
     progress: &mut OperationProgress,
     tx: &mpsc::Sender<CopyResult>,
 ) -> Result<(), String> {
-    let source = source.clone();
-    let dest = dest.clone();
+    let source = source.to_path_buf();
+    let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {
         // Use symlink_metadata to avoid following symlinks

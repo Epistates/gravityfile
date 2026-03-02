@@ -63,7 +63,7 @@ impl LuaIsolatedContext {
 
         // Add 'fs' if read permission is granted
         if sandbox.has_permission(crate::sandbox::Permission::Read) {
-            let fs = bindings::create_fs_api(&lua)?;
+            let fs = bindings::create_fs_api(&lua, Some(sandbox.clone()))?;
             globals.set("fs", fs).ok();
         }
 
@@ -84,10 +84,8 @@ impl LuaIsolatedContext {
             LuaValue::String(s) => Value::String(s.to_string_lossy()),
             LuaValue::Table(t) => {
                 let mut obj = std::collections::HashMap::new();
-                for pair in t.pairs::<String, LuaValue>() {
-                    if let Ok((k, v)) = pair {
-                        obj.insert(k, Self::lua_to_value(v));
-                    }
+                for (k, v) in t.pairs::<String, LuaValue>().flatten() {
+                    obj.insert(k, Self::lua_to_value(v));
                 }
                 Value::Object(obj)
             }

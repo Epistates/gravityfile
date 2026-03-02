@@ -271,58 +271,19 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     }))
                     .await;
             }
-            UndoableOperation::FilesDeleted { trash_entries } => {
-                // Restore from trash (if possible)
+            UndoableOperation::FilesDeleted { paths: _ } => {
                 use crate::progress::OperationType;
-
-                if trash_entries.is_empty() {
-                    let _ = tx
-                        .send(OperationResult::Complete(OperationComplete {
-                            operation_type: OperationType::Move,
-                            succeeded: 0,
-                            failed: 0,
-                            bytes_processed: 0,
-                            errors: vec![crate::OperationError::new(
-                                PathBuf::new(),
-                                "Cannot undo permanent deletion".to_string(),
-                            )],
-                        }))
-                        .await;
-                    return;
-                }
-
-                // Move files back from trash
-                let mut progress =
-                    OperationProgress::new(OperationType::Move, trash_entries.len(), 0);
-                let mut succeeded = 0;
-                let mut failed = 0;
-
-                for (original, trash) in trash_entries {
-                    progress.set_current_file(Some(trash.clone()));
-                    let _ = tx.send(OperationResult::Progress(progress.clone())).await;
-
-                    let result =
-                        tokio::task::spawn_blocking(move || std::fs::rename(&trash, &original))
-                            .await;
-
-                    match result {
-                        Ok(Ok(())) => {
-                            succeeded += 1;
-                            progress.complete_file(0);
-                        }
-                        _ => {
-                            failed += 1;
-                        }
-                    }
-                }
 
                 let _ = tx
                     .send(OperationResult::Complete(OperationComplete {
-                        operation_type: OperationType::Move,
-                        succeeded,
-                        failed,
+                        operation_type: OperationType::Delete,
+                        succeeded: 0,
+                        failed: 0,
                         bytes_processed: 0,
-                        errors: progress.errors,
+                        errors: vec![crate::OperationError::new(
+                            PathBuf::new(),
+                            "Cannot undo trash operations from within the application".to_string(),
+                        )],
                     }))
                     .await;
             }

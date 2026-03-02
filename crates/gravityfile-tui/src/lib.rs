@@ -115,10 +115,7 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
 
     let app = App::with_config(path, config);
-    let result = rt.block_on(async {
-        let exit_data = app.run_and_return_exit_data(terminal).await;
-        exit_data
-    });
+    let result = rt.block_on(async { app.run_and_return_exit_data(terminal).await });
 
     // Disable mouse capture before restoring terminal
     let _ = execute!(std::io::stdout(), DisableMouseCapture);

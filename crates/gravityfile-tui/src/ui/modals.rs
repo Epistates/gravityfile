@@ -1,7 +1,7 @@
 //! Modal dialog widgets.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -20,14 +20,15 @@ use crate::ui::format_size;
 pub struct DeleteConfirmModal<'a> {
     theme: &'a Theme,
     marked_paths: &'a HashSet<PathBuf>,
-    get_size: Box<dyn Fn(&PathBuf) -> Option<u64> + 'a>,
+    #[allow(clippy::type_complexity)]
+    get_size: Box<dyn Fn(&Path) -> Option<u64> + 'a>,
 }
 
 impl<'a> DeleteConfirmModal<'a> {
     /// Create a new delete confirmation modal.
     pub fn new<F>(theme: &'a Theme, marked_paths: &'a HashSet<PathBuf>, get_size: F) -> Self
     where
-        F: Fn(&PathBuf) -> Option<u64> + 'a,
+        F: Fn(&Path) -> Option<u64> + 'a,
     {
         Self {
             theme,
@@ -852,13 +853,10 @@ impl Widget for SettingsModal<'_> {
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        let mut lines = vec![];
-
-        // Section header
-        lines.push(Line::styled(
+        let mut lines = vec![Line::styled(
             " Startup",
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        ));
+        )];
         lines.push(Line::raw(""));
 
         // Scan on startup

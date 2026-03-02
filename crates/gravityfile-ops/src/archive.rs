@@ -232,13 +232,13 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
         let outpath = destination.join(&entry_path);
 
         // Security: Double-check that resolved path stays within destination
-        if let Some(canonical_out) = outpath.parent().and_then(|p| p.canonicalize().ok()) {
-            if !canonical_out.starts_with(&canonical_dest) {
-                return Err(ArchiveError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Path escapes destination: {}", entry_path.display()),
-                )));
-            }
+        if let Some(canonical_out) = outpath.parent().and_then(|p| p.canonicalize().ok())
+            && !canonical_out.starts_with(&canonical_dest)
+        {
+            return Err(ArchiveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Path escapes destination: {}", entry_path.display()),
+            )));
         }
 
         if entry.is_dir() {
@@ -301,10 +301,10 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
             }
 
             // Create parent directories if needed
-            if let Some(parent) = outpath.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = outpath.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent)?;
             }
 
             // Create the symlink
@@ -326,10 +326,10 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
         } else {
             // Regular file
             // Create parent directories if needed
-            if let Some(parent) = outpath.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = outpath.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent)?;
             }
 
             let mut outfile = File::create(&outpath)?;
@@ -428,68 +428,68 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
 
         // Security: Double-check that resolved path stays within destination
         // (handles symlink attacks where intermediate directories are symlinks)
-        if let Some(canonical_out) = outpath.parent().and_then(|p| p.canonicalize().ok()) {
-            if !canonical_out.starts_with(&canonical_dest) {
-                return Err(ArchiveError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Path escapes destination: {}", entry_path.display()),
-                )));
-            }
+        if let Some(canonical_out) = outpath.parent().and_then(|p| p.canonicalize().ok())
+            && !canonical_out.starts_with(&canonical_dest)
+        {
+            return Err(ArchiveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Path escapes destination: {}", entry_path.display()),
+            )));
         }
 
         // Security: Validate symlink targets
         let entry_type = entry.header().entry_type();
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
-            if let Ok(Some(link_target)) = entry.link_name() {
-                // Reject absolute symlink targets
-                if link_target.is_absolute() {
+        if (entry_type.is_symlink() || entry_type.is_hard_link())
+            && let Ok(Some(link_target)) = entry.link_name()
+        {
+            // Reject absolute symlink targets
+            if link_target.is_absolute() {
+                return Err(ArchiveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Symlink with absolute target rejected: {} -> {}",
+                        entry_path.display(),
+                        link_target.display()
+                    ),
+                )));
+            }
+
+            // Reject symlink targets with parent directory traversal
+            if link_target
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                // Calculate where the symlink would resolve to
+                let symlink_parent = outpath.parent().unwrap_or(destination);
+                let resolved = symlink_parent.join(&link_target);
+
+                // Check if resolved path escapes destination
+                // We need to normalize the path without following symlinks
+                let mut normalized = PathBuf::new();
+                for component in resolved.components() {
+                    match component {
+                        std::path::Component::ParentDir => {
+                            normalized.pop();
+                        }
+                        std::path::Component::Normal(c) => {
+                            normalized.push(c);
+                        }
+                        std::path::Component::RootDir => {
+                            normalized.push("/");
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !normalized.starts_with(&canonical_dest) {
                     return Err(ArchiveError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "Symlink with absolute target rejected: {} -> {}",
+                            "Symlink escapes destination: {} -> {}",
                             entry_path.display(),
                             link_target.display()
                         ),
                     )));
-                }
-
-                // Reject symlink targets with parent directory traversal
-                if link_target
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    // Calculate where the symlink would resolve to
-                    let symlink_parent = outpath.parent().unwrap_or(destination);
-                    let resolved = symlink_parent.join(&link_target);
-
-                    // Check if resolved path escapes destination
-                    // We need to normalize the path without following symlinks
-                    let mut normalized = PathBuf::new();
-                    for component in resolved.components() {
-                        match component {
-                            std::path::Component::ParentDir => {
-                                normalized.pop();
-                            }
-                            std::path::Component::Normal(c) => {
-                                normalized.push(c);
-                            }
-                            std::path::Component::RootDir => {
-                                normalized.push("/");
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if !normalized.starts_with(&canonical_dest) {
-                        return Err(ArchiveError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "Symlink escapes destination: {} -> {}",
-                                entry_path.display(),
-                                link_target.display()
-                            ),
-                        )));
-                    }
                 }
             }
         }
@@ -626,7 +626,7 @@ fn add_path_to_zip_with_visited<W: Write + std::io::Seek>(
         {
             // Unix symlink mode: S_IFLNK (0o120000) | 0o777
             let symlink_mode = 0o120777;
-            let unix_options = options.clone().unix_permissions(symlink_mode);
+            let unix_options = options.unix_permissions(symlink_mode);
 
             archive.start_file(name, unix_options)?;
             // Write the target path as the file content

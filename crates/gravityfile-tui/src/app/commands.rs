@@ -214,7 +214,7 @@ pub enum SortCommand {
 
 /// Parse and execute a command string.
 pub fn parse_command(cmd: &str) -> CommandAction {
-    let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() {
         return CommandAction::None;
     }

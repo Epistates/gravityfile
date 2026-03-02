@@ -73,23 +73,23 @@ async fn move_impl(
     let mut moved_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     // Ensure destination exists and is a directory
-    if !destination.exists() {
-        if let Err(e) = fs::create_dir_all(&destination) {
-            progress.add_error(OperationError::new(
-                destination.clone(),
-                format!("Failed to create destination: {}", e),
-            ));
-            let _ = tx
-                .send(MoveResult::Complete(OperationComplete {
-                    operation_type: OperationType::Move,
-                    succeeded: 0,
-                    failed: sources.len(),
-                    bytes_processed: 0,
-                    errors: progress.errors.clone(),
-                }))
-                .await;
-            return;
-        }
+    if !destination.exists()
+        && let Err(e) = fs::create_dir_all(&destination)
+    {
+        progress.add_error(OperationError::new(
+            destination.clone(),
+            format!("Failed to create destination: {}", e),
+        ));
+        let _ = tx
+            .send(MoveResult::Complete(OperationComplete {
+                operation_type: OperationType::Move,
+                succeeded: 0,
+                failed: sources.len(),
+                bytes_processed: 0,
+                errors: progress.errors.clone(),
+            }))
+            .await;
+        return;
     }
 
     for source in sources {

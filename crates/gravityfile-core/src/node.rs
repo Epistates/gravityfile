@@ -188,7 +188,7 @@ pub struct FileNode {
     pub inode: Option<InodeInfo>,
 
     /// Content hash (computed on demand).
-    pub content_hash: Option<ContentHash>,
+    pub content_hash: Option<Box<ContentHash>>,
 
     /// Git status for this file/directory.
     #[serde(default)]

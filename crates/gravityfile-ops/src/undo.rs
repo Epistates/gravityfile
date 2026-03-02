@@ -44,11 +44,10 @@ pub enum UndoableOperation {
         /// List of created files/directories.
         created: Vec<PathBuf>,
     },
-    /// Files were moved to trash.
+    /// Files were moved to trash or permanently deleted.
     FilesDeleted {
-        /// List of (original_path, trash_path) pairs.
-        /// Only populated if trash was used.
-        trash_entries: Vec<(PathBuf, PathBuf)>,
+        /// List of paths that were deleted.
+        paths: Vec<PathBuf>,
     },
     /// A file or directory was renamed.
     FileRenamed {
@@ -81,12 +80,8 @@ impl UndoableOperation {
             Self::FilesCopied { created } => {
                 format!("Delete {} copied items", created.len())
             }
-            Self::FilesDeleted { trash_entries } => {
-                if trash_entries.is_empty() {
-                    "Cannot undo permanent deletion".to_string()
-                } else {
-                    format!("Restore {} items from trash", trash_entries.len())
-                }
+            Self::FilesDeleted { paths } => {
+                format!("Deleted {} items (recover via OS trash)", paths.len())
             }
             Self::FileRenamed { old_name, .. } => {
                 format!("Rename back to '{}'", old_name)
@@ -98,10 +93,7 @@ impl UndoableOperation {
 
     /// Check if this operation can be undone.
     pub fn can_undo(&self) -> bool {
-        match self {
-            Self::FilesDeleted { trash_entries } => !trash_entries.is_empty(),
-            _ => true,
-        }
+        !matches!(self, Self::FilesDeleted { .. })
     }
 }
 
@@ -166,14 +158,12 @@ impl UndoLog {
     }
 
     /// Record a delete operation.
-    pub fn record_delete(&mut self, trash_entries: Vec<(PathBuf, PathBuf)>) -> u64 {
-        let count = trash_entries.len();
-        let desc = if trash_entries.is_empty() {
-            format!("Permanently deleted {} items", count)
-        } else {
-            format!("Moved {} items to trash", count)
-        };
-        self.record(UndoableOperation::FilesDeleted { trash_entries }, desc)
+    pub fn record_delete(&mut self, paths: Vec<PathBuf>) -> u64 {
+        let count = paths.len();
+        self.record(
+            UndoableOperation::FilesDeleted { paths },
+            format!("Deleted {} items", count),
+        )
     }
 
     /// Record a rename operation.

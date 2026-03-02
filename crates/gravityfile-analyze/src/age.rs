@@ -413,12 +413,12 @@ impl BucketCollector {
         if self.largest_files.len() < self.max_files {
             self.largest_files.push((path, size, modified));
             self.largest_files.sort_by(|a, b| b.1.cmp(&a.1));
-        } else if let Some(smallest) = self.largest_files.last() {
-            if size > smallest.1 {
-                self.largest_files.pop();
-                self.largest_files.push((path, size, modified));
-                self.largest_files.sort_by(|a, b| b.1.cmp(&a.1));
-            }
+        } else if let Some(smallest) = self.largest_files.last()
+            && size > smallest.1
+        {
+            self.largest_files.pop();
+            self.largest_files.push((path, size, modified));
+            self.largest_files.sort_by(|a, b| b.1.cmp(&a.1));
         }
     }
 }

@@ -10,7 +10,8 @@ mod scanning;
 pub mod state;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
@@ -19,7 +20,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use ratatui::{DefaultTerminal, Frame};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::{FileNode, FileTree};
@@ -173,6 +174,8 @@ pub struct App {
     cached_treemap_len: usize,
     /// Visual selection mode state.
     visual_state: Option<state::VisualState>,
+    /// Plugin manager.
+    plugin_manager: Arc<RwLock<gravityfile_plugin::PluginManager>>,
 }
 
 impl App {
@@ -199,6 +202,20 @@ impl App {
         } else {
             user_settings.scan_on_startup
         };
+
+        // Initialize plugin manager and register runtimes
+        let mut pm_inner = gravityfile_plugin::PluginManager::default();
+        if let Ok(rt) = gravityfile_plugin::lua::LuaRuntime::new() {
+            let _ = pm_inner.register_runtime(Box::new(rt));
+        }
+        if let Ok(rt) = gravityfile_plugin::rhai::RhaiRuntime::new() {
+            let _ = pm_inner.register_runtime(Box::new(rt));
+        }
+        if let Ok(rt) = gravityfile_plugin::wasm::WasmRuntime::new() {
+            let _ = pm_inner.register_runtime(Box::new(rt));
+        }
+
+        let plugin_manager = Arc::new(RwLock::new(pm_inner));
 
         let mut app = Self {
             path: path.clone(),
@@ -253,6 +270,7 @@ impl App {
             treemap_state: crate::ui::TreemapState::new(),
             cached_treemap_len: 0,
             visual_state: None,
+            plugin_manager,
         };
 
         // Update cached lengths for immediate navigation
@@ -265,8 +283,64 @@ impl App {
         app
     }
 
+    /// Initialize plugin runtimes and discover plugins.
+    async fn init_plugins(&self) {
+        let mut pm = self.plugin_manager.write().await;
+        if let Err(e) = pm.init_runtimes() {
+            eprintln!("Plugin runtime init error: {}", e);
+        }
+        if let Err(e) = pm.discover_plugins().await {
+            eprintln!("Plugin discovery error: {}", e);
+        }
+    }
+
+    /// Dispatch a plugin hook.
+    async fn dispatch_hook(&self, hook: gravityfile_plugin::Hook) {
+        let theme_name = match self.theme.variant {
+            crate::theme::ThemeVariant::Dark => "dark",
+            crate::theme::ThemeVariant::Light => "light",
+        };
+
+        let mut ctx = gravityfile_plugin::HookContext::new()
+            .with_cwd(self.path.clone())
+            .with_view_root(self.view_root.clone())
+            .with_theme(theme_name);
+
+        if let Some(node) = self.get_current_node()
+            && let Ok(json_val) = serde_json::to_value(node)
+            && let Ok(plugin_val) = serde_json::from_value::<gravityfile_plugin::Value>(json_val)
+        {
+            ctx.set("selected_node", plugin_val);
+        }
+
+        let pm = self.plugin_manager.read().await;
+        let _ = pm.dispatch_hook(&hook, &ctx).await;
+    }
+
+    /// Get the currently selected node in the current view.
+    fn get_current_node(&self) -> Option<&gravityfile_core::FileNode> {
+        let tree = self.tree.as_ref()?;
+        let path = self.get_selected_path()?;
+        Self::find_node_at_path(&tree.root, &path, &tree.root_path)
+    }
+
+    /// Check for navigation and dispatch hook if needed.
+    async fn check_navigation(&self, old_root: &std::path::Path) {
+        if old_root != self.view_root {
+            self.dispatch_hook(gravityfile_plugin::Hook::OnNavigate {
+                from: old_root.to_path_buf(),
+                to: self.view_root.clone(),
+            })
+            .await;
+        }
+    }
+
     /// Run the application with async event loop.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> AppResult<()> {
+        self.init_plugins().await;
+        self.dispatch_hook(gravityfile_plugin::Hook::OnStartup)
+            .await;
+
         // Start scan if configured to do so
         if self.scan_on_startup {
             self.start_scan();
@@ -282,6 +356,8 @@ impl App {
                 terminal.draw(|frame| self.render(frame))?;
                 self.needs_redraw = false;
             }
+
+            let old_view_root = self.view_root.clone();
 
             tokio::select! {
                 biased;
@@ -372,6 +448,8 @@ impl App {
                 }
             }
 
+            self.check_navigation(&old_view_root).await;
+
             // Handle pending suspend command (opening files in external apps)
             if let Some(mut cmd) = self.pending_suspend_command.take() {
                 // Check if this is a bulk rename operation
@@ -394,6 +472,9 @@ impl App {
                 self.needs_redraw = true;
             }
         }
+
+        self.dispatch_hook(gravityfile_plugin::Hook::OnShutdown)
+            .await;
 
         Ok(())
     }
@@ -403,6 +484,10 @@ impl App {
         mut self,
         mut terminal: DefaultTerminal,
     ) -> AppResult<crate::ExitData> {
+        self.init_plugins().await;
+        self.dispatch_hook(gravityfile_plugin::Hook::OnStartup)
+            .await;
+
         // Start scan if configured to do so
         if self.scan_on_startup {
             self.start_scan();
@@ -418,6 +503,8 @@ impl App {
                 terminal.draw(|frame| self.render(frame))?;
                 self.needs_redraw = false;
             }
+
+            let old_view_root = self.view_root.clone();
 
             tokio::select! {
                 biased;
@@ -508,6 +595,8 @@ impl App {
                 }
             }
 
+            self.check_navigation(&old_view_root).await;
+
             // Handle pending suspend command (opening files in external apps)
             if let Some(mut cmd) = self.pending_suspend_command.take() {
                 // Check if this is a bulk rename operation
@@ -530,6 +619,9 @@ impl App {
                 self.needs_redraw = true;
             }
         }
+
+        self.dispatch_hook(gravityfile_plugin::Hook::OnShutdown)
+            .await;
 
         Ok(crate::ExitData {
             last_cwd: self.view_root,
@@ -633,7 +725,28 @@ impl App {
 
                 // Start background analysis
                 self.analyzing = true;
-                self.scan_rx = Some(scanning::start_analysis(tree_for_analysis));
+                self.scan_rx = Some(scanning::start_analysis(tree_for_analysis.clone()));
+
+                // Dispatch scan complete hook (extract only the stats we need)
+                let pm = self.plugin_manager.clone();
+                let scan_path = tree_for_analysis.root_path.clone();
+                let total_files = tree_for_analysis.stats.total_files;
+                let total_dirs = tree_for_analysis.stats.total_dirs;
+                let total_size = tree_for_analysis.stats.total_size;
+                let view_root = self.view_root.clone();
+                tokio::spawn(async move {
+                    let ctx = gravityfile_plugin::HookContext::new().with_view_root(view_root);
+
+                    let hook = gravityfile_plugin::Hook::OnScanComplete {
+                        path: scan_path,
+                        total_files,
+                        total_dirs,
+                        total_size,
+                    };
+
+                    let pm_lock = pm.read().await;
+                    let _ = pm_lock.dispatch_hook(&hook, &ctx).await;
+                });
             }
             ScanResult::ScanComplete(Err(e)) => {
                 self.error = Some(e.to_string());
@@ -1499,13 +1612,13 @@ impl App {
             }
         };
 
-        if let Some(path) = path {
-            if path != self.path {
-                if self.marked.contains(&path) {
-                    self.marked.remove(&path);
-                } else {
-                    self.marked.insert(path);
-                }
+        if let Some(path) = path
+            && path != self.path
+        {
+            if self.marked.contains(&path) {
+                self.marked.remove(&path);
+            } else {
+                self.marked.insert(path);
             }
         }
     }
@@ -1537,13 +1650,13 @@ impl App {
     }
 
     /// Get the size of a path from the tree.
-    fn get_path_size(&self, target: &PathBuf) -> Option<u64> {
+    fn get_path_size(&self, target: &Path) -> Option<u64> {
         let tree = self.tree.as_ref()?;
 
         fn find_size(
             node: &gravityfile_core::FileNode,
-            target: &PathBuf,
-            current: &PathBuf,
+            target: &Path,
+            current: &Path,
         ) -> Option<u64> {
             if current == target {
                 return Some(node.size);
@@ -1608,18 +1721,18 @@ impl App {
         let mode = self.clipboard.mode;
 
         // Pre-flight conflict detection (only if no resolution provided)
-        if resolution.is_none() {
-            if let Some(conflict) = self.check_paste_conflict(&sources, &destination) {
-                // Store the pending operation and show conflict modal
-                self.pending_operation = Some(PendingOperation::Paste {
-                    sources: sources.clone(),
-                    destination: destination.clone(),
-                    mode,
-                });
-                self.pending_conflict = Some(conflict);
-                self.mode = AppMode::ConflictResolution;
-                return;
-            }
+        if resolution.is_none()
+            && let Some(conflict) = self.check_paste_conflict(&sources, &destination)
+        {
+            // Store the pending operation and show conflict modal
+            self.pending_operation = Some(PendingOperation::Paste {
+                sources: sources.clone(),
+                destination: destination.clone(),
+                mode,
+            });
+            self.pending_conflict = Some(conflict);
+            self.mode = AppMode::ConflictResolution;
+            return;
         }
 
         match mode {
@@ -1646,7 +1759,7 @@ impl App {
     }
 
     /// Check if pasting would cause a conflict with an existing file.
-    fn check_paste_conflict(&self, sources: &[PathBuf], destination: &PathBuf) -> Option<Conflict> {
+    fn check_paste_conflict(&self, sources: &[PathBuf], destination: &Path) -> Option<Conflict> {
         use gravityfile_ops::ConflictKind;
 
         for source in sources {
@@ -1886,10 +1999,10 @@ impl App {
 
     /// Execute go to directory.
     fn execute_goto(&mut self, path_str: &str) {
-        let path = if path_str.starts_with('~') {
+        let path = if let Some(rest) = path_str.strip_prefix('~') {
             // Expand tilde
             if let Some(home) = dirs::home_dir() {
-                home.join(&path_str[1..].trim_start_matches('/'))
+                home.join(rest.trim_start_matches('/'))
             } else {
                 std::path::PathBuf::from(path_str)
             }
@@ -2505,7 +2618,7 @@ impl App {
                 let path = self.view_root.join(&*child.name);
 
                 Some(SelectedInfo {
-                    name: child.name.to_string().into(),
+                    name: child.name.to_string(),
                     path,
                     size: child.size,
                     file_count: child.file_count(),
@@ -2540,10 +2653,10 @@ impl App {
                 false
             }
             LayoutMode::Miller => {
-                if let Some((view_node, _)) = self.get_view_root_node() {
-                    if let Some(child) = view_node.children.get(self.miller_state.selected) {
-                        return !child.is_dir();
-                    }
+                if let Some((view_node, _)) = self.get_view_root_node()
+                    && let Some(child) = view_node.children.get(self.miller_state.selected)
+                {
+                    return !child.is_dir();
                 }
                 false
             }
@@ -2570,10 +2683,10 @@ impl App {
                 None
             }
             LayoutMode::Miller => {
-                if let Some((view_node, _)) = self.get_view_root_node() {
-                    if let Some(child) = view_node.children.get(self.miller_state.selected) {
-                        return Some(self.view_root.join(&*child.name));
-                    }
+                if let Some((view_node, _)) = self.get_view_root_node()
+                    && let Some(child) = view_node.children.get(self.miller_state.selected)
+                {
+                    return Some(self.view_root.join(&*child.name));
                 }
                 None
             }
@@ -2760,15 +2873,15 @@ impl App {
 
     /// Lazy load a directory's children using quick_list.
     /// This updates the tree in-place with the new children.
-    fn lazy_load_directory(&mut self, path: &PathBuf) {
+    fn lazy_load_directory(&mut self, path: &Path) {
         // First check if we have cached scan data for this directory
         if let Some(cached_tree) = self.scanned_cache.get(path).cloned() {
             // Use cached scan data - it has full size/structure information
-            if let Some(tree) = &mut self.tree {
-                if let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path) {
-                    // Replace with the cached node (preserves all scan data)
-                    *node = cached_tree.root;
-                }
+            if let Some(tree) = &mut self.tree
+                && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
+            {
+                // Replace with the cached node (preserves all scan data)
+                *node = cached_tree.root;
             }
             return;
         }
@@ -2777,10 +2890,10 @@ impl App {
         // When the full scan completes, it will replace this with accurate data
         if let Ok(quick_tree) = gravityfile_scan::quick_list(path) {
             // Find the node in our tree and update its children
-            if let Some(tree) = &mut self.tree {
-                if let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path) {
-                    node.children = quick_tree.root.children;
-                }
+            if let Some(tree) = &mut self.tree
+                && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
+            {
+                node.children = quick_tree.root.children;
             }
         }
     }
@@ -2788,8 +2901,8 @@ impl App {
     /// Find a mutable reference to a node by path.
     fn find_node_mut<'a>(
         node: &'a mut gravityfile_core::FileNode,
-        target: &PathBuf,
-        current_path: &PathBuf,
+        target: &Path,
+        current_path: &Path,
     ) -> Option<&'a mut gravityfile_core::FileNode> {
         if current_path == target {
             return Some(node);
@@ -2797,10 +2910,10 @@ impl App {
 
         for child in &mut node.children {
             let child_path = current_path.join(&*child.name);
-            if target.starts_with(&child_path) {
-                if let Some(found) = Self::find_node_mut(child, target, &child_path) {
-                    return Some(found);
-                }
+            if target.starts_with(&child_path)
+                && let Some(found) = Self::find_node_mut(child, target, &child_path)
+            {
+                return Some(found);
             }
         }
 
@@ -2877,17 +2990,13 @@ impl App {
 
     /// Navigate to a parent directory that's outside the current scan root.
     /// This extends the tree by lazy-loading the parent.
-    fn navigate_to_parent_beyond_scan_root(
-        &mut self,
-        parent: &PathBuf,
-        dir_we_came_from: &PathBuf,
-    ) {
+    fn navigate_to_parent_beyond_scan_root(&mut self, parent: &Path, dir_we_came_from: &Path) {
         // Cache current tree before navigating away (if we have scan data)
-        if let Some(tree) = &self.tree {
-            if self.has_full_scan {
-                self.scanned_cache
-                    .insert(tree.root_path.clone(), tree.clone());
-            }
+        if let Some(tree) = &self.tree
+            && self.has_full_scan
+        {
+            self.scanned_cache
+                .insert(tree.root_path.clone(), tree.clone());
         }
 
         // Load the parent directory contents
@@ -2899,9 +3008,9 @@ impl App {
         self.merge_cached_scans_into_tree(&mut parent_tree.root, parent);
 
         // Create a new tree rooted at the parent
-        self.path = parent.clone();
+        self.path = parent.to_path_buf();
         self.tree = Some(parent_tree);
-        self.view_root = parent.clone();
+        self.view_root = parent.to_path_buf();
         self.view_history.clear();
         // Note: don't clear forward_history here - we want to allow navigating back
 
@@ -2909,7 +3018,7 @@ impl App {
         self.has_full_scan = false;
 
         // Reset tree state for the new root
-        self.tree_state = TreeState::new(parent.clone());
+        self.tree_state = TreeState::new(parent.to_path_buf());
 
         // Update cached parent for Miller columns display
         self.update_cached_parent();
@@ -2925,7 +3034,7 @@ impl App {
     fn merge_cached_scans_into_tree(
         &self,
         node: &mut gravityfile_core::FileNode,
-        node_path: &PathBuf,
+        node_path: &Path,
     ) {
         for child in &mut node.children {
             if child.is_dir() {
@@ -2939,7 +3048,7 @@ impl App {
     }
 
     /// Select a child entry by matching its name.
-    fn select_child_by_name(&mut self, target_path: &PathBuf) {
+    fn select_child_by_name(&mut self, target_path: &Path) {
         let dir_name = target_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -3019,10 +3128,10 @@ impl App {
         }
 
         // If we're at the tree root and have a cached parent, use that
-        if self.view_root == tree.root_path {
-            if let Some(cached) = &self.cached_parent_tree {
-                return Some(&cached.root);
-            }
+        if self.view_root == tree.root_path
+            && let Some(cached) = &self.cached_parent_tree
+        {
+            return Some(&cached.root);
         }
 
         None
@@ -3641,20 +3750,20 @@ impl App {
             self.view_root.join(target)
         };
 
-        if let Some(node) = Self::find_node_at_path(&tree.root, &target_path, &tree.root_path) {
-            if node.is_dir() {
-                let saved_expanded = self.tree_state.expanded.clone();
-                let saved_selected = self.tree_state.selected;
-                self.view_history
-                    .push((self.view_root.clone(), saved_selected, saved_expanded));
+        if let Some(node) = Self::find_node_at_path(&tree.root, &target_path, &tree.root_path)
+            && node.is_dir()
+        {
+            let saved_expanded = self.tree_state.expanded.clone();
+            let saved_selected = self.tree_state.selected;
+            self.view_history
+                .push((self.view_root.clone(), saved_selected, saved_expanded));
 
-                self.view_root = target_path;
-                self.tree_state.selected = 0;
-                self.tree_state.offset = 0;
-                self.tree_state.expand(&self.view_root);
-                self.update_cached_tree_len();
-                self.sync_to_active_tab();
-            }
+            self.view_root = target_path;
+            self.tree_state.selected = 0;
+            self.tree_state.offset = 0;
+            self.tree_state.expand(&self.view_root);
+            self.update_cached_tree_len();
+            self.sync_to_active_tab();
         }
     }
 
@@ -3700,44 +3809,44 @@ impl App {
 
     /// Jump to a bookmark.
     fn jump_to_bookmark(&mut self, key: char) {
-        if let Some(path) = self.user_settings.bookmarks.get(key).cloned() {
-            if path.is_dir() {
-                // Save current state to history
-                let saved_expanded = self.tree_state.expanded.clone();
-                let saved_selected = self.tree_state.selected;
-                self.view_history
-                    .push((self.view_root.clone(), saved_selected, saved_expanded));
+        if let Some(path) = self.user_settings.bookmarks.get(key).cloned()
+            && path.is_dir()
+        {
+            // Save current state to history
+            let saved_expanded = self.tree_state.expanded.clone();
+            let saved_selected = self.tree_state.selected;
+            self.view_history
+                .push((self.view_root.clone(), saved_selected, saved_expanded));
 
-                // Check if we need to rescan (jumping outside current tree)
-                let needs_rescan = !path.starts_with(&self.path);
+            // Check if we need to rescan (jumping outside current tree)
+            let needs_rescan = !path.starts_with(&self.path);
 
-                self.view_root = path.clone();
-                self.forward_history.clear();
-                self.tree_state.selected = 0;
-                self.tree_state.offset = 0;
-                self.miller_state.reset();
+            self.view_root = path.clone();
+            self.forward_history.clear();
+            self.tree_state.selected = 0;
+            self.tree_state.offset = 0;
+            self.miller_state.reset();
 
-                if needs_rescan {
-                    // We're jumping outside the scanned tree, need to rescan
-                    self.path = path;
-                    self.tree = gravityfile_scan::quick_list(&self.path).ok();
-                    self.tree_state = TreeState::new(self.path.clone());
-                    self.tree_state.expand(&self.path);
-                    self.duplicates = None;
-                    self.age_report = None;
-                    self.has_full_scan = false;
-                    // Start a background scan of the new location
-                    if self.scan_on_startup {
-                        self.start_scan();
-                    }
-                } else {
-                    self.tree_state.expand(&self.view_root);
+            if needs_rescan {
+                // We're jumping outside the scanned tree, need to rescan
+                self.path = path;
+                self.tree = gravityfile_scan::quick_list(&self.path).ok();
+                self.tree_state = TreeState::new(self.path.clone());
+                self.tree_state.expand(&self.path);
+                self.duplicates = None;
+                self.age_report = None;
+                self.has_full_scan = false;
+                // Start a background scan of the new location
+                if self.scan_on_startup {
+                    self.start_scan();
                 }
-
-                self.update_cached_tree_len();
-                self.update_cached_miller_len();
-                self.sync_to_active_tab();
+            } else {
+                self.tree_state.expand(&self.view_root);
             }
+
+            self.update_cached_tree_len();
+            self.update_cached_miller_len();
+            self.sync_to_active_tab();
         }
     }
 
@@ -3822,11 +3931,11 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('y') => {
                 // Check for validation errors before executing
-                if let Some(state) = &self.bulk_rename_state {
-                    if state.error.is_some() {
-                        // Can't execute with errors
-                        return;
-                    }
+                if let Some(state) = &self.bulk_rename_state
+                    && state.error.is_some()
+                {
+                    // Can't execute with errors
+                    return;
                 }
                 // Execute the bulk rename
                 self.execute_bulk_rename();
@@ -4379,7 +4488,7 @@ impl App {
     }
 
     /// Navigate to a search result path.
-    fn navigate_to_search_result(&mut self, target: &PathBuf) {
+    fn navigate_to_search_result(&mut self, target: &Path) {
         // If it's a directory, drill into it
         // If it's a file, navigate to its parent and select it
         if target.is_dir() {
@@ -4393,7 +4502,7 @@ impl App {
                 .push((self.view_root.clone(), saved_selected, saved_expanded));
 
             // Navigate to directory
-            self.view_root = target.clone();
+            self.view_root = target.to_path_buf();
             self.tree_state.selected = 0;
             self.tree_state.offset = 0;
             self.tree_state.expand(&self.view_root);
@@ -4425,8 +4534,6 @@ impl App {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .map(|s| s.to_string());
-                let target_clone = target.clone();
-
                 match self.layout_mode {
                     LayoutMode::Tree => {
                         // For tree view, we need to find the index in flattened list
@@ -4443,7 +4550,7 @@ impl App {
                                 &self.clipboard,
                             )
                             .flatten(&self.tree_state);
-                            if let Some(pos) = items.iter().position(|i| i.path == target_clone) {
+                            if let Some(pos) = items.iter().position(|i| i.path == target) {
                                 self.tree_state.selected = pos;
                             }
                         }
@@ -4494,16 +4601,16 @@ impl App {
             }
             KeyAction::Sort => {
                 // 's' saves settings
-                if let Some(ref state) = self.settings_state {
-                    if state.dirty {
-                        // Save settings to disk
-                        self.user_settings = state.settings.clone();
-                        if let Err(e) = self.user_settings.save() {
-                            self.error = Some(format!("Failed to save settings: {}", e));
-                        } else {
-                            // Apply settings immediately where applicable
-                            self.scan_on_startup = self.user_settings.scan_on_startup;
-                        }
+                if let Some(ref state) = self.settings_state
+                    && state.dirty
+                {
+                    // Save settings to disk
+                    self.user_settings = state.settings.clone();
+                    if let Err(e) = self.user_settings.save() {
+                        self.error = Some(format!("Failed to save settings: {}", e));
+                    } else {
+                        // Apply settings immediately where applicable
+                        self.scan_on_startup = self.user_settings.scan_on_startup;
                     }
                 }
                 self.settings_state = None;

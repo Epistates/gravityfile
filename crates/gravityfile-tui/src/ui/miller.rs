@@ -3,7 +3,7 @@
 //! Provides a three-column layout: Parent | Current | Preview
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -173,13 +173,11 @@ impl<'a> MillerColumns<'a> {
 
     /// Get entries for a directory node.
     fn get_entries(node: &FileNode) -> Vec<ColumnEntry> {
-        node.children
-            .iter()
-            .map(|child| ColumnEntry::from_node(child))
-            .collect()
+        node.children.iter().map(ColumnEntry::from_node).collect()
     }
 
     /// Render a single column.
+    #[allow(clippy::too_many_arguments)]
     fn render_column(
         &self,
         area: Rect,
@@ -189,7 +187,7 @@ impl<'a> MillerColumns<'a> {
         highlight_name: Option<&str>,
         offset: usize,
         title: Option<&str>,
-        base_path: Option<&PathBuf>,
+        base_path: Option<&Path>,
         total_size: u64,
     ) {
         // Draw border
@@ -223,7 +221,7 @@ impl<'a> MillerColumns<'a> {
             let y = inner.y + row_idx as u16;
 
             let is_selected = selected == Some(entry_idx);
-            let is_highlighted = highlight_name.map_or(false, |name| name == entry.name);
+            let is_highlighted = highlight_name.is_some_and(|name| name == entry.name);
 
             // Check if this entry is marked
             let entry_path = base_path.map(|bp| bp.join(&entry.name));
@@ -494,34 +492,34 @@ impl<'a> MillerColumns<'a> {
                         ]));
                     }
 
-                    if let Some(mtime) = modified {
-                        if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                            let secs = duration.as_secs();
-                            lines.push(Line::from(vec![
-                                Span::styled("Modified: ", self.theme.help_desc),
-                                Span::raw(format_timestamp(secs)),
-                            ]));
-                        }
+                    if let Some(mtime) = modified
+                        && let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH)
+                    {
+                        let secs = duration.as_secs();
+                        lines.push(Line::from(vec![
+                            Span::styled("Modified: ", self.theme.help_desc),
+                            Span::raw(format_timestamp(secs)),
+                        ]));
                     }
 
-                    if let Some(ctime) = created {
-                        if let Ok(duration) = ctime.duration_since(std::time::UNIX_EPOCH) {
-                            let secs = duration.as_secs();
-                            lines.push(Line::from(vec![
-                                Span::styled("Created: ", self.theme.help_desc),
-                                Span::raw(format_timestamp(secs)),
-                            ]));
-                        }
+                    if let Some(ctime) = created
+                        && let Ok(duration) = ctime.duration_since(std::time::UNIX_EPOCH)
+                    {
+                        let secs = duration.as_secs();
+                        lines.push(Line::from(vec![
+                            Span::styled("Created: ", self.theme.help_desc),
+                            Span::raw(format_timestamp(secs)),
+                        ]));
                     }
 
-                    if let Some(atime) = accessed {
-                        if let Ok(duration) = atime.duration_since(std::time::UNIX_EPOCH) {
-                            let secs = duration.as_secs();
-                            lines.push(Line::from(vec![
-                                Span::styled("Accessed: ", self.theme.help_desc),
-                                Span::raw(format_timestamp(secs)),
-                            ]));
-                        }
+                    if let Some(atime) = accessed
+                        && let Ok(duration) = atime.duration_since(std::time::UNIX_EPOCH)
+                    {
+                        let secs = duration.as_secs();
+                        lines.push(Line::from(vec![
+                            Span::styled("Accessed: ", self.theme.help_desc),
+                            Span::raw(format_timestamp(secs)),
+                        ]));
                     }
 
                     Paragraph::new(lines).render(inner, buf);
@@ -739,7 +737,7 @@ impl StatefulWidget for MillerColumns<'_> {
             Some(self.current_name),
             0,
             Some("Parent"),
-            parent_base_path.as_ref(),
+            parent_base_path.as_deref(),
             parent_total_size,
         );
 

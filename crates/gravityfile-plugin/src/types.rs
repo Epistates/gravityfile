@@ -103,10 +103,11 @@ impl std::fmt::Display for PluginKind {
 ///
 /// This is a simplified representation that can be converted to/from
 /// runtime-specific value types (mlua::Value, rhai::Dynamic, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     /// Null/nil value.
+    #[default]
     Null,
 
     /// Boolean value.
@@ -189,12 +190,6 @@ impl Value {
             Self::Object(obj) => Some(obj),
             _ => None,
         }
-    }
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::Null
     }
 }
 

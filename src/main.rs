@@ -8,7 +8,7 @@
 //!   grav export [PATH]       Export scan to JSON
 //!   grav --help              Show help
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Context, Result};
@@ -167,7 +167,7 @@ fn main() -> Result<()> {
 }
 
 /// Run a quick scan and display summary.
-fn run_scan(path: &PathBuf, max_depth: Option<u32>, top_n: usize) -> Result<()> {
+fn run_scan(path: &Path, max_depth: Option<u32>, top_n: usize) -> Result<()> {
     let path = path.canonicalize().context("Invalid path")?;
 
     eprintln!("Scanning {}...", path.display());
@@ -211,12 +211,7 @@ fn run_scan(path: &PathBuf, max_depth: Option<u32>, top_n: usize) -> Result<()> 
 }
 
 /// Run duplicate detection.
-fn run_duplicates(
-    path: &PathBuf,
-    min_size: &str,
-    top_n: usize,
-    format: OutputFormat,
-) -> Result<()> {
+fn run_duplicates(path: &Path, min_size: &str, top_n: usize, format: OutputFormat) -> Result<()> {
     let path = path.canonicalize().context("Invalid path")?;
     let min_bytes = parse_size(min_size)?;
 
@@ -282,7 +277,7 @@ fn run_duplicates(
 }
 
 /// Run age analysis.
-fn run_age(path: &PathBuf, stale_threshold: &str, format: OutputFormat) -> Result<()> {
+fn run_age(path: &Path, stale_threshold: &str, format: OutputFormat) -> Result<()> {
     let path = path.canonicalize().context("Invalid path")?;
     let stale_duration = parse_duration(stale_threshold)?;
 
@@ -359,7 +354,7 @@ fn run_age(path: &PathBuf, stale_threshold: &str, format: OutputFormat) -> Resul
 }
 
 /// Export scan results to JSON.
-fn run_export(path: &PathBuf, output: Option<PathBuf>) -> Result<()> {
+fn run_export(path: &Path, output: Option<PathBuf>) -> Result<()> {
     let path = path.canonicalize().context("Invalid path")?;
 
     eprintln!("Scanning {}...", path.display());
@@ -386,7 +381,7 @@ fn run_export(path: &PathBuf, output: Option<PathBuf>) -> Result<()> {
 /// Print a node and its children.
 fn print_node(
     node: &gravityfile_core::FileNode,
-    path: &PathBuf,
+    path: &Path,
     depth: u32,
     max_depth: u32,
     top_n: usize,

@@ -365,21 +365,21 @@ impl PluginRuntime for RhaiRuntime {
 
         // Convert result
         let mut hook_result = HookResult::ok();
-        if result.is_map() {
-            if let Some(map) = result.try_cast::<rhai::Map>() {
-                if let Some(prevent) = map.get("prevent_default") {
-                    if prevent.as_bool().unwrap_or(false) {
-                        hook_result = hook_result.prevent_default();
-                    }
-                }
-                if let Some(stop) = map.get("stop_propagation") {
-                    if stop.as_bool().unwrap_or(false) {
-                        hook_result = hook_result.stop_propagation();
-                    }
-                }
-                if let Some(val) = map.get("value") {
-                    hook_result.value = Some(Self::dynamic_to_value(val));
-                }
+        if result.is_map()
+            && let Some(map) = result.try_cast::<rhai::Map>()
+        {
+            if let Some(prevent) = map.get("prevent_default")
+                && prevent.as_bool().unwrap_or(false)
+            {
+                hook_result = hook_result.prevent_default();
+            }
+            if let Some(stop) = map.get("stop_propagation")
+                && stop.as_bool().unwrap_or(false)
+            {
+                hook_result = hook_result.stop_propagation();
+            }
+            if let Some(val) = map.get("value") {
+                hook_result.value = Some(Self::dynamic_to_value(val));
             }
         }
 
