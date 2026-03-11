@@ -7,13 +7,14 @@
 //!
 //! This minimizes disk I/O by eliminating non-duplicates early.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
 use derive_builder::Builder;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +44,7 @@ pub struct DuplicateConfig {
     #[builder(default = "4096")]
     pub partial_hash_tail: usize,
 
-    /// Patterns to exclude from duplicate detection.
+    /// Patterns to exclude from duplicate detection (glob syntax).
     #[builder(default)]
     pub exclude_patterns: Vec<String>,
 
@@ -107,20 +108,23 @@ pub struct DuplicateReport {
     /// Groups of duplicate files, sorted by wasted space descending.
     pub groups: Vec<DuplicateGroup>,
 
-    /// Total size of all duplicate files.
+    /// Total size of all duplicate files (computed before max_groups truncation).
     pub total_duplicate_size: u64,
 
-    /// Total wasted space (could be reclaimed).
+    /// Total wasted space (could be reclaimed, computed before max_groups truncation).
     pub total_wasted_space: u64,
 
     /// Number of files analyzed.
     pub files_analyzed: u64,
 
-    /// Number of files that have duplicates.
+    /// Number of files that have duplicates (computed before max_groups truncation).
     pub files_with_duplicates: u64,
 
-    /// Number of unique duplicate groups.
+    /// Number of unique duplicate groups (computed before max_groups truncation).
     pub group_count: usize,
+
+    /// Number of groups omitted due to max_groups limit.
+    pub groups_omitted: usize,
 }
 
 impl DuplicateReport {
@@ -153,6 +157,8 @@ pub struct HashProgress {
 /// Duplicate file finder.
 pub struct DuplicateFinder {
     config: DuplicateConfig,
+    /// Compiled globset for exclude patterns. Built once at construction.
+    exclude_globset: Option<GlobSet>,
 }
 
 impl DuplicateFinder {
@@ -160,19 +166,57 @@ impl DuplicateFinder {
     pub fn new() -> Self {
         Self {
             config: DuplicateConfig::default(),
+            exclude_globset: None,
         }
     }
 
     /// Create a new duplicate finder with custom config.
     pub fn with_config(config: DuplicateConfig) -> Self {
-        Self { config }
+        let exclude_globset = build_globset(&config.exclude_patterns);
+        Self {
+            config,
+            exclude_globset,
+        }
     }
 
     /// Find duplicates in a scanned file tree.
     pub fn find_duplicates(&self, tree: &FileTree) -> DuplicateReport {
-        // Phase 1: Collect all files with their paths and sizes
+        // Phase 1: Collect all files with their paths and sizes.
+        // Pass seen_inodes to skip hardlinked copies of the same data.
         let mut files: Vec<FileInfo> = Vec::new();
-        self.collect_files(&tree.root, &tree.root_path, &mut files);
+        let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+
+        // Handle root-is-file case
+        if tree.root.is_file() {
+            let path = tree.root_path.clone();
+            let should_exclude = self.is_excluded(&path);
+            if !should_exclude && tree.root.size > 0 {
+                if let Some(inode) = &tree.root.inode {
+                    if seen_inodes.insert((inode.inode, inode.device))
+                        && seen_paths.insert(path.clone())
+                    {
+                        files.push(FileInfo {
+                            path,
+                            size: tree.root.size,
+                        });
+                    }
+                } else if seen_paths.insert(path.clone()) {
+                    files.push(FileInfo {
+                        path,
+                        size: tree.root.size,
+                    });
+                }
+            }
+        } else {
+            self.collect_files(
+                &tree.root,
+                &tree.root_path,
+                &mut files,
+                &mut seen_inodes,
+                &mut seen_paths,
+            );
+        }
 
         // Filter by size constraints
         files.retain(|f| f.size >= self.config.min_size && f.size <= self.config.max_size);
@@ -182,9 +226,9 @@ impl DuplicateFinder {
         // Phase 2: Group by size
         let size_groups = self.group_by_size(files);
 
-        // Phase 3: For groups with 2+ files, compute hashes (parallelized across size groups)
+        // Phase 3: For groups with 2+ files, compute hashes.
+        // Only outer iterator is parallelised; inner stays sequential to avoid nested par_iter.
         let duplicate_groups: Vec<DuplicateGroup> = if self.config.quick_compare {
-            // Process size groups in parallel
             size_groups
                 .into_par_iter()
                 .flat_map(|(_size, files)| self.find_dups_in_size_group_partial(files))
@@ -200,16 +244,21 @@ impl DuplicateFinder {
         let mut groups = duplicate_groups;
         groups.sort_by(|a, b| b.wasted_bytes.cmp(&a.wasted_bytes));
 
-        // Apply max_groups limit if set
-        if self.config.max_groups > 0 && groups.len() > self.config.max_groups {
-            groups.truncate(self.config.max_groups);
-        }
-
-        // Calculate totals
+        // Compute all summary stats from the full (untruncated) groups list
         let total_duplicate_size: u64 = groups.iter().map(|g| g.size * g.paths.len() as u64).sum();
         let total_wasted_space: u64 = groups.iter().map(|g| g.wasted_bytes).sum();
         let files_with_duplicates: u64 = groups.iter().map(|g| g.paths.len() as u64).sum();
         let group_count = groups.len();
+
+        // Truncate AFTER computing stats
+        let groups_omitted = if self.config.max_groups > 0 && groups.len() > self.config.max_groups
+        {
+            let omitted = groups.len() - self.config.max_groups;
+            groups.truncate(self.config.max_groups);
+            omitted
+        } else {
+            0
+        };
 
         DuplicateReport {
             groups,
@@ -218,24 +267,45 @@ impl DuplicateFinder {
             files_analyzed,
             files_with_duplicates,
             group_count,
+            groups_omitted,
         }
     }
 
-    /// Collect all files from the tree.
-    fn collect_files(&self, node: &FileNode, current_path: &Path, files: &mut Vec<FileInfo>) {
+    /// Collect all files from the tree, deduplicating by inode and path.
+    fn collect_files(
+        &self,
+        node: &FileNode,
+        current_path: &Path,
+        files: &mut Vec<FileInfo>,
+        seen_inodes: &mut HashSet<(u64, u64)>,
+        seen_paths: &mut HashSet<PathBuf>,
+    ) {
         match &node.kind {
             NodeKind::File { .. } => {
-                // Check exclusions
-                let name = node.name.as_str();
-                let should_exclude = self
-                    .config
-                    .exclude_patterns
-                    .iter()
-                    .any(|p| name.contains(p) || current_path.to_string_lossy().contains(p));
+                // current_path is already the full file path — the Directory branch
+                // pre-joins the child name before recursing.
+                let file_path = current_path.to_path_buf();
 
-                if !should_exclude && node.size > 0 {
+                // Skip duplicate paths
+                if !seen_paths.insert(file_path.clone()) {
+                    return;
+                }
+
+                // Skip hardlinks to already-seen inodes
+                if let Some(inode) = &node.inode
+                    && !seen_inodes.insert((inode.inode, inode.device))
+                {
+                    return;
+                }
+
+                // Apply glob exclude patterns
+                if self.is_excluded(&file_path) {
+                    return;
+                }
+
+                if node.size > 0 {
                     files.push(FileInfo {
-                        path: current_path.to_path_buf(),
+                        path: file_path,
                         size: node.size,
                     });
                 }
@@ -243,11 +313,27 @@ impl DuplicateFinder {
             NodeKind::Directory { .. } => {
                 for child in &node.children {
                     let child_path = current_path.join(&*child.name);
-                    self.collect_files(child, &child_path, files);
+                    self.collect_files(child, &child_path, files, seen_inodes, seen_paths);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Check whether a path matches any configured exclude glob patterns.
+    fn is_excluded(&self, path: &Path) -> bool {
+        if let Some(gs) = &self.exclude_globset {
+            // Match against the full path and also just the file name component
+            if gs.is_match(path) {
+                return true;
+            }
+            if let Some(name) = path.file_name()
+                && gs.is_match(Path::new(name))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Group files by size.
@@ -256,7 +342,7 @@ impl DuplicateFinder {
         for file in files {
             groups.entry(file.size).or_default().push(file);
         }
-        // Remove groups with only one file
+        // Remove groups with only one file — they cannot be duplicates
         groups.retain(|_, v| v.len() > 1);
         groups
     }
@@ -269,9 +355,9 @@ impl DuplicateFinder {
 
         let mut result = Vec::new();
 
-        // Compute partial hashes in parallel
+        // Compute partial hashes sequentially within the group
         let partial_hashes: Vec<(PathBuf, u64, Option<[u8; 32]>)> = files
-            .par_iter()
+            .iter()
             .map(|f| {
                 let hash = self.compute_partial_hash(&f.path);
                 (f.path.clone(), f.size, hash)
@@ -286,17 +372,16 @@ impl DuplicateFinder {
             }
         }
 
-        // For groups with 2+ matching partial hashes, compute full hash
+        // For groups with 2+ matching partial hashes, compute full hash (sequential)
         for (_partial_hash, candidates) in partial_groups {
             if candidates.len() < 2 {
                 continue;
             }
 
-            // Compute full hashes in parallel
             let full_hashes: Vec<(PathBuf, u64, Option<ContentHash>)> = candidates
-                .par_iter()
+                .iter()
                 .map(|(path, size)| {
-                    let hash = self.compute_full_hash(path);
+                    let hash = compute_full_hash(path);
                     (path.clone(), *size, hash)
                 })
                 .collect();
@@ -330,17 +415,16 @@ impl DuplicateFinder {
         result
     }
 
-    /// Find duplicates in a single size group using only full hash.
+    /// Find duplicates in a single size group using only full hash (sequential within group).
     fn find_dups_in_size_group_full(&self, files: Vec<FileInfo>) -> Vec<DuplicateGroup> {
         if files.len() < 2 {
             return Vec::new();
         }
 
-        // Compute full hashes in parallel
         let hashes: Vec<(PathBuf, u64, Option<ContentHash>)> = files
-            .par_iter()
+            .iter()
             .map(|f| {
-                let hash = self.compute_full_hash(&f.path);
+                let hash = compute_full_hash(&f.path);
                 (f.path.clone(), f.size, hash)
             })
             .collect();
@@ -404,36 +488,47 @@ impl DuplicateFinder {
 
         Some(*hasher.finalize().as_bytes())
     }
+}
 
-    /// Compute full BLAKE3 hash of a file.
-    fn compute_full_hash(&self, path: &Path) -> Option<ContentHash> {
-        // Try memory-mapped I/O for larger files (faster)
-        let file = File::open(path).ok()?;
-        let metadata = file.metadata().ok()?;
-        let file_size = metadata.len();
-
-        // Use mmap for files > 128KB, buffered read for smaller
-        if file_size > 128 * 1024 {
-            // Memory-mapped hashing (much faster for large files)
-            let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-            let hash = blake3::hash(&mmap);
-            Some(ContentHash::new(*hash.as_bytes()))
-        } else {
-            // Buffered read for small files
-            let mut hasher = Hasher::new();
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut file = file;
-
-            loop {
-                let bytes_read = file.read(&mut buffer).ok()?;
-                if bytes_read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..bytes_read]);
-            }
-
-            Some(ContentHash::new(*hasher.finalize().as_bytes()))
+/// Compute full BLAKE3 hash of a file using buffered streaming I/O.
+fn compute_full_hash(path: &Path) -> Option<ContentHash> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
         }
+        hasher.update(&buf[..n]);
+    }
+    Some(ContentHash::new(*hasher.finalize().as_bytes()))
+}
+
+/// Build a GlobSet from a list of glob pattern strings.
+/// Returns None if the pattern list is empty or all patterns are invalid.
+fn build_globset(patterns: &[String]) -> Option<GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let mut builder = GlobSetBuilder::new();
+    let mut any_valid = false;
+    for p in patterns {
+        match Glob::new(p) {
+            Ok(g) => {
+                builder.add(g);
+                any_valid = true;
+            }
+            Err(e) => {
+                tracing::warn!("Invalid exclude glob pattern {:?}: {}", p, e);
+            }
+        }
+    }
+    if any_valid {
+        builder.build().ok()
+    } else {
+        None
     }
 }
 
@@ -475,11 +570,10 @@ mod tests {
     #[test]
     fn test_compute_full_hash() {
         let temp = create_test_files();
-        let finder = DuplicateFinder::new();
 
-        let hash1 = finder.compute_full_hash(&temp.path().join("file1.txt"));
-        let hash2 = finder.compute_full_hash(&temp.path().join("file2.txt"));
-        let hash3 = finder.compute_full_hash(&temp.path().join("file3.txt"));
+        let hash1 = compute_full_hash(&temp.path().join("file1.txt"));
+        let hash2 = compute_full_hash(&temp.path().join("file2.txt"));
+        let hash3 = compute_full_hash(&temp.path().join("file3.txt"));
 
         assert!(hash1.is_some());
         assert!(hash2.is_some());
@@ -501,5 +595,32 @@ mod tests {
 
         assert!(hash1.is_some());
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_groups_omitted_field() {
+        // Build a report with max_groups limiting the output
+        let report = DuplicateReport {
+            groups: Vec::new(),
+            total_duplicate_size: 0,
+            total_wasted_space: 0,
+            files_analyzed: 0,
+            files_with_duplicates: 0,
+            group_count: 5,
+            groups_omitted: 3,
+        };
+        assert_eq!(report.groups_omitted, 3);
+        assert_eq!(report.group_count, 5);
+    }
+
+    #[test]
+    fn test_glob_exclude() {
+        let config = DuplicateConfig {
+            exclude_patterns: vec!["*.log".to_string()],
+            ..Default::default()
+        };
+        let finder = DuplicateFinder::with_config(config);
+        assert!(finder.is_excluded(Path::new("/some/path/debug.log")));
+        assert!(!finder.is_excluded(Path::new("/some/path/main.rs")));
     }
 }

@@ -11,10 +11,10 @@ gravityfile-core.workspace = true
 blake3.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
-chrono.workspace = true
 derive_builder.workspace = true
 serde.workspace = true
-memmap2 = "0.9"
+globset.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

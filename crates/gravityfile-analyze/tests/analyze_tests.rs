@@ -27,7 +27,7 @@ fn test_duplicate_config_builder() {
     // Test default config
     let default_config = DuplicateConfig::default();
     assert_eq!(default_config.min_size, 1024);
-    assert_eq!(default_config.quick_compare, true);
+    assert!(default_config.quick_compare);
 }
 
 #[test]
@@ -68,6 +68,7 @@ fn test_duplicate_report_properties() {
         files_analyzed: 100,
         files_with_duplicates: 20,
         group_count: 5,
+        groups_omitted: 0,
     };
 
     assert!(!report.has_duplicates());
@@ -214,7 +215,7 @@ fn test_find_duplicates_with_exclusion_patterns() {
 
     let config = DuplicateConfig::builder()
         .min_size(1u64)
-        .exclude_patterns(vec![".txt".to_string()])
+        .exclude_patterns(vec!["*.txt".to_string()])
         .build()
         .unwrap();
 
@@ -301,7 +302,12 @@ fn test_find_duplicates_with_max_groups_limit() {
 
     let report = finder.find_duplicates(&tree);
 
-    assert_eq!(report.group_count, 2);
+    // group_count reflects the full (pre-truncation) number of groups
+    assert_eq!(report.group_count, 3);
+    // groups Vec is truncated to max_groups
+    assert_eq!(report.groups.len(), 2);
+    // groups_omitted records how many were dropped
+    assert_eq!(report.groups_omitted, 1);
 }
 
 #[test]
@@ -358,9 +364,9 @@ fn create_test_tree_with_files(
             use blake3::Hasher;
             let mut hasher = Hasher::new();
             hasher.update(&content);
-            node.content_hash = Some(Box::new(gravityfile_core::ContentHash::new(
+            node.content_hash = Some(gravityfile_core::ContentHash::new(
                 *hasher.finalize().as_bytes(),
-            )));
+            ));
         }
 
         root.children.push(node);
@@ -374,7 +380,7 @@ fn create_test_tree_with_files(
     for path in paths {
         if let Ok(metadata) = fs::metadata(path) {
             stats.record_file(
-                path.to_path_buf(),
+                path,
                 metadata.len(),
                 now,
                 1, // depth
@@ -442,9 +448,9 @@ fn create_test_tree_with_nested_files(
             use blake3::Hasher;
             let mut hasher = Hasher::new();
             hasher.update(&content);
-            node.content_hash = Some(Box::new(gravityfile_core::ContentHash::new(
+            node.content_hash = Some(gravityfile_core::ContentHash::new(
                 *hasher.finalize().as_bytes(),
-            )));
+            ));
         }
 
         current.children.push(node);
@@ -466,7 +472,7 @@ fn create_test_tree_with_nested_files(
     for (path, _) in paths {
         if let Ok(metadata) = fs::metadata(path) {
             stats.record_file(
-                path.to_path_buf(),
+                path,
                 metadata.len(),
                 now,
                 1, // depth
