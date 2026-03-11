@@ -19,6 +19,7 @@ pub struct SizeBar {
     empty_char: char,
 }
 
+#[allow(dead_code)]
 impl SizeBar {
     /// Create a new size bar.
     pub fn new(ratio: f64) -> Self {
@@ -73,13 +74,11 @@ impl Widget for SizeBar {
 }
 
 /// A compact size bar using Unicode block characters for finer granularity.
-#[allow(dead_code)]
 pub struct CompactSizeBar {
     ratio: f64,
     style: Style,
 }
 
-#[allow(dead_code)]
 impl CompactSizeBar {
     /// Block characters for 8 levels of fill.
     const BLOCKS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];

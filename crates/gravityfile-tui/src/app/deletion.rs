@@ -67,12 +67,11 @@ pub fn start_deletion_with_mode(
                     bytes_freed += size;
                 }
                 Ok(Err(e)) => {
-                    // Log the error for debugging
-                    eprintln!("Failed to delete {:?}: {}", path, e);
+                    tracing::warn!("Failed to delete {:?}: {}", path, e);
                     failed += 1;
                 }
                 Err(e) => {
-                    eprintln!("Task failed for {:?}: {}", path, e);
+                    tracing::warn!("Deletion task panicked for {:?}: {}", path, e);
                     failed += 1;
                 }
             }

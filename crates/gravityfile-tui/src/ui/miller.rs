@@ -16,7 +16,7 @@ use gravityfile_core::{FileNode, GitStatus, NodeKind};
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::preview::PreviewContent;
 use crate::theme::Theme;
-use crate::ui::{SizeBar, format_size};
+use crate::ui::{CompactSizeBar, format_size, truncate_to_width};
 
 /// State for Miller columns view.
 #[derive(Debug, Clone, Default)]
@@ -254,19 +254,19 @@ impl<'a> MillerColumns<'a> {
             };
             let checkbox_width: u16 = 2;
 
-            // Icon and style based on type
+            // Icon and style based on type (ASCII/box-drawing to match tree view)
             let (icon, base_style) = if entry.is_dir {
-                ("📁 ", self.theme.directory)
+                (" ", self.theme.directory)
             } else if entry.is_symlink {
                 if entry.is_broken_symlink {
-                    ("🔗 ", self.theme.symlink.add_modifier(Modifier::DIM))
+                    (" ", self.theme.symlink.add_modifier(Modifier::DIM))
                 } else {
-                    ("🔗 ", self.theme.symlink)
+                    (" ", self.theme.symlink)
                 }
             } else if entry.is_executable {
-                ("⚙ ", self.theme.executable)
+                ("* ", self.theme.executable)
             } else {
-                ("📄 ", self.theme.file)
+                ("  ", self.theme.file)
             };
 
             // Apply clipboard styling (cut items are dimmed, copied items are italic)
@@ -299,19 +299,26 @@ impl<'a> MillerColumns<'a> {
             };
             let git_len = git_indicator.len();
 
-            // Truncate name if needed (account for git indicator)
+            // Truncate name if needed (account for git indicator, Unicode-safe)
             let name_max_len = available_for_name.saturating_sub(git_len);
-            let name = if entry.name.len() > name_max_len {
-                let truncated_len = name_max_len.saturating_sub(1);
-                format!("{}…", &entry.name[..truncated_len.min(entry.name.len())])
-            } else {
-                entry.name.clone()
+            let name = {
+                use unicode_width::UnicodeWidthStr;
+                if entry.name.width() > name_max_len {
+                    let truncated = truncate_to_width(&entry.name, name_max_len.saturating_sub(1));
+                    format!("{}…", truncated)
+                } else {
+                    entry.name.clone()
+                }
             };
 
-            // Pad name (account for git indicator)
+            // Pad name (account for git indicator, using display widths)
+            let name_display_width = {
+                use unicode_width::UnicodeWidthStr;
+                name.width()
+            };
             let name_padding = " ".repeat(
                 available_for_name
-                    .saturating_sub(name.len())
+                    .saturating_sub(name_display_width)
                     .saturating_sub(git_len),
             );
 
@@ -363,9 +370,7 @@ impl<'a> MillerColumns<'a> {
 
             let bar_area = Rect::new(inner.x + inner.width - size_bar_width, y, size_bar_width, 1);
 
-            let bar = SizeBar::new(ratio)
-                .filled_style(self.theme.size_bar_style(ratio))
-                .empty_style(Style::default().fg(self.theme.muted));
+            let bar = CompactSizeBar::new(ratio).style(self.theme.size_bar_style(ratio));
 
             Widget::render(bar, bar_area, buf);
         }
@@ -449,7 +454,7 @@ impl<'a> MillerColumns<'a> {
                     let mut display_lines = vec![header, Line::raw("")];
                     let max_lines = inner.height.saturating_sub(2) as usize;
                     for (name, is_dir) in entries.iter().take(max_lines) {
-                        let icon = if *is_dir { "📁 " } else { "📄 " };
+                        let icon = if *is_dir { " " } else { "  " };
                         let style = if *is_dir {
                             self.theme.directory
                         } else {
@@ -552,12 +557,14 @@ impl<'a> MillerColumns<'a> {
                     let max_lines = inner.height.saturating_sub(3) as usize;
 
                     for archive_entry in entries.iter().take(max_lines) {
+                        // Distinguish symlinks from directories with a
+                        // distinct icon so the user can tell them apart.
                         let icon = if archive_entry.is_symlink {
-                            "🔗 "
+                            "@ "
                         } else if archive_entry.is_dir {
-                            "📁 "
+                            " "
                         } else {
-                            "📄 "
+                            "  "
                         };
 
                         let size_str = if archive_entry.is_dir || archive_entry.is_symlink {

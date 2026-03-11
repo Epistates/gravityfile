@@ -209,6 +209,8 @@ impl ClipboardState {
 }
 
 /// Sort mode for file listings.
+///
+/// Arrow convention: ↑ = ascending (A→Z, small→large), ↓ = descending (Z→A, large→small).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumIter, FromRepr)]
 pub enum SortMode {
     /// Size descending (largest first) - default for disk usage analyzer.
@@ -219,10 +221,10 @@ pub enum SortMode {
     #[strum(to_string = "Size ↑")]
     SizeAscending,
     /// Name ascending (A-Z).
-    #[strum(to_string = "Name ↓")]
+    #[strum(to_string = "Name ↑")]
     NameAscending,
     /// Name descending (Z-A).
-    #[strum(to_string = "Name ↑")]
+    #[strum(to_string = "Name ↓")]
     NameDescending,
     /// Modified date descending (newest first).
     #[strum(to_string = "Date ↓")]
@@ -261,12 +263,13 @@ impl SortMode {
     }
 
     /// Get a short label for display in the status bar.
+    /// ↑ = ascending (A→Z, small→large), ↓ = descending (Z→A, large→small).
     pub fn short_label(&self) -> &'static str {
         match self {
             Self::SizeDescending => "SZ↓",
             Self::SizeAscending => "SZ↑",
-            Self::NameAscending => "NM↓",
-            Self::NameDescending => "NM↑",
+            Self::NameAscending => "NM↑",
+            Self::NameDescending => "NM↓",
             Self::ModifiedDescending => "DT↓",
             Self::ModifiedAscending => "DT↑",
             Self::CountDescending => "CT↓",

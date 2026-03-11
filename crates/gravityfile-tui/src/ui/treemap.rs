@@ -16,6 +16,7 @@ use gravityfile_core::FileNode;
 
 use crate::app::state::ClipboardState;
 use crate::theme::Theme;
+use crate::ui::truncate_to_width;
 
 /// State for the treemap view.
 #[derive(Debug, Clone, Default)]
@@ -393,13 +394,19 @@ impl Widget for TreemapView<'_> {
             // Draw label if there's room
             if rect.width >= 4 && rect.height >= 2 {
                 let available_width = (rect.width as usize).saturating_sub(2);
-                let label = if treemap_rect.name.len() > available_width {
-                    format!(
-                        "{}…",
-                        &treemap_rect.name[..available_width.saturating_sub(1)]
-                    )
-                } else {
-                    treemap_rect.name.clone()
+                let label = {
+                    use unicode_width::UnicodeWidthStr;
+                    if treemap_rect.name.width() > available_width {
+                        format!(
+                            "{}…",
+                            truncate_to_width(
+                                &treemap_rect.name,
+                                available_width.saturating_sub(1)
+                            )
+                        )
+                    } else {
+                        treemap_rect.name.clone()
+                    }
                 };
 
                 let label_y = rect.y + 1;

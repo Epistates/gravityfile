@@ -223,11 +223,7 @@ fn open_with_system(path: &Path, openers: &FileOpeners) -> OpenResult {
     }
 }
 
-/// Check if a command exists in PATH.
+/// Check if a command exists in PATH using the `which` crate (no subprocess).
 fn which_exists(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    which::which(cmd).is_ok()
 }

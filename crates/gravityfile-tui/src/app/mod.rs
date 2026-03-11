@@ -176,6 +176,9 @@ pub struct App {
     visual_state: Option<state::VisualState>,
     /// Plugin manager.
     plugin_manager: Arc<RwLock<gravityfile_plugin::PluginManager>>,
+    /// Last known terminal content-area height (rows available for the file list).
+    /// Updated on every render; used for scroll/ensure_visible calculations.
+    viewport_height: usize,
 }
 
 impl App {
@@ -193,15 +196,12 @@ impl App {
         let user_settings = UserSettings::load();
 
         // Load quick tree immediately for instant display
-        let quick_tree = gravityfile_scan::quick_list(&path).ok();
+        let quick_tree = gravityfile_scan::quick_list(&path, None).ok();
 
-        // Determine scan_on_startup: CLI flag overrides user settings
-        // CLI flag (-S) is explicit; if not provided, use user settings
-        let scan_on_startup = if config.scan_on_startup {
-            true // CLI flag was explicitly set
-        } else {
-            user_settings.scan_on_startup
-        };
+        // Determine scan_on_startup: CLI flag (Some) overrides user settings; None defers to settings.
+        let scan_on_startup = config
+            .scan_on_startup
+            .unwrap_or(user_settings.scan_on_startup);
 
         // Initialize plugin manager and register runtimes
         let mut pm_inner = gravityfile_plugin::PluginManager::default();
@@ -271,6 +271,7 @@ impl App {
             cached_treemap_len: 0,
             visual_state: None,
             plugin_manager,
+            viewport_height: 40, // reasonable default before first render
         };
 
         // Update cached lengths for immediate navigation
@@ -287,10 +288,10 @@ impl App {
     async fn init_plugins(&self) {
         let mut pm = self.plugin_manager.write().await;
         if let Err(e) = pm.init_runtimes() {
-            eprintln!("Plugin runtime init error: {}", e);
+            tracing::warn!("Plugin runtime init error: {}", e);
         }
         if let Err(e) = pm.discover_plugins().await {
-            eprintln!("Plugin discovery error: {}", e);
+            tracing::warn!("Plugin discovery error: {}", e);
         }
     }
 
@@ -353,7 +354,7 @@ impl App {
 
         while self.mode != AppMode::Quit {
             if self.needs_redraw {
-                terminal.draw(|frame| self.render(frame))?;
+                terminal.draw(|frame| self.draw(frame))?;
                 self.needs_redraw = false;
             }
 
@@ -365,26 +366,7 @@ impl App {
                 Some(Ok(event)) = events.next() => {
                     match event {
                         Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                            if self.mode == AppMode::Command {
-                                self.handle_command_input(key_event);
-                            } else if self.mode == AppMode::Search {
-                                self.handle_search_input(key_event);
-                            } else if matches!(self.mode, AppMode::Renaming | AppMode::CreatingFile | AppMode::CreatingDirectory | AppMode::Taking | AppMode::GoingTo) {
-                                self.handle_input_event(key_event);
-                            } else if self.mode == AppMode::ConflictResolution {
-                                self.handle_conflict_key(key_event);
-                            } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
-                                self.handle_bookmark_key(key_event);
-                            } else if self.mode == AppMode::BookmarkList {
-                                self.handle_bookmark_list_input(key_event);
-                            } else if self.mode == AppMode::ConfirmBulkRename {
-                                self.handle_bulk_rename_input(key_event);
-                            } else if self.mode == AppMode::Visual {
-                                self.handle_visual_mode_input(key_event);
-                            } else {
-                                let action = KeyAction::from_key_event(key_event);
-                                self.handle_action(action);
-                            }
+                            self.dispatch_key_event(key_event);
                         }
                         Event::Mouse(mouse_event) => {
                             // Only handle mouse events in Normal mode for now
@@ -400,22 +382,7 @@ impl App {
                     while crossterm::event::poll(Duration::ZERO)? {
                         match crossterm::event::read() {
                             Ok(Event::Key(key_event)) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                                if self.mode == AppMode::Command {
-                                    self.handle_command_input(key_event);
-                                } else if self.mode == AppMode::Search {
-                                    self.handle_search_input(key_event);
-                                } else if matches!(self.mode, AppMode::Renaming | AppMode::CreatingFile | AppMode::CreatingDirectory | AppMode::Taking | AppMode::GoingTo) {
-                                    self.handle_input_event(key_event);
-                                } else if self.mode == AppMode::ConflictResolution {
-                                    self.handle_conflict_key(key_event);
-                                } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
-                                    self.handle_bookmark_key(key_event);
-                                } else if self.mode == AppMode::BookmarkList {
-                                    self.handle_bookmark_list_input(key_event);
-                                } else {
-                                    let action = KeyAction::from_key_event(key_event);
-                                    self.handle_action(action);
-                                }
+                                self.dispatch_key_event(key_event);
                                 if self.mode == AppMode::Quit {
                                     break;
                                 }
@@ -443,8 +410,9 @@ impl App {
                     self.needs_redraw = true;
                 }
 
-                _ = interval.tick() => {
-                    // Periodic tick for background updates
+                _ = interval.tick(), if self.scan_progress.is_some() || self.deletion_progress.is_some() => {
+                    // Periodic tick only when background work is active (avoids busy-waking CPU)
+                    self.needs_redraw = true;
                 }
             }
 
@@ -500,7 +468,7 @@ impl App {
 
         while self.mode != AppMode::Quit {
             if self.needs_redraw {
-                terminal.draw(|frame| self.render(frame))?;
+                terminal.draw(|frame| self.draw(frame))?;
                 self.needs_redraw = false;
             }
 
@@ -512,26 +480,7 @@ impl App {
                 Some(Ok(event)) = events.next() => {
                     match event {
                         Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                            if self.mode == AppMode::Command {
-                                self.handle_command_input(key_event);
-                            } else if self.mode == AppMode::Search {
-                                self.handle_search_input(key_event);
-                            } else if matches!(self.mode, AppMode::Renaming | AppMode::CreatingFile | AppMode::CreatingDirectory | AppMode::Taking | AppMode::GoingTo) {
-                                self.handle_input_event(key_event);
-                            } else if self.mode == AppMode::ConflictResolution {
-                                self.handle_conflict_key(key_event);
-                            } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
-                                self.handle_bookmark_key(key_event);
-                            } else if self.mode == AppMode::BookmarkList {
-                                self.handle_bookmark_list_input(key_event);
-                            } else if self.mode == AppMode::ConfirmBulkRename {
-                                self.handle_bulk_rename_input(key_event);
-                            } else if self.mode == AppMode::Visual {
-                                self.handle_visual_mode_input(key_event);
-                            } else {
-                                let action = KeyAction::from_key_event(key_event);
-                                self.handle_action(action);
-                            }
+                            self.dispatch_key_event(key_event);
                         }
                         Event::Mouse(mouse_event) => {
                             // Only handle mouse events in Normal mode for now
@@ -547,22 +496,7 @@ impl App {
                     while crossterm::event::poll(Duration::ZERO)? {
                         match crossterm::event::read() {
                             Ok(Event::Key(key_event)) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                                if self.mode == AppMode::Command {
-                                    self.handle_command_input(key_event);
-                                } else if self.mode == AppMode::Search {
-                                    self.handle_search_input(key_event);
-                                } else if matches!(self.mode, AppMode::Renaming | AppMode::CreatingFile | AppMode::CreatingDirectory | AppMode::Taking | AppMode::GoingTo) {
-                                    self.handle_input_event(key_event);
-                                } else if self.mode == AppMode::ConflictResolution {
-                                    self.handle_conflict_key(key_event);
-                                } else if matches!(self.mode, AppMode::SettingBookmark | AppMode::JumpingToBookmark) {
-                                    self.handle_bookmark_key(key_event);
-                                } else if self.mode == AppMode::BookmarkList {
-                                    self.handle_bookmark_list_input(key_event);
-                                } else {
-                                    let action = KeyAction::from_key_event(key_event);
-                                    self.handle_action(action);
-                                }
+                                self.dispatch_key_event(key_event);
                                 if self.mode == AppMode::Quit {
                                     break;
                                 }
@@ -590,8 +524,9 @@ impl App {
                     self.needs_redraw = true;
                 }
 
-                _ = interval.tick() => {
-                    // Periodic tick for background updates
+                _ = interval.tick(), if self.scan_progress.is_some() || self.deletion_progress.is_some() => {
+                    // Periodic tick only when background work is active (avoids busy-waking CPU)
+                    self.needs_redraw = true;
                 }
             }
 
@@ -825,9 +760,10 @@ impl App {
     /// Update cached tree item count.
     fn update_cached_tree_len(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                .flatten(&self.tree_state);
-            self.cached_tree_len = items.len();
+            // Use flatten_count to avoid allocating a full Vec just for the length.
+            self.cached_tree_len =
+                TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                    .flatten_count(&self.tree_state);
         } else {
             self.cached_tree_len = 0;
         }
@@ -954,7 +890,7 @@ impl App {
                     self.miller_state.selected = miller_idx;
                     self.miller_state.offset = 0;
                     self.update_cached_miller_len();
-                    self.miller_state.ensure_visible(20);
+                    self.miller_state.ensure_visible(self.viewport_height);
                     self.update_preview();
                 } else {
                     // Fallback: reset miller state
@@ -974,7 +910,7 @@ impl App {
                 if let Some(tree_idx) = data.tree_index {
                     self.tree_state.selected = tree_idx;
                     self.tree_state.offset = 0;
-                    self.tree_state.ensure_visible(20);
+                    self.tree_state.ensure_visible(self.viewport_height);
                 }
                 self.update_cached_tree_len();
             }
@@ -1135,9 +1071,55 @@ impl App {
         self.preview_state.update(Some(&file_path));
     }
 
-    /// Render the application.
-    fn render(&self, frame: &mut Frame) {
-        frame.render_widget(self, frame.area());
+    /// Draw the application into the given frame, updating `viewport_height` first.
+    fn draw(&mut self, frame: &mut Frame) {
+        // Subtract rows for header(1) + view_tabs(1) + footer(1) = 3, plus dir_tabs(1)
+        // when multiple directory tabs are open.
+        let chrome_rows: u16 = if self.tab_manager.len() > 1 { 5 } else { 4 };
+        let h = frame.area().height.saturating_sub(chrome_rows) as usize;
+        if h > 0 {
+            self.viewport_height = h;
+        }
+        frame.render_widget(&*self, frame.area());
+    }
+
+    /// Dispatch a key event to the appropriate handler for the current mode.
+    ///
+    /// This is the single authoritative entry point for all key events, used
+    /// by both the primary event loop and the drain loop to avoid duplication
+    /// and to ensure all modes (including Visual and ConfirmBulkRename) are
+    /// handled consistently everywhere.
+    fn dispatch_key_event(&mut self, key_event: crossterm::event::KeyEvent) {
+        if self.mode == AppMode::Command {
+            self.handle_command_input(key_event);
+        } else if self.mode == AppMode::Search {
+            self.handle_search_input(key_event);
+        } else if matches!(
+            self.mode,
+            AppMode::Renaming
+                | AppMode::CreatingFile
+                | AppMode::CreatingDirectory
+                | AppMode::Taking
+                | AppMode::GoingTo
+        ) {
+            self.handle_input_event(key_event);
+        } else if self.mode == AppMode::ConflictResolution {
+            self.handle_conflict_key(key_event);
+        } else if matches!(
+            self.mode,
+            AppMode::SettingBookmark | AppMode::JumpingToBookmark
+        ) {
+            self.handle_bookmark_key(key_event);
+        } else if self.mode == AppMode::BookmarkList {
+            self.handle_bookmark_list_input(key_event);
+        } else if self.mode == AppMode::ConfirmBulkRename {
+            self.handle_bulk_rename_input(key_event);
+        } else if self.mode == AppMode::Visual {
+            self.handle_visual_mode_input(key_event);
+        } else {
+            let action = KeyAction::from_key_event(key_event);
+            self.handle_action(action);
+        }
     }
 
     /// Handle a key action.
@@ -1162,7 +1144,9 @@ impl App {
             }
             AppMode::ConfirmDelete => {
                 match action {
-                    KeyAction::Confirm | KeyAction::DrillDown => {
+                    // 'y'/Enter both confirm deletion.
+                    // KeyAction::Yank covers the 'y' key since that is its normal-mode mapping.
+                    KeyAction::Confirm | KeyAction::DrillDown | KeyAction::Yank => {
                         self.execute_deletion();
                     }
                     KeyAction::Quit | KeyAction::Cancel => {
@@ -1742,7 +1726,12 @@ impl App {
                     conflict_resolution: resolution,
                     preserve_timestamps: false,
                 };
-                let rx = gravityfile_ops::start_copy(sources, destination, options);
+                let rx = gravityfile_ops::start_copy(
+                    sources,
+                    destination,
+                    options,
+                    gravityfile_ops::CancellationToken::new(),
+                );
                 self.scan_rx = Some(Self::adapt_copy_rx(rx));
             }
             ClipboardMode::Cut => {
@@ -1750,7 +1739,12 @@ impl App {
                 let options = MoveOptions {
                     conflict_resolution: resolution,
                 };
-                let rx = gravityfile_ops::start_move(sources, destination, options);
+                let rx = gravityfile_ops::start_move(
+                    sources,
+                    destination,
+                    options,
+                    gravityfile_ops::CancellationToken::new(),
+                );
                 self.scan_rx = Some(Self::adapt_move_rx(rx));
                 self.clipboard.clear();
             }
@@ -1838,10 +1832,10 @@ impl App {
                     MoveResult::Progress(p) => ScanResult::OperationProgress(p),
                     MoveResult::Conflict(c) => ScanResult::OperationConflict(c),
                     MoveResult::Complete(c) => ScanResult::OperationComplete {
-                        operation_type: c.operation_type,
-                        succeeded: c.succeeded,
-                        failed: c.failed,
-                        bytes_processed: c.bytes_processed,
+                        operation_type: c.inner.operation_type,
+                        succeeded: c.inner.succeeded,
+                        failed: c.inner.failed,
+                        bytes_processed: c.inner.bytes_processed,
                     },
                 };
                 if tx.send(scan_result).await.is_err() {
@@ -2059,7 +2053,7 @@ impl App {
                 self.scan_progress = None;
 
                 // Load quick tree for immediate display
-                self.tree = gravityfile_scan::quick_list(&path).ok();
+                self.tree = gravityfile_scan::quick_list(&path, None).ok();
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
 
@@ -2854,7 +2848,7 @@ impl App {
             self.miller_state.offset = 0;
             self.tree_state.expanded = fwd_expanded;
             self.update_cached_miller_len();
-            self.miller_state.ensure_visible(20);
+            self.miller_state.ensure_visible(self.viewport_height);
             self.update_preview();
             self.sync_to_active_tab();
             return;
@@ -2888,7 +2882,7 @@ impl App {
 
         // Quick load directory contents for immediate display
         // When the full scan completes, it will replace this with accurate data
-        if let Ok(quick_tree) = gravityfile_scan::quick_list(path) {
+        if let Ok(quick_tree) = gravityfile_scan::quick_list(path, None) {
             // Find the node in our tree and update its children
             if let Some(tree) = &mut self.tree
                 && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
@@ -3000,7 +2994,7 @@ impl App {
         }
 
         // Load the parent directory contents
-        let Ok(mut parent_tree) = gravityfile_scan::quick_list(parent) else {
+        let Ok(mut parent_tree) = gravityfile_scan::quick_list(parent, None) else {
             return; // Can't access parent directory
         };
 
@@ -3147,7 +3141,7 @@ impl App {
             if let Some(parent_path) = self.view_root.parent() {
                 let parent_path_buf = parent_path.to_path_buf();
                 // Load the parent directory
-                if let Ok(mut parent_tree) = gravityfile_scan::quick_list(&parent_path_buf) {
+                if let Ok(mut parent_tree) = gravityfile_scan::quick_list(&parent_path_buf, None) {
                     // Merge any cached scans into the parent tree's children
                     // This ensures previously scanned directories show their data
                     self.merge_cached_scans_into_tree(&mut parent_tree.root, &parent_path_buf);
@@ -3830,7 +3824,7 @@ impl App {
             if needs_rescan {
                 // We're jumping outside the scanned tree, need to rescan
                 self.path = path;
-                self.tree = gravityfile_scan::quick_list(&self.path).ok();
+                self.tree = gravityfile_scan::quick_list(&self.path, None).ok();
                 self.tree_state = TreeState::new(self.path.clone());
                 self.tree_state.expand(&self.path);
                 self.duplicates = None;

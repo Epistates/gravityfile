@@ -369,10 +369,10 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
             0
         };
 
-        let mut y = results_area.y;
         for (i, result) in results.iter().skip(offset).take(max_visible).enumerate() {
+            let row = i as u16;
             let is_selected = i + offset == selected;
-            let style = if is_selected {
+            let base_style = if is_selected {
                 ctx.theme.selected
             } else if result.is_dir {
                 ctx.theme.directory
@@ -380,32 +380,87 @@ fn render_search_overlay(ctx: &RenderContext, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(ctx.theme.foreground)
             };
 
-            // Add indicator for directories
-            let prefix = if result.is_dir { "📁 " } else { "   " };
-            let text = format!("{}{}", prefix, result.display);
+            // H-2: Build a per-character spans line so matched characters are highlighted.
+            let prefix = if result.is_dir { " " } else { "   " };
 
-            // Truncate if needed
-            let max_width = results_area.width as usize;
-            let display = if text.len() > max_width {
-                format!("{}…", &text[..max_width - 1])
+            // Highlight style for matched characters (bold + accent color on selected, just
+            // bold+underline otherwise so it is visible on both dark and light themes).
+            let match_style = if is_selected {
+                base_style.add_modifier(
+                    ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED,
+                )
             } else {
-                text
+                Style::default()
+                    .fg(ctx.theme.warning)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             };
 
-            buf.set_string(results_area.x, y, &display, style);
-            y += 1;
+            // Build spans: prefix + per-character display name (highlighting matched indices)
+            // nucleo returns UTF-32 code-point indices, so we enumerate chars (not byte offsets).
+            let mut spans: Vec<Span> = vec![Span::styled(prefix, base_style)];
+            for (char_pos, ch) in result.display.chars().enumerate() {
+                let is_match = result.matched_indices.contains(&char_pos);
+                let s = ch.to_string();
+                spans.push(if is_match {
+                    Span::styled(s, match_style)
+                } else {
+                    Span::styled(s, base_style)
+                });
+            }
+
+            // Truncate total display to fit width (Unicode-safe): rebuild if too wide
+            let max_cols = results_area.width as usize;
+            {
+                use unicode_width::UnicodeWidthStr;
+                let total_text = format!("{}{}", prefix, result.display);
+                if total_text.width() > max_cols {
+                    // Rebuild spans from a truncated string
+                    let truncated = {
+                        let mut bpos = 0usize;
+                        let mut cols = 0usize;
+                        for ch in total_text.chars() {
+                            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                            if cols + w > max_cols.saturating_sub(1) {
+                                break;
+                            }
+                            cols += w;
+                            bpos += ch.len_utf8();
+                        }
+                        format!("{}…", &total_text[..bpos])
+                    };
+                    spans.clear();
+                    spans.push(Span::styled(prefix, base_style));
+                    let display_part = &truncated[prefix.len()..];
+                    for (char_pos, ch) in display_part.chars().enumerate() {
+                        let is_match = result.matched_indices.contains(&char_pos);
+                        let s = ch.to_string();
+                        spans.push(if is_match {
+                            Span::styled(s, match_style)
+                        } else {
+                            Span::styled(s, base_style)
+                        });
+                    }
+                    // Add ellipsis span
+                    spans.push(Span::styled("…", base_style));
+                }
+            }
+            let row_area = Rect::new(results_area.x, results_area.y + row, results_area.width, 1);
+            Line::from(spans).render(row_area, buf);
         }
 
         // Show result count
         if results.len() > max_visible {
             let count_str = format!("[{}/{}]", selected + 1, results.len());
             let x = results_area.x + results_area.width.saturating_sub(count_str.len() as u16);
-            buf.set_string(
+            let count_area = Rect::new(
                 x,
                 results_area.y + results_area.height - 1,
-                &count_str,
-                Style::default().fg(ctx.theme.muted),
+                count_str.len() as u16,
+                1,
             );
+            Line::from(count_str)
+                .style(Style::default().fg(ctx.theme.muted))
+                .render(count_area, buf);
         }
     }
 }

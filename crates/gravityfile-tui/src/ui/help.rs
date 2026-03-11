@@ -41,7 +41,7 @@ impl<'a> HelpOverlay<'a> {
                     .add_modifier(Modifier::BOLD),
             ));
             if y < area.y + area.height {
-                buf.set_line(area.x, y, &title_line, area.width);
+                title_line.render(Rect::new(area.x, y, area.width, 1), buf);
                 y += 1;
             }
 
@@ -55,7 +55,7 @@ impl<'a> HelpOverlay<'a> {
                 let desc_span =
                     Span::styled(format!(" {}", binding.description), self.theme.help_desc);
                 let line = Line::from(vec![key_span, desc_span]);
-                buf.set_line(area.x, y, &line, area.width);
+                line.render(Rect::new(area.x, y, area.width, 1), buf);
                 y += 1;
             }
 
@@ -94,36 +94,21 @@ impl Widget for HelpOverlay<'_> {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(inner);
 
-        // Get sections
+        // L-2: Use balanced split instead of hard-coded title strings.
+        // Distribute all sections evenly across the two columns.
         let sections = get_help_sections();
         let section_refs: Vec<&_> = sections.iter().collect();
-
-        // Left column: Navigation, Selection & Clipboard, File Operations
-        let left_sections: Vec<&_> = section_refs
-            .iter()
-            .filter(|s| {
-                s.title == "Navigation"
-                    || s.title == "Selection & Clipboard"
-                    || s.title == "File Operations"
-            })
-            .copied()
-            .collect();
-
-        // Right column: Views & Display, Commands, then Command Palette reference
-        let right_sections: Vec<&_> = section_refs
-            .iter()
-            .filter(|s| s.title == "Views & Display" || s.title == "Commands")
-            .copied()
-            .collect();
+        let total = section_refs.len();
+        let left_count = total.div_ceil(2);
+        let (left_sections, right_sections) = section_refs.split_at(left_count);
 
         // Render left column
-        self.render_section_column(&left_sections, left_col, buf);
+        self.render_section_column(left_sections, left_col, buf);
 
-        // Render right column with sections + command palette
+        // Render right column with remaining sections + command palette
         let mut y = right_col.y;
 
-        // First render the sections
-        for section in &right_sections {
+        for section in right_sections {
             if y >= right_col.y + right_col.height {
                 break;
             }
@@ -135,7 +120,7 @@ impl Widget for HelpOverlay<'_> {
                     .fg(self.theme.info)
                     .add_modifier(Modifier::BOLD),
             ));
-            buf.set_line(right_col.x, y, &title_line, right_col.width);
+            title_line.render(Rect::new(right_col.x, y, right_col.width, 1), buf);
             y += 1;
 
             // Bindings
@@ -148,7 +133,7 @@ impl Widget for HelpOverlay<'_> {
                 let desc_span =
                     Span::styled(format!(" {}", binding.description), self.theme.help_desc);
                 let line = Line::from(vec![key_span, desc_span]);
-                buf.set_line(right_col.x, y, &line, right_col.width);
+                line.render(Rect::new(right_col.x, y, right_col.width, 1), buf);
                 y += 1;
             }
 
@@ -163,7 +148,7 @@ impl Widget for HelpOverlay<'_> {
                     .fg(self.theme.info)
                     .add_modifier(Modifier::BOLD),
             ));
-            buf.set_line(right_col.x, y, &title_line, right_col.width);
+            title_line.render(Rect::new(right_col.x, y, right_col.width, 1), buf);
             y += 1;
 
             let commands = get_command_help();
@@ -175,7 +160,7 @@ impl Widget for HelpOverlay<'_> {
                 let cmd_span = Span::styled(format!("{:>14}", cmd), self.theme.help_key);
                 let desc_span = Span::styled(format!(" {}", desc), self.theme.help_desc);
                 let line = Line::from(vec![cmd_span, desc_span]);
-                buf.set_line(right_col.x, y, &line, right_col.width);
+                line.render(Rect::new(right_col.x, y, right_col.width, 1), buf);
                 y += 1;
             }
         }

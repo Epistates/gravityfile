@@ -9,11 +9,28 @@ mod treemap;
 
 pub use help::HelpOverlay;
 pub use miller::{MillerColumns, MillerState};
-pub use size_bar::SizeBar;
+pub use size_bar::CompactSizeBar;
 pub use tree::{TreeState, TreeView, VisibleNodeKind};
 pub use treemap::{TreemapState, TreemapView};
 
 use ratatui::layout::{Constraint, Layout, Rect};
+use unicode_width::UnicodeWidthChar;
+
+/// Truncate a string to at most `max_width` display columns, respecting
+/// char boundaries and Unicode widths. Returns a byte-valid substring.
+pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
+    let mut byte_pos = 0;
+    let mut col_count = 0;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(1);
+        if col_count + w > max_width {
+            break;
+        }
+        col_count += w;
+        byte_pos += ch.len_utf8();
+    }
+    &s[..byte_pos]
+}
 
 /// Layout areas for the application.
 #[derive(Debug, Clone, Copy)]
@@ -27,18 +44,15 @@ pub struct AppLayout {
 }
 
 impl AppLayout {
-    /// Compute layout from terminal area.
+    /// Compute layout from the content area (already minus header/footer rows).
+    ///
+    /// `render_app` owns the vertical layout and passes the content `Rect` here.
+    /// `AppLayout` only handles the optional horizontal details-panel split so we
+    /// do not double-subtract header/footer rows.
     pub fn new(area: Rect, show_details: bool) -> Self {
         let min_main_width = 50;
-        let details_width = 30;
-
-        // Vertical split: header, main content, footer
-        let [header, content, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        // M-8: make details panel width proportional instead of fixed 30
+        let details_width = (area.width / 4).clamp(30, 60);
 
         // Horizontal split for details panel (if enabled and space available)
         let (main, details) = if show_details && area.width >= min_main_width + details_width {
@@ -46,17 +60,21 @@ impl AppLayout {
                 Constraint::Min(min_main_width),
                 Constraint::Length(details_width),
             ])
-            .areas(content);
+            .areas(area);
             (main, Some(details))
         } else {
-            (content, None)
+            (area, None)
         };
 
         Self {
-            header,
+            // These are unused — kept only so downstream code that reads
+            // them will not break. They intentionally point at the content
+            // area since the real header/footer rects are owned by
+            // `render_app` and are not passed down.
+            header: area,
             main,
             details,
-            footer,
+            footer: area,
         }
     }
 }

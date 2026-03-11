@@ -13,7 +13,7 @@ use gravityfile_core::{FileNode, GitStatus, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
-use crate::ui::{SizeBar, format_size};
+use crate::ui::{CompactSizeBar, format_size, truncate_to_width};
 
 /// State for the tree view.
 #[derive(Debug, Default, Clone)]
@@ -174,6 +174,24 @@ impl<'a> TreeView<'a> {
             &mut items,
         );
         items
+    }
+
+    /// Count visible items without allocating a Vec.
+    /// Use this when only the count is needed (e.g. updating `cached_tree_len`).
+    pub fn flatten_count(&self, state: &TreeState) -> usize {
+        self.count_node(self.root, &self.root_path.clone(), state)
+    }
+
+    fn count_node(&self, node: &FileNode, path: &PathBuf, state: &TreeState) -> usize {
+        let is_expanded = state.is_expanded(path);
+        let mut count = 1; // this node itself
+        if is_expanded && node.is_dir() {
+            for child in &node.children {
+                let child_path = path.join(&*child.name);
+                count += self.count_node(child, &child_path, state);
+            }
+        }
+        count
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -348,12 +366,16 @@ impl StatefulWidget for TreeView<'_> {
                 .saturating_sub(size_bar_width + 1)
                 .saturating_sub(size_text_width + 1);
 
-            // Truncate name if needed
-            let name = if item.node.name.len() > available_for_name as usize {
-                let truncated_len = available_for_name.saturating_sub(1) as usize;
-                format!("{}…", &item.node.name[..truncated_len])
-            } else {
-                item.node.name.clone()
+            // Truncate name if needed (Unicode-safe)
+            let name = {
+                use unicode_width::UnicodeWidthStr;
+                let max = available_for_name as usize;
+                if item.node.name.width() > max {
+                    let truncated = truncate_to_width(&item.node.name, max.saturating_sub(1));
+                    format!("{}…", truncated)
+                } else {
+                    item.node.name.clone()
+                }
             };
 
             // Build line with checkbox
@@ -376,11 +398,19 @@ impl StatefulWidget for TreeView<'_> {
             let git_span = Span::styled(&git_indicator, git_style);
 
             // Pad name to fill space (accounting for git indicator)
-            let git_len = git_indicator.len() as u16;
+            // Use display width, not byte length, for correct Unicode padding
+            let git_display_width = {
+                use unicode_width::UnicodeWidthStr;
+                git_indicator.width() as u16
+            };
+            let name_display_width = {
+                use unicode_width::UnicodeWidthStr;
+                name.width() as u16
+            };
             let name_padding = " ".repeat(
                 available_for_name
-                    .saturating_sub(name.len() as u16)
-                    .saturating_sub(git_len) as usize,
+                    .saturating_sub(name_display_width)
+                    .saturating_sub(git_display_width) as usize,
             );
             let padding_span = Span::raw(&name_padding);
 
@@ -438,9 +468,7 @@ impl StatefulWidget for TreeView<'_> {
                 1,
             );
 
-            let bar = SizeBar::new(ratio)
-                .filled_style(self.theme.size_bar_style(ratio))
-                .empty_style(Style::default().fg(self.theme.muted));
+            let bar = CompactSizeBar::new(ratio).style(self.theme.size_bar_style(ratio));
 
             if is_selected {
                 // Dim the bar slightly for selected row

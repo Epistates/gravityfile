@@ -48,11 +48,12 @@ pub use theme::Theme;
 
 /// Configuration for the TUI application.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TuiConfig {
     /// Whether to automatically start scanning on startup.
-    /// If false (default), only a quick directory listing is shown
-    /// and the user must press 'R' to start a full scan.
-    pub scan_on_startup: bool,
+    /// `None` means defer to the user's saved settings.
+    /// `Some(true)` forces scanning on, `Some(false)` forces it off.
+    pub scan_on_startup: Option<bool>,
     /// Path to a file where the last working directory will be written on exit.
     /// This enables shell integration for `cd` on exit functionality.
     pub cwd_file: Option<std::path::PathBuf>,
@@ -68,7 +69,7 @@ impl TuiConfig {
 
     /// Enable auto-scan on startup.
     pub fn with_scan_on_startup(mut self, scan: bool) -> Self {
-        self.scan_on_startup = scan;
+        self.scan_on_startup = Some(scan);
         self
     }
 
@@ -101,6 +102,15 @@ pub fn run(path: std::path::PathBuf) -> AppResult<()> {
 pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult<()> {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
+
+    // Install a panic hook that restores the terminal before printing the panic message,
+    // so the terminal is not left in raw mode on unexpected panics.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        ratatui::restore();
+        original_hook(panic_info);
+    }));
 
     // Create tokio runtime for async operations
     let rt = tokio::runtime::Runtime::new()?;

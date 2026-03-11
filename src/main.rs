@@ -1,11 +1,11 @@
 //! gravityfile - A state-of-the-art file system analyzer with TUI.
 //!
 //! Usage:
-//!   grav [PATH]              Launch interactive TUI
-//!   grav scan [PATH]         Quick scan summary
-//!   grav duplicates [PATH]   Find duplicate files
-//!   grav age [PATH]          Analyze file ages
-//!   grav export [PATH]       Export scan to JSON
+//!   grav \[PATH\]              Launch interactive TUI
+//!   grav scan \[PATH\]         Quick scan summary
+//!   grav duplicates \[PATH\]   Find duplicate files
+//!   grav age \[PATH\]          Analyze file ages
+//!   grav export \[PATH\]       Export scan to JSON
 //!   grav --help              Show help
 
 use std::path::{Path, PathBuf};

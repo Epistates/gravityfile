@@ -88,10 +88,13 @@ impl Widget for DeleteConfirmModal<'_> {
             Line::raw(""),
         ];
 
-        // List items (limited) - show full paths for clarity
+        // List items (limited) - show full paths for clarity.
+        // Sort paths for deterministic display order (HashSet iteration is random).
         let max_items = (inner.height as usize).saturating_sub(5);
         let max_path_len = (inner.width as usize).saturating_sub(6);
-        for path in self.marked_paths.iter().take(max_items) {
+        let mut sorted_paths: Vec<&PathBuf> = self.marked_paths.iter().collect();
+        sorted_paths.sort();
+        for path in sorted_paths.iter().take(max_items) {
             // Show full path, truncated from the left if too long
             let full_path = path.display().to_string();
             let display_path = if full_path.len() > max_path_len {

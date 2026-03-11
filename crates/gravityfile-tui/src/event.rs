@@ -80,6 +80,7 @@ pub enum KeyAction {
     GoTo,
 
     // Confirmation
+    /// Explicit confirmation action (e.g. mapped from 'y' via dedicated confirm logic).
     #[allow(dead_code)]
     Confirm,
     Cancel,
