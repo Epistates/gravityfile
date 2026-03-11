@@ -20,10 +20,11 @@ pub use conflict::{Conflict, ConflictKind, ConflictResolution};
 pub use copy::{CopyOptions, CopyResult, start_copy};
 pub use create::{CreateResult, start_create_directory, start_create_file};
 pub use executor::{OperationExecutor, OperationResult, execute_undo};
-pub use move_op::{MoveOptions, MoveResult, start_move};
+pub use move_op::{MoveComplete, MoveOptions, MoveResult, start_move};
 pub use operation::{FileOperation, OperationError};
 pub use progress::{OperationComplete, OperationProgress, OperationType};
 pub use rename::{RenameResult, start_rename};
+pub use tokio_util::sync::CancellationToken;
 pub use undo::{UndoEntry, UndoLog, UndoableOperation};
 
 /// Default channel buffer size for operation progress updates.

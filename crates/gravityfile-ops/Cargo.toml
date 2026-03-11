@@ -9,11 +9,12 @@ description = "File operations engine for gravityfile"
 [dependencies]
 gravityfile-core.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+tracing.workspace = true
 
 # File operations
-fs_extra = "1.3"
 trash = "5"
 
 # Archive support

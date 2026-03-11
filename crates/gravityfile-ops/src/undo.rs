@@ -51,11 +51,12 @@ pub enum UndoableOperation {
     },
     /// A file or directory was renamed.
     FileRenamed {
-        /// The path (with new name).
+        /// The full path with the new name (after rename).
         path: PathBuf,
-        /// The old name.
-        old_name: String,
-        /// The new name.
+        /// The full original path (before rename) — used to undo.
+        // HIGH-5: store full old path instead of bare old_name string
+        old_path: PathBuf,
+        /// The new name (informational).
         new_name: String,
     },
     /// A file was created.
@@ -83,8 +84,14 @@ impl UndoableOperation {
             Self::FilesDeleted { paths } => {
                 format!("Deleted {} items (recover via OS trash)", paths.len())
             }
-            Self::FileRenamed { old_name, .. } => {
-                format!("Rename back to '{}'", old_name)
+            Self::FileRenamed { old_path, .. } => {
+                format!(
+                    "Rename back to '{}'",
+                    old_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )
             }
             Self::FileCreated { .. } => "Delete the created file".to_string(),
             Self::DirectoryCreated { .. } => "Delete the created directory".to_string(),
@@ -167,14 +174,24 @@ impl UndoLog {
     }
 
     /// Record a rename operation.
-    pub fn record_rename(&mut self, path: PathBuf, old_name: String, new_name: String) -> u64 {
+    ///
+    /// `source` is the full original path before the rename.
+    /// `new_name` is the new name component (used for the description).
+    pub fn record_rename(&mut self, source: PathBuf, new_name: String) -> u64 {
+        let parent = source.parent().unwrap_or(std::path::Path::new(""));
+        let new_path = parent.join(&new_name);
+        let old_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let description = format!("Renamed '{}' to '{}'", old_name, new_name);
         self.record(
             UndoableOperation::FileRenamed {
-                path,
-                old_name: old_name.clone(),
-                new_name: new_name.clone(),
+                path: new_path,
+                old_path: source,
+                new_name,
             },
-            format!("Renamed '{}' to '{}'", old_name, new_name),
+            description,
         )
     }
 
@@ -204,15 +221,15 @@ impl UndoLog {
 
     /// Pop the most recent undoable entry.
     ///
-    /// Returns None if the log is empty or the most recent operation cannot be undone.
+    /// Returns `None` if the log is empty or the back entry cannot be undone.
+    /// Does NOT drain through non-undoable entries — only examines the back.
     pub fn pop(&mut self) -> Option<UndoEntry> {
-        // Find the most recent undoable entry
-        while let Some(entry) = self.entries.pop_back() {
-            if entry.operation.can_undo() {
-                return Some(entry);
-            }
+        // HIGH-4: only look at the back entry; don't consume non-undoable ones
+        if self.entries.back()?.operation.can_undo() {
+            self.entries.pop_back()
+        } else {
+            None
         }
-        None
     }
 
     /// Peek at the most recent entry without removing it.
@@ -280,11 +297,7 @@ mod tests {
         let mut log = UndoLog::new(10);
 
         log.record_create_file(PathBuf::from("/test/file.txt"));
-        log.record_rename(
-            PathBuf::from("/test/new.txt"),
-            "old.txt".to_string(),
-            "new.txt".to_string(),
-        );
+        log.record_rename(PathBuf::from("/test/old.txt"), "new.txt".to_string());
 
         let entry = log.pop().unwrap();
         assert!(matches!(
@@ -299,5 +312,18 @@ mod tests {
         ));
 
         assert!(log.pop().is_none());
+    }
+
+    #[test]
+    fn test_pop_does_not_drain_non_undoable() {
+        let mut log = UndoLog::new(10);
+        log.record_create_file(PathBuf::from("/test/file.txt"));
+        // Delete is non-undoable; push it last so it is the back entry
+        log.record_delete(vec![PathBuf::from("/test/other.txt")]);
+
+        // pop() should return None because the back entry is non-undoable
+        assert!(log.pop().is_none());
+        // The undoable create entry must still be present
+        assert_eq!(log.len(), 2);
     }
 }

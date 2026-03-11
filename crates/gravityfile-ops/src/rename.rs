@@ -56,8 +56,9 @@ async fn rename_impl(source: PathBuf, new_name: String, tx: mpsc::Sender<RenameR
     let parent = source.parent().unwrap_or(std::path::Path::new(""));
     let new_path = parent.join(&new_name);
 
-    // Check if target already exists
-    if new_path.exists() && new_path != source {
+    // Check if target already exists — use symlink_metadata so we see the link itself
+    // LOW-5: replace new_path.exists() (follows symlinks) with symlink_metadata check
+    if new_path.symlink_metadata().is_ok() && new_path != source {
         progress.add_error(OperationError::new(
             source.clone(),
             format!("'{}' already exists", new_name),
@@ -128,8 +129,11 @@ pub fn validate_filename(name: &str) -> Result<(), String> {
         return Err("Name cannot be empty".into());
     }
 
+    // Most filesystems (ext4, APFS, NTFS) enforce a 255-byte limit on
+    // filenames, not a 255-character limit. A name like "界".repeat(255)
+    // is 255 characters but 765 bytes and will be rejected by the OS.
     if name.len() > 255 {
-        return Err("Name is too long (max 255 characters)".into());
+        return Err("Name is too long (max 255 bytes)".into());
     }
 
     // Check for invalid characters

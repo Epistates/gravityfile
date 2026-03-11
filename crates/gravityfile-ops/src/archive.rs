@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -12,6 +12,12 @@ const MAX_DECOMPRESSION_RATIO: f64 = 1000.0;
 
 /// Maximum total size for extracted content (10 GB).
 const MAX_TOTAL_EXTRACTED_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Maximum number of entries allowed in a TAR archive.
+const MAX_ENTRY_COUNT: u64 = 100_000;
+
+/// Maximum size for a single TAR entry (10 GB).
+const MAX_SINGLE_ENTRY_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Error that can occur during archive operations.
 #[derive(Debug, Error)]
@@ -125,7 +131,8 @@ impl ArchiveFormat {
 /// # Ok::<(), gravityfile_ops::ArchiveError>(())
 /// ```
 pub fn extract_archive(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<PathBuf>> {
-    if !archive_path.exists() {
+    // LOW-4: use symlink_metadata so we detect a symlink-as-archive-path correctly
+    if std::fs::symlink_metadata(archive_path).is_err() {
         return Err(ArchiveError::NotFound(archive_path.to_path_buf()));
     }
 
@@ -162,9 +169,18 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
     let file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
     let mut extracted_files = Vec::new();
-    let canonical_dest = destination
-        .canonicalize()
-        .unwrap_or_else(|_| destination.to_path_buf());
+
+    // MED-3: canonicalization is required — return error on failure
+    let canonical_dest = destination.canonicalize().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Failed to canonicalize destination '{}': {}",
+                destination.display(),
+                e
+            ),
+        )
+    })?;
 
     // Security: Check for decompression bombs before extraction
     let mut total_uncompressed: u64 = 0;
@@ -198,6 +214,11 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
         )));
     }
 
+    // MED-1: Extract in two passes — regular files and directories first,
+    // symlinks last. This prevents a previously-extracted symlink from
+    // redirecting `create_dir_all` outside the extraction root.
+    let mut symlink_indices = Vec::new();
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let entry_path = entry.enclosed_name().ok_or_else(|| {
@@ -229,109 +250,39 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
             )));
         }
 
+        // Defer symlinks to the second pass.
+        if entry.is_symlink() {
+            symlink_indices.push(i);
+            continue;
+        }
+
         let outpath = destination.join(&entry_path);
 
         // Security: Double-check that resolved path stays within destination
-        if let Some(canonical_out) = outpath.parent().and_then(|p| p.canonicalize().ok())
-            && !canonical_out.starts_with(&canonical_dest)
-        {
-            return Err(ArchiveError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Path escapes destination: {}", entry_path.display()),
-            )));
+        if let Some(parent) = outpath.parent() {
+            std::fs::create_dir_all(parent)?;
+            let canonical_out = parent.canonicalize().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Failed to canonicalize output path '{}': {}",
+                        parent.display(),
+                        e
+                    ),
+                )
+            })?;
+            if !canonical_out.starts_with(&canonical_dest) {
+                return Err(ArchiveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Path escapes destination: {}", entry_path.display()),
+                )));
+            }
         }
 
         if entry.is_dir() {
             std::fs::create_dir_all(&outpath)?;
-        } else if entry.is_symlink() {
-            // Security: Handle symlinks in ZIP archives
-            // Read the symlink target from the file content
-            let mut target_bytes = Vec::new();
-            std::io::copy(&mut entry, &mut target_bytes)?;
-            let target_str = String::from_utf8_lossy(&target_bytes);
-            let link_target = Path::new(target_str.trim());
-
-            // Reject absolute symlink targets
-            if link_target.is_absolute() {
-                return Err(ArchiveError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Symlink with absolute target rejected: {} -> {}",
-                        entry_path.display(),
-                        link_target.display()
-                    ),
-                )));
-            }
-
-            // Reject symlink targets that escape destination
-            if link_target
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                let symlink_parent = outpath.parent().unwrap_or(destination);
-                let resolved = symlink_parent.join(link_target);
-
-                // Normalize path to check if it escapes
-                let mut normalized = PathBuf::new();
-                for component in resolved.components() {
-                    match component {
-                        std::path::Component::ParentDir => {
-                            normalized.pop();
-                        }
-                        std::path::Component::Normal(c) => {
-                            normalized.push(c);
-                        }
-                        std::path::Component::RootDir => {
-                            normalized.push("/");
-                        }
-                        _ => {}
-                    }
-                }
-
-                if !normalized.starts_with(&canonical_dest) {
-                    return Err(ArchiveError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Symlink escapes destination: {} -> {}",
-                            entry_path.display(),
-                            link_target.display()
-                        ),
-                    )));
-                }
-            }
-
-            // Create parent directories if needed
-            if let Some(parent) = outpath.parent()
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            // Create the symlink
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(link_target, &outpath)?;
-            }
-            #[cfg(windows)]
-            {
-                // On Windows, we need to know if the target is a directory
-                // Since we can't reliably know, skip symlinks with a warning
-                // (Windows symlinks require admin privileges anyway)
-                eprintln!(
-                    "Warning: Skipping symlink {} -> {} (Windows symlinks not supported)",
-                    entry_path.display(),
-                    link_target.display()
-                );
-            }
         } else {
             // Regular file
-            // Create parent directories if needed
-            if let Some(parent) = outpath.parent()
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-
             let mut outfile = File::create(&outpath)?;
             std::io::copy(&mut entry, &mut outfile)?;
 
@@ -340,12 +291,77 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
             {
                 use std::os::unix::fs::PermissionsExt;
                 if let Some(mode) = entry.unix_mode() {
-                    // Security: Only preserve standard rwx permissions (0o777)
-                    // Strip setuid (0o4000), setgid (0o2000), and sticky (0o1000) bits
                     let safe_mode = mode & 0o777;
                     std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(safe_mode))?;
                 }
             }
+        }
+
+        extracted_files.push(outpath);
+    }
+
+    // Second pass: extract symlinks after all regular entries are in place.
+    for i in symlink_indices {
+        let mut entry = archive.by_index(i)?;
+        let entry_path = entry.enclosed_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid file path in archive",
+            )
+        })?;
+
+        let outpath = destination.join(&entry_path);
+
+        // Read the symlink target from the file content
+        let mut target_bytes = Vec::new();
+        std::io::copy(&mut entry, &mut target_bytes)?;
+        let target_str = String::from_utf8_lossy(&target_bytes);
+        let link_target = Path::new(target_str.trim());
+
+        // Reject absolute symlink targets
+        if link_target.is_absolute() {
+            return Err(ArchiveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Symlink with absolute target rejected: {} -> {}",
+                    entry_path.display(),
+                    link_target.display()
+                ),
+            )));
+        }
+
+        // Validate target does not escape destination (always, not only
+        // when ParentDir is present — guards against chained symlinks).
+        let symlink_parent = outpath.parent().unwrap_or(destination);
+        let canonical_parent = symlink_parent
+            .canonicalize()
+            .unwrap_or_else(|_| symlink_parent.to_path_buf());
+        let resolved = canonical_parent.join(link_target);
+        let normalized = resolve_path(&resolved);
+
+        if !normalized.starts_with(&canonical_dest) {
+            return Err(ArchiveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Symlink escapes destination: {} -> {}",
+                    entry_path.display(),
+                    link_target.display()
+                ),
+            )));
+        }
+
+        // Create the symlink
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(link_target, &outpath)?;
+        }
+        #[cfg(windows)]
+        {
+            tracing::warn!(
+                "Skipping symlink {} -> {} (Windows symlinks not supported)",
+                entry_path.display(),
+                link_target.display()
+            );
         }
 
         extracted_files.push(outpath);
@@ -381,11 +397,93 @@ fn extract_tar_xz(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<
     extract_tar_from_reader(decoder, destination)
 }
 
+/// Resolve `..` and `.` in a path while preserving root/prefix components.
+/// Used for symlink target validation where the resolved path is absolute.
+fn resolve_path(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => {
+                resolved.push(other);
+            }
+        }
+    }
+    resolved
+}
+
+/// Validate that a TAR symlink target does not escape the destination.
+///
+/// Returns `Err` if the target is absolute (including Windows Prefix), or if normalizing
+/// the resolved path places it outside `canonical_dest`.
+fn validate_tar_symlink_target(
+    link_target: &Path,
+    outpath: &Path,
+    destination: &Path,
+    canonical_dest: &Path,
+) -> ArchiveResult<()> {
+    // MED-4: Reject Prefix (Windows absolute path) as absolute
+    for component in link_target.components() {
+        if matches!(component, Component::Prefix(_)) {
+            return Err(ArchiveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Symlink with absolute (prefixed) target rejected: {}",
+                    link_target.display()
+                ),
+            )));
+        }
+    }
+
+    // Reject standard absolute symlink targets
+    if link_target.is_absolute() {
+        return Err(ArchiveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Symlink with absolute target rejected: {}",
+                link_target.display()
+            ),
+        )));
+    }
+
+    // Always validate the resolved target against canonical_dest,
+    // not only when ParentDir is present. A target like `safe_subdir`
+    // could itself be a previously-extracted symlink pointing outside
+    // the root (chained symlink attack / TOCTOU zip-slip variant).
+    //
+    // Canonicalize the parent directory (which must already exist) to
+    // resolve any filesystem-level symlinks (e.g. /var -> /private/var
+    // on macOS) so the starts_with check against canonical_dest works.
+    let symlink_parent = outpath.parent().unwrap_or(destination);
+    let canonical_parent = symlink_parent
+        .canonicalize()
+        .unwrap_or_else(|_| symlink_parent.to_path_buf());
+    let resolved = canonical_parent.join(link_target);
+    let normalized = resolve_path(&resolved);
+
+    if !normalized.starts_with(canonical_dest) {
+        return Err(ArchiveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Symlink escapes destination: {}", link_target.display()),
+        )));
+    }
+
+    Ok(())
+}
+
 /// Extract a TAR archive from a reader.
 ///
 /// # Security
 /// This function validates all paths to prevent directory traversal attacks.
 /// Paths containing `..` components or absolute paths are rejected.
+///
+/// # Bomb protection (CRIT-4)
+/// - Checks `entry.header().size()` against `MAX_SINGLE_ENTRY_SIZE` before unpacking.
+/// - Maintains a cumulative byte counter against `MAX_TOTAL_EXTRACTED_SIZE`.
+/// - Limits entry count to `MAX_ENTRY_COUNT`.
 fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveResult<Vec<PathBuf>> {
     let mut archive = tar::Archive::new(reader);
     // Security: Don't preserve setuid/setgid bits
@@ -394,13 +492,36 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
     archive.set_unpack_xattrs(false);
 
     let mut extracted_files = Vec::new();
-    let canonical_dest = destination
-        .canonicalize()
-        .unwrap_or_else(|_| destination.to_path_buf());
+
+    // MED-3: canonicalization is required — return error on failure
+    let canonical_dest = destination.canonicalize().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Failed to canonicalize destination '{}': {}",
+                destination.display(),
+                e
+            ),
+        )
+    })?;
+
+    // CRIT-4: bomb protection counters
+    let mut entry_count: u64 = 0;
+    let mut total_extracted_bytes: u64 = 0;
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
-        let entry_path = entry.path()?;
+
+        // CRIT-4: enforce entry count limit
+        entry_count += 1;
+        if entry_count > MAX_ENTRY_COUNT {
+            return Err(ArchiveError::DecompressionBomb(format!(
+                "Archive exceeds maximum entry count of {}",
+                MAX_ENTRY_COUNT
+            )));
+        }
+
+        let entry_path = entry.path()?.into_owned();
 
         // Security: Reject absolute paths
         if entry_path.is_absolute() {
@@ -413,7 +534,7 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
         // Security: Reject paths with parent directory components
         if entry_path
             .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+            .any(|c| matches!(c, Component::ParentDir))
         {
             return Err(ArchiveError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -424,77 +545,82 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
             )));
         }
 
+        // Pre-flight check: reject obviously oversized entries before
+        // even attempting to unpack (defense in depth alongside the
+        // post-unpack verification below).
+        let declared_size = entry.header().size().unwrap_or(0);
+        if declared_size > MAX_SINGLE_ENTRY_SIZE {
+            return Err(ArchiveError::DecompressionBomb(format!(
+                "Entry '{}' declares size {} bytes (max {} bytes)",
+                entry_path.display(),
+                declared_size,
+                MAX_SINGLE_ENTRY_SIZE
+            )));
+        }
+
         let outpath = destination.join(&entry_path);
 
         // Security: Double-check that resolved path stays within destination
         // (handles symlink attacks where intermediate directories are symlinks)
-        if let Some(canonical_out) = outpath.parent().and_then(|p| p.canonicalize().ok())
-            && !canonical_out.starts_with(&canonical_dest)
-        {
-            return Err(ArchiveError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Path escapes destination: {}", entry_path.display()),
-            )));
+        if let Some(parent) = outpath.parent() {
+            std::fs::create_dir_all(parent)?;
+            let canonical_out = parent.canonicalize().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Failed to canonicalize output path '{}': {}",
+                        parent.display(),
+                        e
+                    ),
+                )
+            })?;
+            if !canonical_out.starts_with(&canonical_dest) {
+                return Err(ArchiveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Path escapes destination: {}", entry_path.display()),
+                )));
+            }
         }
 
-        // Security: Validate symlink targets
+        // Security: Validate symlink targets (MED-4 normalizer used)
         let entry_type = entry.header().entry_type();
         if (entry_type.is_symlink() || entry_type.is_hard_link())
             && let Ok(Some(link_target)) = entry.link_name()
         {
-            // Reject absolute symlink targets
-            if link_target.is_absolute() {
-                return Err(ArchiveError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Symlink with absolute target rejected: {} -> {}",
-                        entry_path.display(),
-                        link_target.display()
-                    ),
-                )));
-            }
-
-            // Reject symlink targets with parent directory traversal
-            if link_target
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                // Calculate where the symlink would resolve to
-                let symlink_parent = outpath.parent().unwrap_or(destination);
-                let resolved = symlink_parent.join(&link_target);
-
-                // Check if resolved path escapes destination
-                // We need to normalize the path without following symlinks
-                let mut normalized = PathBuf::new();
-                for component in resolved.components() {
-                    match component {
-                        std::path::Component::ParentDir => {
-                            normalized.pop();
-                        }
-                        std::path::Component::Normal(c) => {
-                            normalized.push(c);
-                        }
-                        std::path::Component::RootDir => {
-                            normalized.push("/");
-                        }
-                        _ => {}
-                    }
-                }
-
-                if !normalized.starts_with(&canonical_dest) {
-                    return Err(ArchiveError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Symlink escapes destination: {} -> {}",
-                            entry_path.display(),
-                            link_target.display()
-                        ),
-                    )));
-                }
-            }
+            validate_tar_symlink_target(&link_target, &outpath, destination, &canonical_dest)?;
         }
 
         entry.unpack(&outpath)?;
+
+        // CRIT-2 fix: count *actual* bytes written to disk rather than
+        // trusting the attacker-controlled declared header size. A crafted
+        // archive can set all header sizes to 0 while encoding arbitrarily
+        // large content, bypassing the pre-flight check above.
+        let actual_size = std::fs::symlink_metadata(&outpath)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        if actual_size > MAX_SINGLE_ENTRY_SIZE {
+            // Best-effort cleanup of the oversized entry.
+            let _ = std::fs::remove_file(&outpath);
+            return Err(ArchiveError::DecompressionBomb(format!(
+                "Entry '{}' extracted to {} bytes (max {} bytes)",
+                entry_path.display(),
+                actual_size,
+                MAX_SINGLE_ENTRY_SIZE
+            )));
+        }
+
+        total_extracted_bytes = total_extracted_bytes.saturating_add(actual_size);
+        if total_extracted_bytes > MAX_TOTAL_EXTRACTED_SIZE {
+            // Best-effort cleanup of the entry that pushed us over.
+            let _ = std::fs::remove_file(&outpath);
+            return Err(ArchiveError::DecompressionBomb(format!(
+                "Archive exceeded maximum total extraction size of {} bytes",
+                MAX_TOTAL_EXTRACTED_SIZE
+            )));
+        }
+
         extracted_files.push(outpath);
     }
 
@@ -562,12 +688,17 @@ fn create_zip(files: &[PathBuf], archive_path: &Path) -> ArchiveResult<()> {
         .compression_method(zip::CompressionMethod::Deflated);
 
     for path in files {
-        add_path_to_zip(
-            &mut archive,
-            path,
-            path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-            &options,
-        )?;
+        // MED-5: return error when file_name() is None
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => {
+                return Err(ArchiveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Path '{}' has no filename component", path.display()),
+                )));
+            }
+        };
+        add_path_to_zip(&mut archive, path, &name, &options)?;
     }
 
     archive.finish()?;
@@ -605,8 +736,8 @@ fn add_path_to_zip_with_visited<W: Write + std::io::Seek>(
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) => {
-            // Skip inaccessible paths with a warning (e.g., broken symlinks)
-            eprintln!("Warning: Cannot access {}: {}", path.display(), e);
+            // LOW-3: use tracing::warn! instead of eprintln!
+            tracing::warn!("Cannot access {}: {}", path.display(), e);
             return Ok(());
         }
     };
@@ -616,7 +747,8 @@ fn add_path_to_zip_with_visited<W: Write + std::io::Seek>(
         let target = match std::fs::read_link(path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Warning: Cannot read symlink {}: {}", path.display(), e);
+                // LOW-3: use tracing::warn! instead of eprintln!
+                tracing::warn!("Cannot read symlink {}: {}", path.display(), e);
                 return Ok(());
             }
         };
@@ -650,7 +782,8 @@ fn add_path_to_zip_with_visited<W: Write + std::io::Seek>(
 
         if !visited.insert(canonical.clone()) {
             // Already visited this directory (symlink loop)
-            eprintln!("Warning: Skipping symlink loop at {}", path.display());
+            // LOW-3: use tracing::warn! instead of eprintln!
+            tracing::warn!("Skipping symlink loop at {}", path.display());
             return Ok(());
         }
 
@@ -719,13 +852,21 @@ fn create_tar_to_writer<W: Write>(files: &[PathBuf], writer: W) -> ArchiveResult
     archive.follow_symlinks(false); // Store symlinks as symlinks, not as their targets
 
     for path in files {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => {
+                // LOW-3: use tracing::warn! instead of eprintln!
+                tracing::warn!("Skipping path with no filename: {}", path.display());
+                continue;
+            }
+        };
 
         // Use symlink_metadata to detect type without following symlinks
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("Warning: Cannot access {}: {}", path.display(), e);
+                // LOW-3: use tracing::warn! instead of eprintln!
+                tracing::warn!("Cannot access {}: {}", path.display(), e);
                 continue;
             }
         };
@@ -735,7 +876,8 @@ fn create_tar_to_writer<W: Write>(files: &[PathBuf], writer: W) -> ArchiveResult
             let target = match std::fs::read_link(path) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("Warning: Cannot read symlink {}: {}", path.display(), e);
+                    // LOW-3: use tracing::warn! instead of eprintln!
+                    tracing::warn!("Cannot read symlink {}: {}", path.display(), e);
                     continue;
                 }
             };
@@ -758,11 +900,11 @@ fn create_tar_to_writer<W: Write>(files: &[PathBuf], writer: W) -> ArchiveResult
             header.set_link_name(&target)?;
             header.set_cksum();
 
-            archive.append_data(&mut header, name, std::io::empty())?;
+            archive.append_data(&mut header, &name, std::io::empty())?;
         } else if metadata.is_dir() {
-            archive.append_dir_all(name, path)?;
+            archive.append_dir_all(&name, path)?;
         } else if metadata.is_file() {
-            archive.append_path_with_name(path, name)?;
+            archive.append_path_with_name(path, &name)?;
         }
         // Other file types (devices, sockets) are silently skipped
     }
@@ -810,7 +952,12 @@ mod tests {
 
         // Create archive
         let archive_path = temp_dir.path().join("test.zip");
-        create_archive(&[source_dir.clone()], &archive_path, ArchiveFormat::Zip).unwrap();
+        create_archive(
+            std::slice::from_ref(&source_dir),
+            &archive_path,
+            ArchiveFormat::Zip,
+        )
+        .unwrap();
 
         assert!(archive_path.exists());
 
@@ -834,7 +981,12 @@ mod tests {
 
         // Create archive
         let archive_path = temp_dir.path().join("test.tar.gz");
-        create_archive(&[source_dir.clone()], &archive_path, ArchiveFormat::TarGz).unwrap();
+        create_archive(
+            std::slice::from_ref(&source_dir),
+            &archive_path,
+            ArchiveFormat::TarGz,
+        )
+        .unwrap();
 
         assert!(archive_path.exists());
 
@@ -849,22 +1001,17 @@ mod tests {
 
     #[test]
     fn test_path_traversal_prevention_absolute_path() {
-        // Test that absolute paths are rejected
-        // This is a unit test for the validation logic, not with actual malicious archives
         let path = Path::new("/etc/passwd");
         assert!(path.is_absolute());
 
-        // Our validation should reject this
         let has_parent_dir = path
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir));
-        // Absolute path check should catch this even without ParentDir
         assert!(path.is_absolute() || has_parent_dir);
     }
 
     #[test]
     fn test_path_traversal_prevention_parent_dir() {
-        // Test that paths with .. are detected
         let path = Path::new("../../../etc/passwd");
         let has_parent_dir = path
             .components()
@@ -877,7 +1024,6 @@ mod tests {
             .any(|c| matches!(c, std::path::Component::ParentDir));
         assert!(has_parent_dir2);
 
-        // Safe path should pass
         let safe_path = Path::new("foo/bar/baz.txt");
         let has_parent_dir3 = safe_path
             .components()
@@ -903,11 +1049,9 @@ mod tests {
     fn test_archive_destination_not_exists() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create a simple test file
         let test_file = temp_dir.path().join("test.txt");
         std::fs::write(&test_file, "test content").unwrap();
 
-        // Create archive
         let archive_path = temp_dir.path().join("test.zip");
         create_archive(&[test_file], &archive_path, ArchiveFormat::Zip).unwrap();
 
@@ -927,27 +1071,26 @@ mod tests {
 
         let archive_path = temp_dir.path().join("test.zip");
 
-        // First creation should succeed
-        create_archive(&[test_file.clone()], &archive_path, ArchiveFormat::Zip).unwrap();
+        create_archive(
+            std::slice::from_ref(&test_file),
+            &archive_path,
+            ArchiveFormat::Zip,
+        )
+        .unwrap();
 
-        // Second creation should fail with DestinationExists
         let result = create_archive(&[test_file], &archive_path, ArchiveFormat::Zip);
         assert!(matches!(result, Err(ArchiveError::DestinationExists(_))));
     }
 
     #[test]
     fn test_zip_path_validation_consistency() {
-        // Verify ZIP and TAR use consistent path validation
-        // Both should reject absolute paths and parent directory components
         let temp_dir = TempDir::new().unwrap();
         let test_file = temp_dir.path().join("test.txt");
         std::fs::write(&test_file, "test").unwrap();
 
-        // Create a normal archive
         let archive_path = temp_dir.path().join("test.zip");
         create_archive(&[test_file], &archive_path, ArchiveFormat::Zip).unwrap();
 
-        // Extract should succeed with valid paths
         let extract_dir = temp_dir.path().join("extracted");
         let result = extract_archive(&archive_path, &extract_dir);
         assert!(result.is_ok());
@@ -955,11 +1098,14 @@ mod tests {
 
     #[test]
     fn test_decompression_constants() {
-        // Verify security constants are reasonable
-        assert!(MAX_DECOMPRESSION_RATIO >= 100.0); // Allow reasonable compression
-        assert!(MAX_DECOMPRESSION_RATIO <= 10000.0); // But not unreasonable
-        assert!(MAX_TOTAL_EXTRACTED_SIZE >= 1024 * 1024 * 1024); // At least 1GB
-        assert!(MAX_TOTAL_EXTRACTED_SIZE <= 100 * 1024 * 1024 * 1024); // At most 100GB
+        const {
+            assert!(MAX_DECOMPRESSION_RATIO >= 100.0);
+            assert!(MAX_DECOMPRESSION_RATIO <= 10000.0);
+            assert!(MAX_TOTAL_EXTRACTED_SIZE >= 1024 * 1024 * 1024);
+            assert!(MAX_TOTAL_EXTRACTED_SIZE <= 100 * 1024 * 1024 * 1024);
+            assert!(MAX_ENTRY_COUNT >= 1_000);
+            assert!(MAX_ENTRY_COUNT <= 10_000_000);
+        }
     }
 
     #[cfg(unix)]
@@ -971,26 +1117,21 @@ mod tests {
         let test_file = temp_dir.path().join("test.txt");
         std::fs::write(&test_file, "test content").unwrap();
 
-        // Set executable permission (no setuid - we can't create those in tests)
         let perms = std::fs::Permissions::from_mode(0o755);
         std::fs::set_permissions(&test_file, perms).unwrap();
 
-        // Create and extract archive
         let archive_path = temp_dir.path().join("test.zip");
         create_archive(&[test_file], &archive_path, ArchiveFormat::Zip).unwrap();
 
         let extract_dir = temp_dir.path().join("extracted");
         extract_archive(&archive_path, &extract_dir).unwrap();
 
-        // Verify extracted file exists and has reasonable permissions
         let extracted_file = extract_dir.join("test.txt");
         assert!(extracted_file.exists());
 
         let extracted_perms = std::fs::metadata(&extracted_file).unwrap().permissions();
         let mode = extracted_perms.mode();
-
-        // Should have rwx permissions but no setuid/setgid bits
-        assert_eq!(mode & 0o7000, 0); // No special bits
+        assert_eq!(mode & 0o7000, 0);
     }
 
     #[cfg(unix)]
@@ -1002,30 +1143,29 @@ mod tests {
         let source_dir = temp_dir.path().join("source");
         std::fs::create_dir(&source_dir).unwrap();
 
-        // Create a file and a symlink to it
         let test_file = source_dir.join("target.txt");
         std::fs::write(&test_file, "target content").unwrap();
 
         let symlink_path = source_dir.join("link.txt");
         symlink("target.txt", &symlink_path).unwrap();
 
-        // Create TAR archive
         let archive_path = temp_dir.path().join("test.tar");
-        create_archive(&[source_dir.clone()], &archive_path, ArchiveFormat::Tar).unwrap();
+        create_archive(
+            std::slice::from_ref(&source_dir),
+            &archive_path,
+            ArchiveFormat::Tar,
+        )
+        .unwrap();
 
         assert!(archive_path.exists());
 
-        // Extract archive
         let extract_dir = temp_dir.path().join("extracted");
         let result = extract_archive(&archive_path, &extract_dir);
-
-        // Extraction should succeed
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "extract failed: {:?}", result.err());
     }
 
     #[test]
     fn test_symlink_validation_paths() {
-        // Test the path validation logic used for symlinks
         let safe_target = Path::new("subdir/file.txt");
         let has_parent = safe_target
             .components()

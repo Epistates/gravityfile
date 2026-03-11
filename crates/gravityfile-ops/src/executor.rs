@@ -1,14 +1,16 @@
 //! High-level operation executor with unified result handling.
 
+use std::fs;
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::conflict::ConflictResolution;
 use crate::copy::{CopyOptions, CopyResult, start_copy};
 use crate::create::{CreateResult, start_create_directory, start_create_file};
 use crate::move_op::{MoveOptions, MoveResult, start_move};
-use crate::progress::{OperationComplete, OperationProgress};
+use crate::progress::{OperationComplete, OperationProgress, OperationType};
 use crate::rename::{RenameResult, start_rename};
 use crate::undo::UndoableOperation;
 use crate::{Conflict, OPERATION_CHANNEL_SIZE};
@@ -53,32 +55,60 @@ impl OperationExecutor {
         self
     }
 
-    /// Execute a copy operation.
+    /// Execute a copy operation (non-cancellable convenience wrapper).
+    ///
+    /// Creates an internal `CancellationToken` that is never cancelled.
+    /// Use [`copy_with_cancellation`](Self::copy_with_cancellation) when the
+    /// caller needs to abort the operation.
     pub fn copy(
         &self,
         sources: Vec<PathBuf>,
         destination: PathBuf,
+    ) -> mpsc::Receiver<OperationResult> {
+        self.copy_with_cancellation(sources, destination, CancellationToken::new())
+    }
+
+    /// Execute a copy operation with cancellation support.
+    pub fn copy_with_cancellation(
+        &self,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        token: CancellationToken,
     ) -> mpsc::Receiver<OperationResult> {
         let options = CopyOptions {
             conflict_resolution: self.default_resolution,
             preserve_timestamps: true,
         };
 
-        let copy_rx = start_copy(sources, destination, options);
+        let copy_rx = start_copy(sources, destination, options, token);
         Self::adapt_copy_results(copy_rx)
     }
 
-    /// Execute a move operation.
+    /// Execute a move operation (non-cancellable convenience wrapper).
+    ///
+    /// Creates an internal `CancellationToken` that is never cancelled.
+    /// Use [`move_to_with_cancellation`](Self::move_to_with_cancellation)
+    /// when the caller needs to abort the operation.
     pub fn move_to(
         &self,
         sources: Vec<PathBuf>,
         destination: PathBuf,
     ) -> mpsc::Receiver<OperationResult> {
+        self.move_to_with_cancellation(sources, destination, CancellationToken::new())
+    }
+
+    /// Execute a move operation with cancellation support.
+    pub fn move_to_with_cancellation(
+        &self,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        token: CancellationToken,
+    ) -> mpsc::Receiver<OperationResult> {
         let options = MoveOptions {
             conflict_resolution: self.default_resolution,
         };
 
-        let move_rx = start_move(sources, destination, options);
+        let move_rx = start_move(sources, destination, options, token);
         Self::adapt_move_results(move_rx)
     }
 
@@ -121,6 +151,10 @@ impl OperationExecutor {
     }
 
     /// Adapt move results to unified result type.
+    ///
+    /// Note: `MoveComplete.moved_pairs` is available to callers who receive
+    /// the raw `MoveResult` channel (e.g., the TUI for undo recording).
+    /// This adapter drops the pairs since `OperationResult` is generic.
     fn adapt_move_results(mut rx: mpsc::Receiver<MoveResult>) -> mpsc::Receiver<OperationResult> {
         let (tx, result_rx) = mpsc::channel(OPERATION_CHANNEL_SIZE);
 
@@ -129,7 +163,7 @@ impl OperationExecutor {
                 let unified = match result {
                     MoveResult::Progress(p) => OperationResult::Progress(p),
                     MoveResult::Conflict(c) => OperationResult::Conflict(c),
-                    MoveResult::Complete(c) => OperationResult::Complete(c),
+                    MoveResult::Complete(mc) => OperationResult::Complete(mc.inner),
                 };
                 if tx.send(unified).await.is_err() {
                     break;
@@ -192,42 +226,85 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
     tokio::spawn(async move {
         match entry.operation {
             UndoableOperation::FilesMoved { moves } => {
-                // Reverse the moves
-                let reverse_moves: Vec<(PathBuf, PathBuf)> =
-                    moves.into_iter().map(|(from, to)| (to, from)).collect();
+                // CRIT-1: Reverse each (original→dest) pair back individually.
+                // We rename dest→original for every pair rather than collecting all
+                // sources and supplying one destination directory (which was wrong
+                // when files came from different parent directories).
+                let total = moves.len();
+                let mut progress = OperationProgress::new(OperationType::Move, total, 0);
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
 
-                let options = MoveOptions {
-                    conflict_resolution: Some(ConflictResolution::Overwrite),
-                };
+                for (original, current) in moves {
+                    // current is where the file lives now; original is where it should go back
+                    progress.set_current_file(Some(current.clone()));
+                    let _ = tx.send(OperationResult::Progress(progress.clone())).await;
 
-                let sources: Vec<PathBuf> =
-                    reverse_moves.iter().map(|(from, _)| from.clone()).collect();
-                let mut move_rx = start_move(
-                    sources,
-                    reverse_moves
-                        .first()
-                        .and_then(|(_, to)| to.parent())
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_default(),
-                    options,
-                );
+                    let orig_clone = original.clone();
+                    let cur_clone = current.clone();
 
-                while let Some(result) = move_rx.recv().await {
-                    let unified = match result {
-                        MoveResult::Progress(p) => OperationResult::Progress(p),
-                        MoveResult::Conflict(c) => OperationResult::Conflict(c),
-                        MoveResult::Complete(c) => OperationResult::Complete(c),
-                    };
-                    if tx.send(unified).await.is_err() {
-                        break;
+                    let result = tokio::task::spawn_blocking(move || {
+                        // Ensure the original parent directory exists
+                        if let Some(parent) = orig_clone.parent() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+                        }
+                        // Try rename first (fast path, same filesystem).
+                        // Fall back to copy+delete for cross-filesystem pairs
+                        // (mirrors the forward move_item logic).
+                        match fs::rename(&cur_clone, &orig_clone) {
+                            Ok(()) => Ok(()),
+                            Err(_rename_err) => {
+                                let meta = fs::symlink_metadata(&cur_clone)
+                                    .map_err(|e| format!("Failed to read metadata: {}", e))?;
+                                if meta.is_dir() {
+                                    let mut visited = std::collections::HashSet::new();
+                                    crate::move_op::copy_dir_recursive_pub(
+                                        &cur_clone,
+                                        &orig_clone,
+                                        &mut visited,
+                                    )?;
+                                    fs::remove_dir_all(&cur_clone)
+                                        .map_err(|e| format!("Failed to remove source: {}", e))
+                                } else {
+                                    fs::copy(&cur_clone, &orig_clone)
+                                        .map_err(|e| format!("Failed to copy: {}", e))?;
+                                    fs::remove_file(&cur_clone)
+                                        .map_err(|e| format!("Failed to remove source: {}", e))
+                                }
+                            }
+                        }
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(())) => {
+                            progress.complete_file(0);
+                            succeeded += 1;
+                        }
+                        Ok(Err(e)) => {
+                            progress.add_error(crate::OperationError::new(current, e));
+                            failed += 1;
+                        }
+                        Err(e) => {
+                            progress.add_error(crate::OperationError::new(current, e.to_string()));
+                            failed += 1;
+                        }
                     }
                 }
+
+                let _ = tx
+                    .send(OperationResult::Complete(OperationComplete {
+                        operation_type: OperationType::Move,
+                        succeeded,
+                        failed,
+                        bytes_processed: 0,
+                        errors: progress.errors,
+                    }))
+                    .await;
             }
             UndoableOperation::FilesCopied { created } => {
                 // Delete the copied files
-                use crate::progress::OperationType;
-                use std::fs;
-
                 let mut progress = OperationProgress::new(OperationType::Delete, created.len(), 0);
                 let mut succeeded = 0;
                 let mut failed = 0;
@@ -240,7 +317,6 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                         // Use symlink_metadata to check type without following symlinks
                         let metadata = fs::symlink_metadata(&path)?;
                         if metadata.is_symlink() {
-                            // Symlinks are always removed as files
                             fs::remove_file(&path)
                         } else if metadata.is_dir() {
                             fs::remove_dir_all(&path)
@@ -272,8 +348,6 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     .await;
             }
             UndoableOperation::FilesDeleted { paths: _ } => {
-                use crate::progress::OperationType;
-
                 let _ = tx
                     .send(OperationResult::Complete(OperationComplete {
                         operation_type: OperationType::Delete,
@@ -288,12 +362,19 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                     .await;
             }
             UndoableOperation::FileRenamed {
-                path,
-                old_name,
+                path: current_path,
+                old_path,
                 new_name: _,
             } => {
-                // Rename back to old name
-                let mut rename_rx = start_rename(path, old_name);
+                // HIGH-5: use the stored full old_path to determine the original name.
+                // `current_path` is where the file lives now (after rename).
+                // We rename current_path back to old_path's file_name component.
+                let old_name = old_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                let mut rename_rx = start_rename(current_path, old_name);
 
                 while let Some(result) = rename_rx.recv().await {
                     let unified = match result {
@@ -308,19 +389,14 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
             UndoableOperation::FileCreated { path }
             | UndoableOperation::DirectoryCreated { path } => {
                 // Delete the created item
-                use crate::progress::OperationType;
-                use std::fs;
-
                 let mut progress = OperationProgress::new(OperationType::Delete, 1, 0);
                 progress.set_current_file(Some(path.clone()));
                 let _ = tx.send(OperationResult::Progress(progress.clone())).await;
 
                 let path_clone = path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    // Use symlink_metadata to check type without following symlinks
                     let metadata = fs::symlink_metadata(&path_clone)?;
                     if metadata.is_symlink() {
-                        // Symlinks are always removed as files
                         fs::remove_file(&path_clone)
                     } else if metadata.is_dir() {
                         fs::remove_dir_all(&path_clone)
