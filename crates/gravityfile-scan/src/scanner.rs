@@ -731,9 +731,11 @@ fn get_ino(metadata: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(windows)]
-fn get_ino(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_index().unwrap_or(0)
+fn get_ino(_metadata: &std::fs::Metadata) -> u64 {
+    // file_index() requires unstable `windows_by_handle` feature.
+    // Hardlink dedup is not supported on Windows; return 0 to treat every
+    // file as unique.
+    0
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -748,9 +750,10 @@ fn get_nlink(metadata: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(windows)]
-fn get_nlink(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    metadata.number_of_links().unwrap_or(1) as u64
+fn get_nlink(_metadata: &std::fs::Metadata) -> u64 {
+    // number_of_links() requires unstable `windows_by_handle` feature.
+    // Return 1 to skip hardlink dedup on Windows.
+    1
 }
 
 #[cfg(not(any(unix, windows)))]
