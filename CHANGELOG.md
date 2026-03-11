@@ -7,11 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.4] - 2026-03-11
 
-### Fixed
+### Added
 
-- **Windows build** - Replaced unstable `windows_by_handle` APIs (`file_index()`, `number_of_links()`) with stable fallbacks; hardlink dedup skipped on Windows
-
-## [0.2.3] - 2026-03-11
+- **WASM Plugin Runtime** - Full WebAssembly plugin support via Extism:
+  - Load `.wasm` plugins alongside Lua and Rhai scripts
+  - Hook dispatch, method invocation, and isolated execution contexts
+  - Automatic hook discovery by inspecting WASM exports
+- **Plugin System Integration** - TUI now initializes and dispatches lifecycle hooks:
+  - `OnStartup`, `OnShutdown`, `OnNavigate`, `OnScanComplete` hooks
+  - Plugin manager with Lua, Rhai, and WASM runtimes registered at startup
+  - Non-blocking hook dispatch via `tokio::spawn` for scan-complete events
+- **Git Status Integration** - Real-time git status indicators in file listings:
+  - Modified (`M`), Staged (`A`), Untracked (`?`), Ignored (`!`), Conflict (`C`) indicators
+  - Color-coded status using theme colors (modified=yellow, staged=green, etc.)
+  - Automatic detection of git repositories
+  - Works in both Tree and Miller column views
+- **Treemap Visualization** - Squarified treemap view for disk usage analysis:
+  - Space-filling rectangular layout showing relative file/directory sizes
+  - Color intensity based on size ratio
+  - Keyboard navigation (arrow keys, Enter to drill down, Backspace to go up)
+  - Directory/file indicators with different border styles
+  - Size labels displayed within rectangles
+- **Visual Mode** - Vim-style range selection:
+  - Press `V` to enter visual mode
+  - Use `j`/`k` to extend selection up/down
+  - Selected range highlighted
+  - `Esc` exits and marks the selected range
+  - Works seamlessly with existing mark system
+- **Archive Support** - Create and extract archives with full format support:
+  - **Supported formats:** ZIP, TAR, TAR.GZ, TAR.BZ2, TAR.XZ
+  - **Commands:** `:extract [destination]`, `:compress <name.zip|tar|tar.gz|...>`
+  - **Archive preview:** Shows file listing with sizes, compression ratios, and symlink indicators
+  - **Symlink support:** Preserves symlinks in archives (ZIP via Unix mode, TAR via link headers)
+  - **Loop detection:** Prevents infinite recursion when archiving circular symlinks
 
 ### Security
 
@@ -26,9 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MED: Empty sandbox = full access** - Empty `allowed_read_paths`/`allowed_write_paths` now deny by default instead of granting unrestricted access
 - **MED: Lua `fs.read_bytes` unbounded read** - Uses `File::open().take(limit).read_to_end()` instead of full allocation
 - **MED: Lua instruction timeout bypass** - Wrapped isolate execution in `tokio::time::timeout` for wall-clock enforcement alongside instruction counter
+- Archive extraction hardened with path traversal prevention, ZIP bomb detection, and symlink escape prevention
 
 ### Fixed
 
+- **Windows build** - Replaced unstable `windows_by_handle` APIs (`file_index()`, `number_of_links()`) with stable fallbacks; hardlink dedup skipped on Windows
 - **Move undo pipeline** - Added `MoveComplete` struct carrying `moved_pairs` from move operations, enabling proper undo recording
 - **Cross-filesystem undo** - Undo now falls back to copy+delete when `fs::rename` fails across filesystems
 - **Windows symlink** - Choose `symlink_dir` vs `symlink_file` based on target type; log failures instead of silent discard
@@ -38,111 +68,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Filename validation** - Uses byte length (`name.len() > 255`) matching OS enforcement instead of char count
 - **Archive symlink icon** - Symlinks in archive preview now show distinct `@ ` icon instead of directory icon
 - **Doc link warnings** - Escaped `[PATH]` in doc comments to prevent rustdoc treating them as links
+- Broken doc comment continuation in plugin crate module docs
+- Test assertions updated to match actual `ScanConfig` defaults
+- `ContentHash` test helpers updated for `Box<ContentHash>` optimization
+- Duplicate finder tests fixed for correct file count assertions
 
 ### Changed
 
+- **API Modernization** - ~25 function signatures changed from `&PathBuf` to `&Path` across all crates, following Rust idioms for borrowed path parameters
+- **Clippy Clean** - Eliminated all clippy warnings across the workspace (let-chains, derive Default, redundant closures, clamp, strip_prefix, etc.)
 - **InodeTracker** - Replaced `DashMap` with `HashMap` since access is single-threaded; ~15% faster inode tracking
 - **GlobSet reuse** - Scanner reuses `ScanConfig`'s pre-compiled `GlobSet` with fallback compilation for builder-created configs
 - **Progress counter** - Replaced `Arc<AtomicU64>` with plain `u64` in sequential scan loop
 - **`truncate_to_width`** - Extracted shared function to `ui/mod.rs`, eliminating 3-way duplication
 - **`TuiConfig`** - Added `#[non_exhaustive]` to prevent future breakage from field additions
 - **Cross-device filter** - Extended to non-directory entries (files and symlinks), not just directory pruning
-- **Convenience wrappers** - Documented that `copy()`/`move_to()` create non-cancellable internal tokens
-- **Removed dead code** - `prefix_len` variable, unused `normalize_path` function
-
-## [0.3.1] - 2026-03-02
-
-### Added
-
-- **WASM Plugin Runtime** - Full WebAssembly plugin support via Extism:
-  - Load `.wasm` plugins alongside Lua and Rhai scripts
-  - Hook dispatch, method invocation, and isolated execution contexts
-  - Automatic hook discovery by inspecting WASM exports
-- **Plugin System Integration** - TUI now initializes and dispatches lifecycle hooks:
-  - `OnStartup`, `OnShutdown`, `OnNavigate`, `OnScanComplete` hooks
-  - Plugin manager with Lua, Rhai, and WASM runtimes registered at startup
-  - Non-blocking hook dispatch via `tokio::spawn` for scan-complete events
-- **Lua Sandbox Enforcement** - Filesystem API now respects sandbox read permissions:
-  - `fs.read`, `fs.read_bytes`, `fs.exists`, `fs.is_dir`, `fs.is_file`, `fs.metadata` all check `SandboxConfig.can_read()`
-  - Sandboxed contexts hide file existence for disallowed paths
-
-### Changed
-
-- **API Modernization** - ~25 function signatures changed from `&PathBuf` to `&Path` across all crates, following Rust idioms for borrowed path parameters
-- **Clippy Clean** - Eliminated all 84 clippy warnings across the workspace:
-  - Collapsed ~35 nested `if` statements using Rust let-chains
-  - Replaced 3 manual `Default` impls with `#[derive(Default)]`
-  - Removed ~6 redundant closures in `map_err` chains
-  - Replaced `.min().max()` chains with `.clamp()`
-  - Replaced manual prefix stripping with `strip_prefix()`
-  - Replaced `iter().any(|&b| b == 0)` with `.contains(&0)`
-  - Removed `trim()` before `split_whitespace()` (redundant)
-  - Replaced `vec![]; push()` patterns with `vec![initial]`
-  - Used `.is_some_and()` over `.map_or(false, ...)`
-  - Used `.is_multiple_of()` over `% N == 0`
-  - Used `.flatten()` on fallible iterators
-- **Undo System Simplification** - `FilesDeleted` variant simplified:
-  - Now stores `paths: Vec<PathBuf>` instead of `trash_entries: Vec<(PathBuf, PathBuf)>`
-  - `can_undo()` always returns `false` for deletions (trash restore removed)
+- **Undo System Simplification** - `FilesDeleted` variant now stores `paths: Vec<PathBuf>`; `can_undo()` always returns `false` for deletions
 - **HookResult Serialization** - Added `Serialize`/`Deserialize` derives for WASM interop
-- **README Rewrite** - Modernized with SOTA performance metrics, plugin system showcase, and condensed keybinding reference
 - **Dependencies Updated** - All workspace dependencies brought to latest versions
-
-### Fixed
-
-- Broken doc comment continuation in plugin crate module docs
-- Test assertions updated to match actual `ScanConfig` defaults
-- `ContentHash` test helpers updated for `Box<ContentHash>` optimization
-- Duplicate finder tests fixed for correct file count assertions
-
-## [0.3.0] - 2026-01-29
-
-### Added
-
-- **Git Status Integration** - Real-time git status indicators in file listings:
-  - Modified (`M`), Staged (`A`), Untracked (`?`), Ignored (`!`), Conflict (`C`) indicators
-  - Color-coded status using theme colors (modified=yellow, staged=green, etc.)
-  - Automatic detection of git repositories
-  - Works in both Tree and Miller column views
-
-- **Treemap Visualization** - Squarified treemap view for disk usage analysis:
-  - Space-filling rectangular layout showing relative file/directory sizes
-  - Color intensity based on size ratio
-  - Keyboard navigation (arrow keys, Enter to drill down, Backspace to go up)
-  - Directory/file indicators with different border styles
-  - Size labels displayed within rectangles
-
-- **Visual Mode** - Vim-style range selection:
-  - Press `V` to enter visual mode
-  - Use `j`/`k` to extend selection up/down
-  - Selected range highlighted
-  - `Esc` exits and marks the selected range
-  - Works seamlessly with existing mark system
-
-- **Archive Support** - Create and extract archives with full format support:
-  - **Supported formats:** ZIP, TAR, TAR.GZ, TAR.BZ2, TAR.XZ
-  - **Commands:** `:extract [destination]`, `:compress <name.zip|tar|tar.gz|...>`
-  - **Archive preview:** Shows file listing with sizes, compression ratios, and symlink indicators
-  - **Symlink support:** Preserves symlinks in archives (ZIP via Unix mode, TAR via link headers)
-  - **Security hardening:**
-    - Path traversal prevention (rejects `..` and absolute paths)
-    - ZIP bomb detection (compression ratio and size limits)
-    - Symlink escape attack prevention
-    - Permission stripping for safe extraction
-  - **Loop detection:** Prevents infinite recursion when archiving circular symlinks
-
-### Changed
-
-- Archive preview now shows 🔗 icon for symlinks with target path display
-- Improved error messages with sanitized output (no path disclosure)
-
-### Security
-
-- Added comprehensive validation for archive extraction to prevent:
-  - Path traversal attacks via `../` sequences
-  - Absolute path extraction attempts
-  - Symlink-based directory escape attacks
-  - ZIP bomb decompression attacks (100:1 ratio limit, 10GB size limit)
 
 ## [0.2.2] - 2026-01-16
 
@@ -270,9 +213,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile export [PATH]` - Export scan results to JSON
 
 [0.2.4]: https://github.com/epistates/gravityfile/releases/tag/v0.2.4
-[0.2.3]: https://github.com/epistates/gravityfile/releases/tag/v0.2.3
-[0.3.1]: https://github.com/epistates/gravityfile/releases/tag/v0.3.1
-[0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2
 [0.2.1]: https://github.com/epistates/gravityfile/releases/tag/v0.2.1
 [0.2.0]: https://github.com/epistates/gravityfile/releases/tag/v0.2.0
