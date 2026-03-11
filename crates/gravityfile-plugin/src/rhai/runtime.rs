@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use rhai::{AST, Dynamic, Engine, Scope};
 
@@ -40,6 +41,9 @@ pub struct RhaiRuntime {
     /// Runtime configuration.
     config: Option<PluginConfig>,
 
+    /// Sandbox configuration used to gate filesystem API access.
+    sandbox: Arc<SandboxConfig>,
+
     /// Whether the runtime has been initialized.
     initialized: bool,
 }
@@ -58,11 +62,15 @@ impl RhaiRuntime {
         engine.set_max_array_size(10_000);
         engine.set_max_map_size(10_000);
 
+        // Disable eval to prevent dynamic code execution
+        engine.disable_symbol("eval");
+
         Ok(Self {
             engine,
             plugins: HashMap::new(),
             next_handle: 0,
             config: None,
+            sandbox: Arc::new(SandboxConfig::default()),
             initialized: false,
         })
     }
@@ -86,25 +94,49 @@ impl RhaiRuntime {
             tracing::info!(target: "plugin_notify", "{}", msg);
         });
 
-        // Register filesystem functions
-        self.engine.register_fn("fs_exists", |path: &str| -> bool {
-            std::path::Path::new(path).exists()
-        });
+        // Register filesystem functions — all gated on sandbox.can_read().
+        let sb = Arc::clone(&self.sandbox);
+        self.engine
+            .register_fn("fs_exists", move |path: &str| -> bool {
+                let p = std::path::Path::new(path);
+                if !sb.can_read(p) {
+                    return false;
+                }
+                p.exists()
+            });
 
-        self.engine.register_fn("fs_is_dir", |path: &str| -> bool {
-            std::path::Path::new(path).is_dir()
-        });
+        let sb = Arc::clone(&self.sandbox);
+        self.engine
+            .register_fn("fs_is_dir", move |path: &str| -> bool {
+                let p = std::path::Path::new(path);
+                if !sb.can_read(p) {
+                    return false;
+                }
+                p.is_dir()
+            });
 
-        self.engine.register_fn("fs_is_file", |path: &str| -> bool {
-            std::path::Path::new(path).is_file()
-        });
+        let sb = Arc::clone(&self.sandbox);
+        self.engine
+            .register_fn("fs_is_file", move |path: &str| -> bool {
+                let p = std::path::Path::new(path);
+                if !sb.can_read(p) {
+                    return false;
+                }
+                p.is_file()
+            });
 
-        self.engine.register_fn("fs_read", |path: &str| -> Dynamic {
-            match std::fs::read_to_string(path) {
-                Ok(content) => Dynamic::from(content),
-                Err(_) => Dynamic::UNIT,
-            }
-        });
+        let sb = Arc::clone(&self.sandbox);
+        self.engine
+            .register_fn("fs_read", move |path: &str| -> Dynamic {
+                let p = std::path::Path::new(path);
+                if !sb.can_read(p) {
+                    return Dynamic::UNIT;
+                }
+                match std::fs::read_to_string(path) {
+                    Ok(content) => Dynamic::from(content),
+                    Err(_) => Dynamic::UNIT,
+                }
+            });
 
         self.engine
             .register_fn("fs_extension", |path: &str| -> Dynamic {
@@ -133,12 +165,18 @@ impl RhaiRuntime {
                 }
             });
 
-        self.engine.register_fn("fs_size", |path: &str| -> Dynamic {
-            match std::fs::metadata(path) {
-                Ok(meta) => Dynamic::from(meta.len() as i64),
-                Err(_) => Dynamic::from(-1_i64),
-            }
-        });
+        let sb = Arc::clone(&self.sandbox);
+        self.engine
+            .register_fn("fs_size", move |path: &str| -> Dynamic {
+                let p = std::path::Path::new(path);
+                if !sb.can_read(p) {
+                    return Dynamic::from(-1_i64);
+                }
+                match std::fs::metadata(path) {
+                    Ok(meta) => Dynamic::from(meta.len() as i64),
+                    Err(_) => Dynamic::from(-1_i64),
+                }
+            });
 
         // Register UI helper functions
         self.engine
@@ -265,6 +303,14 @@ impl PluginRuntime for RhaiRuntime {
         if self.initialized {
             return Ok(());
         }
+
+        // Build a sandbox from plugin config settings.
+        self.sandbox = Arc::new(SandboxConfig {
+            timeout_ms: config.default_timeout_ms,
+            max_memory: config.max_memory_mb * 1024 * 1024,
+            allow_network: config.allow_network,
+            ..SandboxConfig::default()
+        });
 
         self.config = Some(config.clone());
         self.init_api()?;
@@ -449,12 +495,18 @@ impl PluginRuntime for RhaiRuntime {
 /// An isolated Rhai context for async execution.
 struct RhaiIsolatedContext {
     engine: Engine,
+    /// Retained for documentation and potential future per-call checks.
+    /// The Arc is cloned into registered engine closures during `new()`.
     #[allow(dead_code)]
-    sandbox: SandboxConfig,
+    sandbox: Arc<SandboxConfig>,
+    /// The compiled AST populated by the first `execute` call.
+    /// `call_function` uses this AST via `Engine::call_fn` — no string interpolation.
+    ast: std::sync::Mutex<Option<AST>>,
 }
 
 impl RhaiIsolatedContext {
     fn new(sandbox: SandboxConfig) -> PluginResult<Self> {
+        let sandbox = Arc::new(sandbox);
         let mut engine = Engine::new();
 
         // Strict limits for isolated contexts
@@ -469,7 +521,54 @@ impl RhaiIsolatedContext {
         // Disable potentially dangerous operations
         engine.disable_symbol("eval");
 
-        Ok(Self { engine, sandbox })
+        // Register sandboxed filesystem functions for isolated contexts.
+        let sb = Arc::clone(&sandbox);
+        engine.register_fn("fs_exists", move |path: &str| -> bool {
+            let p = std::path::Path::new(path);
+            sb.can_read(p) && p.exists()
+        });
+
+        let sb = Arc::clone(&sandbox);
+        engine.register_fn("fs_is_dir", move |path: &str| -> bool {
+            let p = std::path::Path::new(path);
+            sb.can_read(p) && p.is_dir()
+        });
+
+        let sb = Arc::clone(&sandbox);
+        engine.register_fn("fs_is_file", move |path: &str| -> bool {
+            let p = std::path::Path::new(path);
+            sb.can_read(p) && p.is_file()
+        });
+
+        let sb = Arc::clone(&sandbox);
+        engine.register_fn("fs_read", move |path: &str| -> Dynamic {
+            let p = std::path::Path::new(path);
+            if !sb.can_read(p) {
+                return Dynamic::UNIT;
+            }
+            match std::fs::read_to_string(path) {
+                Ok(content) => Dynamic::from(content),
+                Err(_) => Dynamic::UNIT,
+            }
+        });
+
+        let sb = Arc::clone(&sandbox);
+        engine.register_fn("fs_size", move |path: &str| -> Dynamic {
+            let p = std::path::Path::new(path);
+            if !sb.can_read(p) {
+                return Dynamic::from(-1_i64);
+            }
+            match std::fs::metadata(path) {
+                Ok(meta) => Dynamic::from(meta.len() as i64),
+                Err(_) => Dynamic::from(-1_i64),
+            }
+        });
+
+        Ok(Self {
+            engine,
+            sandbox,
+            ast: std::sync::Mutex::new(None),
+        })
     }
 }
 
@@ -491,13 +590,29 @@ impl IsolatedContext for RhaiIsolatedContext {
                 message: format!("Invalid UTF-8: {}", e),
             })?;
 
-            let result =
+            // Compile to AST so that subsequent call_function calls can use it
+            // via Engine::call_fn, without any string interpolation.
+            let compiled =
                 self.engine
-                    .eval::<Dynamic>(code_str)
+                    .compile(code_str)
                     .map_err(|e| PluginError::ExecutionError {
                         name: "isolate".into(),
                         message: e.to_string(),
                     })?;
+
+            let mut scope = Scope::new();
+            let result = self
+                .engine
+                .eval_ast_with_scope::<Dynamic>(&mut scope, &compiled)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: "isolate".into(),
+                    message: e.to_string(),
+                })?;
+
+            // Persist the compiled AST for subsequent call_function invocations.
+            if let Ok(mut guard) = self.ast.lock() {
+                *guard = Some(compiled);
+            }
 
             Ok(RhaiRuntime::dynamic_to_value(&result))
         })
@@ -516,27 +631,34 @@ impl IsolatedContext for RhaiIsolatedContext {
                 });
             }
 
-            // Rhai requires AST to call functions, so we construct a call expression
-            let args_str: Vec<String> = args
-                .iter()
-                .map(|v| match v {
-                    Value::String(s) => format!("\"{}\"", s.replace("\"", "\\\"")),
-                    Value::Integer(i) => i.to_string(),
-                    Value::Float(f) => f.to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    _ => "()".to_string(),
-                })
-                .collect();
+            // Convert args to Rhai Dynamic values — no string interpolation.
+            let rhai_args: Vec<Dynamic> = args.iter().map(RhaiRuntime::value_to_dynamic).collect();
 
-            let code = format!("{}({})", name, args_str.join(", "));
+            // Retrieve the previously compiled AST (populated by execute).
+            let ast_guard = self.ast.lock().map_err(|_| PluginError::ExecutionError {
+                name: "isolate".into(),
+                message: "AST mutex poisoned".to_string(),
+            })?;
 
-            let result =
-                self.engine
-                    .eval::<Dynamic>(&code)
-                    .map_err(|e| PluginError::ExecutionError {
-                        name: "isolate".into(),
-                        message: e.to_string(),
-                    })?;
+            let ast = ast_guard
+                .as_ref()
+                .ok_or_else(|| PluginError::ExecutionError {
+                    name: "isolate".into(),
+                    message: format!(
+                        "Cannot call '{}': no code has been executed in this context yet. \
+                     Call execute() with the script source first.",
+                        name
+                    ),
+                })?;
+
+            let mut scope = Scope::new();
+            let result = self
+                .engine
+                .call_fn::<Dynamic>(&mut scope, ast, name, rhai_args)
+                .map_err(|e| PluginError::ExecutionError {
+                    name: "isolate".into(),
+                    message: e.to_string(),
+                })?;
 
             Ok(RhaiRuntime::dynamic_to_value(&result))
         })

@@ -8,6 +8,7 @@ description = "Language-agnostic plugin system for gravityfile"
 
 [dependencies]
 gravityfile-core.workspace = true
+indexmap.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 serde.workspace = true

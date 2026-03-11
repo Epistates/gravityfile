@@ -213,7 +213,11 @@ impl From<i32> for Value {
 
 impl From<u64> for Value {
     fn from(u: u64) -> Self {
-        Self::Integer(u as i64)
+        if let Ok(i) = i64::try_from(u) {
+            Self::Integer(i)
+        } else {
+            Self::Float(u as f64)
+        }
     }
 }
 

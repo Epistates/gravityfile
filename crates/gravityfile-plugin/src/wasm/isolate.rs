@@ -1,15 +1,16 @@
 //! Isolated WASM context for async plugin execution.
 
-use extism::{Manifest, Plugin};
+use std::time::Duration;
+
+use extism::{Manifest, Plugin, Wasm};
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::{BoxFuture, IsolatedContext};
-use crate::sandbox::SandboxConfig;
+use crate::sandbox::{Permission, SandboxConfig};
 use crate::types::{PluginError, PluginResult, Value};
 
 /// An isolated WASM context with limited API access.
 pub struct WasmIsolatedContext {
-    #[allow(dead_code)]
     sandbox: SandboxConfig,
 }
 
@@ -17,6 +18,43 @@ impl WasmIsolatedContext {
     /// Create a new isolated WASM context.
     pub fn new(sandbox: SandboxConfig) -> PluginResult<Self> {
         Ok(Self { sandbox })
+    }
+
+    /// Build a sandboxed Extism plugin from raw WASM bytes.
+    fn build_plugin(&self, code: &[u8]) -> Result<Plugin, String> {
+        let wasm = Wasm::data(code);
+        let sandbox = &self.sandbox;
+
+        // Only enable WASI when the sandbox explicitly permits syscall-level access.
+        let allow_wasi = sandbox.has_permission(Permission::Execute)
+            || sandbox.has_permission(Permission::Network);
+
+        let mut manifest = Manifest::new([wasm]);
+
+        if sandbox.max_memory > 0 {
+            let pages = (sandbox.max_memory / (64 * 1024)).max(1) as u32;
+            manifest = manifest.with_memory_max(pages);
+        }
+
+        if sandbox.timeout_ms > 0 {
+            manifest = manifest.with_timeout(Duration::from_millis(sandbox.timeout_ms));
+        }
+
+        for path in &sandbox.allowed_read_paths {
+            if let Some(s) = path.to_str() {
+                manifest = manifest.with_allowed_path(s.to_string(), path);
+            }
+        }
+
+        for path in &sandbox.allowed_write_paths {
+            if let Some(s) = path.to_str()
+                && !sandbox.allowed_read_paths.contains(path)
+            {
+                manifest = manifest.with_allowed_path(s.to_string(), path);
+            }
+        }
+
+        Plugin::new(&manifest, [], allow_wasi).map_err(|e| e.to_string())
     }
 }
 
@@ -34,12 +72,12 @@ impl IsolatedContext for WasmIsolatedContext {
                 });
             }
 
-            // In Extism, "code" would be the WASM binary.
-            let manifest = Manifest::new([extism::Wasm::data(code)]);
-            let mut plugin =
-                Plugin::new(&manifest, [], true).map_err(|e| PluginError::ExecutionError {
+            // Build a sandboxed Extism plugin from the provided WASM binary.
+            let mut plugin = self
+                .build_plugin(code)
+                .map_err(|e| PluginError::ExecutionError {
                     name: "wasm_isolate".into(),
-                    message: e.to_string(),
+                    message: e,
                 })?;
 
             // Extism allows running a "main" or default function

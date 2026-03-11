@@ -104,12 +104,16 @@ impl SandboxConfig {
         }
     }
 
-    /// Create a permissive sandbox (for trusted plugins).
+    /// Create a permissive sandbox for trusted plugins.
+    ///
+    /// WARNING: This preset grants broad filesystem read access and environment
+    /// variable access. It does NOT grant execute or wildcard command access.
+    /// Use only with fully audited, first-party plugins. For untrusted plugins
+    /// use [`SandboxConfig::default`] or [`SandboxConfig::minimal`] instead.
     pub fn permissive() -> Self {
         let mut permissions = HashSet::new();
         permissions.insert(Permission::Read);
         permissions.insert(Permission::Write);
-        permissions.insert(Permission::Execute);
         permissions.insert(Permission::Environment);
         permissions.insert(Permission::Ui);
         permissions.insert(Permission::Notify);
@@ -117,7 +121,7 @@ impl SandboxConfig {
         Self {
             allowed_read_paths: vec![PathBuf::from("/")],
             allowed_write_paths: vec![],
-            allowed_commands: HashSet::from(["*".to_string()]),
+            allowed_commands: HashSet::new(),
             allow_network: false,
             allow_env: true,
             timeout_ms: 30000,
@@ -179,26 +183,51 @@ impl SandboxConfig {
     }
 
     /// Check if reading a path is allowed.
+    ///
+    /// Paths are canonicalized before comparison to prevent traversal attacks
+    /// via symlinks or `..` components.
+    ///
+    /// Callers must explicitly list allowed paths: an empty `allowed_read_paths`
+    /// list means no paths are allowed (deny-by-default), not unrestricted access.
     pub fn can_read(&self, path: &std::path::Path) -> bool {
         if !self.has_permission(Permission::Read) {
             return false;
         }
+        // Empty path list means no paths are explicitly permitted — deny all.
         if self.allowed_read_paths.is_empty() {
-            return true; // No restrictions
+            return false;
         }
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return false;
+        };
         self.allowed_read_paths
             .iter()
-            .any(|allowed| path.starts_with(allowed))
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .any(|allowed| canonical.starts_with(&allowed))
     }
 
     /// Check if writing to a path is allowed.
+    ///
+    /// Paths are canonicalized before comparison to prevent traversal attacks
+    /// via symlinks or `..` components.
+    ///
+    /// Callers must explicitly list allowed paths: an empty `allowed_write_paths`
+    /// list means no paths are allowed (deny-by-default), not unrestricted access.
     pub fn can_write(&self, path: &std::path::Path) -> bool {
         if !self.has_permission(Permission::Write) {
             return false;
         }
+        // Empty path list means no paths are explicitly permitted — deny all.
+        if self.allowed_write_paths.is_empty() {
+            return false;
+        }
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return false;
+        };
         self.allowed_write_paths
             .iter()
-            .any(|allowed| path.starts_with(allowed))
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .any(|allowed| canonical.starts_with(&allowed))
     }
 
     /// Check if executing a command is allowed.

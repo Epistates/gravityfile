@@ -1,5 +1,7 @@
 //! Rust-to-Lua bindings for the gravityfile API.
 
+use std::io::Read as _;
+
 use mlua::{Lua, Table, Value as LuaValue};
 
 use crate::sandbox::SandboxConfig;
@@ -12,7 +14,7 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
         message: format!("Failed to create fs table: {}", e),
     })?;
 
-    // fs.read(path, limit?) - Read file contents
+    // fs.read(path, limit?) - Read file contents (capped at source via take())
     let sb_clone1 = sandbox.clone();
     let read = lua
         .create_function(move |lua, (path, limit): (String, Option<usize>)| {
@@ -29,15 +31,13 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
                 return Ok(LuaValue::Nil);
             }
 
-            let content = std::fs::read_to_string(path).map_err(mlua::Error::external)?;
+            let f = std::fs::File::open(path).map_err(mlua::Error::external)?;
+            let mut content = String::new();
+            f.take(limit as u64)
+                .read_to_string(&mut content)
+                .map_err(mlua::Error::external)?;
 
-            let truncated = if content.len() > limit {
-                &content[..limit]
-            } else {
-                &content
-            };
-
-            Ok(LuaValue::String(lua.create_string(truncated)?))
+            Ok(LuaValue::String(lua.create_string(content.as_str())?))
         })
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),
@@ -62,15 +62,13 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
                 return Ok(LuaValue::Nil);
             }
 
-            let content = std::fs::read(path).map_err(mlua::Error::external)?;
+            let f = std::fs::File::open(path).map_err(mlua::Error::external)?;
+            let mut buf = Vec::new();
+            f.take(limit as u64)
+                .read_to_end(&mut buf)
+                .map_err(mlua::Error::external)?;
 
-            let truncated = if content.len() > limit {
-                &content[..limit]
-            } else {
-                &content
-            };
-
-            Ok(LuaValue::String(lua.create_string(truncated)?))
+            Ok(LuaValue::String(lua.create_string(&buf)?))
         })
         .map_err(|e| PluginError::LoadError {
             name: "lua".into(),

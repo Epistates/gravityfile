@@ -3,10 +3,35 @@
 //! This module defines the language-agnostic [`PluginRuntime`] trait that
 //! all scripting language implementations must satisfy.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+
+use indexmap::IndexMap;
+
+/// All hook names recognized by the plugin system.
+///
+/// This is the single source of truth used by both `discover_plugins` and
+/// `load_plugin` when collecting the hooks a plugin implements.
+const HOOK_NAMES: &[&str] = &[
+    "on_navigate",
+    "on_drill_down",
+    "on_back",
+    "on_scan_start",
+    "on_scan_progress",
+    "on_scan_complete",
+    "on_delete_start",
+    "on_delete_complete",
+    "on_copy_start",
+    "on_copy_complete",
+    "on_move_start",
+    "on_move_complete",
+    "on_render",
+    "on_action",
+    "on_mode_change",
+    "on_startup",
+    "on_shutdown",
+];
 
 use tokio_util::sync::CancellationToken;
 
@@ -21,7 +46,7 @@ pub struct PluginHandle(pub(crate) usize);
 
 impl PluginHandle {
     /// Create a new plugin handle.
-    pub fn new(id: usize) -> Self {
+    pub(crate) fn new(id: usize) -> Self {
         Self(id)
     }
 
@@ -159,10 +184,10 @@ pub struct LoadedPlugin {
 /// Manager for all plugin runtimes and loaded plugins.
 pub struct PluginManager {
     /// Available runtimes keyed by name.
-    runtimes: HashMap<String, Box<dyn PluginRuntime>>,
+    runtimes: IndexMap<String, Box<dyn PluginRuntime>>,
 
-    /// Loaded plugins keyed by handle.
-    plugins: HashMap<PluginHandle, LoadedPlugin>,
+    /// Loaded plugins keyed by handle, insertion-ordered for deterministic dispatch.
+    plugins: IndexMap<PluginHandle, LoadedPlugin>,
 
     /// Plugin config.
     config: PluginConfig,
@@ -173,11 +198,34 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
+    /// Validate a plugin name against the allowed character set.
+    ///
+    /// Names must be 1–64 characters long and match `[a-zA-Z0-9_-]+`.
+    fn validate_plugin_name(name: &str) -> PluginResult<()> {
+        if name.is_empty() || name.len() > 64 {
+            return Err(PluginError::ConfigError {
+                message: format!("Plugin name '{}' must be 1–64 characters long", name),
+            });
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(PluginError::ConfigError {
+                message: format!(
+                    "Plugin name '{}' contains invalid characters (allowed: [a-zA-Z0-9_-])",
+                    name
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Create a new plugin manager with the given configuration.
     pub fn new(config: PluginConfig) -> Self {
         Self {
-            runtimes: HashMap::new(),
-            plugins: HashMap::new(),
+            runtimes: IndexMap::new(),
+            plugins: IndexMap::new(),
             config,
             next_handle: 0,
         }
@@ -239,6 +287,16 @@ impl PluginManager {
                     message: e.to_string(),
                 })?;
 
+            // Validate plugin name to prevent injection or path-manipulation attacks
+            if let Err(e) = Self::validate_plugin_name(&metadata.name) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Skipping plugin with invalid name"
+                );
+                continue;
+            }
+
             // Find the appropriate runtime
             let runtime_name = &metadata.runtime;
             let runtime = self.runtimes.get_mut(runtime_name).ok_or_else(|| {
@@ -247,8 +305,24 @@ impl PluginManager {
                 }
             })?;
 
-            // Find the entry point file
+            // Find the entry point file and verify it stays within the plugin dir
             let entry_file = path.join(&metadata.entry);
+            let canonical_plugin_dir = match std::fs::canonicalize(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let canonical_entry = match std::fs::canonicalize(&entry_file) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if !canonical_entry.starts_with(&canonical_plugin_dir) {
+                tracing::warn!(
+                    plugin = %metadata.name,
+                    entry = %metadata.entry,
+                    "Skipping plugin: entry point escapes plugin directory"
+                );
+                continue;
+            }
             if !entry_file.exists() {
                 continue;
             }
@@ -257,22 +331,11 @@ impl PluginManager {
             let handle = runtime.load_plugin(&metadata.name, &entry_file)?;
 
             // Collect hooks
-            let hooks: Vec<String> = [
-                "on_navigate",
-                "on_drill_down",
-                "on_scan_start",
-                "on_scan_complete",
-                "on_delete_start",
-                "on_delete_complete",
-                "on_render",
-                "on_action",
-                "on_startup",
-                "on_shutdown",
-            ]
-            .iter()
-            .filter(|h| runtime.has_hook(handle, h))
-            .map(|s| s.to_string())
-            .collect();
+            let hooks: Vec<String> = HOOK_NAMES
+                .iter()
+                .filter(|h| runtime.has_hook(handle, h))
+                .map(|s| s.to_string())
+                .collect();
 
             let loaded_plugin = LoadedPlugin {
                 handle,
@@ -299,6 +362,9 @@ impl PluginManager {
                 message: e.to_string(),
             })?;
 
+        // Validate plugin name
+        Self::validate_plugin_name(&metadata.name)?;
+
         // Find runtime
         let runtime = self.runtimes.get_mut(&metadata.runtime).ok_or_else(|| {
             PluginError::RuntimeNotAvailable {
@@ -306,22 +372,28 @@ impl PluginManager {
             }
         })?;
 
-        // Load plugin
+        // Verify entry point stays within the plugin directory (path traversal guard)
         let entry_file = path.join(&metadata.entry);
+        let canonical_plugin_dir = std::fs::canonicalize(path).map_err(PluginError::Io)?;
+        let canonical_entry = std::fs::canonicalize(&entry_file).map_err(PluginError::Io)?;
+        if !canonical_entry.starts_with(&canonical_plugin_dir) {
+            return Err(PluginError::ConfigError {
+                message: format!(
+                    "Plugin '{}': entry point '{}' escapes the plugin directory",
+                    metadata.name, metadata.entry
+                ),
+            });
+        }
+
+        // Load plugin
         let handle = runtime.load_plugin(&metadata.name, &entry_file)?;
 
         // Collect hooks
-        let hooks: Vec<String> = [
-            "on_navigate",
-            "on_drill_down",
-            "on_scan_start",
-            "on_scan_complete",
-            "on_render",
-        ]
-        .iter()
-        .filter(|h| runtime.has_hook(handle, h))
-        .map(|s| s.to_string())
-        .collect();
+        let hooks: Vec<String> = HOOK_NAMES
+            .iter()
+            .filter(|h| runtime.has_hook(handle, h))
+            .map(|s| s.to_string())
+            .collect();
 
         let loaded_plugin = LoadedPlugin {
             handle,
@@ -337,7 +409,7 @@ impl PluginManager {
 
     /// Unload a plugin.
     pub fn unload_plugin(&mut self, handle: PluginHandle) -> PluginResult<()> {
-        if let Some(plugin) = self.plugins.remove(&handle)
+        if let Some(plugin) = self.plugins.shift_remove(&handle)
             && let Some(runtime) = self.runtimes.get_mut(&plugin.metadata.runtime)
         {
             runtime.unload_plugin(handle)?;
@@ -371,7 +443,11 @@ impl PluginManager {
                     }
                     Err(e) => {
                         // Log error but continue to other plugins
-                        eprintln!("Plugin {} hook error: {}", plugin.id, e);
+                        tracing::warn!(
+                            plugin_id = %plugin.id,
+                            error = %e,
+                            "Plugin hook dispatch error"
+                        );
                     }
                 }
             }

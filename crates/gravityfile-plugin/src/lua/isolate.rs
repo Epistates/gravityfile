@@ -3,6 +3,8 @@
 //! This provides a lightweight, isolated Lua environment for running
 //! async plugins (previewers, analyzers) safely in background tasks.
 
+use std::time::Duration;
+
 use mlua::{Lua, Value as LuaValue};
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +40,12 @@ impl LuaIsolatedContext {
         globals.set("os", LuaValue::Nil).ok();
         globals.set("io", LuaValue::Nil).ok();
         globals.set("debug", LuaValue::Nil).ok();
+        globals.set("require", LuaValue::Nil).ok();
+        globals.set("package", LuaValue::Nil).ok();
+        // Disable string.dump to prevent bytecode extraction
+        if let Ok(string_table) = globals.get::<mlua::Table>("string") {
+            string_table.set("dump", LuaValue::Nil).ok();
+        }
 
         // Add basic 'gf' namespace
         let gf = lua.create_table().map_err(|e| PluginError::LoadError {
@@ -139,50 +147,62 @@ impl IsolatedContext for LuaIsolatedContext {
                 message: format!("Invalid UTF-8 in code: {}", e),
             })?;
 
-            // Set up instruction hook for cancellation and timeout
-            let cancel_clone = cancel.clone();
-            let instruction_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let max_instructions = self.sandbox.timeout_ms * 10000; // Rough estimate
+            // Wall-clock timeout via tokio — guards against blocking I/O that
+            // the instruction-count hook cannot interrupt.
+            let timeout_dur = Duration::from_millis(self.sandbox.timeout_ms);
+            let timeout_ms = self.sandbox.timeout_ms;
 
-            let ic = instruction_count.clone();
-            let _ = self.lua.set_hook(
-                mlua::HookTriggers::new().every_nth_instruction(1000),
-                move |_lua, _debug| {
-                    let count = ic.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
-                    if cancel_clone.is_cancelled() {
-                        return Err(mlua::Error::external("Cancelled"));
-                    }
-                    if count > max_instructions {
-                        return Err(mlua::Error::external("Timeout"));
-                    }
-                    Ok(mlua::VmState::Continue)
-                },
-            );
+            let exec_future = async {
+                // Set up instruction hook as a CPU-spin guard (also handles cancellation).
+                let cancel_clone = cancel.clone();
+                let instruction_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let max_instructions = self.sandbox.timeout_ms * 10000; // rough estimate
 
-            // Execute the code
-            let result = self.lua.load(code_str).eval::<LuaValue>().map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("Cancelled") {
-                    PluginError::Cancelled {
-                        name: "isolate".into(),
-                    }
-                } else if msg.contains("Timeout") {
-                    PluginError::Timeout {
-                        name: "isolate".into(),
-                        timeout_ms: self.sandbox.timeout_ms,
-                    }
-                } else {
-                    PluginError::ExecutionError {
-                        name: "isolate".into(),
-                        message: msg,
-                    }
-                }
-            })?;
+                let ic = instruction_count.clone();
+                let _ = self.lua.set_hook(
+                    mlua::HookTriggers::new().every_nth_instruction(1000),
+                    move |_lua, _debug| {
+                        let count = ic.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+                        if cancel_clone.is_cancelled() {
+                            return Err(mlua::Error::external("Cancelled"));
+                        }
+                        if count > max_instructions {
+                            return Err(mlua::Error::external("Timeout"));
+                        }
+                        Ok(mlua::VmState::Continue)
+                    },
+                );
 
-            // Remove hook
-            self.lua.remove_hook();
+                let result = self.lua.load(code_str).eval::<LuaValue>().map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("Cancelled") {
+                        PluginError::Cancelled {
+                            name: "isolate".into(),
+                        }
+                    } else if msg.contains("Timeout") {
+                        PluginError::Timeout {
+                            name: "isolate".into(),
+                            timeout_ms: self.sandbox.timeout_ms,
+                        }
+                    } else {
+                        PluginError::ExecutionError {
+                            name: "isolate".into(),
+                            message: msg,
+                        }
+                    }
+                });
 
-            Ok(Self::lua_to_value(result))
+                self.lua.remove_hook();
+                result
+            };
+
+            match tokio::time::timeout(timeout_dur, exec_future).await {
+                Ok(result) => Ok(Self::lua_to_value(result?)),
+                Err(_elapsed) => Err(PluginError::Timeout {
+                    name: "isolate".into(),
+                    timeout_ms,
+                }),
+            }
         })
     }
 
@@ -199,31 +219,44 @@ impl IsolatedContext for LuaIsolatedContext {
                 });
             }
 
-            let globals = self.lua.globals();
-            let func: mlua::Function =
-                globals.get(name).map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: format!("Function '{}' not found: {}", name, e),
-                })?;
+            let timeout_dur = Duration::from_millis(self.sandbox.timeout_ms);
+            let timeout_ms = self.sandbox.timeout_ms;
 
-            // Convert args
-            let lua_args: Vec<LuaValue> = args
-                .iter()
-                .map(|v| self.value_to_lua(&self.lua, v))
-                .collect::<Result<_, _>>()
-                .map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                })?;
+            let call_future = async {
+                let globals = self.lua.globals();
+                let func: mlua::Function =
+                    globals.get(name).map_err(|e| PluginError::ExecutionError {
+                        name: "isolate".into(),
+                        message: format!("Function '{}' not found: {}", name, e),
+                    })?;
 
-            let result: LuaValue =
-                func.call(mlua::MultiValue::from_vec(lua_args))
+                // Convert args
+                let lua_args: Vec<LuaValue> = args
+                    .iter()
+                    .map(|v| self.value_to_lua(&self.lua, v))
+                    .collect::<Result<_, _>>()
                     .map_err(|e| PluginError::ExecutionError {
                         name: "isolate".into(),
                         message: e.to_string(),
                     })?;
 
-            Ok(Self::lua_to_value(result))
+                let result: LuaValue =
+                    func.call(mlua::MultiValue::from_vec(lua_args))
+                        .map_err(|e| PluginError::ExecutionError {
+                            name: "isolate".into(),
+                            message: e.to_string(),
+                        })?;
+
+                Ok(Self::lua_to_value(result))
+            };
+
+            match tokio::time::timeout(timeout_dur, call_future).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(PluginError::Timeout {
+                    name: "isolate".into(),
+                    timeout_ms,
+                }),
+            }
         })
     }
 

@@ -43,6 +43,9 @@ pub struct LuaRuntime {
     /// Runtime configuration.
     config: Option<PluginConfig>,
 
+    /// Sandbox configuration used to gate filesystem API access.
+    sandbox: SandboxConfig,
+
     /// Whether the runtime has been initialized.
     initialized: bool,
 }
@@ -53,25 +56,67 @@ impl LuaRuntime {
         let lua = Lua::new();
 
         // Disable potentially dangerous standard library functions
-        lua.globals()
-            .set("loadfile", LuaValue::Nil)
-            .map_err(|e| PluginError::LoadError {
+        {
+            let globals = lua.globals();
+            let map_err = |e: mlua::Error| PluginError::LoadError {
                 name: "lua".into(),
                 message: e.to_string(),
-            })?;
-
-        lua.globals()
-            .set("dofile", LuaValue::Nil)
-            .map_err(|e| PluginError::LoadError {
-                name: "lua".into(),
-                message: e.to_string(),
-            })?;
+            };
+            globals.set("loadfile", LuaValue::Nil).map_err(map_err)?;
+            globals
+                .set("dofile", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            globals
+                .set("load", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            globals
+                .set("os", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            globals
+                .set("io", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            globals
+                .set("debug", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            globals
+                .set("require", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            globals
+                .set("package", LuaValue::Nil)
+                .map_err(|e| PluginError::LoadError {
+                    name: "lua".into(),
+                    message: e.to_string(),
+                })?;
+            // Disable string.dump to prevent bytecode extraction
+            if let Ok(string_table) = globals.get::<mlua::Table>("string") {
+                string_table.set("dump", LuaValue::Nil).ok();
+            }
+        }
 
         Ok(Self {
             lua,
             plugins: HashMap::new(),
             next_handle: 0,
             config: None,
+            sandbox: SandboxConfig::default(),
             initialized: false,
         })
     }
@@ -152,8 +197,8 @@ impl LuaRuntime {
             message: e.to_string(),
         })?;
 
-        // Create the 'fs' namespace (filesystem API)
-        let fs = bindings::create_fs_api(&self.lua, None)?;
+        // Create the 'fs' namespace (filesystem API), gated by the runtime sandbox.
+        let fs = bindings::create_fs_api(&self.lua, Some(self.sandbox.clone()))?;
         globals.set("fs", fs).map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
@@ -309,6 +354,14 @@ impl PluginRuntime for LuaRuntime {
         if self.initialized {
             return Ok(());
         }
+
+        // Build a sandbox from plugin config settings.
+        self.sandbox = SandboxConfig {
+            timeout_ms: config.default_timeout_ms,
+            max_memory: config.max_memory_mb * 1024 * 1024,
+            allow_network: config.allow_network,
+            ..SandboxConfig::default()
+        };
 
         self.config = Some(config.clone());
         self.init_api()?;

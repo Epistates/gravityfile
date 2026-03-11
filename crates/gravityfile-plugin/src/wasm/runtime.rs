@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use extism::{Manifest, Plugin, Wasm};
 
 use crate::config::{PluginConfig, PluginMetadata};
 use crate::hooks::{Hook, HookContext, HookResult};
 use crate::runtime::{BoxFuture, IsolatedContext, PluginHandle, PluginRuntime};
-use crate::sandbox::SandboxConfig;
+use crate::sandbox::{Permission, SandboxConfig};
 use crate::types::{PluginError, PluginResult, Value};
 
 use super::isolate::WasmIsolatedContext;
@@ -40,6 +41,9 @@ pub struct WasmRuntime {
     /// Runtime configuration.
     config: Option<PluginConfig>,
 
+    /// Sandbox configuration used to build restricted Extism manifests.
+    sandbox: SandboxConfig,
+
     /// Whether the runtime has been initialized.
     initialized: bool,
 }
@@ -51,8 +55,47 @@ impl WasmRuntime {
             plugins: HashMap::new(),
             next_handle: 0,
             config: None,
+            sandbox: SandboxConfig::default(),
             initialized: false,
         })
+    }
+
+    /// Load a WASM plugin, applying sandbox restrictions.
+    ///
+    /// - `allow_wasi` is set only when the sandbox has Execute or Network permission,
+    ///   matching the principle that WASI grants syscall-level access.
+    /// - Filesystem paths from the sandbox are mapped into the Extism manifest.
+    /// - Memory and timeout limits are applied.
+    fn load_plugin_with_sandbox(wasm: Wasm, sandbox: &SandboxConfig) -> Result<Plugin, String> {
+        let allow_wasi = sandbox.has_permission(Permission::Execute)
+            || sandbox.has_permission(Permission::Network);
+
+        let mut manifest = Manifest::new([wasm]);
+
+        if sandbox.max_memory > 0 {
+            let pages = (sandbox.max_memory / (64 * 1024)).max(1) as u32;
+            manifest = manifest.with_memory_max(pages);
+        }
+
+        if sandbox.timeout_ms > 0 {
+            manifest = manifest.with_timeout(Duration::from_millis(sandbox.timeout_ms));
+        }
+
+        for path in &sandbox.allowed_read_paths {
+            if let Some(s) = path.to_str() {
+                manifest = manifest.with_allowed_path(s.to_string(), path);
+            }
+        }
+
+        for path in &sandbox.allowed_write_paths {
+            if let Some(s) = path.to_str()
+                && !sandbox.allowed_read_paths.contains(path)
+            {
+                manifest = manifest.with_allowed_path(s.to_string(), path);
+            }
+        }
+
+        Plugin::new(&manifest, [], allow_wasi).map_err(|e| e.to_string())
     }
 }
 
@@ -76,6 +119,14 @@ impl PluginRuntime for WasmRuntime {
             return Ok(());
         }
 
+        // Build a sandbox from plugin config settings.
+        self.sandbox = SandboxConfig {
+            timeout_ms: config.default_timeout_ms,
+            max_memory: config.max_memory_mb * 1024 * 1024,
+            allow_network: config.allow_network,
+            ..SandboxConfig::default()
+        };
+
         self.config = Some(config.clone());
         self.initialized = true;
 
@@ -84,11 +135,12 @@ impl PluginRuntime for WasmRuntime {
 
     fn load_plugin(&mut self, id: &str, source: &Path) -> PluginResult<PluginHandle> {
         let wasm = Wasm::file(source);
-        let manifest = Manifest::new([wasm]);
 
-        let plugin = Plugin::new(&manifest, [], true).map_err(|e| PluginError::LoadError {
-            name: id.to_string(),
-            message: e.to_string(),
+        let plugin = Self::load_plugin_with_sandbox(wasm, &self.sandbox).map_err(|e| {
+            PluginError::LoadError {
+                name: id.to_string(),
+                message: e,
+            }
         })?;
 
         // Determine which hooks are available by checking exports
@@ -200,9 +252,11 @@ impl PluginRuntime for WasmRuntime {
                 Ok(result)
             }
             Err(e) => {
-                eprintln!(
-                    "WASM plugin '{}' hook '{}' failed: {}",
-                    plugin.name, hook_name, e
+                tracing::warn!(
+                    plugin = %plugin.name,
+                    hook = %hook_name,
+                    error = %e,
+                    "WASM plugin hook failed"
                 );
                 Ok(HookResult::ok())
             }
