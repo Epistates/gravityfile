@@ -10,10 +10,10 @@ description = "File system scanning engine for gravityfile"
 gravityfile-core.workspace = true
 jwalk.workspace = true
 rayon.workspace = true
-dashmap.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 compact_str.workspace = true
+globset.workspace = true
 git2 = { workspace = true, optional = true }
 
 [features]

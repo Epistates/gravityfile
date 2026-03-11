@@ -1,7 +1,9 @@
 //! Git repository status detection.
 //!
 //! This module provides functionality to detect git status for files
-//! within a repository. It caches repository state for efficient lookups.
+//! within a repository. It caches repository state for efficient lookups,
+//! and restricts the status query to the scanned subtree so that large
+//! monorepos do not force a full-repo status load.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,11 @@ impl GitStatusCache {
 
     /// Initialize the cache by discovering and scanning the git repository.
     ///
+    /// `start_path` is the directory we are scanning (the subtree root). The
+    /// git status query is restricted to that subtree via a pathspec so that
+    /// only relevant entries are loaded, keeping memory usage proportional to
+    /// the scanned directory rather than the whole repository.
+    ///
     /// Returns true if a git repository was found and scanned.
     #[cfg(feature = "git")]
     pub fn initialize(&mut self, start_path: &Path) -> bool {
@@ -44,12 +51,30 @@ impl GitStatusCache {
 
         self.repo_root = Some(workdir.clone());
 
-        // Get all file statuses
+        // Build a pathspec that restricts status to the scanned subtree.
+        // We compute start_path relative to the repo workdir so git2 can
+        // apply it as a standard pathspec pattern.
+        let pathspec_str = start_path
+            .strip_prefix(&workdir)
+            .ok()
+            .and_then(|rel| rel.to_str())
+            .map(|s| {
+                if s.is_empty() {
+                    // Scanning the repo root — match everything.
+                    "**".to_string()
+                } else {
+                    format!("{s}/**")
+                }
+            })
+            .unwrap_or_else(|| "**".to_string());
+
+        // Get file statuses restricted to the subtree.
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
             .include_ignored(true)
             .recurse_untracked_dirs(true)
-            .include_unmodified(false);
+            .include_unmodified(false)
+            .pathspec(&pathspec_str);
 
         let statuses = match repo.statuses(Some(&mut opts)) {
             Ok(s) => s,
