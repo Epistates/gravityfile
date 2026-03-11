@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-03-11
+
+### Security
+
+- **CRIT: Rhai code injection** - Replaced string interpolation in `call_function` with `Engine::call_fn` using typed args and stored AST, eliminating arbitrary code execution via plugin args
+- **CRIT: TAR decompression bomb bypass** - Size limits now check actual bytes written to disk via `symlink_metadata` instead of trusting attacker-controlled header sizes
+- **CRIT: Cross-filesystem move data loss** - Added cleanup on partial copy failure and warning on source removal failure to prevent duplicate/orphaned content
+- **HIGH: Plugin sandbox bypass (Rhai)** - All `fs_*` functions now gate on `SandboxConfig.can_read()` via `Arc`-shared config
+- **HIGH: Plugin sandbox bypass (Lua)** - `LuaRuntime` now stores and passes `SandboxConfig` to `create_fs_api` instead of `None`
+- **HIGH: Plugin sandbox bypass (WASM)** - Manifest now maps sandbox config to `allowed_paths`, memory limits, timeout; WASI disabled by default
+- **MED: ZIP symlink escape** - Deferred symlink extraction to second pass preventing symlink-redirected `create_dir_all`
+- **MED: Chained symlink attack** - Always validate symlink targets against canonical destination, not only when `..` present
+- **MED: Empty sandbox = full access** - Empty `allowed_read_paths`/`allowed_write_paths` now deny by default instead of granting unrestricted access
+- **MED: Lua `fs.read_bytes` unbounded read** - Uses `File::open().take(limit).read_to_end()` instead of full allocation
+- **MED: Lua instruction timeout bypass** - Wrapped isolate execution in `tokio::time::timeout` for wall-clock enforcement alongside instruction counter
+
+### Fixed
+
+- **Move undo pipeline** - Added `MoveComplete` struct carrying `moved_pairs` from move operations, enabling proper undo recording
+- **Cross-filesystem undo** - Undo now falls back to copy+delete when `fs::rename` fails across filesystems
+- **Windows symlink** - Choose `symlink_dir` vs `symlink_file` based on target type; log failures instead of silent discard
+- **Fuzzy search highlights** - Fixed misalignment on non-ASCII filenames by using character positions instead of byte offsets to match nucleo's UTF-32 indices
+- **Viewport height** - Correctly subtracts 5 rows when directory tabs are visible instead of always 4
+- **Git pathspec** - Empty relative path at repo root now produces `**` instead of `/**`
+- **Filename validation** - Uses byte length (`name.len() > 255`) matching OS enforcement instead of char count
+- **Archive symlink icon** - Symlinks in archive preview now show distinct `@ ` icon instead of directory icon
+- **Doc link warnings** - Escaped `[PATH]` in doc comments to prevent rustdoc treating them as links
+
+### Changed
+
+- **InodeTracker** - Replaced `DashMap` with `HashMap` since access is single-threaded; ~15% faster inode tracking
+- **GlobSet reuse** - Scanner reuses `ScanConfig`'s pre-compiled `GlobSet` with fallback compilation for builder-created configs
+- **Progress counter** - Replaced `Arc<AtomicU64>` with plain `u64` in sequential scan loop
+- **`truncate_to_width`** - Extracted shared function to `ui/mod.rs`, eliminating 3-way duplication
+- **`TuiConfig`** - Added `#[non_exhaustive]` to prevent future breakage from field additions
+- **Cross-device filter** - Extended to non-directory entries (files and symlinks), not just directory pruning
+- **Convenience wrappers** - Documented that `copy()`/`move_to()` create non-cancellable internal tokens
+- **Removed dead code** - `prefix_len` variable, unused `normalize_path` function
+
 ## [0.3.1] - 2026-03-02
 
 ### Added
@@ -224,6 +263,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.2.3]: https://github.com/epistates/gravityfile/releases/tag/v0.2.3
 [0.3.1]: https://github.com/epistates/gravityfile/releases/tag/v0.3.1
 [0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2
