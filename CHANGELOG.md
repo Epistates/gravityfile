@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-03-11
+
+### Fixed
+
+- **Windows build** - Replaced unstable `windows_by_handle` APIs (`file_index()`, `number_of_links()`) with stable fallbacks; hardlink dedup skipped on Windows
+
 ## [0.2.3] - 2026-03-11
 
 ### Security
@@ -263,6 +269,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.2.4]: https://github.com/epistates/gravityfile/releases/tag/v0.2.4
 [0.2.3]: https://github.com/epistates/gravityfile/releases/tag/v0.2.3
 [0.3.1]: https://github.com/epistates/gravityfile/releases/tag/v0.3.1
 [0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
