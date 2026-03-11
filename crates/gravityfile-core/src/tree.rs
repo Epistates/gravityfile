@@ -1,6 +1,6 @@
 //! File tree container and statistics.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -36,25 +36,25 @@ impl TreeStats {
         Self::default()
     }
 
-    /// Update stats with a file entry.
-    pub fn record_file(&mut self, path: PathBuf, size: u64, modified: SystemTime, depth: u32) {
+    /// Update stats with a file entry. Only clones the path when updating a tracked field.
+    pub fn record_file(&mut self, path: &Path, size: u64, modified: SystemTime, depth: u32) {
         self.total_files += 1;
         self.total_size += size;
         self.max_depth = self.max_depth.max(depth);
 
         // Track largest file
         if self.largest_file.as_ref().is_none_or(|(_, s)| size > *s) {
-            self.largest_file = Some((path.clone(), size));
+            self.largest_file = Some((path.to_path_buf(), size));
         }
 
         // Track oldest file
         if self.oldest_file.as_ref().is_none_or(|(_, t)| modified < *t) {
-            self.oldest_file = Some((path.clone(), modified));
+            self.oldest_file = Some((path.to_path_buf(), modified));
         }
 
         // Track newest file
         if self.newest_file.as_ref().is_none_or(|(_, t)| modified > *t) {
-            self.newest_file = Some((path, modified));
+            self.newest_file = Some((path.to_path_buf(), modified));
         }
     }
 
@@ -71,6 +71,8 @@ impl TreeStats {
 }
 
 /// Complete scanned file tree with metadata.
+///
+/// **Warning:** `Clone` performs a deep clone of the entire tree — O(n) in the number of nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTree {
     /// Root node of the tree.
@@ -96,7 +98,7 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    /// Create a new file tree.
+    /// Create a new file tree. `scanned_at` should be captured by the caller at scan start time.
     pub fn new(
         root: FileNode,
         root_path: PathBuf,
@@ -117,21 +119,25 @@ impl FileTree {
     }
 
     /// Get the total size of the tree.
+    #[inline]
     pub fn total_size(&self) -> u64 {
         self.root.size
     }
 
     /// Get the total number of files.
+    #[inline]
     pub fn total_files(&self) -> u64 {
         self.stats.total_files
     }
 
     /// Get the total number of directories.
+    #[inline]
     pub fn total_dirs(&self) -> u64 {
         self.stats.total_dirs
     }
 
     /// Check if there were any warnings during scanning.
+    #[inline]
     pub fn has_warnings(&self) -> bool {
         !self.warnings.is_empty()
     }
@@ -154,11 +160,25 @@ mod tests {
         let mut stats = TreeStats::new();
         let now = SystemTime::now();
 
-        stats.record_file(PathBuf::from("/test/file.txt"), 1024, now, 2);
+        stats.record_file(Path::new("/test/file.txt"), 1024, now, 2);
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.total_size, 1024);
         assert_eq!(stats.max_depth, 2);
         assert!(stats.largest_file.is_some());
+    }
+
+    #[test]
+    fn test_tree_stats_record_file_tracks_extremes() {
+        let mut stats = TreeStats::new();
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
+
+        stats.record_file(Path::new("/small_old"), 100, t1, 1);
+        stats.record_file(Path::new("/big_new"), 999, t2, 2);
+
+        assert_eq!(stats.largest_file.as_ref().unwrap().1, 999);
+        assert_eq!(stats.oldest_file.as_ref().unwrap().1, t1);
+        assert_eq!(stats.newest_file.as_ref().unwrap().1, t2);
     }
 }

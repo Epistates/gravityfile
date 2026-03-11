@@ -10,5 +10,5 @@ description = "Core types and traits for gravityfile"
 serde.workspace = true
 thiserror.workspace = true
 compact_str.workspace = true
-chrono.workspace = true
 derive_builder.workspace = true
+globset = "0.4"

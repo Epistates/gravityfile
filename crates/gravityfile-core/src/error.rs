@@ -1,26 +1,38 @@
 //! Error types for scanning operations.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors that can occur during scanning.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Serialize)]
 pub enum ScanError {
     /// Permission denied for a path.
-    #[error("Permission denied: {path}")]
-    PermissionDenied { path: PathBuf },
+    #[error("Permission denied: {path}: {}", serialize_io_error_display(source))]
+    PermissionDenied {
+        path: PathBuf,
+        #[source]
+        #[serde(serialize_with = "serialize_io_error")]
+        source: std::io::Error,
+    },
 
     /// Path not found.
-    #[error("Path not found: {path}")]
-    NotFound { path: PathBuf },
+    #[error("Path not found: {path}: {}", serialize_io_error_display(source))]
+    NotFound {
+        path: PathBuf,
+        #[source]
+        #[serde(serialize_with = "serialize_io_error")]
+        source: std::io::Error,
+    },
 
     /// Generic I/O error.
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
+        #[serde(serialize_with = "serialize_io_error")]
         source: std::io::Error,
     },
 
@@ -45,13 +57,24 @@ pub enum ScanError {
     Other { message: String },
 }
 
+fn serialize_io_error<S: serde::Serializer>(
+    error: &std::io::Error,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&error.to_string())
+}
+
+fn serialize_io_error_display(error: &std::io::Error) -> String {
+    error.to_string()
+}
+
 impl ScanError {
-    /// Create an I/O error with path context.
+    /// Create an I/O error with path context. Preserves the original `io::Error` as the source.
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         let path = path.into();
         match source.kind() {
-            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied { path },
-            std::io::ErrorKind::NotFound => Self::NotFound { path },
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied { path, source },
+            std::io::ErrorKind::NotFound => Self::NotFound { path, source },
             _ => Self::Io { path, source },
         }
     }
@@ -83,9 +106,15 @@ pub struct ScanWarning {
     pub kind: WarningKind,
 }
 
+impl fmt::Display for ScanWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
 impl ScanWarning {
     /// Create a new scan warning.
-    pub fn new(path: impl Into<PathBuf>, message: impl Into<String>, kind: WarningKind) -> Self {
+    pub fn new(path: impl Into<PathBuf>, kind: WarningKind, message: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             message: message.into(),
@@ -138,9 +167,24 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_error_preserves_source() {
+        let err = ScanError::io(
+            "/test/path",
+            std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        );
+        match err {
+            ScanError::NotFound { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            _ => panic!("Expected NotFound variant"),
+        }
+    }
+
+    #[test]
     fn test_scan_warning_creation() {
         let warning = ScanWarning::permission_denied("/test/path");
         assert_eq!(warning.kind, WarningKind::PermissionDenied);
         assert!(warning.message.contains("Permission denied"));
+        assert_eq!(format!("{warning}"), warning.message);
     }
 }

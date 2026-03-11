@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use derive_builder::Builder;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for scanning operations.
@@ -32,7 +33,7 @@ pub struct ScanConfig {
     #[serde(default)]
     pub max_depth: Option<u32>,
 
-    /// Patterns to ignore (gitignore syntax).
+    /// Patterns to ignore (gitignore-style glob syntax via `globset`).
     #[builder(default)]
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
@@ -56,6 +57,12 @@ pub struct ScanConfig {
     #[builder(default = "4096")]
     #[serde(default = "default_min_hash_size")]
     pub min_hash_size: u64,
+
+    /// Compiled glob patterns for ignore matching. Rebuilt from `ignore_patterns`.
+    #[serde(skip)]
+    #[builder(setter(skip))]
+    #[builder(default)]
+    compiled_ignore: Option<GlobSet>,
 }
 
 fn default_true() -> bool {
@@ -87,7 +94,7 @@ impl ScanConfig {
 
     /// Create a simple config for scanning a path.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
+        let mut config = Self {
             root: root.into(),
             follow_symlinks: false,
             cross_filesystems: false,
@@ -98,34 +105,55 @@ impl ScanConfig {
             include_hidden: true,
             compute_hashes: false,
             min_hash_size: 4096,
+            compiled_ignore: None,
+        };
+        config.compile_patterns();
+        config
+    }
+
+    /// Compile ignore patterns into a `GlobSet` for efficient matching.
+    /// Call this after modifying `ignore_patterns`.
+    pub fn compile_patterns(&mut self) {
+        if self.ignore_patterns.is_empty() {
+            self.compiled_ignore = None;
+            return;
+        }
+        let mut builder = GlobSetBuilder::new();
+        for pattern in &self.ignore_patterns {
+            if let Ok(glob) = Glob::new(pattern) {
+                builder.add(glob);
+            }
+        }
+        self.compiled_ignore = builder.build().ok();
+    }
+
+    /// Check if a name should be ignored based on compiled glob patterns.
+    pub fn should_ignore(&self, name: &str) -> bool {
+        if let Some(ref globset) = self.compiled_ignore {
+            globset.is_match(name)
+        } else if !self.ignore_patterns.is_empty() {
+            // Fallback: compile on-the-fly (patterns not yet compiled)
+            self.ignore_patterns.iter().any(|p| {
+                Glob::new(p)
+                    .map(|g| g.compile_matcher().is_match(name))
+                    .unwrap_or(false)
+            })
+        } else {
+            false
         }
     }
 
-    /// Check if a path should be ignored based on patterns.
-    pub fn should_ignore(&self, name: &str) -> bool {
-        // Simple pattern matching for now
-        // TODO: Use gitignore-style matching
-        for pattern in &self.ignore_patterns {
-            if name == pattern {
-                return true;
-            }
-            // Handle glob patterns
-            if pattern.ends_with('*') {
-                let prefix = &pattern[..pattern.len() - 1];
-                if name.starts_with(prefix) {
-                    return true;
-                }
-            }
-            if let Some(suffix) = pattern.strip_prefix('*')
-                && name.ends_with(suffix)
-            {
-                return true;
-            }
-        }
-        false
+    /// Return the compiled `GlobSet` for ignore patterns, if any.
+    ///
+    /// This is the same set used internally by `should_ignore`. Useful when
+    /// callers need an owned, `Send + Sync` handle (e.g. for closures sent
+    /// to thread pools) without recompiling the patterns.
+    pub fn compiled_ignore_set(&self) -> Option<&GlobSet> {
+        self.compiled_ignore.as_ref()
     }
 
     /// Check if hidden files should be skipped.
+    #[inline]
     pub fn should_skip_hidden(&self, name: &str) -> bool {
         !self.include_hidden && name.starts_with('.')
     }
@@ -164,16 +192,37 @@ mod tests {
     }
 
     #[test]
-    fn test_should_ignore() {
-        let config = ScanConfig::builder()
+    fn test_should_ignore_glob() {
+        let mut config = ScanConfig::builder()
             .root("/test")
-            .ignore_patterns(vec!["node_modules".to_string(), "*.log".to_string()])
+            .ignore_patterns(vec![
+                "node_modules".to_string(),
+                "*.log".to_string(),
+                "**/*.tmp".to_string(),
+            ])
             .build()
             .unwrap();
+        config.compile_patterns();
 
         assert!(config.should_ignore("node_modules"));
         assert!(config.should_ignore("test.log"));
+        assert!(config.should_ignore("cache.tmp"));
         assert!(!config.should_ignore("src"));
+        assert!(!config.should_ignore("test.txt"));
+    }
+
+    #[test]
+    fn test_should_ignore_prefix_glob() {
+        let mut config = ScanConfig::builder()
+            .root("/test")
+            .ignore_patterns(vec!["build*".to_string()])
+            .build()
+            .unwrap();
+        config.compile_patterns();
+
+        assert!(config.should_ignore("build"));
+        assert!(config.should_ignore("build-output"));
+        assert!(!config.should_ignore("rebuild"));
     }
 
     #[test]
