@@ -29,6 +29,7 @@ blake3 = { version = "1", features = ["rayon", "mmap"] }
 # Async (minimal features for smaller binary)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["full"] }
 
 # TUI
 ratatui = { version = "0.30", features = ["crossterm_0_28"] }
@@ -55,6 +56,12 @@ gravityfile-tui = { version = "0.3.1", path = "crates/gravityfile-tui" }
 
 # Logging
 tracing = "0.1"
+
+# Collections
+indexmap = "2"
+
+# Glob patterns
+globset = "0.4"
 
 # File operations
 fs_extra = "1.3"
