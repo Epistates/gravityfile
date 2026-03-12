@@ -139,7 +139,7 @@ impl OperationExecutor {
                 let unified = match result {
                     CopyResult::Progress(p) => OperationResult::Progress(p),
                     CopyResult::Conflict(c) => OperationResult::Conflict(c),
-                    CopyResult::Complete(c) => OperationResult::Complete(c),
+                    CopyResult::Complete(cc) => OperationResult::Complete(cc.inner),
                 };
                 if tx.send(unified).await.is_err() {
                     break;

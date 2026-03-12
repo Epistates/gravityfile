@@ -19,7 +19,17 @@ pub enum CopyResult {
     /// A conflict was detected that needs resolution.
     Conflict(Conflict),
     /// The operation completed.
-    Complete(OperationComplete),
+    Complete(CopyComplete),
+}
+
+/// Completion result for copy operations, including the created paths
+/// needed by the undo system.
+#[derive(Debug)]
+pub struct CopyComplete {
+    /// Standard operation completion info.
+    pub inner: OperationComplete,
+    /// List of all created files and directories for undo recording.
+    pub created_paths: Vec<PathBuf>,
 }
 
 /// Options for copy operations.
@@ -44,12 +54,15 @@ pub fn start_copy(
 
     if sources.is_empty() {
         // Send immediate completion for empty sources
-        let complete = OperationComplete {
-            operation_type: OperationType::Copy,
-            succeeded: 0,
-            failed: 0,
-            bytes_processed: 0,
-            errors: vec![],
+        let complete = CopyComplete {
+            inner: OperationComplete {
+                operation_type: OperationType::Copy,
+                succeeded: 0,
+                failed: 0,
+                bytes_processed: 0,
+                errors: vec![],
+            },
+            created_paths: vec![],
         };
         tokio::spawn(async move {
             let _ = tx.send(CopyResult::Complete(complete)).await;
@@ -79,6 +92,7 @@ async fn copy_impl(
     let global_resolution: Option<ConflictResolution> = options.conflict_resolution;
     let mut succeeded = 0;
     let mut failed = 0;
+    let mut created_paths = Vec::new();
 
     // Ensure destination exists and is a directory
     if !destination.exists()
@@ -89,12 +103,15 @@ async fn copy_impl(
             format!("Failed to create destination: {}", e),
         ));
         let _ = tx
-            .send(CopyResult::Complete(OperationComplete {
-                operation_type: OperationType::Copy,
-                succeeded: 0,
-                failed: sources.len(),
-                bytes_processed: 0,
-                errors: progress.errors.clone(),
+            .send(CopyResult::Complete(CopyComplete {
+                inner: OperationComplete {
+                    operation_type: OperationType::Copy,
+                    succeeded: 0,
+                    failed: sources.len(),
+                    bytes_processed: 0,
+                    errors: progress.errors.clone(),
+                },
+                created_paths: vec![],
             }))
             .await;
         return;
@@ -122,7 +139,7 @@ async fn copy_impl(
 
         // Check for conflicts using symlink_metadata so we see the link itself
         let dest_meta = fs::symlink_metadata(&dest_path).ok();
-        if dest_meta.is_some() {
+        let final_dest = if dest_meta.is_some() {
             let conflict_kind = if dest_meta.as_ref().is_some_and(|m| m.is_dir()) {
                 ConflictKind::DirectoryExists
             } else {
@@ -151,26 +168,20 @@ async fn copy_impl(
                 }
                 ConflictResolution::Abort => {
                     let _ = tx
-                        .send(CopyResult::Complete(OperationComplete {
-                            operation_type: OperationType::Copy,
-                            succeeded,
-                            failed: failed + 1,
-                            bytes_processed: progress.bytes_processed,
-                            errors: progress.errors.clone(),
+                        .send(CopyResult::Complete(CopyComplete {
+                            inner: OperationComplete {
+                                operation_type: OperationType::Copy,
+                                succeeded,
+                                failed: failed + 1,
+                                bytes_processed: progress.bytes_processed,
+                                errors: progress.errors.clone(),
+                            },
+                            created_paths,
                         }))
                         .await;
                     return;
                 }
-                ConflictResolution::AutoRename => {
-                    let new_dest = auto_rename_path(&dest_path);
-                    if let Err(e) = copy_item(&source, &new_dest, &mut progress, &tx).await {
-                        progress.add_error(OperationError::new(source.clone(), e));
-                        failed += 1;
-                    } else {
-                        succeeded += 1;
-                    }
-                    continue;
-                }
+                ConflictResolution::AutoRename => auto_rename_path(&dest_path),
                 ConflictResolution::Overwrite | ConflictResolution::OverwriteAll => {
                     // CRIT-3: handle removal failure — record error and skip this source
                     let remove_result = if let Some(ref m) = dest_meta {
@@ -190,30 +201,37 @@ async fn copy_impl(
                         failed += 1;
                         continue;
                     }
+                    dest_path.clone()
                 }
             }
-        }
+        } else {
+            dest_path.clone()
+        };
 
         // Perform the copy
         progress.set_current_file(Some(source.clone()));
         let _ = tx.send(CopyResult::Progress(progress.clone())).await;
 
-        if let Err(e) = copy_item(&source, &dest_path, &mut progress, &tx).await {
+        if let Err(e) = copy_item(&source, &final_dest, &mut progress, &tx).await {
             progress.add_error(OperationError::new(source.clone(), e));
             failed += 1;
         } else {
             succeeded += 1;
+            created_paths.push(final_dest);
         }
     }
 
     // Send completion
     let _ = tx
-        .send(CopyResult::Complete(OperationComplete {
-            operation_type: OperationType::Copy,
-            succeeded,
-            failed,
-            bytes_processed: progress.bytes_processed,
-            errors: progress.errors,
+        .send(CopyResult::Complete(CopyComplete {
+            inner: OperationComplete {
+                operation_type: OperationType::Copy,
+                succeeded,
+                failed,
+                bytes_processed: progress.bytes_processed,
+                errors: progress.errors,
+            },
+            created_paths,
         }))
         .await;
 }
