@@ -17,6 +17,7 @@ use derive_builder::Builder;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use gravityfile_core::{ContentHash, FileNode, FileTree, NodeKind};
 
@@ -180,7 +181,7 @@ impl DuplicateFinder {
     }
 
     /// Find duplicates in a scanned file tree.
-    pub fn find_duplicates(&self, tree: &FileTree) -> DuplicateReport {
+    pub fn find_duplicates(&self, tree: &FileTree, token: CancellationToken) -> DuplicateReport {
         // Phase 1: Collect all files with their paths and sizes.
         // Pass seen_inodes to skip hardlinked copies of the same data.
         let mut files: Vec<FileInfo> = Vec::new();
@@ -215,6 +216,7 @@ impl DuplicateFinder {
                 &mut files,
                 &mut seen_inodes,
                 &mut seen_paths,
+                &token,
             );
         }
 
@@ -231,12 +233,22 @@ impl DuplicateFinder {
         let duplicate_groups: Vec<DuplicateGroup> = if self.config.quick_compare {
             size_groups
                 .into_par_iter()
-                .flat_map(|(_size, files)| self.find_dups_in_size_group_partial(files))
+                .flat_map(|(_size, files)| {
+                    if token.is_cancelled() {
+                        return Vec::new();
+                    }
+                    self.find_dups_in_size_group_partial(files, &token)
+                })
                 .collect()
         } else {
             size_groups
                 .into_par_iter()
-                .flat_map(|(_size, files)| self.find_dups_in_size_group_full(files))
+                .flat_map(|(_size, files)| {
+                    if token.is_cancelled() {
+                        return Vec::new();
+                    }
+                    self.find_dups_in_size_group_full(files, &token)
+                })
                 .collect()
         };
 
@@ -279,7 +291,11 @@ impl DuplicateFinder {
         files: &mut Vec<FileInfo>,
         seen_inodes: &mut HashSet<(u64, u64)>,
         seen_paths: &mut HashSet<PathBuf>,
+        token: &CancellationToken,
     ) {
+        if token.is_cancelled() {
+            return;
+        }
         match &node.kind {
             NodeKind::File { .. } => {
                 // current_path is already the full file path — the Directory branch
@@ -313,7 +329,14 @@ impl DuplicateFinder {
             NodeKind::Directory { .. } => {
                 for child in &node.children {
                     let child_path = current_path.join(&*child.name);
-                    self.collect_files(child, &child_path, files, seen_inodes, seen_paths);
+                    self.collect_files(
+                        child,
+                        &child_path,
+                        files,
+                        seen_inodes,
+                        seen_paths,
+                        token,
+                    );
                 }
             }
             _ => {}
@@ -348,7 +371,11 @@ impl DuplicateFinder {
     }
 
     /// Find duplicates in a single size group using partial hash then full hash.
-    fn find_dups_in_size_group_partial(&self, files: Vec<FileInfo>) -> Vec<DuplicateGroup> {
+    fn find_dups_in_size_group_partial(
+        &self,
+        files: Vec<FileInfo>,
+        token: &CancellationToken,
+    ) -> Vec<DuplicateGroup> {
         if files.len() < 2 {
             return Vec::new();
         }
@@ -359,10 +386,17 @@ impl DuplicateFinder {
         let partial_hashes: Vec<(PathBuf, u64, Option<[u8; 32]>)> = files
             .iter()
             .map(|f| {
+                if token.is_cancelled() {
+                    return (f.path.clone(), f.size, None);
+                }
                 let hash = self.compute_partial_hash(&f.path);
                 (f.path.clone(), f.size, hash)
             })
             .collect();
+
+        if token.is_cancelled() {
+            return Vec::new();
+        }
 
         // Group by partial hash
         let mut partial_groups: HashMap<[u8; 32], Vec<(PathBuf, u64)>> = HashMap::new();
@@ -374,6 +408,9 @@ impl DuplicateFinder {
 
         // For groups with 2+ matching partial hashes, compute full hash (sequential)
         for (_partial_hash, candidates) in partial_groups {
+            if token.is_cancelled() {
+                break;
+            }
             if candidates.len() < 2 {
                 continue;
             }
@@ -381,10 +418,17 @@ impl DuplicateFinder {
             let full_hashes: Vec<(PathBuf, u64, Option<ContentHash>)> = candidates
                 .iter()
                 .map(|(path, size)| {
-                    let hash = compute_full_hash(path);
+                    if token.is_cancelled() {
+                        return (path.clone(), *size, None);
+                    }
+                    let hash = compute_full_hash(path, token);
                     (path.clone(), *size, hash)
                 })
                 .collect();
+
+            if token.is_cancelled() {
+                break;
+            }
 
             // Group by full hash
             let mut full_groups: HashMap<ContentHash, Vec<PathBuf>> = HashMap::new();
@@ -416,7 +460,11 @@ impl DuplicateFinder {
     }
 
     /// Find duplicates in a single size group using only full hash (sequential within group).
-    fn find_dups_in_size_group_full(&self, files: Vec<FileInfo>) -> Vec<DuplicateGroup> {
+    fn find_dups_in_size_group_full(
+        &self,
+        files: Vec<FileInfo>,
+        token: &CancellationToken,
+    ) -> Vec<DuplicateGroup> {
         if files.len() < 2 {
             return Vec::new();
         }
@@ -424,10 +472,17 @@ impl DuplicateFinder {
         let hashes: Vec<(PathBuf, u64, Option<ContentHash>)> = files
             .iter()
             .map(|f| {
-                let hash = compute_full_hash(&f.path);
+                if token.is_cancelled() {
+                    return (f.path.clone(), f.size, None);
+                }
+                let hash = compute_full_hash(&f.path, token);
                 (f.path.clone(), f.size, hash)
             })
             .collect();
+
+        if token.is_cancelled() {
+            return Vec::new();
+        }
 
         // Group by hash
         let mut groups: HashMap<ContentHash, Vec<PathBuf>> = HashMap::new();
@@ -491,12 +546,15 @@ impl DuplicateFinder {
 }
 
 /// Compute full BLAKE3 hash of a file using buffered streaming I/O.
-fn compute_full_hash(path: &Path) -> Option<ContentHash> {
+fn compute_full_hash(path: &Path, token: &CancellationToken) -> Option<ContentHash> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut hasher = Hasher::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
+        if token.is_cancelled() {
+            return None;
+        }
         let n = reader.read(&mut buf).ok()?;
         if n == 0 {
             break;
@@ -571,9 +629,10 @@ mod tests {
     fn test_compute_full_hash() {
         let temp = create_test_files();
 
-        let hash1 = compute_full_hash(&temp.path().join("file1.txt"));
-        let hash2 = compute_full_hash(&temp.path().join("file2.txt"));
-        let hash3 = compute_full_hash(&temp.path().join("file3.txt"));
+        let token = CancellationToken::new();
+        let hash1 = compute_full_hash(&temp.path().join("file1.txt"), &token);
+        let hash2 = compute_full_hash(&temp.path().join("file2.txt"), &token);
+        let hash3 = compute_full_hash(&temp.path().join("file3.txt"), &token);
 
         assert!(hash1.is_some());
         assert!(hash2.is_some());

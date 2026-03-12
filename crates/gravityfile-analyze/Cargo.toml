@@ -15,6 +15,7 @@ derive_builder.workspace = true
 serde.workspace = true
 globset.workspace = true
 tracing.workspace = true
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

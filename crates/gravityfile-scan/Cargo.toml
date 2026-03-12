@@ -12,6 +12,7 @@ jwalk.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 compact_str.workspace = true
 globset.workspace = true
 git2 = { workspace = true, optional = true }

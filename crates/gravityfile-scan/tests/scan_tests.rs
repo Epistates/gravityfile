@@ -5,6 +5,7 @@ use std::os::unix::fs as unix_fs;
 use gravityfile_core::{NodeKind, ScanConfig, WarningKind};
 use gravityfile_scan::{JwalkScanner, quick_list};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,7 +35,7 @@ fn test_scan_counts_files_and_dirs() {
     fs::write(root.join("b/f3.txt"), "!").unwrap();
 
     let config = ScanConfig::new(root);
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     assert_eq!(tree.stats.total_files, 3);
     assert!(tree.stats.total_dirs >= 2);
@@ -53,7 +54,7 @@ fn test_scan_aggregates_size_into_directories() {
         .apparent_size(true)
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     // Root size must be >= the single file we wrote.
     assert!(tree.root.size >= 4096);
@@ -82,7 +83,7 @@ fn test_scan_children_sorted_by_size_descending() {
         .apparent_size(true)
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     let sizes: Vec<u64> = tree.root.children.iter().map(|c| c.size).collect();
     for window in sizes.windows(2) {
@@ -111,7 +112,7 @@ fn test_scan_ignore_pattern_excludes_directory_and_its_contents() {
         .ignore_patterns(vec!["node_modules".to_string()])
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     assert!(
         !names(&tree).contains(&"node_modules"),
@@ -134,7 +135,7 @@ fn test_scan_ignore_glob_pattern_excludes_matching_files() {
         .ignore_patterns(vec!["*.log".to_string()])
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     assert!(
         !names(&tree).contains(&"debug.log"),
@@ -157,7 +158,7 @@ fn test_scan_includes_hidden_files_by_default() {
     fs::write(root.join("visible"), "public").unwrap();
 
     let config = ScanConfig::new(root); // include_hidden defaults to true
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     let ns = names(&tree);
     assert!(
@@ -180,7 +181,7 @@ fn test_scan_excludes_hidden_files_when_configured() {
         .include_hidden(false)
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     let ns = names(&tree);
     assert!(!ns.contains(&".hidden"), "hidden file must be suppressed");
@@ -207,7 +208,7 @@ fn test_scan_counts_hardlink_size_once() {
         .apparent_size(false) // disk usage mode triggers dedup
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     // Three directory entries but physically one inode; total_files == 3 but
     // root.size must reflect only one copy's disk footprint.
@@ -237,7 +238,7 @@ fn test_scan_apparent_size_counts_all_hardlink_entries() {
         .apparent_size(true)
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     // In apparent-size mode every directory entry is counted independently.
     assert_eq!(
@@ -260,7 +261,7 @@ fn test_scan_records_broken_symlink_as_warning() {
     unix_fs::symlink("/nonexistent/target", root.join("broken_link")).unwrap();
 
     let config = ScanConfig::new(root);
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     let broken_warnings: Vec<_> = tree
         .warnings
@@ -296,7 +297,7 @@ fn test_scan_does_not_follow_symlinks_by_default() {
         .follow_symlinks(false)
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     // The symlink itself should appear but "outside.txt" must not be traversed.
     assert_eq!(
@@ -320,7 +321,7 @@ fn test_scan_symlink_node_carries_target_and_broken_flag() {
     unix_fs::symlink("/does/not/exist", root.join("bad_link")).unwrap();
 
     let config = ScanConfig::new(root);
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     let good = tree
         .root
@@ -376,14 +377,14 @@ fn test_scan_disk_size_uses_block_count_not_byte_length() {
         .apparent_size(false)
         .build()
         .unwrap();
-    let tree_disk = scanner().scan(&config_disk).unwrap();
+    let tree_disk = scanner().scan(&config_disk, CancellationToken::new()).unwrap();
 
     let config_apparent = ScanConfig::builder()
         .root(root)
         .apparent_size(true)
         .build()
         .unwrap();
-    let tree_apparent = scanner().scan(&config_apparent).unwrap();
+    let tree_apparent = scanner().scan(&config_apparent, CancellationToken::new()).unwrap();
 
     // Disk usage must be strictly less than apparent size for a sparse file.
     assert!(
@@ -416,7 +417,7 @@ fn test_scan_max_depth_limits_traversal() {
         .max_depth(Some(3))
         .build()
         .unwrap();
-    let tree = scanner().scan(&config).unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
 
     fn find_node<'a>(
         node: &'a gravityfile_core::FileNode,
@@ -466,7 +467,7 @@ fn test_scan_unreadable_directory_does_not_panic() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
     let config = ScanConfig::new(root);
-    let result = scanner().scan(&config);
+    let result = scanner().scan(&config, CancellationToken::new());
 
     // Restore permissions so TempDir cleanup works regardless of test outcome.
     let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
@@ -841,7 +842,7 @@ fn test_scan_progress_events_are_emitted_for_large_file_set() {
     let mut rx = scanner.subscribe();
 
     let config = ScanConfig::new(root);
-    scanner.scan(&config).unwrap();
+    scanner.scan(&config, CancellationToken::new()).unwrap();
 
     // Drain whatever was buffered (broadcast channel may have dropped some).
     let mut received = 0usize;

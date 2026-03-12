@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use gravityfile_core::{FileNode, FileTree, NodeKind};
 
@@ -192,7 +193,7 @@ impl AgeAnalyzer {
     }
 
     /// Analyze file ages in a tree.
-    pub fn analyze(&self, tree: &FileTree) -> AgeReport {
+    pub fn analyze(&self, tree: &FileTree, token: CancellationToken) -> AgeReport {
         let mut bucket_collectors: Vec<BucketCollector> = self
             .config
             .buckets
@@ -214,6 +215,7 @@ impl AgeAnalyzer {
             &mut total_files,
             &mut total_size,
             &mut total_age_secs,
+            &token,
         );
 
         // Sort stale directories by size descending and apply limit
@@ -233,13 +235,16 @@ impl AgeAnalyzer {
         // This avoids the half_files = total_files / 2 = 0 trap when total_files == 1,
         // which would cause cumulative >= 0 to fire immediately on the first (possibly
         // empty) bucket rather than on the bucket that actually holds the file.
-        let median_age_bucket = if total_files == 0 {
+        let median_age_bucket = if total_files == 0 || token.is_cancelled() {
             None
         } else {
             let median_rank = total_files.div_ceil(2);
             let mut cumulative = 0u64;
             let mut found: Option<String> = None;
             for c in &bucket_collectors {
+                if token.is_cancelled() {
+                    break;
+                }
                 cumulative += c.file_count;
                 if cumulative >= median_rank {
                     found = Some(c.bucket.name.clone());
@@ -302,7 +307,11 @@ impl AgeAnalyzer {
         total_files: &mut u64,
         total_size: &mut u64,
         total_age_secs: &mut u64,
+        token: &CancellationToken,
     ) -> Option<SystemTime> {
+        if token.is_cancelled() {
+            return None;
+        }
         match &node.kind {
             NodeKind::File { .. } => {
                 // current_path is already the full file path — the Directory branch
@@ -343,6 +352,7 @@ impl AgeAnalyzer {
                         total_files,
                         total_size,
                         total_age_secs,
+                        token,
                     );
                     newest_in_subtree = match (newest_in_subtree, child_newest) {
                         (Some(a), Some(b)) => Some(a.max(b)),

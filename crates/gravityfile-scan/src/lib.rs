@@ -17,10 +17,11 @@
 //!
 //! ```rust,no_run
 //! use gravityfile_scan::{JwalkScanner, ScanConfig};
+//! use tokio_util::sync::CancellationToken;
 //!
 //! let config = ScanConfig::new("/path/to/scan");
 //! let scanner = JwalkScanner::new();
-//! let tree = scanner.scan(&config).unwrap();
+//! let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
 //!
 //! println!("Total size: {} bytes", tree.total_size());
 //! println!("Total files: {}", tree.total_files());

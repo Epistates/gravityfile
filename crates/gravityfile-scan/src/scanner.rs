@@ -12,6 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use compact_str::CompactString;
 use jwalk::{DirEntry, Parallelism, WalkDirGeneric};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use gravityfile_core::{
     FileNode, FileTree, InodeInfo, NodeId, NodeKind, ScanConfig, ScanError, ScanWarning,
@@ -39,7 +40,7 @@ impl JwalkScanner {
     }
 
     /// Perform a scan of the given path.
-    pub fn scan(&self, config: &ScanConfig) -> Result<FileTree, ScanError> {
+    pub fn scan(&self, config: &ScanConfig, token: CancellationToken) -> Result<FileTree, ScanError> {
         let start = Instant::now();
         let root_path = config
             .root
@@ -70,6 +71,7 @@ impl JwalkScanner {
             &mut inode_tracker,
             &mut stats,
             &mut warnings,
+            token,
         )?;
 
         // Build tree from collected entries
@@ -96,27 +98,20 @@ impl JwalkScanner {
         inode_tracker: &mut InodeTracker,
         stats: &mut TreeStats,
         warnings: &mut Vec<ScanWarning>,
+        token: CancellationToken,
     ) -> Result<HashMap<PathBuf, Vec<EntryInfo>>, ScanError> {
-        // Platform-specific thread default: 4 on macOS, rayon default everywhere else.
+        // Use global rayon pool to avoid lingering threads from new pools.
         let parallelism = match config.threads {
-            0 => {
-                #[cfg(target_os = "macos")]
-                {
-                    Parallelism::RayonNewPool(4)
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    Parallelism::RayonDefaultPool {
-                        busy_timeout: std::time::Duration::from_millis(100),
-                    }
-                }
-            }
-            n => Parallelism::RayonNewPool(n),
+            0 => Parallelism::RayonDefaultPool {
+                busy_timeout: std::time::Duration::from_millis(100),
+            },
+            n => Parallelism::RayonNewPool(n), // Explicit thread count still gets its own pool
         };
 
         // Capture config fields needed in the closure.
         let cross_filesystems = config.cross_filesystems;
         let include_hidden = config.include_hidden;
+        let token_clone = token.clone();
 
         // Re-use the GlobSet already compiled by ScanConfig when available.
         // Fall back to compiling on-the-fly if patterns exist but weren't compiled
@@ -145,6 +140,12 @@ impl JwalkScanner {
             .min_depth(0)
             .max_depth(config.max_depth.map(|d| d as usize).unwrap_or(usize::MAX))
             .process_read_dir(move |_depth, _dir_path, _state, children| {
+                // Check for cancellation
+                if token_clone.is_cancelled() {
+                    children.clear();
+                    return;
+                }
+
                 // Prune and filter early — before jwalk recurses.
                 children.retain_mut(|entry_result| {
                     let entry = match entry_result {
@@ -182,6 +183,13 @@ impl JwalkScanner {
         let mut progress_counter: u64 = 0;
 
         for entry_result in walker {
+            // Check for cancellation
+            if token.is_cancelled() {
+                return Err(ScanError::Other {
+                    message: "Scan cancelled".to_string(),
+                });
+            }
+
             let entry: DirEntry<((), ())> = match entry_result {
                 Ok(e) => e,
                 Err(err) => {
@@ -818,7 +826,7 @@ mod tests {
         let config = ScanConfig::new(temp.path());
 
         let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config).unwrap();
+        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
 
         assert_eq!(tree.stats.total_files, 4);
         // dir1, dir2, subdir + root = 4, but root not counted in walker
@@ -832,7 +840,7 @@ mod tests {
         let config = ScanConfig::new(temp.path());
 
         let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config).unwrap();
+        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
 
         // Children should be sorted by size descending
         for i in 0..tree.root.children.len().saturating_sub(1) {
@@ -850,7 +858,7 @@ mod tests {
             .unwrap();
 
         let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config).unwrap();
+        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
 
         // dir2 should be ignored
         assert!(!tree.root.children.iter().any(|c| c.name.as_str() == "dir2"));

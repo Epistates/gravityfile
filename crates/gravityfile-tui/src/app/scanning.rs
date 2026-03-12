@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use gravityfile_analyze::{AgeAnalyzer, AgeConfig, DuplicateConfig, DuplicateFinder};
 use gravityfile_core::FileTree;
@@ -16,7 +17,7 @@ use super::state::ScanResult;
 /// Start a background filesystem scan.
 ///
 /// Returns a receiver that will receive scan progress updates and the final result.
-pub fn start_scan(path: PathBuf) -> mpsc::Receiver<ScanResult> {
+pub fn start_scan(path: PathBuf, token: CancellationToken) -> mpsc::Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel(SCAN_CHANNEL_SIZE);
 
     tokio::spawn(async move {
@@ -39,7 +40,8 @@ pub fn start_scan(path: PathBuf) -> mpsc::Receiver<ScanResult> {
         });
 
         // Run scan in blocking task (jwalk uses rayon internally)
-        let result = tokio::task::spawn_blocking(move || scanner.scan(&config))
+        let token_clone = token.clone();
+        let result = tokio::task::spawn_blocking(move || scanner.scan(&config, token_clone))
             .await
             .unwrap_or_else(|e| {
                 Err(gravityfile_scan::ScanError::Other {
@@ -58,7 +60,7 @@ pub fn start_scan(path: PathBuf) -> mpsc::Receiver<ScanResult> {
 /// Start background analysis of a scanned tree.
 ///
 /// Returns a receiver that will receive the analysis results.
-pub fn start_analysis(tree: FileTree) -> mpsc::Receiver<ScanResult> {
+pub fn start_analysis(tree: FileTree, token: CancellationToken) -> mpsc::Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel(ANALYSIS_CHANNEL_SIZE);
 
     tokio::spawn(async move {
@@ -69,17 +71,25 @@ pub fn start_analysis(tree: FileTree) -> mpsc::Receiver<ScanResult> {
                 .build()
                 .unwrap();
             let finder = DuplicateFinder::with_config(dup_config);
-            let duplicates = finder.find_duplicates(&tree);
+            let duplicates = finder.find_duplicates(&tree, token.clone());
+
+            if token.is_cancelled() {
+                return None;
+            }
 
             let age_config = AgeConfig::default();
             let analyzer = AgeAnalyzer::with_config(age_config);
-            let age_report = analyzer.analyze(&tree);
+            let age_report = analyzer.analyze(&tree, token.clone());
 
-            (duplicates, age_report)
+            if token.is_cancelled() {
+                return None;
+            }
+
+            Some((duplicates, age_report))
         })
         .await;
 
-        if let Ok((duplicates, age_report)) = result {
+        if let Ok(Some((duplicates, age_report))) = result {
             let _ = tx
                 .send(ScanResult::AnalysisComplete {
                     duplicates,

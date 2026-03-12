@@ -2,6 +2,7 @@ use gravityfile_analyze::{DuplicateConfig, DuplicateFinder};
 use gravityfile_core::{FileNode, FileTree, NodeId, ScanConfig, Timestamps};
 use std::fs;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn test_duplicate_config_builder() {
@@ -108,7 +109,7 @@ fn test_find_duplicates_with_empty_tree() {
         Vec::new(),
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     assert_eq!(report.files_analyzed, 0);
     assert!(!report.has_duplicates());
@@ -135,7 +136,7 @@ fn test_find_duplicates_with_no_actual_duplicates() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     assert_eq!(report.files_analyzed, 3);
     assert!(!report.has_duplicates());
@@ -163,7 +164,7 @@ fn test_find_duplicates_with_exact_duplicates() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     assert_eq!(report.files_analyzed, 3);
     assert!(report.has_duplicates());
@@ -195,7 +196,7 @@ fn test_find_duplicates_with_mixed_content() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     assert_eq!(report.files_analyzed, 4);
     assert!(report.has_duplicates());
@@ -229,7 +230,7 @@ fn test_find_duplicates_with_exclusion_patterns() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     // .txt files should be excluded, only .hidden_file remains
     assert_eq!(report.files_analyzed, 1);
@@ -261,7 +262,7 @@ fn test_find_duplicates_with_size_filtering() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     // Only medium and large should be analyzed
     assert_eq!(report.files_analyzed, 2);
@@ -300,7 +301,7 @@ fn test_find_duplicates_with_max_groups_limit() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     // group_count reflects the full (pre-truncation) number of groups
     assert_eq!(report.group_count, 3);
@@ -331,7 +332,7 @@ fn test_find_duplicates_in_nested_structure() {
         ],
     );
 
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     assert_eq!(report.files_analyzed, 2);
     assert!(report.has_duplicates());
