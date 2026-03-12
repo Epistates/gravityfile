@@ -1,45 +1,40 @@
 //! gravityfile - A state-of-the-art file system analyzer with TUI.
 //!
 //! Usage:
-//!   grav \[PATH\]              Launch interactive TUI
-//!   grav scan \[PATH\]         Quick scan summary
-//!   grav duplicates \[PATH\]   Find duplicate files
-//!   grav age \[PATH\]          Analyze file ages
-//!   grav export \[PATH\]       Export scan to JSON
-//!   grav --help              Show help
+//!   grav [PATH]              Launch interactive TUI
+//!   grav scan [PATH]         Quick scan summary
+//!   grav duplicates [PATH]   Find duplicate files
+//!   grav age [PATH]          Analyze file ages
 
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use color_eyre::eyre::{Context, Result};
-
-use gravityfile_analyze::{AgeAnalyzer, AgeConfig, DuplicateConfig, DuplicateFinder, format_age};
-use gravityfile_scan::{JwalkScanner, ScanConfig};
+use color_eyre::Result;
+use color_eyre::eyre::Context;
+use gravityfile_analyze::{AgeAnalyzer, AgeConfig, DuplicateConfig, DuplicateFinder};
+use gravityfile_core::ScanConfig;
+use gravityfile_scan::JwalkScanner;
+use humansize::{BINARY, format_size as format_size_human};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(
-    name = "gravityfile",
-    version,
-    about = "A state-of-the-art file system analyzer",
-    long_about = "gravityfile helps you understand where your disk space goes.\n\n\
-                  Launch the interactive TUI by running `grav [PATH]`, or use \
-                  subcommands for quick operations."
-)]
+#[command(author, version, about, long_about = None)]
+#[command(name = "grav")]
 struct Cli {
-    /// Path to analyze (defaults to current directory)
+    /// Path to scan (default: current directory)
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Start scanning immediately on startup (default: show quick listing only)
-    #[arg(short = 'S', long)]
+    /// Start a full recursive scan immediately on startup
+    #[arg(short, long)]
     scan: bool,
 
-    /// Write the last working directory to this file on exit (for shell integration)
-    #[arg(long = "cwd-file")]
+    /// Write final CWD to file on exit
+    #[arg(long)]
     cwd_file: Option<PathBuf>,
 
-    /// Print the last working directory to stdout on exit (for shell integration)
-    #[arg(long = "print-cwd")]
+    /// Print final CWD to stdout on exit
+    #[arg(long)]
     print_cwd: bool,
 
     #[command(subcommand)]
@@ -48,74 +43,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Quick scan and show summary
+    /// Quick scan summary
     Scan {
         /// Path to scan
         #[arg(default_value = ".")]
         path: PathBuf,
-
         /// Maximum depth to display
-        #[arg(short, long, default_value = "3")]
-        depth: u32,
-
-        /// Show all entries (no depth limit on display)
         #[arg(short, long)]
-        all: bool,
-
-        /// Number of top entries to show per directory
-        #[arg(short = 'n', long, default_value = "10")]
+        max_depth: Option<u32>,
+        /// Number of top items to show per directory
+        #[arg(short, long, default_value = "5")]
         top: usize,
     },
-
     /// Find duplicate files
     Duplicates {
         /// Path to scan
         #[arg(default_value = ".")]
         path: PathBuf,
-
-        /// Minimum file size to consider (e.g., "1KB", "1MB")
-        #[arg(short, long, default_value = "1KB")]
+        /// Minimum file size to consider (e.g. 1MB, 100KB)
+        #[arg(short, long, default_value = "1MB")]
         min_size: String,
-
-        /// Maximum number of duplicate groups to show
-        #[arg(short = 'n', long, default_value = "20")]
+        /// Maximum number of groups to show
+        #[arg(short, long, default_value = "20")]
         top: usize,
-
         /// Output format
         #[arg(short, long, default_value = "text")]
         format: OutputFormat,
     },
-
     /// Analyze file ages
     Age {
         /// Path to scan
         #[arg(default_value = ".")]
         path: PathBuf,
-
-        /// Show stale directories older than this (e.g., "1y", "6m", "30d")
+        /// Stale threshold (e.g. 1y, 6m, 30d)
         #[arg(short, long, default_value = "1y")]
         stale: String,
-
         /// Output format
         #[arg(short, long, default_value = "text")]
         format: OutputFormat,
     },
-
-    /// Export scan results to JSON
+    /// Export scan result to JSON
     Export {
         /// Path to scan
         #[arg(default_value = ".")]
         path: PathBuf,
-
-        /// Output file (defaults to stdout)
+        /// Output file path (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum OutputFormat {
-    #[default]
     Text,
     Json,
 }
@@ -123,16 +102,28 @@ enum OutputFormat {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
+    // Initialize tracing
+    let log_file = std::env::temp_dir().join("gravityfile.log");
+    let file = std::fs::File::create(&log_file)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_writer(std::sync::Arc::new(file))
+        .with_ansi(false)
+        .init();
+
+    tracing::info!("Starting gravityfile v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Log file: {}", log_file.display());
+
     let cli = Cli::parse();
 
     match cli.command {
         Some(Command::Scan {
             path,
-            depth,
-            all,
+            max_depth,
             top,
         }) => {
-            run_scan(&path, if all { None } else { Some(depth) }, top)?;
+            run_scan(&path, max_depth, top)?;
+            std::process::exit(0);
         }
         Some(Command::Duplicates {
             path,
@@ -141,6 +132,7 @@ fn main() -> Result<()> {
             format,
         }) => {
             run_duplicates(&path, &min_size, top, format)?;
+            std::process::exit(0);
         }
         Some(Command::Age {
             path,
@@ -148,9 +140,11 @@ fn main() -> Result<()> {
             format,
         }) => {
             run_age(&path, &stale, format)?;
+            std::process::exit(0);
         }
         Some(Command::Export { path, output }) => {
             run_export(&path, output)?;
+            std::process::exit(0);
         }
         None => {
             // Launch TUI
@@ -160,10 +154,9 @@ fn main() -> Result<()> {
                 .with_cwd_file(cli.cwd_file)
                 .with_print_cwd(cli.print_cwd);
             gravityfile_tui::run_with_config(path, config)?;
+            std::process::exit(0);
         }
     }
-
-    Ok(())
 }
 
 /// Run a quick scan and display summary.
@@ -174,7 +167,7 @@ fn run_scan(path: &Path, max_depth: Option<u32>, top_n: usize) -> Result<()> {
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config).context("Scan failed")?;
+    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
 
     // Print summary
     println!();
@@ -219,7 +212,7 @@ fn run_duplicates(path: &Path, min_size: &str, top_n: usize, format: OutputForma
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config).context("Scan failed")?;
+    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
 
     eprintln!("Finding duplicates (min size: {})...", min_size);
 
@@ -230,42 +223,34 @@ fn run_duplicates(path: &Path, min_size: &str, top_n: usize, format: OutputForma
         .unwrap();
 
     let finder = DuplicateFinder::with_config(dup_config);
-    let report = finder.find_duplicates(&tree);
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
 
     match format {
         OutputFormat::Text => {
             println!();
-            println!("{}", "─".repeat(70));
-            println!(" Duplicate File Report");
-            println!("{}", "─".repeat(70));
+            println!("{}", "─".repeat(60));
+            println!(" DUPLICATE REPORT - {}", path.display());
+            println!(
+                " {} groups | {} files | {} wasted",
+                report.group_count,
+                report.files_with_duplicates,
+                format_size(report.total_wasted_space)
+            );
+            println!("{}", "─".repeat(60));
             println!();
 
-            if report.groups.is_empty() {
-                println!(" No duplicate files found.");
-            } else {
+            for (i, group) in report.groups.iter().enumerate() {
                 println!(
-                    " Found {} duplicate groups ({} files)",
-                    report.group_count, report.files_with_duplicates
+                    " [{}] {} ({} × {})",
+                    i + 1,
+                    format_size(group.wasted_bytes),
+                    group.paths.len(),
+                    format_size(group.size)
                 );
-                println!(
-                    " Total wasted space: {}",
-                    format_size(report.total_wasted_space)
-                );
-                println!();
-
-                for (i, group) in report.groups.iter().enumerate() {
-                    println!(
-                        " Group {} ({} files, {} each, {} wasted)",
-                        i + 1,
-                        group.count(),
-                        format_size(group.size),
-                        format_size(group.wasted_bytes)
-                    );
-                    for path in &group.paths {
-                        println!("   {}", path.display());
-                    }
-                    println!();
+                for path in &group.paths {
+                    println!("   {}", path.display());
                 }
+                println!();
             }
         }
         OutputFormat::Json => {
@@ -285,7 +270,7 @@ fn run_age(path: &Path, stale_threshold: &str, format: OutputFormat) -> Result<(
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config).context("Scan failed")?;
+    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
 
     eprintln!("Analyzing file ages...");
 
@@ -295,55 +280,51 @@ fn run_age(path: &Path, stale_threshold: &str, format: OutputFormat) -> Result<(
         .unwrap();
 
     let analyzer = AgeAnalyzer::with_config(age_config);
-    let report = analyzer.analyze(&tree);
+    let report = analyzer.analyze(&tree, CancellationToken::new());
 
     match format {
         OutputFormat::Text => {
             println!();
-            println!("{}", "─".repeat(70));
-            println!(" Age Distribution Report");
-            println!("{}", "─".repeat(70));
+            println!("{}", "─".repeat(60));
+            println!(" AGE ANALYSIS - {}", path.display());
+            println!(
+                " {} files | {} | Avg age: {}",
+                report.total_files,
+                format_size(report.total_size),
+                gravityfile_analyze::format_age(report.average_age)
+            );
+            println!("{}", "─".repeat(60));
             println!();
 
-            // Age buckets
-            println!(" Age Distribution:");
-            let max_size = report
-                .buckets
-                .iter()
-                .map(|b| b.total_size)
-                .max()
-                .unwrap_or(1);
+            println!(" DISTRIBUTION:");
             for bucket in &report.buckets {
-                let bar_len = ((bucket.total_size as f64 / max_size as f64) * 30.0) as usize;
-                let bar = "█".repeat(bar_len);
+                let bar_width = 20;
+                let filled = if report.total_files > 0 {
+                    (bucket.file_count as f64 / report.total_files as f64 * bar_width as f64).round()
+                        as usize
+                } else {
+                    0
+                };
+                let bar = "█".repeat(filled);
                 println!(
-                    "   {:<12} {:>10} {:>8} files  {}",
-                    bucket.name,
-                    format_size(bucket.total_size),
-                    bucket.file_count,
-                    bar
+                    " {:<12} {:>8} files  {}",
+                    bucket.name, bucket.file_count, bar
                 );
             }
-            println!();
 
-            // Stale directories
             if !report.stale_directories.is_empty() {
-                println!(" Stale Directories (no changes in {}):", stale_threshold);
-                println!(" Total stale: {}", format_size(report.total_stale_size()));
                 println!();
-
-                for dir in &report.stale_directories {
+                println!(" STALE DIRECTORIES (> {}):", stale_threshold);
+                for (i, dir) in report.stale_directories.iter().enumerate().take(10) {
                     println!(
-                        "   {} ({}, {} ago)",
+                        " [{}] {} - {} (newest: {})",
+                        i + 1,
                         dir.path.display(),
                         format_size(dir.size),
-                        format_age(dir.newest_file_age)
+                        gravityfile_analyze::format_age(dir.newest_file_age)
                     );
                 }
-            } else {
-                println!(" No stale directories found.");
             }
-            println!();
         }
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -353,7 +334,7 @@ fn run_age(path: &Path, stale_threshold: &str, format: OutputFormat) -> Result<(
     Ok(())
 }
 
-/// Export scan results to JSON.
+/// Run export to JSON.
 fn run_export(path: &Path, output: Option<PathBuf>) -> Result<()> {
     let path = path.canonicalize().context("Invalid path")?;
 
@@ -361,7 +342,7 @@ fn run_export(path: &Path, output: Option<PathBuf>) -> Result<()> {
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config).context("Scan failed")?;
+    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
 
     let json = serde_json::to_string_pretty(&tree)?;
 
@@ -378,121 +359,75 @@ fn run_export(path: &Path, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Print a node and its children.
 fn print_node(
     node: &gravityfile_core::FileNode,
-    path: &Path,
+    _path: &Path,
     depth: u32,
     max_depth: u32,
     top_n: usize,
-    root_size: u64,
+    total_size: u64,
 ) {
+    if depth > max_depth {
+        return;
+    }
+
     let indent = "  ".repeat(depth as usize);
-    let ratio = if root_size > 0 {
-        node.size as f64 / root_size as f64 * 100.0
+    let percentage = if total_size > 0 {
+        (node.size as f64 / total_size as f64) * 100.0
     } else {
         0.0
     };
 
-    let bar = make_bar(ratio / 100.0, 10);
-
-    let name = if depth == 0 {
-        path.display().to_string()
-    } else {
-        node.name.to_string()
-    };
-
-    let dir_marker = if node.is_dir() { "/" } else { "" };
-
     println!(
-        "{}{}{:<40} {:>10} {:>5.1}% {}",
+        "{}{:<30} {:>10} [{:>5.1}%]",
         indent,
-        if node.is_dir() { "▼ " } else { "  " },
-        truncate(&format!("{}{}", name, dir_marker), 40),
+        node.name,
         format_size(node.size),
-        ratio,
-        bar
+        percentage
     );
 
-    if node.is_dir() && depth < max_depth {
-        let children_to_show = node.children.iter().take(top_n);
-        let remaining = node.children.len().saturating_sub(top_n);
-
-        for child in children_to_show {
-            let child_path = path.join(&*child.name);
-            print_node(child, &child_path, depth + 1, max_depth, top_n, root_size);
+    if depth < max_depth && node.is_dir() {
+        for child in node.children.iter().take(top_n) {
+            print_node(child, _path, depth + 1, max_depth, top_n, total_size);
         }
-
-        if remaining > 0 {
-            let indent = "  ".repeat((depth + 1) as usize);
-            println!("{}  ... and {} more", indent, remaining);
+        if node.children.len() > top_n {
+            println!("{}  ... ({} more items)", indent, node.children.len() - top_n);
         }
     }
 }
 
-/// Create a simple ASCII bar.
-fn make_bar(ratio: f64, width: usize) -> String {
-    let filled = (ratio * width as f64).round() as usize;
-    let empty = width.saturating_sub(filled);
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
-}
-
-/// Format size in human-readable form.
 fn format_size(bytes: u64) -> String {
-    humansize::format_size(bytes, humansize::BINARY)
+    format_size_human(bytes, BINARY)
 }
 
-/// Truncate a string to max length.
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
+fn parse_size(s: &str) -> Result<u64> {
+    let s = s.to_uppercase();
+    if s.ends_with("GB") || s.ends_with("G") {
+        let num: f64 = s.trim_end_matches("GB").trim_end_matches('G').parse()?;
+        Ok((num * 1024.0 * 1024.0 * 1024.0) as u64)
+    } else if s.ends_with("MB") || s.ends_with("M") {
+        let num: f64 = s.trim_end_matches("MB").trim_end_matches('M').parse()?;
+        Ok((num * 1024.0 * 1024.0) as u64)
+    } else if s.ends_with("KB") || s.ends_with("K") {
+        let num: f64 = s.trim_end_matches("KB").trim_end_matches('K').parse()?;
+        Ok((num * 1024.0) as u64)
+    } else if s.ends_with('B') {
+        let num: u64 = s.trim_end_matches('B').parse()?;
+        Ok(num)
     } else {
-        format!("{}…", &s[..max_len - 1])
+        let num: u64 = s.parse()?;
+        Ok(num)
     }
 }
 
-/// Parse a size string (e.g., "1KB", "10MB", "1GB").
-fn parse_size(s: &str) -> Result<u64> {
-    let s = s.trim().to_uppercase();
-
-    let (num, multiplier) = if s.ends_with("GB") || s.ends_with("G") {
-        let num: f64 = s
-            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
-            .parse()?;
-        (num, 1024 * 1024 * 1024)
-    } else if s.ends_with("MB") || s.ends_with("M") {
-        let num: f64 = s
-            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
-            .parse()?;
-        (num, 1024 * 1024)
-    } else if s.ends_with("KB") || s.ends_with("K") {
-        let num: f64 = s
-            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
-            .parse()?;
-        (num, 1024)
-    } else if s.ends_with('B') {
-        let num: f64 = s
-            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
-            .parse()?;
-        (num, 1)
-    } else {
-        let num: f64 = s.parse()?;
-        (num, 1)
-    };
-
-    Ok((num * multiplier as f64) as u64)
-}
-
-/// Parse a duration string (e.g., "1y", "6m", "30d", "1w").
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
-    let s = s.trim().to_lowercase();
-
+    let s = s.to_lowercase();
     let (num, multiplier) = if s.ends_with('y') {
         let num: f64 = s.trim_end_matches('y').parse()?;
-        (num, 365.0 * 24.0 * 60.0 * 60.0)
-    } else if s.ends_with('m') {
-        let num: f64 = s.trim_end_matches('m').parse()?;
-        (num, 30.0 * 24.0 * 60.0 * 60.0)
+        (num, 365.25 * 24.0 * 60.0 * 60.0)
+    } else if s.ends_with("mo") {
+        let num: f64 = s.trim_end_matches("mo").parse()?;
+        (num, 30.44 * 24.0 * 60.0 * 60.0)
     } else if s.ends_with('w') {
         let num: f64 = s.trim_end_matches('w').parse()?;
         (num, 7.0 * 24.0 * 60.0 * 60.0)
