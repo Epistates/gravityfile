@@ -18,13 +18,28 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let sb_clone1 = sandbox.clone();
     let read = lua
         .create_function(move |lua, (path, limit): (String, Option<usize>)| {
-            let limit = limit.unwrap_or(1024 * 1024); // 1MB default
+            let limit = limit.unwrap_or_else(|| {
+                sb_clone1
+                    .as_ref()
+                    .map(|sb| sb.max_read_size)
+                    .unwrap_or(1024 * 1024)
+            });
             let path = std::path::Path::new(&path);
 
-            if let Some(sb) = &sb_clone1
-                && !sb.can_read(path)
-            {
-                return Err(mlua::Error::external("Read denied by sandbox policy"));
+            if let Some(sb) = &sb_clone1 {
+                if !sb.can_read(path) {
+                    return Err(mlua::Error::external("Read denied by sandbox policy"));
+                }
+                // Also check total file size if metadata is available
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.len() > sb.max_read_size as u64 && limit > sb.max_read_size {
+                        return Err(mlua::Error::external(format!(
+                            "Read denied: file too large ({} bytes > {} limit)",
+                            meta.len(),
+                            sb.max_read_size
+                        )));
+                    }
+                }
             }
 
             if !path.exists() {
@@ -49,13 +64,27 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let sb_clone2 = sandbox.clone();
     let read_bytes = lua
         .create_function(move |lua, (path, limit): (String, Option<usize>)| {
-            let limit = limit.unwrap_or(1024 * 1024);
+            let limit = limit.unwrap_or_else(|| {
+                sb_clone2
+                    .as_ref()
+                    .map(|sb| sb.max_read_size)
+                    .unwrap_or(1024 * 1024)
+            });
             let path = std::path::Path::new(&path);
 
-            if let Some(sb) = &sb_clone2
-                && !sb.can_read(path)
-            {
-                return Err(mlua::Error::external("Read denied by sandbox policy"));
+            if let Some(sb) = &sb_clone2 {
+                if !sb.can_read(path) {
+                    return Err(mlua::Error::external("Read denied by sandbox policy"));
+                }
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.len() > sb.max_read_size as u64 && limit > sb.max_read_size {
+                        return Err(mlua::Error::external(format!(
+                            "Read denied: file too large ({} bytes > {} limit)",
+                            meta.len(),
+                            sb.max_read_size
+                        )));
+                    }
+                }
             }
 
             if !path.exists() {

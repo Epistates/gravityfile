@@ -132,6 +132,15 @@ impl RhaiRuntime {
                 if !sb.can_read(p) {
                     return Dynamic::UNIT;
                 }
+
+                // Check file size before reading
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.len() > sb.max_read_size as u64 {
+                        tracing::warn!(target: "plugin", "Read denied: file too large ({} bytes > {} limit)", meta.len(), sb.max_read_size);
+                        return Dynamic::UNIT;
+                    }
+                }
+
                 match std::fs::read_to_string(path) {
                     Ok(content) => Dynamic::from(content),
                     Err(_) => Dynamic::UNIT,

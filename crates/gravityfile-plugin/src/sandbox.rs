@@ -184,50 +184,68 @@ impl SandboxConfig {
 
     /// Check if reading a path is allowed.
     ///
-    /// Paths are canonicalized before comparison to prevent traversal attacks
+    /// Paths are normalized before comparison to prevent traversal attacks
     /// via symlinks or `..` components.
-    ///
-    /// Callers must explicitly list allowed paths: an empty `allowed_read_paths`
-    /// list means no paths are allowed (deny-by-default), not unrestricted access.
     pub fn can_read(&self, path: &std::path::Path) -> bool {
         if !self.has_permission(Permission::Read) {
             return false;
         }
-        // Empty path list means no paths are explicitly permitted — deny all.
         if self.allowed_read_paths.is_empty() {
             return false;
         }
-        let Ok(canonical) = std::fs::canonicalize(path) else {
+
+        let Some(normalized) = self.normalize_path(path) else {
             return false;
         };
         self.allowed_read_paths
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok())
-            .any(|allowed| canonical.starts_with(&allowed))
+            .any(|allowed| normalized.starts_with(&allowed))
     }
 
     /// Check if writing to a path is allowed.
     ///
-    /// Paths are canonicalized before comparison to prevent traversal attacks
+    /// Paths are normalized before comparison to prevent traversal attacks
     /// via symlinks or `..` components.
-    ///
-    /// Callers must explicitly list allowed paths: an empty `allowed_write_paths`
-    /// list means no paths are allowed (deny-by-default), not unrestricted access.
     pub fn can_write(&self, path: &std::path::Path) -> bool {
         if !self.has_permission(Permission::Write) {
             return false;
         }
-        // Empty path list means no paths are explicitly permitted — deny all.
         if self.allowed_write_paths.is_empty() {
             return false;
         }
-        let Ok(canonical) = std::fs::canonicalize(path) else {
+
+        let Some(normalized) = self.normalize_path(path) else {
             return false;
         };
         self.allowed_write_paths
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok())
-            .any(|allowed| canonical.starts_with(&allowed))
+            .any(|allowed| normalized.starts_with(&allowed))
+    }
+
+    /// Normalize a path for sandbox comparison, handling non-existent components.
+    ///
+    /// Returns `None` if the path cannot be sufficiently resolved, which causes
+    /// the caller to deny access (safe default).
+    fn normalize_path(&self, path: &std::path::Path) -> Option<PathBuf> {
+        // Try canonicalizing directly first (works for existing paths)
+        if let Ok(c) = std::fs::canonicalize(path) {
+            return Some(c);
+        }
+
+        // If it doesn't exist, try canonicalizing the parent and joining the
+        // final component. This handles writes to new files inside existing dirs.
+        if let Some(parent) = path.parent() {
+            if let Ok(c) = std::fs::canonicalize(parent) {
+                if let Some(name) = path.file_name() {
+                    return Some(c.join(name));
+                }
+            }
+        }
+
+        // Cannot resolve — deny by returning None.
+        None
     }
 
     /// Check if executing a command is allowed.
