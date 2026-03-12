@@ -7,7 +7,7 @@
 
 > "Where mass accumulates, attention should follow."
 
-**gravityfile** is a high-performance, SOTA file system explorer and analyzer. Built for modern terminal power users, it combines the speed of parallelized Rust with a visually stunning and highly intuitive TUI.
+**gravityfile** is a high-performance, file system explorer and analyzer. Built for modern terminal power users, it combines the speed of parallelized Rust with a visually stunning and highly intuitive TUI.
 
 <img src="assets/video.gif" alt="gravityfile" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
 
