@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-03-11
+
+### Fixed
+
+- **Quit unresponsive during mouse activity** - Replaced sync `crossterm::event::poll`/`read` drain loop with async `EventStream::now_or_never()`, fixing key events (`q`, Ctrl-C) being dropped when mouse motion floods the event queue
+- **Slow quit** - Skip event drain, navigation check, and suspend handling once quit is triggered; reduced runtime shutdown timeout from 100ms to 10ms
+- **Terminal cleanup on quit** - Drain buffered events after disabling mouse capture before restoring terminal, preventing raw escape sequences from leaking to the shell
+
 ## [0.2.4] - 2026-03-11
 
 ### Added
@@ -212,6 +220,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.2.5]: https://github.com/epistates/gravityfile/releases/tag/v0.2.5
 [0.2.4]: https://github.com/epistates/gravityfile/releases/tag/v0.2.4
 [0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2
 [0.2.1]: https://github.com/epistates/gravityfile/releases/tag/v0.2.1

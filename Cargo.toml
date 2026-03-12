@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/gravityfile"
@@ -47,15 +47,16 @@ derive_builder = "0.20"
 tempfile = "3"
 
 # Internal crates
-gravityfile-core = { version = "0.2.4", path = "crates/gravityfile-core" }
-gravityfile-scan = { version = "0.2.4", path = "crates/gravityfile-scan" }
-gravityfile-analyze = { version = "0.2.4", path = "crates/gravityfile-analyze" }
-gravityfile-ops = { version = "0.2.4", path = "crates/gravityfile-ops" }
-gravityfile-plugin = { version = "0.2.4", path = "crates/gravityfile-plugin" }
-gravityfile-tui = { version = "0.2.4", path = "crates/gravityfile-tui" }
+gravityfile-core = { version = "0.2.5", path = "crates/gravityfile-core" }
+gravityfile-scan = { version = "0.2.5", path = "crates/gravityfile-scan" }
+gravityfile-analyze = { version = "0.2.5", path = "crates/gravityfile-analyze" }
+gravityfile-ops = { version = "0.2.5", path = "crates/gravityfile-ops" }
+gravityfile-plugin = { version = "0.2.5", path = "crates/gravityfile-plugin" }
+gravityfile-tui = { version = "0.2.5", path = "crates/gravityfile-tui" }
 
 # Logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Collections
 indexmap = "2"
@@ -104,8 +105,11 @@ gravityfile-tui.workspace = true
 clap.workspace = true
 color-eyre.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true }
 humansize.workspace = true
 serde_json.workspace = true
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
 
 [profile.release]
 lto = true

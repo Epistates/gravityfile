@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "clap",
  "color-eyre",
@@ -2044,11 +2044,14 @@ dependencies = [
  "humansize",
  "serde_json",
  "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "gravityfile-analyze"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "blake3",
  "derive_builder",
@@ -2058,12 +2061,13 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio-util",
  "tracing",
 ]
 
 [[package]]
 name = "gravityfile-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "compact_str 0.8.1",
  "derive_builder",
@@ -2074,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-ops"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bzip2",
  "flate2",
@@ -2093,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-plugin"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dirs",
  "extism",
@@ -2114,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-scan"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "compact_str 0.8.1",
  "git2",
@@ -2125,11 +2129,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "gravityfile-tui"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bzip2",
  "color-eyre",
@@ -2144,6 +2149,7 @@ dependencies = [
  "gravityfile-scan",
  "humansize",
  "itertools",
+ "libc",
  "nucleo",
  "open",
  "opensesame",
@@ -2156,6 +2162,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 1.0.3+spec-1.1.0",
  "tracing",
  "trash",
