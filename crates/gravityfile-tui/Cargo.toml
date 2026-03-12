@@ -21,6 +21,7 @@ ratatui.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 color-eyre.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true }
 humansize.workspace = true
 strum.workspace = true
 itertools.workspace = true
@@ -51,6 +52,10 @@ treemd = { version = "0.5", optional = true }
 
 # System open command (for non-editor files)
 open = "5"
+
+# PTY buffer flush on quit (unix only)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Safe deletion (move to trash instead of permanent delete)
 trash.workspace = true

@@ -103,23 +103,16 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
 
-    // Install a panic hook that restores the terminal before printing the panic message,
-    // so the terminal is not left in raw mode on unexpected panics.
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-        ratatui::restore();
-        original_hook(panic_info);
-    }));
-
-    // Create tokio runtime for async operations
+    // Create tokio runtime for async operations - setup services BEFORE terminal
     let rt = tokio::runtime::Runtime::new()?;
 
     // Store config options we need after the app runs
     let cwd_file = config.cwd_file.clone();
     let print_cwd = config.print_cwd;
 
-    let terminal = ratatui::init();
+    // Initialize terminal with Ratatui's high-level API
+    // This automatically installs a panic hook that restores the terminal.
+    let terminal = ratatui::try_init()?;
 
     // Enable mouse capture
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -127,12 +120,21 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
     let app = App::with_config(path, config);
     let result = rt.block_on(async { app.run_and_return_exit_data(terminal).await });
 
-    // Disable mouse capture before restoring terminal
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    ratatui::restore();
+    // Discard all pending terminal output sitting in the kernel's PTY buffer.
+    // During heavy TUI rendering (e.g. scanning 45K files at 20fps), the Rust
+    // process writes escape sequences faster than the terminal emulator can
+    // consume them. This creates a multi-second backlog in the PTY buffer.
+    // Without flushing, LeaveAlternateScreen queues behind all that output
+    // and the user sees the TUI "frozen" for seconds after pressing quit.
+    #[cfg(unix)]
+    unsafe {
+        libc::tcflush(libc::STDOUT_FILENO, libc::TCOFLUSH);
+    }
 
-    // Shutdown runtime immediately to cancel background tasks
-    rt.shutdown_timeout(std::time::Duration::from_millis(100));
+    // Now these commands go to the front of an empty buffer — instant.
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::try_restore()?;
+    rt.shutdown_background();
 
     // Handle exit data for shell integration
     if let Ok(exit_data) = &result {

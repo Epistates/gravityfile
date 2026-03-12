@@ -14,18 +14,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream};
-use futures::StreamExt;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
+use crossterm::execute;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use futures::{FutureExt, StreamExt};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::{FileNode, FileTree};
 use gravityfile_ops::{
-    Conflict, CopyOptions, CopyResult, MoveOptions, MoveResult, OperationProgress, UndoLog,
+    Conflict, CopyOptions, MoveOptions, OperationProgress, UndoLog,
 };
 use gravityfile_scan::ScanProgress;
 
@@ -42,7 +41,6 @@ use self::commands::{
 };
 use self::constants::{PAGE_SIZE, TICK_INTERVAL_MS};
 use self::input::{InputResult, InputState};
-use self::render::{RenderContext, render_app};
 use self::state::{
     AppMode, BookmarkListState, ClipboardMode, ClipboardState, DeletionProgress,
     DuplicatesViewState, LayoutMode, PendingOperation, ScanResult, SelectedInfo, SettingsState,
@@ -129,6 +127,8 @@ pub struct App {
     scan_progress: Option<ScanProgress>,
     /// Channel for receiving scan results.
     scan_rx: Option<mpsc::Receiver<ScanResult>>,
+    /// Token for cancelling active scan.
+    scan_token: CancellationToken,
     /// Scan warnings/errors (populated in real-time during scan).
     warnings: Vec<gravityfile_core::ScanWarning>,
     /// Selected warning index.
@@ -165,7 +165,7 @@ pub struct App {
     /// Cache of scanned directories by path.
     /// This preserves scan data when navigating to parent directories and allows
     /// restoring it when navigating back.
-    scanned_cache: HashMap<PathBuf, FileTree>,
+    scanned_cache: Option<HashMap<PathBuf, FileTree>>,
     /// Bulk rename state for the confirmation modal.
     bulk_rename_state: Option<state::BulkRenameState>,
     /// Treemap view state.
@@ -175,7 +175,7 @@ pub struct App {
     /// Visual selection mode state.
     visual_state: Option<state::VisualState>,
     /// Plugin manager.
-    plugin_manager: Arc<RwLock<gravityfile_plugin::PluginManager>>,
+    plugin_manager: Option<Arc<RwLock<gravityfile_plugin::PluginManager>>>,
     /// Last known terminal content-area height (rows available for the file list).
     /// Updated on every render; used for scroll/ensure_visible calculations.
     viewport_height: usize,
@@ -249,6 +249,7 @@ impl App {
             deletion_progress: None,
             scan_progress: None,
             scan_rx: None,
+            scan_token: CancellationToken::new(),
             warnings: Vec::new(),
             selected_warning: 0,
             analyzing: false,
@@ -265,12 +266,12 @@ impl App {
             bookmark_list_state: None,
             cached_parent_tree: None,
             pending_suspend_command: None,
-            scanned_cache: HashMap::new(),
+            scanned_cache: Some(HashMap::new()),
             bulk_rename_state: None,
             treemap_state: crate::ui::TreemapState::new(),
             cached_treemap_len: 0,
             visual_state: None,
-            plugin_manager,
+            plugin_manager: Some(plugin_manager),
             viewport_height: 40, // reasonable default before first render
         };
 
@@ -286,12 +287,14 @@ impl App {
 
     /// Initialize plugin runtimes and discover plugins.
     async fn init_plugins(&self) {
-        let mut pm = self.plugin_manager.write().await;
-        if let Err(e) = pm.init_runtimes() {
-            tracing::warn!("Plugin runtime init error: {}", e);
-        }
-        if let Err(e) = pm.discover_plugins().await {
-            tracing::warn!("Plugin discovery error: {}", e);
+        if let Some(pm) = &self.plugin_manager {
+            let mut pm = pm.write().await;
+            if let Err(e) = pm.init_runtimes() {
+                tracing::warn!("Plugin runtime init error: {}", e);
+            }
+            if let Err(e) = pm.discover_plugins().await {
+                tracing::warn!("Plugin discovery error: {}", e);
+            }
         }
     }
 
@@ -307,15 +310,32 @@ impl App {
             .with_view_root(self.view_root.clone())
             .with_theme(theme_name);
 
-        if let Some(node) = self.get_current_node()
-            && let Ok(json_val) = serde_json::to_value(node)
-            && let Ok(plugin_val) = serde_json::from_value::<gravityfile_plugin::Value>(json_val)
-        {
-            ctx.set("selected_node", plugin_val);
+        if let Some(node) = self.get_current_node() {
+            // Serialize only the node's own metadata, NOT its children.
+            // Children can be enormous after a full scan and serializing
+            // them causes multi-second stalls on every hook dispatch.
+            let shallow = serde_json::json!({
+                "name": node.name,
+                "kind": node.kind,
+                "size": node.size,
+                "blocks": node.blocks,
+                "timestamps": node.timestamps,
+                "inode": node.inode,
+                "content_hash": node.content_hash,
+                "git_status": node.git_status,
+                "child_count": node.children.len(),
+            });
+            if let Ok(plugin_val) =
+                serde_json::from_value::<gravityfile_plugin::Value>(shallow)
+            {
+                ctx.set("selected_node", plugin_val);
+            }
         }
 
-        let pm = self.plugin_manager.read().await;
-        let _ = pm.dispatch_hook(&hook, &ctx).await;
+        if let Some(pm) = &self.plugin_manager {
+            let pm = pm.read().await;
+            let _ = pm.dispatch_hook(&hook, &ctx).await;
+        }
     }
 
     /// Get the currently selected node in the current view.
@@ -337,114 +357,8 @@ impl App {
     }
 
     /// Run the application with async event loop.
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> AppResult<()> {
-        self.init_plugins().await;
-        self.dispatch_hook(gravityfile_plugin::Hook::OnStartup)
-            .await;
-
-        // Start scan if configured to do so
-        if self.scan_on_startup {
-            self.start_scan();
-        }
-        // Otherwise quick list is already loaded in new() for immediate display
-
-        let period = Duration::from_millis(TICK_INTERVAL_MS);
-        let mut interval = tokio::time::interval(period);
-        let mut events = EventStream::new();
-
-        while self.mode != AppMode::Quit {
-            if self.needs_redraw {
-                terminal.draw(|frame| self.draw(frame))?;
-                self.needs_redraw = false;
-            }
-
-            let old_view_root = self.view_root.clone();
-
-            tokio::select! {
-                biased;
-
-                Some(Ok(event)) = events.next() => {
-                    match event {
-                        Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                            self.dispatch_key_event(key_event);
-                        }
-                        Event::Mouse(mouse_event) => {
-                            // Only handle mouse events in Normal mode for now
-                            if self.mode == AppMode::Normal {
-                                let action = MouseAction::from_mouse_event(mouse_event);
-                                self.handle_mouse_action(action);
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    // Drain any additional pending events
-                    while crossterm::event::poll(Duration::ZERO)? {
-                        match crossterm::event::read() {
-                            Ok(Event::Key(key_event)) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                                self.dispatch_key_event(key_event);
-                                if self.mode == AppMode::Quit {
-                                    break;
-                                }
-                            }
-                            Ok(Event::Mouse(mouse_event)) => {
-                                if self.mode == AppMode::Normal {
-                                    let action = MouseAction::from_mouse_event(mouse_event);
-                                    self.handle_mouse_action(action);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    self.needs_redraw = true;
-                }
-
-                Some(result) = async {
-                    if let Some(rx) = &mut self.scan_rx {
-                        rx.recv().await
-                    } else {
-                        std::future::pending().await
-                    }
-                } => {
-                    self.handle_scan_result(result);
-                    self.needs_redraw = true;
-                }
-
-                _ = interval.tick(), if self.scan_progress.is_some() || self.deletion_progress.is_some() => {
-                    // Periodic tick only when background work is active (avoids busy-waking CPU)
-                    self.needs_redraw = true;
-                }
-            }
-
-            self.check_navigation(&old_view_root).await;
-
-            // Handle pending suspend command (opening files in external apps)
-            if let Some(mut cmd) = self.pending_suspend_command.take() {
-                // Check if this is a bulk rename operation
-                let is_bulk_rename = self.bulk_rename_state.is_some();
-
-                // Restore terminal before running external command
-                ratatui::restore();
-
-                // Run the command and wait for it to complete
-                let _ = cmd.status();
-
-                // Reinitialize terminal
-                terminal = ratatui::init();
-
-                // If this was bulk rename, process the edited file
-                if is_bulk_rename {
-                    self.process_bulk_rename_from_editor();
-                }
-
-                self.needs_redraw = true;
-            }
-        }
-
-        self.dispatch_hook(gravityfile_plugin::Hook::OnShutdown)
-            .await;
-
-        Ok(())
+    pub async fn run(self, terminal: DefaultTerminal) -> AppResult<()> {
+        self.run_and_return_exit_data(terminal).await.map(|_| ())
     }
 
     /// Run the application and return exit data for shell integration.
@@ -483,7 +397,6 @@ impl App {
                             self.dispatch_key_event(key_event);
                         }
                         Event::Mouse(mouse_event) => {
-                            // Only handle mouse events in Normal mode for now
                             if self.mode == AppMode::Normal {
                                 let action = MouseAction::from_mouse_event(mouse_event);
                                 self.handle_mouse_action(action);
@@ -492,22 +405,24 @@ impl App {
                         _ => {}
                     }
 
-                    // Drain any additional pending events
-                    while crossterm::event::poll(Duration::ZERO)? {
-                        match crossterm::event::read() {
-                            Ok(Event::Key(key_event)) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                                self.dispatch_key_event(key_event);
-                                if self.mode == AppMode::Quit {
-                                    break;
+                    // Batch-drain pending events (async-only to avoid sync/async conflict)
+                    if self.mode != AppMode::Quit {
+                        while let Some(Some(Ok(next_event))) = events.next().now_or_never() {
+                            match next_event {
+                                Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
+                                    self.dispatch_key_event(key_event);
+                                    if self.mode == AppMode::Quit {
+                                        break;
+                                    }
                                 }
-                            }
-                            Ok(Event::Mouse(mouse_event)) => {
-                                if self.mode == AppMode::Normal {
-                                    let action = MouseAction::from_mouse_event(mouse_event);
-                                    self.handle_mouse_action(action);
+                                Event::Mouse(mouse_event) => {
+                                    if self.mode == AppMode::Normal {
+                                        let action = MouseAction::from_mouse_event(mouse_event);
+                                        self.handle_mouse_action(action);
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                     self.needs_redraw = true;
@@ -530,6 +445,11 @@ impl App {
                 }
             }
 
+            // Skip post-event work when quitting for instant exit
+            if self.mode == AppMode::Quit {
+                break;
+            }
+
             self.check_navigation(&old_view_root).await;
 
             // Handle pending suspend command (opening files in external apps)
@@ -538,13 +458,22 @@ impl App {
                 let is_bulk_rename = self.bulk_rename_state.is_some();
 
                 // Restore terminal before running external command
-                ratatui::restore();
+                let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+                    let _ = crossterm::event::read();
+                }
+                let _ = ratatui::try_restore();
 
                 // Run the command and wait for it to complete
                 let _ = cmd.status();
 
                 // Reinitialize terminal
-                terminal = ratatui::init();
+                if let Ok(new_terminal) = ratatui::try_init() {
+                    terminal = new_terminal;
+                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                } else {
+                    self.error = Some("Failed to reinitialize terminal".to_string());
+                }
 
                 // If this was bulk rename, process the edited file
                 if is_bulk_rename {
@@ -558,6 +487,26 @@ impl App {
         self.dispatch_hook(gravityfile_plugin::Hook::OnShutdown)
             .await;
 
+        self.scan_token.cancel();
+
+        // Take heavy structures — they'll be dropped when the runtime shuts down
+        // in the background, avoiding any delay on the main thread.
+        let tree = self.tree.take();
+        let cache = self.scanned_cache.take();
+        let duplicates = self.duplicates.take();
+        let age_report = self.age_report.take();
+        let pm = self.plugin_manager.take();
+        let parent_tree = self.cached_parent_tree.take();
+
+        tokio::spawn(async move {
+            drop(tree);
+            drop(cache);
+            drop(duplicates);
+            drop(age_report);
+            drop(pm);
+            drop(parent_tree);
+        });
+
         Ok(crate::ExitData {
             last_cwd: self.view_root,
         })
@@ -568,6 +517,10 @@ impl App {
     /// The UI will detect scanning state via `scan_progress.is_some()`.
     /// If we have a quick tree, it remains visible during scanning.
     fn start_scan(&mut self) {
+        // Cancel any existing scan
+        self.scan_token.cancel();
+        self.scan_token = CancellationToken::new();
+
         // Update the scan root to the current view_root
         self.path = self.view_root.clone();
 
@@ -581,7 +534,10 @@ impl App {
         // Don't reset cached lengths - keep them for navigation
         // self.cached_tree_len = 0;
 
-        self.scan_rx = Some(scanning::start_scan(self.view_root.clone()));
+        self.scan_rx = Some(scanning::start_scan(
+            self.view_root.clone(),
+            self.scan_token.clone(),
+        ));
     }
 
     /// Handle a scan result from the background task.
@@ -624,8 +580,17 @@ impl App {
 
                 let tree_for_analysis = tree.clone();
 
-                // Cache the scanned tree for later restoration
-                self.scanned_cache.insert(root_path.clone(), tree.clone());
+                // Cache the scanned tree for later restoration, with eviction policy.
+                if let Some(cache) = &mut self.scanned_cache {
+                    if cache.len() >= 10 {
+                        // Evict a random entry (simple but effective for this scale)
+                        // In a future update, we could use an LRU policy.
+                        if let Some(key) = cache.keys().next().cloned() {
+                            cache.remove(&key);
+                        }
+                    }
+                    cache.insert(root_path.clone(), tree.clone());
+                }
 
                 self.tree = Some(tree);
 
@@ -660,28 +625,32 @@ impl App {
 
                 // Start background analysis
                 self.analyzing = true;
-                self.scan_rx = Some(scanning::start_analysis(tree_for_analysis.clone()));
+                self.scan_rx = Some(scanning::start_analysis(
+                    tree_for_analysis.clone(),
+                    self.scan_token.clone(),
+                ));
 
                 // Dispatch scan complete hook (extract only the stats we need)
-                let pm = self.plugin_manager.clone();
-                let scan_path = tree_for_analysis.root_path.clone();
-                let total_files = tree_for_analysis.stats.total_files;
-                let total_dirs = tree_for_analysis.stats.total_dirs;
-                let total_size = tree_for_analysis.stats.total_size;
-                let view_root = self.view_root.clone();
-                tokio::spawn(async move {
-                    let ctx = gravityfile_plugin::HookContext::new().with_view_root(view_root);
+                if let Some(pm) = self.plugin_manager.clone() {
+                    let scan_path = tree_for_analysis.root_path.clone();
+                    let total_files = tree_for_analysis.stats.total_files;
+                    let total_dirs = tree_for_analysis.stats.total_dirs;
+                    let total_size = tree_for_analysis.stats.total_size;
+                    let view_root = self.view_root.clone();
+                    tokio::spawn(async move {
+                        let ctx = gravityfile_plugin::HookContext::new().with_view_root(view_root);
 
-                    let hook = gravityfile_plugin::Hook::OnScanComplete {
-                        path: scan_path,
-                        total_files,
-                        total_dirs,
-                        total_size,
-                    };
+                        let hook = gravityfile_plugin::Hook::OnScanComplete {
+                            path: scan_path,
+                            total_files,
+                            total_dirs,
+                            total_size,
+                        };
 
-                    let pm_lock = pm.read().await;
-                    let _ = pm_lock.dispatch_hook(&hook, &ctx).await;
-                });
+                        let pm_lock = pm.read().await;
+                        let _ = pm_lock.dispatch_hook(&hook, &ctx).await;
+                    });
+                }
             }
             ScanResult::ScanComplete(Err(e)) => {
                 self.error = Some(e.to_string());
@@ -729,9 +698,23 @@ impl App {
                 succeeded,
                 failed,
                 bytes_processed: _,
+                undo_info,
             } => {
                 self.operation_progress = None;
                 self.scan_rx = None;
+
+                // Record in undo log if successful
+                if let Some(undo) = undo_info {
+                    let description = match operation_type {
+                        gravityfile_ops::OperationType::Copy => format!("Copied {} items", succeeded),
+                        gravityfile_ops::OperationType::Move => format!("Moved {} items", succeeded),
+                        gravityfile_ops::OperationType::Rename => "Renamed item".to_string(),
+                        gravityfile_ops::OperationType::CreateFile => "Created file".to_string(),
+                        gravityfile_ops::OperationType::CreateDirectory => "Created directory".to_string(),
+                        _ => format!("{:?} operation", operation_type),
+                    };
+                    self.undo_log.record(undo, description);
+                }
 
                 let action = match operation_type {
                     gravityfile_ops::OperationType::Copy => "Copied",
@@ -1801,19 +1784,30 @@ impl App {
     }
 
     /// Adapt copy result channel to ScanResult channel.
-    fn adapt_copy_rx(mut rx: mpsc::Receiver<CopyResult>) -> mpsc::Receiver<ScanResult> {
+    fn adapt_copy_rx(mut rx: mpsc::Receiver<gravityfile_ops::CopyResult>) -> mpsc::Receiver<ScanResult> {
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 let scan_result = match result {
-                    CopyResult::Progress(p) => ScanResult::OperationProgress(p),
-                    CopyResult::Conflict(c) => ScanResult::OperationConflict(c),
-                    CopyResult::Complete(c) => ScanResult::OperationComplete {
-                        operation_type: c.operation_type,
-                        succeeded: c.succeeded,
-                        failed: c.failed,
-                        bytes_processed: c.bytes_processed,
-                    },
+                    gravityfile_ops::CopyResult::Progress(p) => ScanResult::OperationProgress(p),
+                    gravityfile_ops::CopyResult::Conflict(c) => ScanResult::OperationConflict(c),
+                    gravityfile_ops::CopyResult::Complete(cc) => {
+                        let undo_info = if cc.inner.is_success() {
+                            Some(gravityfile_ops::UndoableOperation::FilesCopied {
+                                created: cc.created_paths,
+                            })
+                        } else {
+                            None
+                        };
+
+                        ScanResult::OperationComplete {
+                            operation_type: cc.inner.operation_type,
+                            succeeded: cc.inner.succeeded,
+                            failed: cc.inner.failed,
+                            bytes_processed: cc.inner.bytes_processed,
+                            undo_info,
+                        }
+                    }
                 };
                 if tx.send(scan_result).await.is_err() {
                     break;
@@ -1824,19 +1818,30 @@ impl App {
     }
 
     /// Adapt move result channel to ScanResult channel.
-    fn adapt_move_rx(mut rx: mpsc::Receiver<MoveResult>) -> mpsc::Receiver<ScanResult> {
+    fn adapt_move_rx(mut rx: mpsc::Receiver<gravityfile_ops::MoveResult>) -> mpsc::Receiver<ScanResult> {
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 let scan_result = match result {
-                    MoveResult::Progress(p) => ScanResult::OperationProgress(p),
-                    MoveResult::Conflict(c) => ScanResult::OperationConflict(c),
-                    MoveResult::Complete(c) => ScanResult::OperationComplete {
-                        operation_type: c.inner.operation_type,
-                        succeeded: c.inner.succeeded,
-                        failed: c.inner.failed,
-                        bytes_processed: c.inner.bytes_processed,
-                    },
+                    gravityfile_ops::MoveResult::Progress(p) => ScanResult::OperationProgress(p),
+                    gravityfile_ops::MoveResult::Conflict(c) => ScanResult::OperationConflict(c),
+                    gravityfile_ops::MoveResult::Complete(mc) => {
+                        let undo_info = if mc.inner.is_success() {
+                            Some(gravityfile_ops::UndoableOperation::FilesMoved {
+                                moves: mc.moved_pairs,
+                            })
+                        } else {
+                            None
+                        };
+
+                        ScanResult::OperationComplete {
+                            operation_type: mc.inner.operation_type,
+                            succeeded: mc.inner.succeeded,
+                            failed: mc.inner.failed,
+                            bytes_processed: mc.inner.bytes_processed,
+                            undo_info,
+                        }
+                    }
                 };
                 if tx.send(scan_result).await.is_err() {
                     break;
@@ -2078,9 +2083,53 @@ impl App {
 
     /// Execute undo of the last operation.
     fn execute_undo(&mut self) {
-        // TODO: Implement undo
-        // For now, just show a message that undo is not yet implemented
-        self.operation_message = Some((false, "Undo not yet implemented".to_string()));
+        if let Some(entry) = self.undo_log.pop() {
+            let msg = format!("Undoing: {}", entry.description);
+            self.operation_message = Some((true, msg));
+
+            // Cancel any active scan
+            self.scan_token.cancel();
+            self.scan_token = CancellationToken::new();
+
+            let rx = gravityfile_ops::execute_undo(entry);
+
+            // Adapt the generic OperationResult to ScanResult
+            let (tx, adapted_rx) = tokio::sync::mpsc::channel(100);
+            let token = self.scan_token.clone();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(result) = rx.recv().await {
+                    if token.is_cancelled() {
+                        break;
+                    }
+                    let scan_result = match result {
+                        gravityfile_ops::OperationResult::Progress(p) => {
+                            ScanResult::OperationProgress(p)
+                        }
+                        gravityfile_ops::OperationResult::Conflict(c) => {
+                            ScanResult::OperationConflict(c)
+                        }
+                        gravityfile_ops::OperationResult::Complete(c) => {
+                            ScanResult::OperationComplete {
+                                operation_type: c.operation_type,
+                                succeeded: c.succeeded,
+                                failed: c.failed,
+                                bytes_processed: c.bytes_processed,
+                                undo_info: None, // Don't record undos of undos in this simple impl
+                            }
+                        }
+                    };
+                    if tx.send(scan_result).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            self.scan_rx = Some(adapted_rx);
+            self.mode = AppMode::Normal;
+        } else {
+            self.operation_message = Some((false, "Nothing to undo".to_string()));
+        }
     }
 
     /// Handle key events in input modes (Renaming, CreatingFile, CreatingDirectory).
@@ -2147,7 +2196,7 @@ impl App {
         let rx = start_rename(source.clone(), new_name.clone());
 
         // Adapt the rename result receiver
-        let adapted_rx = Self::adapt_rename_rx(rx);
+        let adapted_rx = Self::adapt_rename_rx(source, new_name.clone(), rx);
         self.scan_rx = Some(adapted_rx);
         self.mode = AppMode::Normal;
 
@@ -2157,6 +2206,8 @@ impl App {
 
     /// Adapt rename receiver to ScanResult.
     fn adapt_rename_rx(
+        source_path: std::path::PathBuf,
+        new_name: String,
         mut rx: mpsc::Receiver<gravityfile_ops::RenameResult>,
     ) -> mpsc::Receiver<ScanResult> {
         let (tx, adapted_rx) = mpsc::channel(100);
@@ -2168,11 +2219,24 @@ impl App {
                         ScanResult::OperationProgress(progress)
                     }
                     gravityfile_ops::RenameResult::Complete(complete) => {
+                        let undo_info = if complete.is_success() {
+                            let parent = source_path.parent().unwrap_or(std::path::Path::new(""));
+                            let new_path = parent.join(&new_name);
+                            Some(gravityfile_ops::UndoableOperation::FileRenamed {
+                                path: new_path,
+                                old_path: source_path.clone(),
+                                new_name: new_name.clone(),
+                            })
+                        } else {
+                            None
+                        };
+
                         ScanResult::OperationComplete {
                             operation_type: complete.operation_type,
                             succeeded: complete.succeeded,
                             failed: complete.failed,
                             bytes_processed: complete.bytes_processed,
+                            undo_info,
                         }
                     }
                 };
@@ -2198,7 +2262,7 @@ impl App {
         let path = parent.join(&name);
         let rx = start_create_file(path.clone());
 
-        let adapted_rx = Self::adapt_create_rx(rx);
+        let adapted_rx = Self::adapt_create_rx(path, rx);
         self.scan_rx = Some(adapted_rx);
 
         self.operation_message = Some((true, format!("Creating file {}...", name)));
@@ -2217,7 +2281,7 @@ impl App {
         let path = parent.join(&name);
         let rx = start_create_directory(path.clone());
 
-        let adapted_rx = Self::adapt_create_rx(rx);
+        let adapted_rx = Self::adapt_create_rx(path, rx);
         self.scan_rx = Some(adapted_rx);
 
         self.operation_message = Some((true, format!("Creating directory {}...", name)));
@@ -2290,6 +2354,7 @@ impl App {
 
     /// Adapt create result receiver to ScanResult.
     fn adapt_create_rx(
+        path: std::path::PathBuf,
         mut rx: mpsc::Receiver<gravityfile_ops::CreateResult>,
     ) -> mpsc::Receiver<ScanResult> {
         let (tx, adapted_rx) = mpsc::channel(100);
@@ -2301,11 +2366,30 @@ impl App {
                         ScanResult::OperationProgress(progress)
                     }
                     gravityfile_ops::CreateResult::Complete(complete) => {
+                        let undo_info = if complete.is_success() {
+                            match complete.operation_type {
+                                gravityfile_ops::OperationType::CreateFile => {
+                                    Some(gravityfile_ops::UndoableOperation::FileCreated {
+                                        path: path.clone(),
+                                    })
+                                }
+                                gravityfile_ops::OperationType::CreateDirectory => {
+                                    Some(gravityfile_ops::UndoableOperation::DirectoryCreated {
+                                        path: path.clone(),
+                                    })
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         ScanResult::OperationComplete {
                             operation_type: complete.operation_type,
                             succeeded: complete.succeeded,
                             failed: complete.failed,
                             bytes_processed: complete.bytes_processed,
+                            undo_info,
                         }
                     }
                 };
@@ -2869,7 +2953,12 @@ impl App {
     /// This updates the tree in-place with the new children.
     fn lazy_load_directory(&mut self, path: &Path) {
         // First check if we have cached scan data for this directory
-        if let Some(cached_tree) = self.scanned_cache.get(path).cloned() {
+        if let Some(cached_tree) = self
+            .scanned_cache
+            .as_ref()
+            .and_then(|c| c.get(path))
+            .cloned()
+        {
             // Use cached scan data - it has full size/structure information
             if let Some(tree) = &mut self.tree
                 && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
@@ -2989,8 +3078,9 @@ impl App {
         if let Some(tree) = &self.tree
             && self.has_full_scan
         {
-            self.scanned_cache
-                .insert(tree.root_path.clone(), tree.clone());
+            if let Some(cache) = &mut self.scanned_cache {
+                cache.insert(tree.root_path.clone(), tree.clone());
+            }
         }
 
         // Load the parent directory contents
@@ -3033,7 +3123,11 @@ impl App {
         for child in &mut node.children {
             if child.is_dir() {
                 let child_path = node_path.join(&*child.name);
-                if let Some(cached_tree) = self.scanned_cache.get(&child_path) {
+                if let Some(cached_tree) = self
+                    .scanned_cache
+                    .as_ref()
+                    .and_then(|c| c.get(&child_path))
+                {
                     // Replace this child with the cached scan data
                     *child = cached_tree.root.clone();
                 }
@@ -4703,61 +4797,5 @@ impl App {
             .collect();
 
         Some(filtered)
-    }
-}
-
-impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let ctx = RenderContext {
-            mode: self.mode,
-            view: self.view,
-            theme: &self.theme,
-            path: &self.path,
-            view_root: &self.view_root,
-            show_details: self.show_details,
-            tree: self.tree.as_ref(),
-            tree_state: &self.tree_state,
-            layout_mode: self.layout_mode,
-            miller_state: &self.miller_state,
-            scan_progress: self.scan_progress.as_ref(),
-            deletion_progress: self.deletion_progress.as_ref(),
-            duplicates: self.duplicates.as_ref(),
-            age_report: self.age_report.as_ref(),
-            warnings: &self.warnings,
-            duplicates_state: &self.duplicates_state,
-            selected_stale_dir: self.selected_stale_dir,
-            selected_warning: self.selected_warning,
-            marked: &self.marked,
-            deletion_message: self.deletion_message.as_ref(),
-            operation_message: self.operation_message.as_ref(),
-            error: self.error.as_deref(),
-            command_input: self.command_input.buffer(),
-            command_cursor: self.command_input.cursor(),
-            input_state: self.input_state.as_ref(),
-            operation_progress: self.operation_progress.as_ref(),
-            pending_conflict: self.pending_conflict.as_ref(),
-            clipboard: &self.clipboard,
-            get_path_size: Box::new(|p| self.get_path_size(p)),
-            get_selected_info: self.get_selected_info(),
-            get_view_root_node: self.get_view_root_node(),
-            get_parent_node: self.get_parent_node(),
-            current_dir_name: self.get_current_dir_name(),
-            get_filtered_duplicates: self.get_filtered_duplicates(),
-            get_filtered_stale_dirs: self.get_filtered_stale_dirs(),
-            sort_mode: self.sort_mode,
-            search_state: &self.search_state,
-            tab_manager: &self.tab_manager,
-            preview_content: &self.preview_state.content,
-            preview_mode: self.preview_state.mode,
-            has_full_scan: self.has_full_scan,
-            settings_state: self.settings_state.as_ref(),
-            bookmark_list_state: self.bookmark_list_state.as_ref(),
-            bookmarks: &self.user_settings.bookmarks,
-            bulk_rename_state: self.bulk_rename_state.as_ref(),
-            treemap_selected: self.treemap_state.selected,
-            visual_state: self.visual_state.as_ref(),
-        };
-
-        render_app(&ctx, area, buf);
     }
 }

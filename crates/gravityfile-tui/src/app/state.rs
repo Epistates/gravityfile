@@ -373,6 +373,8 @@ pub enum ScanResult {
         succeeded: usize,
         failed: usize,
         bytes_processed: u64,
+        /// OPTIONAL: Information for the undo log.
+        undo_info: Option<gravityfile_ops::UndoableOperation>,
     },
 }
 
