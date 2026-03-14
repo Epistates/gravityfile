@@ -3,7 +3,6 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/gravityfile.svg)](https://crates.io/crates/gravityfile)
 [![Built With Ratatui](https://img.shields.io/badge/Built_With_Ratatui-000?logo=ratatui&logoColor=fff)](https://ratatui.rs/)
-[![SOTA Grade](https://img.shields.io/badge/SOTA-Google--Grade-brightgreen.svg)]()
 
 > "Where mass accumulates, attention should follow."
 
