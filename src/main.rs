@@ -106,7 +106,10 @@ fn main() -> Result<()> {
     let log_file = std::env::temp_dir().join("gravityfile.log");
     let file = std::fs::File::create(&log_file)?;
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
         .with_writer(std::sync::Arc::new(file))
         .with_ansi(false)
         .init();
@@ -167,7 +170,9 @@ fn run_scan(path: &Path, max_depth: Option<u32>, top_n: usize) -> Result<()> {
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
+    let tree = scanner
+        .scan(&config, CancellationToken::new())
+        .context("Scan failed")?;
 
     // Print summary
     println!();
@@ -212,7 +217,9 @@ fn run_duplicates(path: &Path, min_size: &str, top_n: usize, format: OutputForma
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
+    let tree = scanner
+        .scan(&config, CancellationToken::new())
+        .context("Scan failed")?;
 
     eprintln!("Finding duplicates (min size: {})...", min_size);
 
@@ -270,7 +277,9 @@ fn run_age(path: &Path, stale_threshold: &str, format: OutputFormat) -> Result<(
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
+    let tree = scanner
+        .scan(&config, CancellationToken::new())
+        .context("Scan failed")?;
 
     eprintln!("Analyzing file ages...");
 
@@ -300,8 +309,8 @@ fn run_age(path: &Path, stale_threshold: &str, format: OutputFormat) -> Result<(
             for bucket in &report.buckets {
                 let bar_width = 20;
                 let filled = if report.total_files > 0 {
-                    (bucket.file_count as f64 / report.total_files as f64 * bar_width as f64).round()
-                        as usize
+                    (bucket.file_count as f64 / report.total_files as f64 * bar_width as f64)
+                        .round() as usize
                 } else {
                     0
                 };
@@ -342,7 +351,9 @@ fn run_export(path: &Path, output: Option<PathBuf>) -> Result<()> {
 
     let config = ScanConfig::new(&path);
     let scanner = JwalkScanner::new();
-    let tree = scanner.scan(&config, CancellationToken::new()).context("Scan failed")?;
+    let tree = scanner
+        .scan(&config, CancellationToken::new())
+        .context("Scan failed")?;
 
     let json = serde_json::to_string_pretty(&tree)?;
 
@@ -391,7 +402,11 @@ fn print_node(
             print_node(child, _path, depth + 1, max_depth, top_n, total_size);
         }
         if node.children.len() > top_n {
-            println!("{}  ... ({} more items)", indent, node.children.len() - top_n);
+            println!(
+                "{}  ... ({} more items)",
+                indent,
+                node.children.len() - top_n
+            );
         }
     }
 }

@@ -130,7 +130,7 @@ impl<'a> TreemapView<'a> {
 
         // Prepare items sorted by size (descending)
         let mut items: Vec<(&FileNode, u64)> = children.iter().map(|n| (*n, n.size)).collect();
-        items.sort_by(|a, b| b.1.cmp(&a.1));
+        items.sort_by_key(|item| std::cmp::Reverse(item.1));
 
         // Apply squarified algorithm
         self.squarify(&items, area, self.root.size, 0, &mut rects);

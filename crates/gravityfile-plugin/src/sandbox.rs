@@ -236,12 +236,11 @@ impl SandboxConfig {
 
         // If it doesn't exist, try canonicalizing the parent and joining the
         // final component. This handles writes to new files inside existing dirs.
-        if let Some(parent) = path.parent() {
-            if let Ok(c) = std::fs::canonicalize(parent) {
-                if let Some(name) = path.file_name() {
-                    return Some(c.join(name));
-                }
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(c) = std::fs::canonicalize(parent)
+            && let Some(name) = path.file_name()
+        {
+            return Some(c.join(name));
         }
 
         // Cannot resolve — deny by returning None.

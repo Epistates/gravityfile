@@ -7,6 +7,7 @@
 //!
 //! This minimizes disk I/O by eliminating non-duplicates early.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -254,7 +255,7 @@ impl DuplicateFinder {
 
         // Sort by wasted space descending
         let mut groups = duplicate_groups;
-        groups.sort_by(|a, b| b.wasted_bytes.cmp(&a.wasted_bytes));
+        groups.sort_by_key(|group| Reverse(group.wasted_bytes));
 
         // Compute all summary stats from the full (untruncated) groups list
         let total_duplicate_size: u64 = groups.iter().map(|g| g.size * g.paths.len() as u64).sum();
@@ -329,14 +330,7 @@ impl DuplicateFinder {
             NodeKind::Directory { .. } => {
                 for child in &node.children {
                     let child_path = current_path.join(&*child.name);
-                    self.collect_files(
-                        child,
-                        &child_path,
-                        files,
-                        seen_inodes,
-                        seen_paths,
-                        token,
-                    );
+                    self.collect_files(child, &child_path, files, seen_inodes, seen_paths, token);
                 }
             }
             _ => {}

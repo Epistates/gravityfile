@@ -231,7 +231,8 @@ impl SearchState {
         }
 
         // Sort by score descending
-        self.results.sort_by(|a, b| b.score.cmp(&a.score));
+        self.results
+            .sort_by_key(|result| std::cmp::Reverse(result.score));
 
         // Limit results to prevent UI slowdown
         self.results.truncate(1000);

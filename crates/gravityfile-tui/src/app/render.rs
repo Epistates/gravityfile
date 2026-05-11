@@ -15,13 +15,10 @@ use crate::ui::modals::{
     DeleteConfirmModal, DeletionProgressModal, InputModal, OperationProgressModal, SettingsModal,
 };
 use crate::ui::{
-    AppLayout, HelpOverlay, MillerColumns, TreeView, TreemapView,
-    format_relative_time, format_size,
+    AppLayout, HelpOverlay, MillerColumns, TreeView, TreemapView, format_relative_time, format_size,
 };
 
-use super::state::{
-    AppMode, ClipboardMode, LayoutMode, View,
-};
+use super::state::{AppMode, ClipboardMode, LayoutMode, View};
 
 /// Item in the duplicates list (either a group header or a file within a group).
 enum DuplicateListItem<'a> {
@@ -170,7 +167,9 @@ impl App {
                     self.marked.len(),
                     format_size(total_size)
                 ),
-                Style::default().fg(self.theme.background).bg(self.theme.info),
+                Style::default()
+                    .fg(self.theme.background)
+                    .bg(self.theme.info),
             )
         } else {
             Span::raw("")
@@ -217,19 +216,26 @@ impl App {
                 HelpOverlay::new(&self.theme).render(area, buf);
             }
             AppMode::ConfirmDelete => {
-                let modal = DeleteConfirmModal::new(&self.theme, &self.marked, |p| self.get_path_size(p));
+                let modal =
+                    DeleteConfirmModal::new(&self.theme, &self.marked, |p| self.get_path_size(p));
                 modal.render(area, buf);
             }
             AppMode::Deleting => {
-                DeletionProgressModal::new(&self.theme, self.deletion_progress.as_ref()).render(area, buf);
+                DeletionProgressModal::new(&self.theme, self.deletion_progress.as_ref())
+                    .render(area, buf);
             }
             AppMode::Command => {
-                CommandPalette::new(&self.theme, self.command_input.buffer(), self.command_input.cursor())
-                    .render(footer, buf);
+                CommandPalette::new(
+                    &self.theme,
+                    self.command_input.buffer(),
+                    self.command_input.cursor(),
+                )
+                .render(footer, buf);
             }
             AppMode::Renaming => {
                 if let Some(input) = &self.input_state {
-                    InputModal::new(&self.theme, input, "Rename", "Enter new name:").render(area, buf);
+                    InputModal::new(&self.theme, input, "Rename", "Enter new name:")
+                        .render(area, buf);
                 }
             }
             AppMode::CreatingFile => {
@@ -286,7 +292,8 @@ impl App {
             }
             AppMode::BookmarkList => {
                 if let Some(state) = &self.bookmark_list_state {
-                    BookmarkListModal::new(&self.theme, &self.user_settings.bookmarks, state).render(area, buf);
+                    BookmarkListModal::new(&self.theme, &self.user_settings.bookmarks, state)
+                        .render(area, buf);
                 }
             }
             AppMode::SettingBookmark => {
@@ -368,7 +375,8 @@ impl App {
             match self.layout_mode {
                 LayoutMode::Tree => {
                     let title = if self.view_root != self.path {
-                        let relative = self.view_root
+                        let relative = self
+                            .view_root
                             .strip_prefix(&self.path)
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|_| self.view_root.display().to_string());
@@ -377,14 +385,20 @@ impl App {
                         format!(" {} ", view_path.display())
                     };
 
-                    let tree_view = TreeView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(self.theme.border)
-                                .title(title)
-                                .title_style(self.theme.title),
-                        );
+                    let tree_view = TreeView::new(
+                        view_node,
+                        &view_path,
+                        &self.theme,
+                        &self.marked,
+                        &self.clipboard,
+                    )
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(self.theme.border)
+                            .title(title)
+                            .title_style(self.theme.title),
+                    );
 
                     let mut tree_state = self.tree_state.clone();
                     ratatui::widgets::StatefulWidget::render(
@@ -455,7 +469,8 @@ impl App {
 
     fn render_duplicates(&self, area: Rect, buf: &mut Buffer) {
         let title = if self.view_root != self.path {
-            let relative = self.view_root
+            let relative = self
+                .view_root
                 .strip_prefix(&self.path)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| self.view_root.display().to_string());
@@ -673,7 +688,8 @@ impl App {
 
     fn render_age(&self, area: Rect, buf: &mut Buffer) {
         let title = if self.view_root != self.path {
-            let relative = self.view_root
+            let relative = self
+                .view_root
                 .strip_prefix(&self.path)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| self.view_root.display().to_string());
@@ -748,7 +764,9 @@ impl App {
                     let list_y = stale_y + 1;
                     let list_height = (inner.y + inner.height).saturating_sub(list_y) as usize;
 
-                    let selected = self.selected_stale_dir.min(stale_dirs.len().saturating_sub(1));
+                    let selected = self
+                        .selected_stale_dir
+                        .min(stale_dirs.len().saturating_sub(1));
 
                     for (i, dir) in stale_dirs.iter().enumerate().take(list_height) {
                         let y = list_y + i as u16;
@@ -786,7 +804,11 @@ impl App {
         let is_scanning = self.scan_progress.is_some();
 
         let title = if is_scanning {
-            let count = self.scan_progress.as_ref().map(|p| p.errors_count).unwrap_or(0);
+            let count = self
+                .scan_progress
+                .as_ref()
+                .map(|p| p.errors_count)
+                .unwrap_or(0);
             format!(" Errors & Warnings ({}) ", count)
         } else if !self.warnings.is_empty() {
             format!(" Scan Errors & Warnings ({}) ", self.warnings.len())
@@ -805,7 +827,11 @@ impl App {
 
         if self.warnings.is_empty() {
             let lines = if is_scanning {
-                let error_count = self.scan_progress.as_ref().map(|p| p.errors_count).unwrap_or(0);
+                let error_count = self
+                    .scan_progress
+                    .as_ref()
+                    .map(|p| p.errors_count)
+                    .unwrap_or(0);
                 if error_count > 0 {
                     vec![
                         Line::raw(""),
@@ -858,9 +884,13 @@ impl App {
                 gravityfile_core::WarningKind::PermissionDenied => {
                     ("\u{1F512}", "Permission Denied", false)
                 }
-                gravityfile_core::WarningKind::BrokenSymlink => ("\u{1F517}", "Broken Symlink", true),
+                gravityfile_core::WarningKind::BrokenSymlink => {
+                    ("\u{1F517}", "Broken Symlink", true)
+                }
                 gravityfile_core::WarningKind::ReadError => ("\u{26A0}", "Read Error", false),
-                gravityfile_core::WarningKind::MetadataError => ("\u{1F4CB}", "Metadata Error", false),
+                gravityfile_core::WarningKind::MetadataError => {
+                    ("\u{1F4CB}", "Metadata Error", false)
+                }
                 gravityfile_core::WarningKind::CrossFilesystem => {
                     ("\u{1F4BE}", "Cross Filesystem", false)
                 }
@@ -876,7 +906,8 @@ impl App {
             };
             let prefix = format!("{}{} {} ", mark_indicator, icon, kind_label);
             let suffix_len = delete_hint.len();
-            let available_width = (inner.width as usize).saturating_sub(prefix.len() + suffix_len + 1);
+            let available_width =
+                (inner.width as usize).saturating_sub(prefix.len() + suffix_len + 1);
             let display_path = if path_str.len() > available_width {
                 format!(
                     "...{}",
@@ -932,7 +963,9 @@ impl App {
             return;
         };
 
-        let (view_node, view_path) = self.get_view_root_node().unwrap_or((&tree.root, tree.root_path.clone()));
+        let (view_node, view_path) = self
+            .get_view_root_node()
+            .unwrap_or((&tree.root, tree.root_path.clone()));
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -940,10 +973,16 @@ impl App {
             .title(format!(" Treemap: {} ", view_path.display()))
             .title_style(self.theme.title);
 
-        TreemapView::new(view_node, &view_path, &self.theme, &self.marked, &self.clipboard)
-            .block(block)
-            .selected(self.treemap_state.selected)
-            .render(area, buf);
+        TreemapView::new(
+            view_node,
+            &view_path,
+            &self.theme,
+            &self.marked,
+            &self.clipboard,
+        )
+        .block(block)
+        .selected(self.treemap_state.selected)
+        .render(area, buf);
     }
 
     fn render_details(&self, area: Rect, buf: &mut Buffer) {
@@ -1029,16 +1068,24 @@ impl App {
                         v.push(("Spc", "+Sel"));
                     }
                     v.push(("V", "Visual"));
-                    v.push(("v", match self.layout_mode {
-                        LayoutMode::Tree => "Miller",
-                        LayoutMode::Miller => "Tree",
-                    }));
+                    v.push((
+                        "v",
+                        match self.layout_mode {
+                            LayoutMode::Tree => "Miller",
+                            LayoutMode::Miller => "Tree",
+                        },
+                    ));
                     v.push(("s", self.sort_mode.short_label()));
                     v
                 }
                 View::Duplicates => {
-                    let is_on_header = !self.duplicates_state.is_expanded(self.duplicates_state.selected_group)
-                        || self.duplicates_state.selected_item(self.duplicates_state.selected_group) == 0;
+                    let is_on_header = !self
+                        .duplicates_state
+                        .is_expanded(self.duplicates_state.selected_group)
+                        || self
+                            .duplicates_state
+                            .selected_item(self.duplicates_state.selected_group)
+                            == 0;
                     let mut v = vec![("j/k", "Nav"), ("h/l", "±Grp")];
                     if is_on_header {
                         v.push(("d", "Del Dups"));
@@ -1071,7 +1118,12 @@ impl App {
                     v
                 }
                 View::Treemap => {
-                    let mut v = vec![("Enter", "Drill"), ("Bksp", "Back"), ("Spc", "+Sel"), ("d", "Del")];
+                    let mut v = vec![
+                        ("Enter", "Drill"),
+                        ("Bksp", "Back"),
+                        ("Spc", "+Sel"),
+                        ("d", "Del"),
+                    ];
                     if !self.marked.is_empty() {
                         v.push(("Esc", "Clear"));
                     }
@@ -1120,7 +1172,11 @@ impl App {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .style(Style::default().bg(self.theme.background).fg(self.theme.foreground))
+            .style(
+                Style::default()
+                    .bg(self.theme.background)
+                    .fg(self.theme.foreground),
+            )
             .border_style(self.theme.border);
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
@@ -1136,13 +1192,27 @@ impl App {
         let mut spans = vec![Span::styled("/", self.theme.help_key)];
 
         if query.is_empty() {
-            spans.push(Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)));
+            spans.push(Span::styled(
+                "_",
+                Style::default().add_modifier(Modifier::SLOW_BLINK),
+            ));
         } else {
             let before_cursor = &query[..cursor];
-            let at_cursor = query.chars().nth(cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
-            let after_cursor = if cursor < query.len() { &query[cursor + 1..] } else { "" };
+            let at_cursor = query
+                .chars()
+                .nth(cursor)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| " ".to_string());
+            let after_cursor = if cursor < query.len() {
+                &query[cursor + 1..]
+            } else {
+                ""
+            };
             spans.push(Span::raw(before_cursor));
-            spans.push(Span::styled(at_cursor, Style::default().add_modifier(Modifier::REVERSED)));
+            spans.push(Span::styled(
+                at_cursor,
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
             spans.push(Span::raw(after_cursor));
         }
 
@@ -1166,33 +1236,65 @@ impl App {
 
         if results.is_empty() {
             if !query.is_empty() {
-                Paragraph::new("No matches found").style(Style::default().fg(self.theme.muted)).render(results_area, buf);
+                Paragraph::new("No matches found")
+                    .style(Style::default().fg(self.theme.muted))
+                    .render(results_area, buf);
             }
         } else {
             let max_visible = results_area.height as usize;
-            let offset = if selected >= max_visible { selected - max_visible + 1 } else { 0 };
+            let offset = if selected >= max_visible {
+                selected - max_visible + 1
+            } else {
+                0
+            };
 
             for (i, result) in results.iter().skip(offset).take(max_visible).enumerate() {
                 let row = i as u16;
                 let is_selected = i + offset == selected;
-                let base_style = if is_selected { self.theme.selected } else if result.is_dir { self.theme.directory } else { Style::default().fg(self.theme.foreground) };
+                let base_style = if is_selected {
+                    self.theme.selected
+                } else if result.is_dir {
+                    self.theme.directory
+                } else {
+                    Style::default().fg(self.theme.foreground)
+                };
                 let prefix = if result.is_dir { " " } else { "   " };
-                let match_style = if is_selected { base_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { Style::default().fg(self.theme.warning).add_modifier(Modifier::BOLD) };
+                let match_style = if is_selected {
+                    base_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                        .fg(self.theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                };
 
                 let mut spans: Vec<Span> = vec![Span::styled(prefix, base_style)];
                 for (char_pos, ch) in result.display.chars().enumerate() {
                     let is_match = result.matched_indices.contains(&char_pos);
-                    spans.push(Span::styled(ch.to_string(), if is_match { match_style } else { base_style }));
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        if is_match { match_style } else { base_style },
+                    ));
                 }
 
-                Line::from(spans).render(Rect::new(results_area.x, results_area.y + row, results_area.width, 1), buf);
+                Line::from(spans).render(
+                    Rect::new(results_area.x, results_area.y + row, results_area.width, 1),
+                    buf,
+                );
             }
 
             if results.len() > max_visible {
                 let count_str = format!("[{}/{}]", selected + 1, results.len());
                 Line::from(count_str)
                     .style(Style::default().fg(self.theme.muted))
-                    .render(Rect::new(results_area.x + results_area.width.saturating_sub(10), results_area.y + results_area.height - 1, 10, 1), buf);
+                    .render(
+                        Rect::new(
+                            results_area.x + results_area.width.saturating_sub(10),
+                            results_area.y + results_area.height - 1,
+                            10,
+                            1,
+                        ),
+                        buf,
+                    );
             }
         }
     }

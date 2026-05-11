@@ -27,6 +27,12 @@ pub struct JwalkScanner {
     progress_tx: broadcast::Sender<ScanProgress>,
 }
 
+struct EntryCollection<'a> {
+    inode_tracker: &'a mut InodeTracker,
+    stats: &'a mut TreeStats,
+    warnings: &'a mut Vec<ScanWarning>,
+}
+
 impl JwalkScanner {
     /// Create a new scanner.
     pub fn new() -> Self {
@@ -40,7 +46,11 @@ impl JwalkScanner {
     }
 
     /// Perform a scan of the given path.
-    pub fn scan(&self, config: &ScanConfig, token: CancellationToken) -> Result<FileTree, ScanError> {
+    pub fn scan(
+        &self,
+        config: &ScanConfig,
+        token: CancellationToken,
+    ) -> Result<FileTree, ScanError> {
         let start = Instant::now();
         let root_path = config
             .root
@@ -64,15 +74,14 @@ impl JwalkScanner {
         let mut warnings = Vec::new();
 
         // Collect all entries first
-        let entries = self.collect_entries(
-            config,
-            &root_path,
-            root_device,
-            &mut inode_tracker,
-            &mut stats,
-            &mut warnings,
-            token,
-        )?;
+        let entries = {
+            let mut collection = EntryCollection {
+                inode_tracker: &mut inode_tracker,
+                stats: &mut stats,
+                warnings: &mut warnings,
+            };
+            self.collect_entries(config, &root_path, root_device, token, &mut collection)?
+        };
 
         // Build tree from collected entries
         let root_node = self.build_tree(&root_path, entries, &node_id_counter, &mut stats);
@@ -95,10 +104,8 @@ impl JwalkScanner {
         config: &ScanConfig,
         root_path: &Path,
         root_device: u64,
-        inode_tracker: &mut InodeTracker,
-        stats: &mut TreeStats,
-        warnings: &mut Vec<ScanWarning>,
         token: CancellationToken,
+        collection: &mut EntryCollection<'_>,
     ) -> Result<HashMap<PathBuf, Vec<EntryInfo>>, ScanError> {
         // Use global rayon pool to avoid lingering threads from new pools.
         let parallelism = match config.threads {
@@ -194,7 +201,7 @@ impl JwalkScanner {
                 Ok(e) => e,
                 Err(err) => {
                     let path = err.path().map(|p| p.to_path_buf()).unwrap_or_default();
-                    warnings.push(ScanWarning::new(
+                    collection.warnings.push(ScanWarning::new(
                         path,
                         WarningKind::ReadError,
                         err.to_string(),
@@ -211,7 +218,7 @@ impl JwalkScanner {
             let metadata = match entry.metadata() {
                 Ok(m) => m,
                 Err(err) => {
-                    warnings.push(ScanWarning::new(
+                    collection.warnings.push(ScanWarning::new(
                         &path,
                         WarningKind::MetadataError,
                         err.to_string(),
@@ -225,7 +232,7 @@ impl JwalkScanner {
             let depth = entry.depth() as u32;
 
             if file_type.is_dir() {
-                stats.record_dir(depth);
+                collection.stats.record_dir(depth);
 
                 // For directories, track them but size will be aggregated later
                 if let Some(parent) = path.parent() {
@@ -267,7 +274,7 @@ impl JwalkScanner {
                     metadata.len()
                 } else {
                     // Only count size for first hardlink encounter.
-                    if nlink > 1 && !inode_tracker.track(inode_info, nlink) {
+                    if nlink > 1 && !collection.inode_tracker.track(inode_info, nlink) {
                         0 // Already counted this inode
                     } else {
                         // Use disk blocks for physical size when apparent_size == false.
@@ -277,7 +284,7 @@ impl JwalkScanner {
 
                 let blocks = get_blocks(&metadata);
 
-                stats.record_file(
+                collection.stats.record_file(
                     &path,
                     size,
                     metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
@@ -314,11 +321,11 @@ impl JwalkScanner {
                 progress_counter += 1;
                 if progress_counter.is_multiple_of(1000) {
                     let _ = self.progress_tx.send(ScanProgress {
-                        files_scanned: stats.total_files,
-                        dirs_scanned: stats.total_dirs,
-                        bytes_scanned: stats.total_size,
+                        files_scanned: collection.stats.total_files,
+                        dirs_scanned: collection.stats.total_dirs,
+                        bytes_scanned: collection.stats.total_size,
                         current_path: path.clone(),
-                        errors_count: warnings.len() as u64,
+                        errors_count: collection.warnings.len() as u64,
                         elapsed: std::time::Duration::ZERO,
                     });
                 }
@@ -328,7 +335,7 @@ impl JwalkScanner {
                     continue;
                 }
 
-                stats.record_symlink();
+                collection.stats.record_symlink();
 
                 if let Some(parent) = path.parent() {
                     // Read symlink target once; re-use for both the warning and
@@ -344,7 +351,9 @@ impl JwalkScanner {
                     };
 
                     if symlink_broken {
-                        warnings.push(ScanWarning::broken_symlink(&path, symlink_target.as_str()));
+                        collection
+                            .warnings
+                            .push(ScanWarning::broken_symlink(&path, symlink_target.as_str()));
                     }
 
                     let entry_info = EntryInfo {
@@ -476,7 +485,8 @@ impl JwalkScanner {
         };
 
         // Sort children by size (descending)
-        node.children.sort_by(|a, b| b.size.cmp(&a.size));
+        node.children
+            .sort_by_key(|child| std::cmp::Reverse(child.size));
 
         node
     }

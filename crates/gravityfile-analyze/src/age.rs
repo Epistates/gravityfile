@@ -219,15 +219,14 @@ impl AgeAnalyzer {
         );
 
         // Sort stale directories by size descending and apply limit
-        stale_candidates.sort_by(|a, b| b.size.cmp(&a.size));
+        stale_candidates.sort_by_key(|candidate| Reverse(candidate.size));
         stale_candidates.truncate(self.config.max_stale_dirs);
 
         // Calculate average age
-        let average_age = if total_files > 0 {
-            Duration::from_secs(total_age_secs / total_files)
-        } else {
-            Duration::ZERO
-        };
+        let average_age = total_age_secs
+            .checked_div(total_files)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
 
         // Find median bucket (bucket containing the cumulative 50th-percentile file).
         //
@@ -270,7 +269,7 @@ impl AgeAnalyzer {
                     .into_iter()
                     .map(|(Reverse(size), path, modified)| (path, size, modified))
                     .collect();
-                largest_files.sort_by(|a, b| b.1.cmp(&a.1));
+                largest_files.sort_by_key(|file| Reverse(file.1));
                 AgeBucketStats {
                     name: bucket.name,
                     max_age: bucket.max_age,

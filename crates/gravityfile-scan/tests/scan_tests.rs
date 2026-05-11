@@ -377,14 +377,18 @@ fn test_scan_disk_size_uses_block_count_not_byte_length() {
         .apparent_size(false)
         .build()
         .unwrap();
-    let tree_disk = scanner().scan(&config_disk, CancellationToken::new()).unwrap();
+    let tree_disk = scanner()
+        .scan(&config_disk, CancellationToken::new())
+        .unwrap();
 
     let config_apparent = ScanConfig::builder()
         .root(root)
         .apparent_size(true)
         .build()
         .unwrap();
-    let tree_apparent = scanner().scan(&config_apparent, CancellationToken::new()).unwrap();
+    let tree_apparent = scanner()
+        .scan(&config_apparent, CancellationToken::new())
+        .unwrap();
 
     // Disk usage must be strictly less than apparent size for a sparse file.
     assert!(

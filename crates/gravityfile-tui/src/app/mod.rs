@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::execute;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::execute;
 use futures::{FutureExt, StreamExt};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::{RwLock, mpsc};
@@ -23,9 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::{FileNode, FileTree};
-use gravityfile_ops::{
-    Conflict, CopyOptions, MoveOptions, OperationProgress, UndoLog,
-};
+use gravityfile_ops::{Conflict, CopyOptions, MoveOptions, OperationProgress, UndoLog};
 use gravityfile_scan::ScanProgress;
 
 use crate::TuiConfig;
@@ -322,9 +320,7 @@ impl App {
                 "git_status": node.git_status,
                 "child_count": node.children.len(),
             });
-            if let Ok(plugin_val) =
-                serde_json::from_value::<gravityfile_plugin::Value>(shallow)
-            {
+            if let Ok(plugin_val) = serde_json::from_value::<gravityfile_plugin::Value>(shallow) {
                 ctx.set("selected_node", plugin_val);
             }
         }
@@ -393,11 +389,9 @@ impl App {
                         Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
                             self.dispatch_key_event(key_event);
                         }
-                        Event::Mouse(mouse_event) => {
-                            if self.mode == AppMode::Normal {
-                                let action = MouseAction::from_mouse_event(mouse_event);
-                                self.handle_mouse_action(action);
-                            }
+                        Event::Mouse(mouse_event) if self.mode == AppMode::Normal => {
+                            let action = MouseAction::from_mouse_event(mouse_event);
+                            self.handle_mouse_action(action);
                         }
                         _ => {}
                     }
@@ -412,11 +406,9 @@ impl App {
                                         break;
                                     }
                                 }
-                                Event::Mouse(mouse_event) => {
-                                    if self.mode == AppMode::Normal {
-                                        let action = MouseAction::from_mouse_event(mouse_event);
-                                        self.handle_mouse_action(action);
-                                    }
+                                Event::Mouse(mouse_event) if self.mode == AppMode::Normal => {
+                                    let action = MouseAction::from_mouse_event(mouse_event);
+                                    self.handle_mouse_action(action);
                                 }
                                 _ => {}
                             }
@@ -703,11 +695,17 @@ impl App {
                 // Record in undo log if successful
                 if let Some(undo) = undo_info {
                     let description = match operation_type {
-                        gravityfile_ops::OperationType::Copy => format!("Copied {} items", succeeded),
-                        gravityfile_ops::OperationType::Move => format!("Moved {} items", succeeded),
+                        gravityfile_ops::OperationType::Copy => {
+                            format!("Copied {} items", succeeded)
+                        }
+                        gravityfile_ops::OperationType::Move => {
+                            format!("Moved {} items", succeeded)
+                        }
                         gravityfile_ops::OperationType::Rename => "Renamed item".to_string(),
                         gravityfile_ops::OperationType::CreateFile => "Created file".to_string(),
-                        gravityfile_ops::OperationType::CreateDirectory => "Created directory".to_string(),
+                        gravityfile_ops::OperationType::CreateDirectory => {
+                            "Created directory".to_string()
+                        }
                         _ => format!("{:?} operation", operation_type),
                     };
                     self.undo_log.record(undo, description);
@@ -773,7 +771,7 @@ impl App {
 
         // Sort children by size descending (same order as treemap layout)
         let mut children: Vec<&FileNode> = node.children.iter().collect();
-        children.sort_by(|a, b| b.size.cmp(&a.size));
+        children.sort_by_key(|child| std::cmp::Reverse(child.size));
 
         let child = children.get(self.treemap_state.selected)?;
         let path = root_path.join(&*child.name);
@@ -1202,27 +1200,22 @@ impl App {
             KeyAction::CloseDirTab => {
                 self.tab_manager.close_active_tab();
             }
-            KeyAction::NextDirTab => {
+            KeyAction::NextDirTab if self.tab_manager.len() > 1 => {
                 // Only switch tabs if there are multiple
-                if self.tab_manager.len() > 1 {
-                    self.tab_manager.next_tab();
-                    self.sync_from_active_tab();
-                }
+                self.tab_manager.next_tab();
+                self.sync_from_active_tab();
             }
-            KeyAction::PrevDirTab => {
+            KeyAction::PrevDirTab if self.tab_manager.len() > 1 => {
                 // Only switch tabs if there are multiple
-                if self.tab_manager.len() > 1 {
-                    self.tab_manager.prev_tab();
-                    self.sync_from_active_tab();
-                }
+                self.tab_manager.prev_tab();
+                self.sync_from_active_tab();
             }
-            KeyAction::DirTab(n) => {
+            KeyAction::DirTab(n) if self.tab_manager.len() > 1 => {
                 // Only switch tabs if there are multiple
-                if self.tab_manager.len() > 1 {
-                    self.tab_manager.switch_to_number(n as usize);
-                    self.sync_from_active_tab();
-                }
+                self.tab_manager.switch_to_number(n as usize);
+                self.sync_from_active_tab();
             }
+            KeyAction::NextDirTab | KeyAction::PrevDirTab | KeyAction::DirTab(_) => {}
 
             KeyAction::MoveUp => self.move_up(),
             KeyAction::MoveDown => self.move_down(),
@@ -1284,18 +1277,17 @@ impl App {
             KeyAction::ClearMarks => {
                 self.marked.clear();
             }
-            KeyAction::EnterVisual => {
+            KeyAction::EnterVisual if self.view == View::Explorer => {
                 // Enter visual selection mode
                 // Only supported in Explorer view for now
-                if self.view == View::Explorer {
-                    let start_index = match self.layout_mode {
-                        LayoutMode::Tree => self.tree_state.selected,
-                        LayoutMode::Miller => self.miller_state.selected,
-                    };
-                    self.visual_state = Some(state::VisualState::new(start_index));
-                    self.mode = AppMode::Visual;
-                }
+                let start_index = match self.layout_mode {
+                    LayoutMode::Tree => self.tree_state.selected,
+                    LayoutMode::Miller => self.miller_state.selected,
+                };
+                self.visual_state = Some(state::VisualState::new(start_index));
+                self.mode = AppMode::Visual;
             }
+            KeyAction::EnterVisual => {}
 
             // Clipboard operations
             KeyAction::Yank => {
@@ -1388,25 +1380,23 @@ impl App {
                 }
             }
 
-            KeyAction::DrillDown | KeyAction::OpenFile => {
-                if self.view == View::Explorer {
-                    // Check if selected item is a file or directory
-                    let is_file = self.is_selected_file();
-                    if is_file {
-                        self.open_selected_file();
-                    } else {
-                        match self.layout_mode {
-                            LayoutMode::Tree => self.drill_into_selected(),
-                            LayoutMode::Miller => self.drill_into_miller_selected(),
-                        }
+            KeyAction::DrillDown | KeyAction::OpenFile if self.view == View::Explorer => {
+                // Check if selected item is a file or directory
+                let is_file = self.is_selected_file();
+                if is_file {
+                    self.open_selected_file();
+                } else {
+                    match self.layout_mode {
+                        LayoutMode::Tree => self.drill_into_selected(),
+                        LayoutMode::Miller => self.drill_into_miller_selected(),
                     }
                 }
             }
-            KeyAction::NavigateBack => {
-                if self.view == View::Explorer {
-                    self.navigate_back();
-                }
+            KeyAction::DrillDown | KeyAction::OpenFile => {}
+            KeyAction::NavigateBack if self.view == View::Explorer => {
+                self.navigate_back();
             }
+            KeyAction::NavigateBack => {}
 
             KeyAction::CommandMode => {
                 self.command_input.clear();
@@ -1781,7 +1771,9 @@ impl App {
     }
 
     /// Adapt copy result channel to ScanResult channel.
-    fn adapt_copy_rx(mut rx: mpsc::Receiver<gravityfile_ops::CopyResult>) -> mpsc::Receiver<ScanResult> {
+    fn adapt_copy_rx(
+        mut rx: mpsc::Receiver<gravityfile_ops::CopyResult>,
+    ) -> mpsc::Receiver<ScanResult> {
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
@@ -1815,7 +1807,9 @@ impl App {
     }
 
     /// Adapt move result channel to ScanResult channel.
-    fn adapt_move_rx(mut rx: mpsc::Receiver<gravityfile_ops::MoveResult>) -> mpsc::Receiver<ScanResult> {
+    fn adapt_move_rx(
+        mut rx: mpsc::Receiver<gravityfile_ops::MoveResult>,
+    ) -> mpsc::Receiver<ScanResult> {
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
@@ -3074,10 +3068,9 @@ impl App {
         // Cache current tree before navigating away (if we have scan data)
         if let Some(tree) = &self.tree
             && self.has_full_scan
+            && let Some(cache) = &mut self.scanned_cache
         {
-            if let Some(cache) = &mut self.scanned_cache {
-                cache.insert(tree.root_path.clone(), tree.clone());
-            }
+            cache.insert(tree.root_path.clone(), tree.clone());
         }
 
         // Load the parent directory contents
@@ -3120,10 +3113,8 @@ impl App {
         for child in &mut node.children {
             if child.is_dir() {
                 let child_path = node_path.join(&*child.name);
-                if let Some(cached_tree) = self
-                    .scanned_cache
-                    .as_ref()
-                    .and_then(|c| c.get(&child_path))
+                if let Some(cached_tree) =
+                    self.scanned_cache.as_ref().and_then(|c| c.get(&child_path))
                 {
                     // Replace this child with the cached scan data
                     *child = cached_tree.root.clone();
@@ -3983,12 +3974,13 @@ impl App {
                 }
             }
             // Allow jumping directly by pressing the bookmark key
-            KeyCode::Char(c) if state::Bookmarks::is_valid_key(c) => {
-                if self.user_settings.bookmarks.get(c).is_some() {
-                    self.bookmark_list_state = None;
-                    self.mode = AppMode::Normal;
-                    self.jump_to_bookmark(c);
-                }
+            KeyCode::Char(c)
+                if state::Bookmarks::is_valid_key(c)
+                    && self.user_settings.bookmarks.get(c).is_some() =>
+            {
+                self.bookmark_list_state = None;
+                self.mode = AppMode::Normal;
+                self.jump_to_bookmark(c);
             }
             _ => {}
         }
@@ -4325,89 +4317,83 @@ impl App {
                     }
                 }
             }
-            MouseAction::Click { y, .. } => {
+            MouseAction::Click { y, .. } if self.view == View::Explorer => {
                 // For now, simple click-to-select functionality
                 // Calculate which item was clicked based on the Y position
                 // This is a simplified implementation - a more complete version would
                 // track rendered areas from the last frame
 
-                if self.view == View::Explorer {
-                    // Estimate header height (path bar + tabs)
-                    let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
-                    let _footer_height: u16 = 1; // Reserved for future use in click calculation
+                // Estimate header height (path bar + tabs)
+                let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                let _footer_height: u16 = 1; // Reserved for future use in click calculation
 
-                    if y > header_height {
-                        let relative_y = (y - header_height) as usize;
+                if y > header_height {
+                    let relative_y = (y - header_height) as usize;
 
-                        match self.layout_mode {
-                            LayoutMode::Tree => {
-                                let new_selected = self.tree_state.offset + relative_y;
-                                if new_selected < self.cached_tree_len {
-                                    self.tree_state.selected = new_selected;
-                                }
+                    match self.layout_mode {
+                        LayoutMode::Tree => {
+                            let new_selected = self.tree_state.offset + relative_y;
+                            if new_selected < self.cached_tree_len {
+                                self.tree_state.selected = new_selected;
                             }
-                            LayoutMode::Miller => {
-                                // In Miller mode, the middle column starts after the left column
-                                // This is a simplified version - we just select by row
-                                let new_selected = self.miller_state.offset + relative_y;
-                                if new_selected < self.cached_miller_len {
-                                    self.miller_state.selected = new_selected;
-                                    self.update_preview();
-                                }
+                        }
+                        LayoutMode::Miller => {
+                            // In Miller mode, the middle column starts after the left column
+                            // This is a simplified version - we just select by row
+                            let new_selected = self.miller_state.offset + relative_y;
+                            if new_selected < self.cached_miller_len {
+                                self.miller_state.selected = new_selected;
+                                self.update_preview();
                             }
                         }
                     }
                 }
             }
-            MouseAction::DoubleClick { y, .. } => {
+            MouseAction::DoubleClick { y, .. } if self.view == View::Explorer => {
                 // Double-click to enter directory
-                if self.view == View::Explorer {
-                    let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
 
-                    if y > header_height {
-                        let relative_y = (y - header_height) as usize;
+                if y > header_height {
+                    let relative_y = (y - header_height) as usize;
 
-                        match self.layout_mode {
-                            LayoutMode::Tree => {
-                                let new_selected = self.tree_state.offset + relative_y;
-                                if new_selected < self.cached_tree_len {
-                                    self.tree_state.selected = new_selected;
-                                    self.drill_into_selected();
-                                }
+                    match self.layout_mode {
+                        LayoutMode::Tree => {
+                            let new_selected = self.tree_state.offset + relative_y;
+                            if new_selected < self.cached_tree_len {
+                                self.tree_state.selected = new_selected;
+                                self.drill_into_selected();
                             }
-                            LayoutMode::Miller => {
-                                let new_selected = self.miller_state.offset + relative_y;
-                                if new_selected < self.cached_miller_len {
-                                    self.miller_state.selected = new_selected;
-                                    self.drill_into_miller_selected();
-                                }
+                        }
+                        LayoutMode::Miller => {
+                            let new_selected = self.miller_state.offset + relative_y;
+                            if new_selected < self.cached_miller_len {
+                                self.miller_state.selected = new_selected;
+                                self.drill_into_miller_selected();
                             }
                         }
                     }
                 }
             }
-            MouseAction::RightClick { y, .. } => {
+            MouseAction::RightClick { y, .. } if self.view == View::Explorer => {
                 // Right-click to toggle mark
-                if self.view == View::Explorer {
-                    let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
 
-                    if y > header_height {
-                        let relative_y = (y - header_height) as usize;
+                if y > header_height {
+                    let relative_y = (y - header_height) as usize;
 
-                        match self.layout_mode {
-                            LayoutMode::Tree => {
-                                let new_selected = self.tree_state.offset + relative_y;
-                                if new_selected < self.cached_tree_len {
-                                    self.tree_state.selected = new_selected;
-                                    self.toggle_mark();
-                                }
+                    match self.layout_mode {
+                        LayoutMode::Tree => {
+                            let new_selected = self.tree_state.offset + relative_y;
+                            if new_selected < self.cached_tree_len {
+                                self.tree_state.selected = new_selected;
+                                self.toggle_mark();
                             }
-                            LayoutMode::Miller => {
-                                let new_selected = self.miller_state.offset + relative_y;
-                                if new_selected < self.cached_miller_len {
-                                    self.miller_state.selected = new_selected;
-                                    self.toggle_mark();
-                                }
+                        }
+                        LayoutMode::Miller => {
+                            let new_selected = self.miller_state.offset + relative_y;
+                            if new_selected < self.cached_miller_len {
+                                self.miller_state.selected = new_selected;
+                                self.toggle_mark();
                             }
                         }
                     }

@@ -31,14 +31,15 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
                     return Err(mlua::Error::external("Read denied by sandbox policy"));
                 }
                 // Also check total file size if metadata is available
-                if let Ok(meta) = std::fs::metadata(path) {
-                    if meta.len() > sb.max_read_size as u64 && limit > sb.max_read_size {
-                        return Err(mlua::Error::external(format!(
-                            "Read denied: file too large ({} bytes > {} limit)",
-                            meta.len(),
-                            sb.max_read_size
-                        )));
-                    }
+                if let Ok(meta) = std::fs::metadata(path)
+                    && meta.len() > sb.max_read_size as u64
+                    && limit > sb.max_read_size
+                {
+                    return Err(mlua::Error::external(format!(
+                        "Read denied: file too large ({} bytes > {} limit)",
+                        meta.len(),
+                        sb.max_read_size
+                    )));
                 }
             }
 
@@ -76,14 +77,15 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
                 if !sb.can_read(path) {
                     return Err(mlua::Error::external("Read denied by sandbox policy"));
                 }
-                if let Ok(meta) = std::fs::metadata(path) {
-                    if meta.len() > sb.max_read_size as u64 && limit > sb.max_read_size {
-                        return Err(mlua::Error::external(format!(
-                            "Read denied: file too large ({} bytes > {} limit)",
-                            meta.len(),
-                            sb.max_read_size
-                        )));
-                    }
+                if let Ok(meta) = std::fs::metadata(path)
+                    && meta.len() > sb.max_read_size as u64
+                    && limit > sb.max_read_size
+                {
+                    return Err(mlua::Error::external(format!(
+                        "Read denied: file too large ({} bytes > {} limit)",
+                        meta.len(),
+                        sb.max_read_size
+                    )));
                 }
             }
 
