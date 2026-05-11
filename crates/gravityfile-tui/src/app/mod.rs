@@ -211,9 +211,6 @@ impl App {
         if let Ok(rt) = gravityfile_plugin::rhai::RhaiRuntime::new() {
             let _ = pm_inner.register_runtime(Box::new(rt));
         }
-        if let Ok(rt) = gravityfile_plugin::wasm::WasmRuntime::new() {
-            let _ = pm_inner.register_runtime(Box::new(rt));
-        }
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
 

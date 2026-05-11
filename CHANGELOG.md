@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-05-11
+
+### Security
+
+- **WASM runtime removed** - Removed the Extism/WASM plugin runtime because the latest Extism release pins a vulnerable Wasmtime line; Lua and Rhai plugin runtimes remain supported
+
+### Changed
+
+- **Dependencies updated** - Bumped direct workspace dependencies to current releases, including `zip` 8, `bzip2` 0.6, `rayon` 1.12, `compact_str` 0.9, `which` 8, and `crossterm` 0.29
+- **Lockfile refreshed** - Pruned stale transitive dependencies after removing the unsafe WASM runtime path and unused optional dependencies
+- **Clippy cleanups** - Kept the workspace warning-free under `cargo clippy --workspace --all-features -- -D warnings`
+
+### Fixed
+
+- **Crossterm backend alignment** - Updated Ratatui/Crossterm integration to use a single Crossterm 0.29 backend stack
+- **Unused `treemd` dependency** - Removed the optional Rust `treemd` crate and feature while preserving external `treemd` command integration
+
 ## [0.2.5] - 2026-03-11
 
 ### Fixed
@@ -220,6 +237,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[0.2.6]: https://github.com/epistates/gravityfile/releases/tag/v0.2.6
 [0.2.5]: https://github.com/epistates/gravityfile/releases/tag/v0.2.5
 [0.2.4]: https://github.com/epistates/gravityfile/releases/tag/v0.2.4
 [0.2.2]: https://github.com/epistates/gravityfile/releases/tag/v0.2.2

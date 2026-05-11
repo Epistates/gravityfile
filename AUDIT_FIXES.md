@@ -1,7 +1,41 @@
 # Audit Fix Tracker
 
 Status: **Complete**
-Date: 2026-03-10
+Date: 2026-05-10
+
+---
+
+## 2026-05 Dependency Audit
+
+### DEP-1: Extism latest release pins vulnerable Wasmtime 41
+- **Files:** `crates/gravityfile-plugin`, `crates/gravityfile-tui`, `README.md`, `docs/PLUGINS.md`
+- **Issue:** `cargo audit` reported critical Wasmtime advisories through `extism 1.21.0`. Extism currently requires `wasmtime = "^41"`, while RustSec fixed ranges start at `>=42.0.2`/newer, so a Cargo override cannot safely resolve it.
+- **Fix:** Removed the compiled Extism/WASM runtime and stale WASM example/docs. Lua and Rhai plugin runtimes remain enabled.
+- **Status:** [x] DONE
+
+### DEP-2: Unused `treemd` crate pulls a large image stack
+- **Files:** `crates/gravityfile-tui/Cargo.toml`, `crates/gravityfile-tui/src/opener.rs`
+- **Issue:** The optional `treemd` feature did not call into the `treemd` crate; markdown opening shells out to an external `treemd` command. The dependency added substantial transitive surface and an unmaintained `paste` advisory warning through AVIF/image crates.
+- **Fix:** Removed the unused optional crate/feature and kept the external-command opener behavior.
+- **Status:** [x] DONE
+
+### DEP-3: Duplicate Crossterm backend versions
+- **Files:** `Cargo.toml`
+- **Issue:** `gravityfile-tui` depended on `crossterm 0.28` while `ratatui 0.30` also supports and pulls `crossterm 0.29`, leaving duplicate terminal backend versions in the graph.
+- **Fix:** Switched Ratatui to its `crossterm_0_29` feature and bumped the direct `crossterm` dependency to `0.29`.
+- **Status:** [x] DONE
+
+### DEP-4: Direct dependency versions lagged transitive latests
+- **Files:** `Cargo.toml`, `crates/gravityfile-tui/Cargo.toml`
+- **Issue:** The workspace used `compact_str 0.8` while Ratatui already uses `0.9`, and TUI used `which 7` while transitive crates used `which 8`.
+- **Fix:** Bumped direct `compact_str` and `which` requirements to the latest compatible major lines.
+- **Status:** [x] DONE
+
+### DEP-5: Strict latest direct dependency pass
+- **Files:** `Cargo.toml`
+- **Issue:** `cargo upgrade --dry-run --incompatible` still found direct manifest ranges behind latest stable releases for `rayon`, `zip`, and `bzip2`.
+- **Fix:** Bumped `rayon` to `1.12`, `zip` to `8`, and `bzip2` to `0.6`.
+- **Status:** [x] DONE
 
 ---
 

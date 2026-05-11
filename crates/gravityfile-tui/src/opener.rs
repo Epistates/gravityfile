@@ -138,17 +138,6 @@ fn is_text_extension(ext: &str) -> bool {
 fn open_markdown(path: &Path, openers: &FileOpeners) -> OpenResult {
     let opener = &openers.md;
 
-    // Check for treemd feature
-    #[cfg(feature = "treemd")]
-    {
-        if opener == "treemd" {
-            // Use built-in treemd - needs terminal suspend
-            let mut cmd = Command::new("treemd");
-            cmd.arg(path);
-            return OpenResult::NeedsSuspend(cmd);
-        }
-    }
-
     // External treemd or other opener
     if opener == "treemd" {
         // Check if treemd is available

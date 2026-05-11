@@ -97,7 +97,7 @@ pub struct PluginMetadata {
     #[serde(default)]
     pub url: String,
 
-    /// Runtime to use (lua, rhai, wasm).
+    /// Runtime to use (lua or rhai).
     #[serde(default = "default_runtime")]
     pub runtime: String,
 

@@ -61,10 +61,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Trait that all plugin runtime implementations must satisfy.
 ///
-/// This trait abstracts over the specific scripting language (Lua, Rhai, WASM)
+/// This trait abstracts over the specific scripting language (Lua or Rhai)
 /// allowing plugins to be written in any supported language.
 pub trait PluginRuntime: Send + Sync {
-    /// Get the name of this runtime (e.g., "lua", "rhai", "wasm").
+    /// Get the name of this runtime (e.g., "lua" or "rhai").
     fn name(&self) -> &'static str;
 
     /// Get the file extensions this runtime handles (e.g., [".lua"]).

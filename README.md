@@ -24,7 +24,7 @@
 - **Safe Operations**: Copy, move, and rename with a robust **Undo System**. Deletions default to system Trash.
 - **Git Integration**: Real-time indicators for modified, staged, and untracked files.
 - **Visual Mode**: Vim-style range selection (`V`) and bulk operations.
-- **Extensible Plugin System**: Customize functionality using **Lua**, **Rhai**, or **WASM** (via Extism).
+- **Extensible Plugin System**: Customize functionality using **Lua** or **Rhai**.
 - **Modern UI**: Full dark/light theme support, glassmorphism-inspired aesthetics, and smooth animations.
 
 ## 🔌 Plugin System
@@ -61,7 +61,7 @@ This installs both `gravityfile` and the short alias `grav`.
 ## 📖 Documentation
 
 - [**User Guide**](#tui-keybindings) - Essential keybindings and usage.
-- [**Plugin Development**](docs/PLUGINS.md) - Extend gravityfile with Lua, Rhai, or WASM.
+- [**Plugin Development**](docs/PLUGINS.md) - Extend gravityfile with Lua or Rhai.
 - [**Architecture Deep-Dive**](docs/ARCHITECTURE.md) - Understanding the technical design.
 
 ## ⌨️ TUI Keybindings
@@ -89,7 +89,7 @@ This installs both `gravityfile` and the short alias `grav`.
 - **Runtime**: [Tokio](https://tokio.rs/)
 - **Serialization**: [Serde](https://serde.rs/)
 - **Hashing**: [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)
-- **Plugin Runtimes**: `mlua`, `rhai`, `extism` (WASM)
+- **Plugin Runtimes**: `mlua`, `rhai`
 
 ## ⚖️ License
 
