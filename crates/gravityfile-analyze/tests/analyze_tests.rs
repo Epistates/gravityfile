@@ -1,6 +1,7 @@
-use gravityfile_analyze::{DuplicateConfig, DuplicateFinder};
+use gravityfile_analyze::{AgeAnalyzer, AgeBucket, AgeConfig, DuplicateConfig, DuplicateFinder};
 use gravityfile_core::{FileNode, FileTree, NodeId, ScanConfig, Timestamps};
 use std::fs;
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -339,6 +340,169 @@ fn test_find_duplicates_in_nested_structure() {
     assert_eq!(report.group_count, 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn test_find_duplicates_ignores_hardlinked_aliases() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+
+    let original = root.join("original.bin");
+    let alias = root.join("alias.bin");
+    fs::write(&original, "same physical file").unwrap();
+    fs::hard_link(&original, &alias).unwrap();
+
+    let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
+    let finder = DuplicateFinder::with_config(config);
+    let tree = create_test_tree_with_files(root, &[original, alias]);
+
+    let report = finder.find_duplicates(&tree, CancellationToken::new());
+
+    assert_eq!(
+        report.files_analyzed, 1,
+        "hardlinked aliases should be analyzed once by inode"
+    );
+    assert!(
+        !report.has_duplicates(),
+        "hardlinks should not be reported as reclaimable duplicate content"
+    );
+}
+
+#[test]
+fn test_age_analyzer_reports_buckets_average_median_and_top_files() {
+    let temp = TempDir::new().unwrap();
+    let root_path = temp.path();
+    let reference_time = SystemTime::UNIX_EPOCH + days(500);
+
+    let root = test_dir(
+        1,
+        "root",
+        vec![
+            test_file(2, "fresh.bin", 100, reference_time - days(1)),
+            test_file(3, "warm.bin", 500, reference_time - days(3)),
+            test_file(4, "old.bin", 1_000, reference_time - days(400)),
+        ],
+    );
+    let tree = test_tree(root_path, root);
+
+    let config = AgeConfig::builder()
+        .reference_time(reference_time)
+        .buckets(vec![
+            AgeBucket::new("Fresh", days(2)),
+            AgeBucket::new("Warm", days(30)),
+            AgeBucket::new("Old", Duration::MAX),
+        ])
+        .min_stale_size(u64::MAX)
+        .top_files_per_bucket(1usize)
+        .build()
+        .unwrap();
+    let report = AgeAnalyzer::with_config(config).analyze(&tree, CancellationToken::new());
+
+    assert_eq!(report.total_files, 3);
+    assert_eq!(report.total_size, 1_600);
+    assert_eq!(
+        report.average_age.as_secs(),
+        (days(1).as_secs() + days(3).as_secs() + days(400).as_secs()) / 3
+    );
+    assert_eq!(report.median_age_bucket.as_deref(), Some("Warm"));
+
+    let fresh = bucket(&report, "Fresh");
+    assert_eq!(fresh.file_count, 1);
+    assert_eq!(fresh.total_size, 100);
+    assert_eq!(fresh.largest_files[0].0, root_path.join("fresh.bin"));
+
+    let warm = bucket(&report, "Warm");
+    assert_eq!(warm.file_count, 1);
+    assert_eq!(warm.total_size, 500);
+    assert_eq!(warm.largest_files[0].0, root_path.join("warm.bin"));
+
+    let old = bucket(&report, "Old");
+    assert_eq!(old.file_count, 1);
+    assert_eq!(old.total_size, 1_000);
+    assert_eq!(old.largest_files[0].0, root_path.join("old.bin"));
+}
+
+#[test]
+fn test_age_analyzer_reports_stale_directories_sorted_and_limited() {
+    let temp = TempDir::new().unwrap();
+    let root_path = temp.path();
+    let reference_time = SystemTime::UNIX_EPOCH + days(1_000);
+
+    let root = test_dir(
+        1,
+        "root",
+        vec![
+            test_dir(
+                2,
+                "old_big",
+                vec![test_file(3, "data.bin", 2_000, reference_time - days(500))],
+            ),
+            test_dir(
+                4,
+                "old_bigger",
+                vec![test_file(5, "data.bin", 4_000, reference_time - days(450))],
+            ),
+            test_dir(
+                6,
+                "old_small",
+                vec![test_file(7, "data.bin", 500, reference_time - days(600))],
+            ),
+            test_dir(
+                8,
+                "new_big",
+                vec![test_file(9, "data.bin", 10_000, reference_time - days(2))],
+            ),
+        ],
+    );
+    let tree = test_tree(root_path, root);
+
+    let config = AgeConfig::builder()
+        .reference_time(reference_time)
+        .stale_threshold(days(365))
+        .min_stale_size(1_000u64)
+        .max_stale_dirs(1usize)
+        .buckets(vec![AgeBucket::new("Any", Duration::MAX)])
+        .build()
+        .unwrap();
+    let report = AgeAnalyzer::with_config(config).analyze(&tree, CancellationToken::new());
+
+    assert!(report.has_stale_directories());
+    assert_eq!(report.stale_directories.len(), 1);
+    let stale = &report.stale_directories[0];
+    assert_eq!(stale.path, root_path.join("old_bigger"));
+    assert_eq!(stale.size, 4_000);
+    assert_eq!(stale.file_count, 1);
+    assert_eq!(stale.newest_file_age, days(450));
+    assert_eq!(report.total_stale_size(), 4_000);
+}
+
+#[test]
+fn test_age_analyzer_honors_pre_cancelled_token() {
+    let temp = TempDir::new().unwrap();
+    let reference_time = SystemTime::UNIX_EPOCH + days(100);
+    let root = test_dir(
+        1,
+        "root",
+        vec![test_file(2, "ignored.bin", 100, reference_time - days(10))],
+    );
+    let tree = test_tree(temp.path(), root);
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let config = AgeConfig::builder()
+        .reference_time(reference_time)
+        .buckets(vec![AgeBucket::new("Any", Duration::MAX)])
+        .build()
+        .unwrap();
+    let report = AgeAnalyzer::with_config(config).analyze(&tree, token);
+
+    assert_eq!(report.total_files, 0);
+    assert_eq!(report.total_size, 0);
+    assert_eq!(report.average_age, Duration::ZERO);
+    assert_eq!(report.median_age_bucket, None);
+    assert_eq!(report.buckets[0].file_count, 0);
+    assert!(report.stale_directories.is_empty());
+}
+
 fn create_test_tree_with_files(
     root_dir: &std::path::Path,
     paths: &[std::path::PathBuf],
@@ -359,6 +523,15 @@ fn create_test_tree_with_files(
             Timestamps::with_modified(now),
             false,
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            node.inode = Some(gravityfile_core::InodeInfo::new(
+                metadata.ino(),
+                metadata.dev(),
+            ));
+        }
 
         // Read actual content for hashing
         if let Ok(content) = fs::read(path) {
@@ -445,6 +618,15 @@ fn create_test_tree_with_nested_files(
             false,
         );
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            node.inode = Some(gravityfile_core::InodeInfo::new(
+                metadata.ino(),
+                metadata.dev(),
+            ));
+        }
+
         if let Ok(content) = fs::read(path) {
             use blake3::Hasher;
             let mut hasher = Hasher::new();
@@ -489,4 +671,55 @@ fn create_test_tree_with_nested_files(
         std::time::Duration::from_secs(0),
         Vec::new(),
     )
+}
+
+fn days(days: u64) -> Duration {
+    Duration::from_secs(days * 24 * 60 * 60)
+}
+
+fn test_file(id: u64, name: &str, size: u64, modified: SystemTime) -> FileNode {
+    FileNode::new_file(
+        NodeId::new(id),
+        name,
+        size,
+        (size / 512).max(1),
+        Timestamps::with_modified(modified),
+        false,
+    )
+}
+
+fn test_dir(id: u64, name: &str, children: Vec<FileNode>) -> FileNode {
+    let mut node = FileNode::new_directory(
+        NodeId::new(id),
+        name,
+        Timestamps::with_modified(SystemTime::UNIX_EPOCH),
+    );
+    node.size = children.iter().map(|child| child.size).sum();
+    node.children = children;
+    node.update_counts();
+    node
+}
+
+fn test_tree(root_dir: &std::path::Path, mut root: FileNode) -> FileTree {
+    root.update_counts();
+    let config = ScanConfig::new(root_dir);
+    FileTree::new(
+        root,
+        root_dir.to_path_buf(),
+        config,
+        gravityfile_core::TreeStats::default(),
+        Duration::ZERO,
+        Vec::new(),
+    )
+}
+
+fn bucket<'a>(
+    report: &'a gravityfile_analyze::AgeReport,
+    name: &str,
+) -> &'a gravityfile_analyze::AgeBucketStats {
+    report
+        .buckets
+        .iter()
+        .find(|bucket| bucket.name == name)
+        .unwrap_or_else(|| panic!("missing age bucket {name}"))
 }

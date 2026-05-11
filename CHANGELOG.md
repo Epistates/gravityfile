@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Dependencies updated** - Bumped direct workspace dependencies to current releases, including `zip` 8, `bzip2` 0.6, `rayon` 1.12, `compact_str` 0.9, `which` 8, and `crossterm` 0.29
+- **Latest dependency refresh** - Updated direct dependencies to latest available releases, including `mlua` 0.12.0-rc.1 and the direct Unix `libc` dependency to 1.0.0-alpha.3
 - **Lockfile refreshed** - Pruned stale transitive dependencies after removing the unsafe WASM runtime path and unused optional dependencies
 - **Clippy cleanups** - Kept the workspace warning-free under `cargo clippy --workspace --all-features -- -D warnings`
 
@@ -21,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Crossterm backend alignment** - Updated Ratatui/Crossterm integration to use a single Crossterm 0.29 backend stack
 - **Unused `treemd` dependency** - Removed the optional Rust `treemd` crate and feature while preserving external `treemd` command integration
+- **Robustness coverage** - Added integration tests for copy/move/undo file workflows, symlink-preserving copies, duplicate hardlink handling, and age-analysis bucket/stale-directory reporting
 
 ## [0.2.5] - 2026-03-11
 

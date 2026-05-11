@@ -47,7 +47,7 @@ open = "5"
 
 # PTY buffer flush on quit (unix only)
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "1.0.0-alpha.3"
 
 # Safe deletion (move to trash instead of permanent delete)
 trash.workspace = true

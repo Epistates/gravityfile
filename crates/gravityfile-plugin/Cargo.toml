@@ -17,7 +17,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 # Plugin runtimes
-mlua = { version = "0.11", features = ["lua54", "async", "serialize", "send", "vendored"] }
+mlua = { version = "0.12.0-rc.1", features = ["lua54", "async", "serialize", "send", "vendored"] }
 rhai = { version = "1.24", features = ["sync", "serde"] }
 
 # Configuration
