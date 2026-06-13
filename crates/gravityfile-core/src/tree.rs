@@ -205,7 +205,13 @@ mod tests {
         // oldest/newest (which previously happened via a Unix-epoch fallback).
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_size, 30);
-        assert_eq!(stats.oldest_file.as_ref().unwrap().0, Path::new("/has_time"));
-        assert_eq!(stats.newest_file.as_ref().unwrap().0, Path::new("/has_time"));
+        assert_eq!(
+            stats.oldest_file.as_ref().unwrap().0,
+            Path::new("/has_time")
+        );
+        assert_eq!(
+            stats.newest_file.as_ref().unwrap().0,
+            Path::new("/has_time")
+        );
     }
 }

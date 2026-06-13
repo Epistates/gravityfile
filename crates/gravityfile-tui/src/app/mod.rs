@@ -216,8 +216,8 @@ impl App {
         // Initialize plugin manager and register runtimes. Scope the plugin
         // filesystem API to the scan root so hook plugins can read scanned files
         // without being granted access to the whole filesystem.
-        let plugin_config = gravityfile_plugin::PluginConfig::default()
-            .with_fs_read_roots(vec![path.clone()]);
+        let plugin_config =
+            gravityfile_plugin::PluginConfig::default().with_fs_read_roots(vec![path.clone()]);
         let mut pm_inner = gravityfile_plugin::PluginManager::new(plugin_config);
         if let Ok(rt) = gravityfile_plugin::lua::LuaRuntime::new() {
             let _ = pm_inner.register_runtime(Box::new(rt));
@@ -4313,7 +4313,9 @@ impl App {
                     let view_root = self.view_root.clone();
                     (start..=end)
                         .filter_map(|i| {
-                            node.children.get(i).map(|child| view_root.join(&*child.name))
+                            node.children
+                                .get(i)
+                                .map(|child| view_root.join(&*child.name))
                         })
                         .collect()
                 } else {

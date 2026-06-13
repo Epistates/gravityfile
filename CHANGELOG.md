@@ -5,32 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.6] - 2026-05-11
+## [0.3.0] - 2026-06-14
+
+First release since 0.2.4; this entry consolidates all changes shipped since
+that release.
 
 ### Security
 
+- **Enforced plugin sandbox permissions** - Declared `PluginPermissions` are now bridged into an enforced `SandboxConfig` scoped to the scan root, so a plugin's filesystem/network/env/command grants are actually applied rather than advisory; filesystem access defaults to deny-all via the new `fs_read_roots` configuration
+- **Hardened hook dispatch** - Added a Tower-based middleware pipeline (timeout/util) around hook dispatch to bound plugin execution
 - **WASM runtime removed** - Removed the Extism/WASM plugin runtime because the latest Extism release pins a vulnerable Wasmtime line; Lua and Rhai plugin runtimes remain supported
-
-### Changed
-
-- **Dependencies updated** - Bumped direct workspace dependencies to current releases, including `zip` 8, `bzip2` 0.6, `rayon` 1.12, `compact_str` 0.9, `which` 8, and `crossterm` 0.29
-- **Latest dependency refresh** - Updated direct dependencies to latest available releases, including `mlua` 0.12.0-rc.1 and the direct Unix `libc` dependency to 1.0.0-alpha.3
-- **Lockfile refreshed** - Pruned stale transitive dependencies after removing the unsafe WASM runtime path and unused optional dependencies
-- **Clippy cleanups** - Kept the workspace warning-free under `cargo clippy --workspace --all-features -- -D warnings`
 
 ### Fixed
 
+- **Data-loss-safe overwrites** - `Overwrite`/`OverwriteAll` copy and move operations now stage into a temporary sibling and atomically swap into place, so a mid-operation failure can never destroy the existing destination
+- **Directory recursion guard** - Added a maximum directory recursion depth to prevent stack overflow on adversarially deep nesting during recursive copy/move
+- **Lua value conversion drift** - Centralized Lua↔`Value` conversions in `lua/convert.rs` so the main runtime and the isolated context can no longer disagree on array-vs-object handling (the isolate previously flattened Lua arrays into objects)
+- **Quit unresponsive during mouse activity** - Replaced sync `crossterm::event::poll`/`read` drain loop with async `EventStream::now_or_never()`, fixing key events (`q`, Ctrl-C) being dropped when mouse motion floods the event queue
+- **Slow quit** - Skip event drain, navigation check, and suspend handling once quit is triggered; reduced runtime shutdown timeout from 100ms to 10ms
+- **Terminal cleanup on quit** - Drain buffered events after disabling mouse capture before restoring terminal, preventing raw escape sequences from leaking to the shell
 - **Crossterm backend alignment** - Updated Ratatui/Crossterm integration to use a single Crossterm 0.29 backend stack
 - **Unused `treemd` dependency** - Removed the optional Rust `treemd` crate and feature while preserving external `treemd` command integration
 - **Robustness coverage** - Added integration tests for copy/move/undo file workflows, symlink-preserving copies, duplicate hardlink handling, and age-analysis bucket/stale-directory reporting
 
-## [0.2.5] - 2026-03-11
+### Changed
 
-### Fixed
-
-- **Quit unresponsive during mouse activity** - Replaced sync `crossterm::event::poll`/`read` drain loop with async `EventStream::now_or_never()`, fixing key events (`q`, Ctrl-C) being dropped when mouse motion floods the event queue
-- **Slow quit** - Skip event drain, navigation check, and suspend handling once quit is triggered; reduced runtime shutdown timeout from 100ms to 10ms
-- **Terminal cleanup on quit** - Drain buffered events after disabling mouse capture before restoring terminal, preventing raw escape sequences from leaking to the shell
+- **Ops internals deduplicated** - Extracted shared copy/symlink/remove helpers across the copy and move paths
+- **TUI/scan/core refinements** - Rendering, scanning, tree, and configuration cleanups
+- **Dependencies updated** - Bumped direct workspace dependencies to current releases, including `zip` 8, `bzip2` 0.6, `rayon` 1.12, `compact_str` 0.9, `which` 8, and `crossterm` 0.29
+- **Latest dependency refresh** - Updated direct dependencies to latest available releases, including `mlua` 0.12.0-rc.1 and the direct Unix `libc` dependency to 1.0.0-alpha.3
+- **Lockfile refreshed** - Pruned stale transitive dependencies after removing the unsafe WASM runtime path and unused optional dependencies
+- **Clippy cleanups** - Kept the workspace warning-free under `cargo clippy --workspace --all-features -- -D warnings`
 
 ## [0.2.4] - 2026-03-11
 

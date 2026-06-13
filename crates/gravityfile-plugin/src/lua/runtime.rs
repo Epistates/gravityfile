@@ -583,9 +583,7 @@ mod tests {
         let start = std::time::Instant::now();
         let res = rt.call_hook_sync(
             handle,
-            &Hook::OnAction {
-                action: "x".into(),
-            },
+            &Hook::OnAction { action: "x".into() },
             &HookContext::new(),
         );
 
@@ -612,9 +610,7 @@ mod tests {
         let res = rt
             .call_hook_sync(
                 handle,
-                &Hook::OnAction {
-                    action: "x".into(),
-                },
+                &Hook::OnAction { action: "x".into() },
                 &HookContext::new(),
             )
             .unwrap();

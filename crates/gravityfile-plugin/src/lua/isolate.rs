@@ -217,12 +217,10 @@ impl IsolatedContext for LuaIsolatedContext {
     }
 
     fn set_global(&mut self, name: &str, value: Value) -> PluginResult<()> {
-        let lua_val =
-            value_to_lua(&self.lua, &value)
-                .map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                })?;
+        let lua_val = value_to_lua(&self.lua, &value).map_err(|e| PluginError::ExecutionError {
+            name: "isolate".into(),
+            message: e.to_string(),
+        })?;
 
         self.lua
             .globals()

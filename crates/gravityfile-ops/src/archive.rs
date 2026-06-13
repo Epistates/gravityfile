@@ -337,7 +337,12 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
             // entry whose declared size lies can't write past the limits.
             let entry_label = entry_path.display().to_string();
             let mut outfile = File::create(&outpath)?;
-            match copy_with_limit(&mut entry, &mut outfile, total_extracted_bytes, &entry_label) {
+            match copy_with_limit(
+                &mut entry,
+                &mut outfile,
+                total_extracted_bytes,
+                &entry_label,
+            ) {
                 Ok(written) => {
                     total_extracted_bytes = total_extracted_bytes.saturating_add(written);
                 }

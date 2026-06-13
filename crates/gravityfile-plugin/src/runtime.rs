@@ -503,7 +503,8 @@ impl PluginManager {
         // roughly its per-call timeout even when several are registered.
         let plugin_budget = self.config.default_timeout_ms.max(1);
         let active = self.plugins.len().max(1) as u64;
-        let budget = Duration::from_millis(plugin_budget.saturating_mul(active).saturating_add(500));
+        let budget =
+            Duration::from_millis(plugin_budget.saturating_mul(active).saturating_add(500));
 
         let request = HookDispatch {
             hook: hook.clone(),

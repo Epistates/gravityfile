@@ -346,4 +346,3 @@ fn get_dir_size(dir: &Path) -> u64 {
     }
     size
 }
-

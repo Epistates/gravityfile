@@ -157,7 +157,11 @@ async fn copy_overwrite_replaces_destination_content() {
     let leftovers: Vec<_> = fs::read_dir(&destination)
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(".gravityfile-tmp"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".gravityfile-tmp")
+        })
         .collect();
     assert!(leftovers.is_empty(), "overwrite left a staging temp behind");
 }

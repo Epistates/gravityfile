@@ -645,8 +645,8 @@ impl RhaiIsolatedContext {
     /// Arm the watchdog for one execution and return the deadline (if any).
     /// Pairs with [`disarm_watchdog`](Self::disarm_watchdog).
     fn arm_watchdog(&self, cancel: &CancellationToken) -> Option<Instant> {
-        let deadline = (self.timeout_ms > 0)
-            .then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
+        let deadline =
+            (self.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
         let mut guard = self.watchdog.lock().unwrap_or_else(|e| e.into_inner());
         guard.deadline = deadline;
         guard.cancel = Some(cancel.clone());
@@ -817,9 +817,7 @@ mod tests {
         // than hang the calling task.
         let ctx = isolate_with_root(std::env::temp_dir(), 50);
         let token = CancellationToken::new();
-        let res = ctx
-            .execute(b"let mut i = 0; loop { i += 1; }", token)
-            .await;
+        let res = ctx.execute(b"let mut i = 0; loop { i += 1; }", token).await;
         assert!(res.is_err(), "runaway loop should be bounded, got {res:?}");
     }
 
@@ -833,7 +831,10 @@ mod tests {
             .execute(b"fs_read(\"/etc/hosts\")", token)
             .await
             .unwrap();
-        assert!(matches!(val, Value::Null), "expected denied read, got {val:?}");
+        assert!(
+            matches!(val, Value::Null),
+            "expected denied read, got {val:?}"
+        );
     }
 
     #[tokio::test]
