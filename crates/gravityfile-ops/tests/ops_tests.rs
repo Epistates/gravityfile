@@ -124,6 +124,79 @@ async fn copy_directory_recreates_symlink_without_following_target() {
 }
 
 #[tokio::test]
+async fn copy_overwrite_replaces_destination_content() {
+    let tmp = TempDir::new().unwrap();
+    let source_dir = tmp.path().join("source");
+    let destination = tmp.path().join("destination");
+    let source = source_dir.join("data.txt");
+    let existing = destination.join("data.txt");
+
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(&source, "new content").unwrap();
+    fs::write(&existing, "old content").unwrap();
+
+    let options = CopyOptions {
+        conflict_resolution: Some(ConflictResolution::Overwrite),
+        preserve_timestamps: false,
+    };
+    let rx = start_copy(
+        vec![source.clone()],
+        destination.clone(),
+        options,
+        CancellationToken::new(),
+    );
+
+    let (complete, _created, conflicts) = wait_for_copy_complete(rx).await;
+
+    assert_eq!(complete.succeeded, 1);
+    assert_eq!(complete.failed, 0);
+    assert_eq!(conflicts, 0);
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "new content");
+    // No staging temp files should be left behind.
+    let leftovers: Vec<_> = fs::read_dir(&destination)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".gravityfile-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "overwrite left a staging temp behind");
+}
+
+#[tokio::test]
+async fn copy_overwrite_failure_preserves_existing_destination() {
+    // When the staged copy fails (here: the source no longer exists), the
+    // pre-existing destination must be left intact — no data loss.
+    let tmp = TempDir::new().unwrap();
+    let destination = tmp.path().join("destination");
+    let existing = destination.join("ghost.txt");
+    let missing_source = tmp.path().join("source").join("ghost.txt");
+
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(&existing, "precious").unwrap();
+
+    let options = CopyOptions {
+        conflict_resolution: Some(ConflictResolution::Overwrite),
+        preserve_timestamps: false,
+    };
+    let rx = start_copy(
+        vec![missing_source],
+        destination.clone(),
+        options,
+        CancellationToken::new(),
+    );
+
+    let (complete, _created, _conflicts) = wait_for_copy_complete(rx).await;
+
+    assert_eq!(complete.succeeded, 0);
+    assert_eq!(complete.failed, 1);
+    assert_eq!(
+        fs::read_to_string(&existing).unwrap(),
+        "precious",
+        "failed overwrite must not destroy the existing destination"
+    );
+}
+
+#[tokio::test]
 async fn move_auto_rename_keeps_existing_destination_and_records_final_pair() {
     let tmp = TempDir::new().unwrap();
     let source_dir = tmp.path().join("source");

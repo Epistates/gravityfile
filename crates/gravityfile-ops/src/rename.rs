@@ -144,6 +144,12 @@ pub fn validate_filename(name: &str) -> Result<(), String> {
         }
     }
 
+    // Reject control characters (newline, tab, DEL, etc.): they break many
+    // tools and enable terminal display spoofing.
+    if name.chars().any(|c| c.is_control()) {
+        return Err("Name cannot contain control characters".into());
+    }
+
     // Additional Windows restrictions (good to enforce everywhere for portability)
     #[cfg(target_os = "windows")]
     {
@@ -204,5 +210,13 @@ mod tests {
         assert!(validate_filename("file ").is_err());
         assert!(validate_filename(" file").is_err());
         assert!(validate_filename("file.").is_err());
+    }
+
+    #[test]
+    fn test_validate_filename_rejects_control_chars() {
+        assert!(validate_filename("a\nb").is_err());
+        assert!(validate_filename("a\tb").is_err());
+        assert!(validate_filename("a\u{7f}b").is_err());
+        assert!(validate_filename("a\u{1b}[31m").is_err());
     }
 }

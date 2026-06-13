@@ -111,45 +111,46 @@ impl ScanConfig {
         config
     }
 
-    /// Compile ignore patterns into a `GlobSet` for efficient matching.
-    /// Call this after modifying `ignore_patterns`.
-    pub fn compile_patterns(&mut self) {
-        if self.ignore_patterns.is_empty() {
-            self.compiled_ignore = None;
-            return;
+    /// Build a `GlobSet` from a list of ignore patterns, skipping invalid globs.
+    /// Returns `None` when there are no patterns. Single source of truth for
+    /// compiling ignore patterns (used by `compile_patterns`, `should_ignore`,
+    /// and the scanner's on-the-fly fallback).
+    pub fn build_ignore_globset(patterns: &[String]) -> Option<GlobSet> {
+        if patterns.is_empty() {
+            return None;
         }
         let mut builder = GlobSetBuilder::new();
-        for pattern in &self.ignore_patterns {
+        for pattern in patterns {
             if let Ok(glob) = Glob::new(pattern) {
                 builder.add(glob);
             }
         }
-        self.compiled_ignore = builder.build().ok();
+        builder.build().ok()
     }
 
-    /// Check if a name should be ignored based on compiled glob patterns.
-    pub fn should_ignore(&self, name: &str) -> bool {
-        if let Some(ref globset) = self.compiled_ignore {
-            globset.is_match(name)
-        } else if !self.ignore_patterns.is_empty() {
-            // Fallback: compile on-the-fly (patterns not yet compiled)
-            self.ignore_patterns.iter().any(|p| {
-                Glob::new(p)
-                    .map(|g| g.compile_matcher().is_match(name))
-                    .unwrap_or(false)
-            })
-        } else {
-            false
+    /// The effective ignore `GlobSet`: the precompiled one if present, otherwise
+    /// compiled on demand from `ignore_patterns`.
+    pub fn effective_ignore_globset(&self) -> Option<GlobSet> {
+        match &self.compiled_ignore {
+            Some(set) => Some(set.clone()),
+            None => Self::build_ignore_globset(&self.ignore_patterns),
         }
     }
 
-    /// Return the compiled `GlobSet` for ignore patterns, if any.
-    ///
-    /// This is the same set used internally by `should_ignore`. Useful when
-    /// callers need an owned, `Send + Sync` handle (e.g. for closures sent
-    /// to thread pools) without recompiling the patterns.
-    pub fn compiled_ignore_set(&self) -> Option<&GlobSet> {
-        self.compiled_ignore.as_ref()
+    /// Compile ignore patterns into a `GlobSet` for efficient matching.
+    /// Call this after modifying `ignore_patterns`.
+    pub fn compile_patterns(&mut self) {
+        self.compiled_ignore = Self::build_ignore_globset(&self.ignore_patterns);
+    }
+
+    /// Check if a name should be ignored based on the ignore glob patterns.
+    pub fn should_ignore(&self, name: &str) -> bool {
+        match &self.compiled_ignore {
+            Some(globset) => globset.is_match(name),
+            // Fallback: compile on-the-fly (patterns not yet compiled).
+            None => Self::build_ignore_globset(&self.ignore_patterns)
+                .is_some_and(|set| set.is_match(name)),
+        }
     }
 
     /// Check if hidden files should be skipped.

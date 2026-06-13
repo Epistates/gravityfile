@@ -27,5 +27,8 @@ dirs = "6"
 # Async utilities
 futures = "0.3"
 
+# Composable middleware for the hook-dispatch pipeline
+tower = { version = "0.5", features = ["timeout", "util"] }
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -556,7 +556,7 @@ fn create_test_tree_with_files(
             stats.record_file(
                 path,
                 metadata.len(),
-                now,
+                Some(now),
                 1, // depth
             );
         }
@@ -657,7 +657,7 @@ fn create_test_tree_with_nested_files(
             stats.record_file(
                 path,
                 metadata.len(),
-                now,
+                Some(now),
                 1, // depth
             );
         }

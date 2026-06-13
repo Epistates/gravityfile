@@ -257,9 +257,17 @@ impl DuplicateFinder {
         let mut groups = duplicate_groups;
         groups.sort_by_key(|group| Reverse(group.wasted_bytes));
 
-        // Compute all summary stats from the full (untruncated) groups list
-        let total_duplicate_size: u64 = groups.iter().map(|g| g.size * g.paths.len() as u64).sum();
-        let total_wasted_space: u64 = groups.iter().map(|g| g.wasted_bytes).sum();
+        // Compute all summary stats from the full (untruncated) groups list.
+        // Saturating arithmetic guards against overflow on pathological inputs
+        // (huge files duplicated very many times).
+        let total_duplicate_size: u64 = groups
+            .iter()
+            .map(|g| g.size.saturating_mul(g.paths.len() as u64))
+            .fold(0u64, u64::saturating_add);
+        let total_wasted_space: u64 = groups
+            .iter()
+            .map(|g| g.wasted_bytes)
+            .fold(0u64, u64::saturating_add);
         let files_with_duplicates: u64 = groups.iter().map(|g| g.paths.len() as u64).sum();
         let group_count = groups.len();
 
@@ -439,7 +447,7 @@ impl DuplicateFinder {
             for (hash, paths) in full_groups {
                 if paths.len() >= 2 {
                     let size = size_for_hash[&hash];
-                    let wasted_bytes = size * (paths.len() as u64 - 1);
+                    let wasted_bytes = size.saturating_mul(paths.len() as u64 - 1);
                     result.push(DuplicateGroup {
                         hash,
                         size,
@@ -494,7 +502,7 @@ impl DuplicateFinder {
         for (hash, paths) in groups {
             if paths.len() >= 2 {
                 let size = size_for_hash[&hash];
-                let wasted_bytes = size * (paths.len() as u64 - 1);
+                let wasted_bytes = size.saturating_mul(paths.len() as u64 - 1);
                 result.push(DuplicateGroup {
                     hash,
                     size,

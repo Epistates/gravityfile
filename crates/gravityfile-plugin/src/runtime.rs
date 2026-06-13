@@ -13,24 +13,32 @@ use indexmap::IndexMap;
 ///
 /// This is the single source of truth used by both `discover_plugins` and
 /// `load_plugin` when collecting the hooks a plugin implements.
-const HOOK_NAMES: &[&str] = &[
+pub(crate) const HOOK_NAMES: &[&str] = &[
     "on_navigate",
     "on_drill_down",
     "on_back",
     "on_scan_start",
     "on_scan_progress",
     "on_scan_complete",
+    "on_scan_error",
     "on_delete_start",
     "on_delete_complete",
     "on_copy_start",
     "on_copy_complete",
     "on_move_start",
     "on_move_complete",
+    "on_rename_start",
+    "on_rename_complete",
+    "on_duplicates_found",
+    "on_age_analysis_complete",
     "on_render",
     "on_action",
     "on_mode_change",
+    "on_selection_change",
     "on_startup",
     "on_shutdown",
+    "on_plugin_load",
+    "on_plugin_unload",
 ];
 
 use tokio_util::sync::CancellationToken;
@@ -165,8 +173,13 @@ pub trait IsolatedContext: Send {
 /// Information about a loaded plugin.
 #[derive(Debug, Clone)]
 pub struct LoadedPlugin {
-    /// Unique handle for this plugin.
+    /// Manager-global handle for this plugin (unique across all runtimes).
     pub handle: PluginHandle,
+
+    /// Runtime-local handle, used to call back into the owning runtime.
+    /// Distinct from `handle` because each runtime numbers its plugins from 0,
+    /// so two runtimes can hand out the same local handle.
+    pub(crate) runtime_handle: PluginHandle,
 
     /// Plugin ID (usually directory name).
     pub id: String,
@@ -181,6 +194,12 @@ pub struct LoadedPlugin {
     pub hooks: Vec<String>,
 }
 
+/// Owned request passed through the hook-dispatch Tower service.
+struct HookDispatch {
+    hook: Hook,
+    ctx: HookContext,
+}
+
 /// Manager for all plugin runtimes and loaded plugins.
 pub struct PluginManager {
     /// Available runtimes keyed by name.
@@ -192,8 +211,7 @@ pub struct PluginManager {
     /// Plugin config.
     config: PluginConfig,
 
-    /// Next plugin handle ID (reserved for future use).
-    #[allow(dead_code)]
+    /// Next manager-global plugin handle ID.
     next_handle: usize,
 }
 
@@ -231,6 +249,13 @@ impl PluginManager {
         }
     }
 
+    /// Allocate a fresh manager-global plugin handle.
+    fn alloc_handle(&mut self) -> PluginHandle {
+        let handle = PluginHandle(self.next_handle);
+        self.next_handle += 1;
+        handle
+    }
+
     /// Register a plugin runtime.
     pub fn register_runtime(&mut self, runtime: Box<dyn PluginRuntime>) -> PluginResult<()> {
         let name = runtime.name().to_string();
@@ -258,6 +283,12 @@ impl PluginManager {
 
     /// Discover and load plugins from the plugin directory.
     pub async fn discover_plugins(&mut self) -> PluginResult<Vec<LoadedPlugin>> {
+        // Respect the global enable switch — when off, the subsystem does nothing.
+        if !self.config.enabled {
+            tracing::debug!("Plugin system disabled; skipping discovery");
+            return Ok(vec![]);
+        }
+
         let plugin_dir = self.config.plugin_dir.clone();
         if !plugin_dir.exists() {
             return Ok(vec![]);
@@ -280,12 +311,22 @@ impl PluginManager {
                 continue;
             }
 
-            // Parse metadata
-            let toml_content = std::fs::read_to_string(&toml_path)?;
-            let metadata: PluginMetadata =
-                toml::from_str(&toml_content).map_err(|e| PluginError::ConfigError {
-                    message: e.to_string(),
-                })?;
+            // Parse metadata. One broken plugin must not abort discovery of the
+            // rest — log and skip it.
+            let metadata: PluginMetadata = match std::fs::read_to_string(&toml_path)
+                .map_err(|e| e.to_string())
+                .and_then(|content| toml::from_str(&content).map_err(|e| e.to_string()))
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %toml_path.display(),
+                        error = %e,
+                        "Skipping plugin with unreadable or invalid plugin.toml"
+                    );
+                    continue;
+                }
+            };
 
             // Validate plugin name to prevent injection or path-manipulation attacks
             if let Err(e) = Self::validate_plugin_name(&metadata.name) {
@@ -297,13 +338,25 @@ impl PluginManager {
                 continue;
             }
 
+            // Honour the per-plugin disable list.
+            if self.config.is_disabled(&metadata.name) {
+                tracing::info!(plugin = %metadata.name, "Skipping disabled plugin");
+                continue;
+            }
+
             // Find the appropriate runtime
             let runtime_name = &metadata.runtime;
-            let runtime = self.runtimes.get_mut(runtime_name).ok_or_else(|| {
-                PluginError::RuntimeNotAvailable {
-                    runtime: runtime_name.clone(),
+            let runtime = match self.runtimes.get_mut(runtime_name) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        plugin = %metadata.name,
+                        runtime = %runtime_name,
+                        "Skipping plugin: no runtime registered for it"
+                    );
+                    continue;
                 }
-            })?;
+            };
 
             // Find the entry point file and verify it stays within the plugin dir
             let entry_file = path.join(&metadata.entry);
@@ -327,18 +380,32 @@ impl PluginManager {
                 continue;
             }
 
-            // Load the plugin
-            let handle = runtime.load_plugin(&metadata.name, &entry_file)?;
+            // Load the plugin (runtime-local handle). A single plugin failing to
+            // load must not abort discovery of the rest.
+            let runtime_handle = match runtime.load_plugin(&metadata.name, &entry_file) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %metadata.name,
+                        error = %e,
+                        "Failed to load plugin"
+                    );
+                    continue;
+                }
+            };
 
             // Collect hooks
             let hooks: Vec<String> = HOOK_NAMES
                 .iter()
-                .filter(|h| runtime.has_hook(handle, h))
+                .filter(|h| runtime.has_hook(runtime_handle, h))
                 .map(|s| s.to_string())
                 .collect();
 
+            // The `runtime` borrow ends above; allocate the global handle now.
+            let handle = self.alloc_handle();
             let loaded_plugin = LoadedPlugin {
                 handle,
+                runtime_handle,
                 id: metadata.name.clone(),
                 metadata,
                 path: path.clone(),
@@ -385,18 +452,21 @@ impl PluginManager {
             });
         }
 
-        // Load plugin
-        let handle = runtime.load_plugin(&metadata.name, &entry_file)?;
+        // Load plugin (runtime-local handle).
+        let runtime_handle = runtime.load_plugin(&metadata.name, &entry_file)?;
 
         // Collect hooks
         let hooks: Vec<String> = HOOK_NAMES
             .iter()
-            .filter(|h| runtime.has_hook(handle, h))
+            .filter(|h| runtime.has_hook(runtime_handle, h))
             .map(|s| s.to_string())
             .collect();
 
+        // The `runtime` borrow ends above; allocate the global handle now.
+        let handle = self.alloc_handle();
         let loaded_plugin = LoadedPlugin {
             handle,
+            runtime_handle,
             id: metadata.name.clone(),
             metadata,
             path: path.to_path_buf(),
@@ -412,32 +482,75 @@ impl PluginManager {
         if let Some(plugin) = self.plugins.shift_remove(&handle)
             && let Some(runtime) = self.runtimes.get_mut(&plugin.metadata.runtime)
         {
-            runtime.unload_plugin(handle)?;
+            runtime.unload_plugin(plugin.runtime_handle)?;
         }
         Ok(())
     }
 
     /// Dispatch a hook to all plugins that implement it.
+    ///
+    /// The dispatch runs through a small Tower service stack: a wall-clock
+    /// `Timeout` layer bounds the whole dispatch (defense-in-depth alongside the
+    /// in-VM CPU/memory guards in each runtime), and the inner service runs the
+    /// per-plugin loop. Composing it this way means cross-cutting concerns
+    /// (timeout, and future additions like concurrency limiting or load
+    /// shedding) are layers rather than inline code.
     pub async fn dispatch_hook(&self, hook: &Hook, ctx: &HookContext) -> Vec<HookResult> {
+        use std::time::Duration;
+        use tower::{ServiceBuilder, ServiceExt, service_fn};
+
+        // Overall budget scales with the plugin count so each plugin still gets
+        // roughly its per-call timeout even when several are registered.
+        let plugin_budget = self.config.default_timeout_ms.max(1);
+        let active = self.plugins.len().max(1) as u64;
+        let budget = Duration::from_millis(plugin_budget.saturating_mul(active).saturating_add(500));
+
+        let request = HookDispatch {
+            hook: hook.clone(),
+            ctx: ctx.clone(),
+        };
+
+        let inner = service_fn(|req: HookDispatch| async move {
+            Ok::<_, std::convert::Infallible>(self.run_hook_dispatch(&req.hook, &req.ctx).await)
+        });
+
+        let svc = ServiceBuilder::new().timeout(budget).service(inner);
+
+        match svc.oneshot(request).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::warn!(
+                    hook = %hook.name(),
+                    "Hook dispatch exceeded its {budget:?} time budget; discarding results"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// The per-plugin dispatch loop (the inner Tower service body).
+    async fn run_hook_dispatch(&self, hook: &Hook, ctx: &HookContext) -> Vec<HookResult> {
         let hook_name = hook.name();
         let mut results = vec![];
 
-        for (handle, plugin) in &self.plugins {
-            if !plugin.hooks.contains(&hook_name.to_string()) {
+        for (_handle, plugin) in &self.plugins {
+            if !plugin.hooks.iter().any(|h| h == hook_name) {
                 continue;
             }
 
             if let Some(runtime) = self.runtimes.get(&plugin.metadata.runtime) {
+                let rh = plugin.runtime_handle;
                 let result = if hook.is_sync() {
-                    runtime.call_hook_sync(*handle, hook, ctx)
+                    runtime.call_hook_sync(rh, hook, ctx)
                 } else {
-                    runtime.call_hook_async(*handle, hook, ctx).await
+                    runtime.call_hook_async(rh, hook, ctx).await
                 };
 
                 match result {
                     Ok(r) => {
-                        results.push(r.clone());
-                        if r.stop_propagation {
+                        let stop = r.stop_propagation;
+                        results.push(r);
+                        if stop {
                             break;
                         }
                     }
@@ -454,6 +567,14 @@ impl PluginManager {
         }
 
         results
+    }
+
+    /// Returns true if any hook result requested that the host's default action
+    /// be prevented. Callers that gate a default action on plugins (navigation,
+    /// deletion, …) can use this on the [`dispatch_hook`](Self::dispatch_hook)
+    /// results.
+    pub fn any_prevent_default(results: &[HookResult]) -> bool {
+        results.iter().any(|r| r.prevent_default)
     }
 
     /// Get all loaded plugins.
@@ -486,5 +607,174 @@ impl PluginManager {
 impl Default for PluginManager {
     fn default() -> Self {
         Self::new(PluginConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PluginMetadata;
+    use crate::hooks::HookResult;
+    use std::time::Duration;
+
+    /// A minimal runtime whose async hook sleeps for a configurable delay,
+    /// letting us exercise the Tower dispatch timeout budget deterministically.
+    struct SleepRuntime {
+        delay: Duration,
+    }
+
+    impl PluginRuntime for SleepRuntime {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn file_extensions(&self) -> &'static [&'static str] {
+            &[".mock"]
+        }
+        fn init(&mut self, _config: &PluginConfig) -> PluginResult<()> {
+            Ok(())
+        }
+        fn load_plugin(&mut self, _id: &str, _source: &Path) -> PluginResult<PluginHandle> {
+            Ok(PluginHandle(0))
+        }
+        fn unload_plugin(&mut self, _handle: PluginHandle) -> PluginResult<()> {
+            Ok(())
+        }
+        fn get_metadata(&self, _handle: PluginHandle) -> Option<&PluginMetadata> {
+            None
+        }
+        fn has_hook(&self, _handle: PluginHandle, _hook_name: &str) -> bool {
+            true
+        }
+        fn call_hook_sync(
+            &self,
+            _handle: PluginHandle,
+            _hook: &Hook,
+            _ctx: &HookContext,
+        ) -> PluginResult<HookResult> {
+            Ok(HookResult {
+                handled: true,
+                ..Default::default()
+            })
+        }
+        fn call_hook_async<'a>(
+            &'a self,
+            _handle: PluginHandle,
+            _hook: &'a Hook,
+            _ctx: &'a HookContext,
+        ) -> BoxFuture<'a, PluginResult<HookResult>> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(HookResult {
+                    handled: true,
+                    ..Default::default()
+                })
+            })
+        }
+        fn call_method<'a>(
+            &'a self,
+            _handle: PluginHandle,
+            _method: &'a str,
+            _args: Vec<Value>,
+        ) -> BoxFuture<'a, PluginResult<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+        fn create_isolated_context(
+            &self,
+            _sandbox: &SandboxConfig,
+        ) -> PluginResult<Box<dyn IsolatedContext>> {
+            Err(PluginError::RuntimeNotAvailable {
+                runtime: "mock".into(),
+            })
+        }
+        fn loaded_plugins(&self) -> Vec<PluginHandle> {
+            vec![PluginHandle(0)]
+        }
+        fn shutdown(&mut self) -> PluginResult<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_metadata() -> PluginMetadata {
+        PluginMetadata {
+            name: "mock".into(),
+            version: "0.0.0".into(),
+            description: String::new(),
+            author: String::new(),
+            url: String::new(),
+            runtime: "mock".into(),
+            kind: PluginKind::default(),
+            entry: "main.mock".into(),
+            min_version: None,
+            hooks: Default::default(),
+            permissions: Default::default(),
+            dependencies: vec![],
+        }
+    }
+
+    /// Build a manager wired with a single mock plugin subscribed to `on_startup`,
+    /// whose async hook sleeps for `delay`.
+    fn manager_with_sleeping_plugin(timeout_ms: u64, delay: Duration) -> PluginManager {
+        let config = PluginConfig {
+            default_timeout_ms: timeout_ms,
+            ..Default::default()
+        };
+        let mut pm = PluginManager::new(config);
+        pm.register_runtime(Box::new(SleepRuntime { delay }))
+            .unwrap();
+        let handle = pm.alloc_handle();
+        pm.plugins.insert(
+            handle,
+            LoadedPlugin {
+                handle,
+                runtime_handle: PluginHandle(0),
+                id: "mock".into(),
+                metadata: mock_metadata(),
+                path: std::path::PathBuf::from("/tmp/mock"),
+                hooks: vec!["on_startup".into()],
+            },
+        );
+        pm
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_result_within_budget() {
+        // Hook completes well inside the budget → its result is returned.
+        let pm = manager_with_sleeping_plugin(50, Duration::from_millis(0));
+        let ctx = HookContext::new();
+        let results = pm.dispatch_hook(&Hook::OnStartup, &ctx).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].handled);
+    }
+
+    #[test]
+    fn any_prevent_default_reflects_veto() {
+        let allow = HookResult {
+            handled: true,
+            ..Default::default()
+        };
+        let veto = HookResult {
+            handled: true,
+            prevent_default: true,
+            ..Default::default()
+        };
+        assert!(!PluginManager::any_prevent_default(&[]));
+        assert!(!PluginManager::any_prevent_default(std::slice::from_ref(
+            &allow
+        )));
+        assert!(PluginManager::any_prevent_default(&[allow, veto]));
+    }
+
+    #[tokio::test]
+    async fn dispatch_discards_results_past_time_budget() {
+        // budget = default_timeout_ms * active(1) + 500ms ≈ 510ms.
+        // A 2s hook blows the budget, so dispatch sheds and returns nothing.
+        let pm = manager_with_sleeping_plugin(10, Duration::from_secs(2));
+        let ctx = HookContext::new();
+        let results = pm.dispatch_hook(&Hook::OnStartup, &ctx).await;
+        assert!(
+            results.is_empty(),
+            "expected empty results when dispatch exceeds its time budget"
+        );
     }
 }

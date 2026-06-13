@@ -47,7 +47,10 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
                 return Ok(LuaValue::Nil);
             }
 
-            let f = std::fs::File::open(path).map_err(mlua::Error::external)?;
+            // Open the canonicalized path so a symlink swapped in after the
+            // sandbox check can't redirect the read (TOCTOU mitigation).
+            let real = std::fs::canonicalize(path).map_err(mlua::Error::external)?;
+            let f = std::fs::File::open(&real).map_err(mlua::Error::external)?;
             let mut content = String::new();
             f.take(limit as u64)
                 .read_to_string(&mut content)
@@ -93,7 +96,9 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
                 return Ok(LuaValue::Nil);
             }
 
-            let f = std::fs::File::open(path).map_err(mlua::Error::external)?;
+            // Open the canonicalized path (TOCTOU mitigation, see fs.read).
+            let real = std::fs::canonicalize(path).map_err(mlua::Error::external)?;
+            let f = std::fs::File::open(&real).map_err(mlua::Error::external)?;
             let mut buf = Vec::new();
             f.take(limit as u64)
                 .read_to_end(&mut buf)

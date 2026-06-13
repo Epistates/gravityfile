@@ -158,13 +158,52 @@ pub fn extract_archive(archive_path: &Path, destination: &Path) -> ArchiveResult
     }
 }
 
+/// Copy from `reader` to `writer`, enforcing the per-entry and cumulative
+/// extraction-size limits against the *actual* bytes written rather than the
+/// attacker-declared header size. Returns the number of bytes written.
+///
+/// This is the ZIP counterpart to the TAR path's post-unpack byte accounting:
+/// the `zip` crate's reader stops at the end of the compressed stream, which a
+/// crafted archive can make far larger than the declared uncompressed size.
+fn copy_with_limit<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    already_extracted: u64,
+    entry_name: &str,
+) -> ArchiveResult<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        written = written.saturating_add(n as u64);
+        if written > MAX_SINGLE_ENTRY_SIZE {
+            return Err(ArchiveError::DecompressionBomb(format!(
+                "Entry '{}' extracted past the maximum size of {} bytes",
+                entry_name, MAX_SINGLE_ENTRY_SIZE
+            )));
+        }
+        if already_extracted.saturating_add(written) > MAX_TOTAL_EXTRACTED_SIZE {
+            return Err(ArchiveError::DecompressionBomb(format!(
+                "Archive exceeded maximum total extraction size of {} bytes",
+                MAX_TOTAL_EXTRACTED_SIZE
+            )));
+        }
+        writer.write_all(&buf[..n])?;
+    }
+    Ok(written)
+}
+
 /// Extract a ZIP archive.
 ///
 /// # Security
 /// This function validates all paths to prevent directory traversal attacks.
 /// Paths containing `..` components or absolute paths are rejected.
 /// Setuid/setgid bits are stripped from extracted file permissions.
-/// Decompression bombs are detected via ratio and size limits.
+/// Decompression bombs are detected via ratio and size limits, and the actual
+/// bytes written per entry and in total are capped during extraction.
 fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<PathBuf>> {
     let file = File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -213,6 +252,18 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
             total_uncompressed, MAX_TOTAL_EXTRACTED_SIZE
         )));
     }
+
+    // Enforce the entry-count limit (parity with the TAR path).
+    if archive.len() as u64 > MAX_ENTRY_COUNT {
+        return Err(ArchiveError::DecompressionBomb(format!(
+            "Archive exceeds maximum entry count of {}",
+            MAX_ENTRY_COUNT
+        )));
+    }
+
+    // Cumulative bytes actually written to disk, checked against the declared
+    // pre-scan totals above as defense in depth.
+    let mut total_extracted_bytes: u64 = 0;
 
     // MED-1: Extract in two passes — regular files and directories first,
     // symlinks last. This prevents a previously-extracted symlink from
@@ -282,9 +333,20 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> ArchiveResult<Vec<Pat
         if entry.is_dir() {
             std::fs::create_dir_all(&outpath)?;
         } else {
-            // Regular file
+            // Regular file. Bound the copy by actual bytes written so a crafted
+            // entry whose declared size lies can't write past the limits.
+            let entry_label = entry_path.display().to_string();
             let mut outfile = File::create(&outpath)?;
-            std::io::copy(&mut entry, &mut outfile)?;
+            match copy_with_limit(&mut entry, &mut outfile, total_extracted_bytes, &entry_label) {
+                Ok(written) => {
+                    total_extracted_bytes = total_extracted_bytes.saturating_add(written);
+                }
+                Err(e) => {
+                    drop(outfile);
+                    let _ = std::fs::remove_file(&outpath);
+                    return Err(e);
+                }
+            }
 
             // Set permissions on Unix - strip setuid/setgid bits for security
             #[cfg(unix)]
@@ -582,12 +644,31 @@ fn extract_tar_from_reader<R: Read>(reader: R, destination: &Path) -> ArchiveRes
             }
         }
 
-        // Security: Validate symlink targets (MED-4 normalizer used)
+        // Security: Validate symlink targets (MED-4 normalizer used).
+        // A symlink/hardlink entry whose link name can't be read is rejected
+        // rather than unpacked — otherwise a malformed header would bypass the
+        // escape check yet still create the link.
         let entry_type = entry.header().entry_type();
-        if (entry_type.is_symlink() || entry_type.is_hard_link())
-            && let Ok(Some(link_target)) = entry.link_name()
-        {
-            validate_tar_symlink_target(&link_target, &outpath, destination, &canonical_dest)?;
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            match entry.link_name() {
+                Ok(Some(link_target)) => {
+                    validate_tar_symlink_target(
+                        &link_target,
+                        &outpath,
+                        destination,
+                        &canonical_dest,
+                    )?;
+                }
+                _ => {
+                    return Err(ArchiveError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Link entry '{}' has an unreadable or missing target",
+                            entry_path.display()
+                        ),
+                    )));
+                }
+            }
         }
 
         entry.unpack(&outpath)?;

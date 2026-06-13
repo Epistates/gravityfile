@@ -80,7 +80,14 @@ impl JwalkScanner {
                 stats: &mut stats,
                 warnings: &mut warnings,
             };
-            self.collect_entries(config, &root_path, root_device, token, &mut collection)?
+            self.collect_entries(
+                config,
+                &root_path,
+                root_device,
+                token,
+                start,
+                &mut collection,
+            )?
         };
 
         // Build tree from collected entries
@@ -105,6 +112,7 @@ impl JwalkScanner {
         root_path: &Path,
         root_device: u64,
         token: CancellationToken,
+        start: Instant,
         collection: &mut EntryCollection<'_>,
     ) -> Result<HashMap<PathBuf, Vec<EntryInfo>>, ScanError> {
         // Use global rayon pool to avoid lingering threads from new pools.
@@ -120,25 +128,11 @@ impl JwalkScanner {
         let include_hidden = config.include_hidden;
         let token_clone = token.clone();
 
-        // Re-use the GlobSet already compiled by ScanConfig when available.
-        // Fall back to compiling on-the-fly if patterns exist but weren't compiled
-        // (e.g. config built via the derive_builder path without calling compile_patterns).
-        let ignore_globset: Option<Arc<globset::GlobSet>> = config
-            .compiled_ignore_set()
-            .cloned()
-            .map(Arc::new)
-            .or_else(|| {
-                if config.ignore_patterns.is_empty() {
-                    return None;
-                }
-                let mut builder = globset::GlobSetBuilder::new();
-                for pattern in &config.ignore_patterns {
-                    if let Ok(glob) = globset::Glob::new(pattern) {
-                        builder.add(glob);
-                    }
-                }
-                builder.build().ok().map(Arc::new)
-            });
+        // Re-use the GlobSet already compiled by ScanConfig when available,
+        // compiling on-the-fly otherwise (e.g. config built via the
+        // derive_builder path without calling compile_patterns).
+        let ignore_globset: Option<Arc<globset::GlobSet>> =
+            config.effective_ignore_globset().map(Arc::new);
 
         let walker = WalkDirGeneric::<((), ())>::new(root_path)
             .parallelism(parallelism)
@@ -246,11 +240,7 @@ impl JwalkScanner {
                         symlink_target: None,
                         symlink_broken: false,
                         executable: false,
-                        timestamps: Timestamps::new(
-                            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                            metadata.accessed().ok(),
-                            metadata.created().ok(),
-                        ),
+                        timestamps: timestamps_from(&metadata),
                         inode: Some(InodeInfo::new(get_ino(&metadata), get_dev(&metadata))),
                     };
 
@@ -284,12 +274,9 @@ impl JwalkScanner {
 
                 let blocks = get_blocks(&metadata);
 
-                collection.stats.record_file(
-                    &path,
-                    size,
-                    metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    depth,
-                );
+                collection
+                    .stats
+                    .record_file(&path, size, metadata.modified().ok(), depth);
 
                 if let Some(parent) = path.parent() {
                     let executable = is_executable(&metadata);
@@ -303,11 +290,7 @@ impl JwalkScanner {
                         symlink_target: None,
                         symlink_broken: false,
                         executable,
-                        timestamps: Timestamps::new(
-                            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                            metadata.accessed().ok(),
-                            metadata.created().ok(),
-                        ),
+                        timestamps: timestamps_from(&metadata),
                         inode: Some(inode_info),
                     };
 
@@ -315,19 +298,6 @@ impl JwalkScanner {
                         .entry(parent.to_path_buf())
                         .or_default()
                         .push(entry_info);
-                }
-
-                // Update progress periodically
-                progress_counter += 1;
-                if progress_counter.is_multiple_of(1000) {
-                    let _ = self.progress_tx.send(ScanProgress {
-                        files_scanned: collection.stats.total_files,
-                        dirs_scanned: collection.stats.total_dirs,
-                        bytes_scanned: collection.stats.total_size,
-                        current_path: path.clone(),
-                        errors_count: collection.warnings.len() as u64,
-                        elapsed: std::time::Duration::ZERO,
-                    });
                 }
             } else if file_type.is_symlink() {
                 // Filter symlinks on different filesystems at depth 1.
@@ -340,15 +310,7 @@ impl JwalkScanner {
                 if let Some(parent) = path.parent() {
                     // Read symlink target once; re-use for both the warning and
                     // the EntryInfo so we never call read_link twice.
-                    let (symlink_target, symlink_broken) = match std::fs::read_link(&path) {
-                        Ok(target) => {
-                            // path.exists() follows the link; broken if it fails.
-                            let broken = !path.exists();
-                            let target_str = CompactString::new(target.to_string_lossy());
-                            (target_str, broken)
-                        }
-                        Err(_) => (CompactString::default(), true),
-                    };
+                    let (symlink_target, symlink_broken) = resolve_symlink(&path);
 
                     if symlink_broken {
                         collection
@@ -366,11 +328,7 @@ impl JwalkScanner {
                         symlink_target: Some(symlink_target),
                         symlink_broken,
                         executable: false,
-                        timestamps: Timestamps::new(
-                            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                            metadata.accessed().ok(),
-                            metadata.created().ok(),
-                        ),
+                        timestamps: timestamps_from(&metadata),
                         inode: None,
                     };
 
@@ -379,6 +337,19 @@ impl JwalkScanner {
                         .or_default()
                         .push(entry_info);
                 }
+            }
+
+            // Update progress periodically across all accepted entries, not only files.
+            progress_counter += 1;
+            if progress_counter.is_multiple_of(1000) {
+                let _ = self.progress_tx.send(ScanProgress {
+                    files_scanned: collection.stats.total_files,
+                    dirs_scanned: collection.stats.total_dirs,
+                    bytes_scanned: collection.stats.total_size,
+                    current_path: path.clone(),
+                    errors_count: collection.warnings.len() as u64,
+                    elapsed: start.elapsed(),
+                });
             }
         }
 
@@ -484,9 +455,10 @@ impl JwalkScanner {
             dir_count,
         };
 
-        // Sort children by size (descending)
-        node.children
-            .sort_by_key(|child| std::cmp::Reverse(child.size));
+        // Sort children by size (descending) with a name tiebreak so equal-size
+        // siblings have a deterministic order regardless of the parallel scan's
+        // collection order. Reuses the canonical comparator from `FileNode`.
+        node.sort_children_by_size();
 
         node
     }
@@ -536,11 +508,7 @@ pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, 
 
     // Get root directory metadata
     let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
-    let root_timestamps = Timestamps::new(
-        root_metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-        root_metadata.accessed().ok(),
-        root_metadata.created().ok(),
-    );
+    let root_timestamps = timestamps_from(&root_metadata);
 
     let root_name = root_path
         .file_name()
@@ -598,11 +566,7 @@ pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, 
             }
         };
 
-        let timestamps = Timestamps::new(
-            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-            metadata.accessed().ok(),
-            metadata.created().ok(),
-        );
+        let timestamps = timestamps_from(&metadata);
 
         let child_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
 
@@ -638,16 +602,9 @@ pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, 
             total_size += size;
             file_count += 1;
             root_node.children.push(child_node);
-            stats.record_file(&entry_path, size, timestamps.modified, 1);
+            stats.record_file(&entry_path, size, metadata.modified().ok(), 1);
         } else if metadata.file_type().is_symlink() {
-            // read_link + exists() in a single pass to avoid the double-syscall.
-            let (target, broken) = match std::fs::read_link(&entry_path) {
-                Ok(t) => {
-                    let broken = !entry_path.exists();
-                    (CompactString::new(t.to_string_lossy()), broken)
-                }
-                Err(_) => (CompactString::default(), true),
-            };
+            let (target, broken) = resolve_symlink(&entry_path);
 
             if broken {
                 warnings.push(ScanWarning::broken_symlink(&entry_path, target.as_str()));
@@ -710,6 +667,35 @@ struct EntryInfo {
     executable: bool,
     timestamps: Timestamps,
     inode: Option<InodeInfo>,
+}
+
+/// Build [`Timestamps`] from metadata, falling back to the Unix epoch only for
+/// the *node's* display timestamp when the real mtime is unreadable.
+fn timestamps_from(metadata: &std::fs::Metadata) -> Timestamps {
+    Timestamps::new(
+        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        metadata.accessed().ok(),
+        metadata.created().ok(),
+    )
+}
+
+/// Resolve a symlink's target and whether it is broken.
+///
+/// "Broken" means the target genuinely does not exist. A failure to stat for
+/// any other reason (e.g. permission denied on a parent component) is *not*
+/// treated as broken, so valid links into restricted directories aren't
+/// mislabelled. The target string is empty if the link itself can't be read.
+fn resolve_symlink(path: &Path) -> (CompactString, bool) {
+    match std::fs::read_link(path) {
+        Ok(target) => {
+            let broken = match std::fs::metadata(path) {
+                Ok(_) => false,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            };
+            (CompactString::new(target.to_string_lossy()), broken)
+        }
+        Err(_) => (CompactString::default(), true),
+    }
 }
 
 /// Check if a file is executable (Unix).

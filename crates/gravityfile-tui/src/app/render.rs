@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Widget};
 use strum::IntoEnumIterator;
+use unicode_width::UnicodeWidthStr;
 
 use gravityfile_analyze::format_age;
 
@@ -15,7 +16,8 @@ use crate::ui::modals::{
     DeleteConfirmModal, DeletionProgressModal, InputModal, OperationProgressModal, SettingsModal,
 };
 use crate::ui::{
-    AppLayout, HelpOverlay, MillerColumns, TreeView, TreemapView, format_relative_time, format_size,
+    AppLayout, HelpOverlay, MillerColumns, TreeView, TreemapView, fit_left_to_width, fit_to_width,
+    format_duration, format_relative_time, format_size,
 };
 
 use super::state::{AppMode, ClipboardMode, LayoutMode, View};
@@ -77,6 +79,9 @@ impl Widget for &App {
         // Render view tabs (Explorer, Duplicates, Age, Errors)
         self.render_tabs(tabs_area, buf);
 
+        // Render scan/analysis state as a non-modal banner above the active view.
+        let content = self.render_activity_banner(content, buf);
+
         // Render content based on view
         match self.view {
             View::Explorer => self.render_explorer(content, buf),
@@ -101,14 +106,13 @@ impl App {
             self.theme.title.add_modifier(Modifier::BOLD),
         );
 
-        // Show scanning indicator when scan is in progress
-        let is_scanning = self.scan_progress.is_some();
-        let scanning_indicator = if is_scanning {
+        // Show background activity without blocking normal exploration.
+        let scanning_indicator = if self.scan_progress.is_some() {
             if let Some(progress) = &self.scan_progress {
                 Span::styled(
                     format!(
-                        " ⟳ scanning: {} files, {} ",
-                        progress.files_scanned,
+                        " ⟳ scanning: {} items, {} ",
+                        progress.total_items(),
                         format_size(progress.bytes_scanned)
                     ),
                     Style::default()
@@ -123,17 +127,32 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 )
             }
+        } else if self.analyzing {
+            Span::styled(
+                " ⟳ analyzing duplicates/age ",
+                Style::default()
+                    .fg(self.theme.info)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::raw("")
         };
 
         let stats = if let Some(tree) = &self.tree {
+            let suffix = if !self.has_full_scan && self.scan_progress.is_none() {
+                " (quick)"
+            } else {
+                ""
+            };
             format!(
-                " {} in {} files, {} dirs ",
+                " {} in {} files, {} dirs{} ",
                 format_size(tree.stats.total_size),
                 tree.stats.total_files,
-                tree.stats.total_dirs
+                tree.stats.total_dirs,
+                suffix
             )
+        } else if self.scan_progress.is_some() {
+            " starting scan ".to_string()
         } else {
             String::new()
         };
@@ -208,6 +227,82 @@ impl App {
         Paragraph::new(line)
             .style(self.theme.header)
             .render(area, buf);
+    }
+
+    fn render_activity_banner(&self, area: Rect, buf: &mut Buffer) -> Rect {
+        if area.height < 5 {
+            return area;
+        }
+
+        let Some(line) = self.activity_banner_line(area.width as usize) else {
+            return area;
+        };
+
+        let [banner, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        Paragraph::new(line)
+            .style(Style::default().bg(self.theme.background))
+            .render(banner, buf);
+        rest
+    }
+
+    fn activity_banner_line(&self, width: usize) -> Option<Line<'static>> {
+        if let Some(progress) = &self.scan_progress {
+            let files_per_second = progress.files_per_second();
+            let rate = if files_per_second >= 1000.0 {
+                format!("{:.1}k files/s", files_per_second / 1000.0)
+            } else if files_per_second > 0.0 {
+                format!("{files_per_second:.0} files/s")
+            } else {
+                "starting".to_string()
+            };
+
+            let path = if progress.current_path.as_os_str().is_empty() {
+                self.view_root.display().to_string()
+            } else {
+                progress.current_path.display().to_string()
+            };
+
+            let prefix = format!(
+                " Scan in background | {} items | {} | {} | {} elapsed | ",
+                progress.total_items(),
+                format_size(progress.bytes_scanned),
+                rate,
+                format_duration(progress.elapsed),
+            );
+            let path_width = width.saturating_sub(prefix.width() + 6);
+
+            return Some(Line::from(vec![
+                Span::styled(" SCAN ", self.theme.help_key_style()),
+                Span::styled(prefix, self.theme.help_desc_style()),
+                Span::styled(
+                    fit_to_width(&path, path_width),
+                    Style::default().fg(self.theme.muted),
+                ),
+            ]));
+        }
+
+        if self.analyzing {
+            return Some(Line::from(vec![
+                Span::styled(" ANALYZE ", self.theme.help_key_style()),
+                Span::styled(
+                    " Building duplicate and age reports in the background; Explorer remains usable.",
+                    self.theme.help_desc_style(),
+                ),
+            ]));
+        }
+
+        if !self.has_full_scan {
+            return Some(Line::from(vec![
+                Span::styled(" QUICK ", self.theme.help_key_style()),
+                Span::styled(
+                    " Directory sizes are not fully measured. Press R for full disk usage, duplicates, age, and treemap accuracy.",
+                    self.theme.help_desc_style(),
+                ),
+            ]));
+        }
+
+        None
     }
 
     fn render_overlays(&self, area: Rect, footer: Rect, buf: &mut Buffer) {
@@ -347,12 +442,19 @@ impl App {
 
     fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
         let is_scanning = self.scan_progress.is_some();
-        let error_count = self.warnings.len();
+        let error_count = self.warnings.len().max(
+            self.scan_progress
+                .as_ref()
+                .map(|p| p.errors_count as usize)
+                .unwrap_or(0),
+        );
 
         let titles: Vec<String> = View::iter()
             .map(|v| {
                 if v == View::Errors && error_count > 0 {
                     format!(" {} ({}) ", v, error_count)
+                } else if self.analyzing && matches!(v, View::Duplicates | View::Age) {
+                    format!(" {} ⟳ ", v)
                 } else if v == View::Explorer && is_scanning {
                     " Explorer ⟳ ".to_string()
                 } else {
@@ -490,7 +592,12 @@ impl App {
 
         if let Some((filtered_groups, total_wasted)) = self.get_filtered_duplicates() {
             if filtered_groups.is_empty() {
-                Paragraph::new("No duplicate files found in this directory.\n\nTip: Press R to scan for duplicates if you haven't already.")
+                let message = if self.has_full_scan {
+                    "No duplicate files found in this directory."
+                } else {
+                    "No duplicate data yet.\n\nPress R to run a full scan."
+                };
+                Paragraph::new(message)
                     .style(Style::default().fg(self.theme.muted))
                     .render(inner, buf);
                 return;
@@ -600,7 +707,8 @@ impl App {
                         let heat_ratio = group.wasted_bytes as f64 / max_wasted as f64;
 
                         let bar_width = 8;
-                        let filled = (heat_ratio * bar_width as f64).round() as usize;
+                        let filled =
+                            ((heat_ratio * bar_width as f64).round() as usize).min(bar_width);
                         let mut heat_bar = "█".repeat(filled);
                         heat_bar.push_str(&"░".repeat(bar_width - filled));
                         let heat_color = self.theme.size_color(heat_ratio);
@@ -680,9 +788,57 @@ impl App {
                 }
             }
         } else {
-            Paragraph::new("Analyzing duplicates...\n\nTip: Press Tab to switch views, R to scan.")
-                .style(Style::default().fg(self.theme.muted))
-                .render(inner, buf);
+            let lines = if self.scan_progress.is_some() {
+                vec![
+                    Line::styled(
+                        "Full scan is running before duplicate analysis starts.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Explorer remains usable while scanning.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            } else if self.analyzing {
+                vec![
+                    Line::styled(
+                        "Analyzing duplicate files...",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Large trees may take a moment because content hashes are compared.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            } else if !self.has_full_scan {
+                vec![
+                    Line::styled(
+                        "Duplicate analysis needs a full recursive scan.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Press R to scan this directory.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            } else {
+                vec![
+                    Line::styled(
+                        "Duplicate analysis is not running.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Run :analyze to start duplicate and age analysis for this scan.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            };
+
+            Paragraph::new(lines).render(inner, buf);
         }
     }
 
@@ -794,9 +950,50 @@ impl App {
                 }
             }
         } else {
-            Paragraph::new("Analyzing file ages...")
-                .style(Style::default().fg(self.theme.muted))
-                .render(inner, buf);
+            let lines = if self.scan_progress.is_some() {
+                vec![
+                    Line::styled(
+                        "Full scan is running before age analysis starts.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Age buckets and stale-directory candidates appear after analysis.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            } else if self.analyzing {
+                vec![Line::styled(
+                    "Analyzing file ages and stale directories...",
+                    Style::default().fg(self.theme.muted),
+                )]
+            } else if !self.has_full_scan {
+                vec![
+                    Line::styled(
+                        "Age analysis needs a full recursive scan.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Press R to scan this directory.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            } else {
+                vec![
+                    Line::styled(
+                        "Age analysis is not running.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        "Run :analyze to start duplicate and age analysis for this scan.",
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]
+            };
+
+            Paragraph::new(lines).render(inner, buf);
         }
     }
 
@@ -908,14 +1105,7 @@ impl App {
             let suffix_len = delete_hint.len();
             let available_width =
                 (inner.width as usize).saturating_sub(prefix.len() + suffix_len + 1);
-            let display_path = if path_str.len() > available_width {
-                format!(
-                    "...{}",
-                    &path_str[path_str.len().saturating_sub(available_width - 3)..]
-                )
-            } else {
-                path_str
-            };
+            let display_path = fit_left_to_width(&path_str, available_width);
 
             let style = if is_selected {
                 self.theme.selected
@@ -940,11 +1130,7 @@ impl App {
                 };
 
                 let max_msg_len = (inner.width as usize).saturating_sub(4);
-                let msg = if warning.message.len() > max_msg_len {
-                    format!("{}...", &warning.message[..max_msg_len.saturating_sub(3)])
-                } else {
-                    warning.message.clone()
-                };
+                let msg = fit_to_width(&warning.message, max_msg_len);
 
                 Line::styled(format!("    {}", msg), msg_style)
                     .render(Rect::new(inner.x, base_y + 1, inner.width, 1), buf);
@@ -967,10 +1153,22 @@ impl App {
             .get_view_root_node()
             .unwrap_or((&tree.root, tree.root_path.clone()));
 
+        let title_suffix = if self.scan_progress.is_some() {
+            " (scanning)"
+        } else if !self.has_full_scan {
+            " (quick sizes)"
+        } else {
+            ""
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border)
-            .title(format!(" Treemap: {} ", view_path.display()))
+            .title(format!(
+                " Treemap: {}{} ",
+                view_path.display(),
+                title_suffix
+            ))
             .title_style(self.theme.title);
 
         TreemapView::new(
@@ -1097,6 +1295,9 @@ impl App {
                     if !self.marked.is_empty() {
                         v.push(("Esc", "Clear"));
                     }
+                    if self.has_full_scan && self.duplicates.is_none() && !self.analyzing {
+                        v.push((":analyze", "Run"));
+                    }
                     v
                 }
                 View::Age => {
@@ -1107,6 +1308,9 @@ impl App {
                         v.push(("Esc", "Unmark"));
                     } else {
                         v.push(("Spc", "+Sel"));
+                    }
+                    if self.has_full_scan && self.age_report.is_none() && !self.analyzing {
+                        v.push((":analyze", "Run"));
                     }
                     v
                 }
@@ -1119,6 +1323,7 @@ impl App {
                 }
                 View::Treemap => {
                     let mut v = vec![
+                        ("j/k", "Select"),
                         ("Enter", "Drill"),
                         ("Bksp", "Back"),
                         ("Spc", "+Sel"),
@@ -1132,7 +1337,19 @@ impl App {
             }
         };
 
-        if self.scan_progress.is_none() {
+        if (self.scan_progress.is_some() || self.analyzing)
+            && self.clipboard.is_empty()
+            && self.marked.is_empty()
+        {
+            let label = if self.scan_progress.is_some() {
+                "Cancel scan"
+            } else {
+                "Cancel analysis"
+            };
+            keys.insert(0, ("Esc", label));
+        }
+
+        if self.scan_progress.is_none() && !self.analyzing {
             if !self.has_full_scan {
                 keys.insert(0, ("⇧R", "Scan"));
             } else {
@@ -1140,7 +1357,7 @@ impl App {
             }
         }
 
-        keys.extend([("?", "Help"), ("q", "Quit")]);
+        keys.extend([("Tab", "Views"), ("?", "Help"), ("q", "Quit")]);
 
         let spans: Vec<Span> = keys
             .iter()
@@ -1197,17 +1414,15 @@ impl App {
                 Style::default().add_modifier(Modifier::SLOW_BLINK),
             ));
         } else {
-            let before_cursor = &query[..cursor];
+            // `cursor` is a char index; build the segments char-by-char so
+            // multi-byte queries never slice on a non-char boundary.
+            let before_cursor: String = query.chars().take(cursor).collect();
             let at_cursor = query
                 .chars()
                 .nth(cursor)
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| " ".to_string());
-            let after_cursor = if cursor < query.len() {
-                &query[cursor + 1..]
-            } else {
-                ""
-            };
+            let after_cursor: String = query.chars().skip(cursor + 1).collect();
             spans.push(Span::raw(before_cursor));
             spans.push(Span::styled(
                 at_cursor,

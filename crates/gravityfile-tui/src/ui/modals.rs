@@ -14,7 +14,7 @@ use gravityfile_ops::{Conflict, ConflictKind, OperationProgress, OperationType};
 use crate::app::input::InputState;
 use crate::app::state::{BookmarkListState, Bookmarks, DeletionProgress, SettingsState};
 use crate::theme::Theme;
-use crate::ui::format_size;
+use crate::ui::{fit_left_to_width, fit_to_width, format_size};
 
 /// Confirmation dialog for deletion.
 pub struct DeleteConfirmModal<'a> {
@@ -97,14 +97,7 @@ impl Widget for DeleteConfirmModal<'_> {
         for path in sorted_paths.iter().take(max_items) {
             // Show full path, truncated from the left if too long
             let full_path = path.display().to_string();
-            let display_path = if full_path.len() > max_path_len {
-                format!(
-                    "...{}",
-                    &full_path[full_path.len().saturating_sub(max_path_len - 3)..]
-                )
-            } else {
-                full_path
-            };
+            let display_path = fit_left_to_width(&full_path, max_path_len);
 
             // Add type indicator and style based on file type
             let (icon, style) = if path.is_symlink() {
@@ -236,11 +229,7 @@ impl Widget for DeletionProgressModal<'_> {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| current.display().to_string());
                 let max_len = (inner.width as usize).saturating_sub(4);
-                let display_name = if name.len() > max_len {
-                    format!("...{}", &name[name.len().saturating_sub(max_len - 3)..])
-                } else {
-                    name
-                };
+                let display_name = fit_left_to_width(&name, max_len);
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!("  {}", display_name),
@@ -458,11 +447,7 @@ impl Widget for OperationProgressModal<'_> {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| current.display().to_string());
             let max_len = (inner.width as usize).saturating_sub(4);
-            let display_name = if name.len() > max_len {
-                format!("...{}", &name[name.len().saturating_sub(max_len - 3)..])
-            } else {
-                name
-            };
+            let display_name = fit_left_to_width(&name, max_len);
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 format!("  {}", display_name),
@@ -529,7 +514,9 @@ impl Widget for InputModal<'_> {
         // Input field with cursor
         let buffer = self.input.buffer();
         let cursor = self.input.cursor();
-        let max_visible = (inner.width as usize).saturating_sub(4);
+        // Floor at 1 so the `max_visible - 1` math below can't underflow on a
+        // very narrow terminal.
+        let max_visible = (inner.width as usize).saturating_sub(4).max(1);
 
         // Calculate visible portion
         let (visible_start, cursor_in_view) = if cursor > max_visible - 1 {
@@ -677,14 +664,7 @@ impl Widget for ConflictModal<'_> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.conflict.source.display().to_string());
         let max_len = (inner.width as usize).saturating_sub(4);
-        let display_name = if source_name.len() > max_len {
-            format!(
-                "...{}",
-                &source_name[source_name.len().saturating_sub(max_len - 3)..]
-            )
-        } else {
-            source_name
-        };
+        let display_name = fit_left_to_width(&source_name, max_len);
         lines.push(Line::styled(
             format!("  {}", display_name),
             Style::default().fg(self.theme.info),
@@ -696,14 +676,7 @@ impl Widget for ConflictModal<'_> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| dest.display().to_string());
-        let dest_display = if dest_name.len() > max_len {
-            format!(
-                "...{}",
-                &dest_name[dest_name.len().saturating_sub(max_len - 3)..]
-            )
-        } else {
-            dest_name
-        };
+        let dest_display = fit_left_to_width(&dest_name, max_len);
         lines.push(Line::styled(
             format!("  → {}", dest_display),
             Style::default().fg(self.theme.muted),
@@ -978,14 +951,7 @@ impl Widget for BookmarkListModal<'_> {
 
                 // Truncate path from the left if too long
                 let path_str = path.display().to_string();
-                let display_path = if path_str.len() > max_path_len {
-                    format!(
-                        "...{}",
-                        &path_str[path_str.len().saturating_sub(max_path_len - 3)..]
-                    )
-                } else {
-                    path_str
-                };
+                let display_path = fit_left_to_width(&path_str, max_path_len);
 
                 let style = if is_selected {
                     Style::default()
@@ -1161,17 +1127,8 @@ impl Widget for BulkRenameConfirmModal<'_> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let old_display = if old_name.len() > max_name_len {
-                format!("{}...", &old_name[..max_name_len.saturating_sub(3)])
-            } else {
-                old_name
-            };
-
-            let new_display = if entry.new_name.len() > max_name_len {
-                format!("{}...", &entry.new_name[..max_name_len.saturating_sub(3)])
-            } else {
-                entry.new_name.clone()
-            };
+            let old_display = fit_to_width(&old_name, max_name_len);
+            let new_display = fit_to_width(&entry.new_name, max_name_len);
 
             let prefix = if is_selected { " > " } else { "   " };
             let style = if is_selected {

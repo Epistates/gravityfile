@@ -121,6 +121,8 @@ pub enum CommandAction {
     Quit,
     /// Refresh/rescan.
     Refresh,
+    /// Run duplicate and age analysis for the current full scan.
+    Analyze,
     /// Navigate to a path.
     NavigateTo(String),
     /// Go to root.
@@ -226,6 +228,9 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Refresh/rescan
         "r" | "refresh" | "rescan" => CommandAction::Refresh,
 
+        // Analyze current scan
+        "analyze" | "analyse" | "analysis" => CommandAction::Analyze,
+
         // Change directory
         "cd" => {
             if parts.len() > 1 {
@@ -249,6 +254,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "duplicates" | "dups" | "d" => CommandAction::SwitchView(View::Duplicates),
         "age" | "a" => CommandAction::SwitchView(View::Age),
         "errors" | "err" => CommandAction::SwitchView(View::Errors),
+        "treemap" | "map" | "heatmap" => CommandAction::SwitchView(View::Treemap),
 
         // Clear marks
         "clear" | "unmark" => CommandAction::ClearMarks,
@@ -448,6 +454,10 @@ mod tests {
         assert!(matches!(
             parse_command("d"),
             CommandAction::SwitchView(View::Duplicates)
+        ));
+        assert!(matches!(
+            parse_command("treemap"),
+            CommandAction::SwitchView(View::Treemap)
         ));
     }
 }

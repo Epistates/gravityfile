@@ -4,6 +4,7 @@
 //! It follows patterns from Yazi's plugin system with two-stage initialization.
 
 mod bindings;
+mod convert;
 mod isolate;
 mod runtime;
 

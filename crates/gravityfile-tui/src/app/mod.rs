@@ -60,6 +60,15 @@ struct LayoutSyncData {
     new_view_root: Option<PathBuf>,
 }
 
+fn quick_list_with_settings(
+    path: &Path,
+    settings: &UserSettings,
+) -> Result<FileTree, gravityfile_scan::ScanError> {
+    let mut config = gravityfile_scan::ScanConfig::new(path);
+    config.include_hidden = settings.show_hidden;
+    gravityfile_scan::quick_list(path, Some(&config))
+}
+
 /// Main application state.
 pub struct App {
     /// Path being analyzed (scan root).
@@ -160,6 +169,9 @@ pub struct App {
     cached_parent_tree: Option<FileTree>,
     /// Pending command that requires terminal suspension (e.g., opening files in editor).
     pending_suspend_command: Option<std::process::Command>,
+    /// Items staged for deletion, awaiting the async `on_delete_start` plugin
+    /// veto check in the run loop before the background delete is actually started.
+    pending_deletion: Option<Vec<(PathBuf, u64)>>,
     /// Cache of scanned directories by path.
     /// This preserves scan data when navigating to parent directories and allows
     /// restoring it when navigating back.
@@ -193,16 +205,20 @@ impl App {
         // Load user settings from disk
         let user_settings = UserSettings::load();
 
-        // Load quick tree immediately for instant display
-        let quick_tree = gravityfile_scan::quick_list(&path, None).ok();
+        // Load quick tree immediately for instant display.
+        let quick_tree = quick_list_with_settings(&path, &user_settings).ok();
 
         // Determine scan_on_startup: CLI flag (Some) overrides user settings; None defers to settings.
         let scan_on_startup = config
             .scan_on_startup
             .unwrap_or(user_settings.scan_on_startup);
 
-        // Initialize plugin manager and register runtimes
-        let mut pm_inner = gravityfile_plugin::PluginManager::default();
+        // Initialize plugin manager and register runtimes. Scope the plugin
+        // filesystem API to the scan root so hook plugins can read scanned files
+        // without being granted access to the whole filesystem.
+        let plugin_config = gravityfile_plugin::PluginConfig::default()
+            .with_fs_read_roots(vec![path.clone()]);
+        let mut pm_inner = gravityfile_plugin::PluginManager::new(plugin_config);
         if let Ok(rt) = gravityfile_plugin::lua::LuaRuntime::new() {
             let _ = pm_inner.register_runtime(Box::new(rt));
         }
@@ -261,6 +277,7 @@ impl App {
             bookmark_list_state: None,
             cached_parent_tree: None,
             pending_suspend_command: None,
+            pending_deletion: None,
             scanned_cache: Some(HashMap::new()),
             bulk_rename_state: None,
             treemap_state: crate::ui::TreemapState::new(),
@@ -293,8 +310,19 @@ impl App {
         }
     }
 
-    /// Dispatch a plugin hook.
+    /// Dispatch a plugin hook, ignoring any results.
     async fn dispatch_hook(&self, hook: gravityfile_plugin::Hook) {
+        let _ = self.dispatch_hook_collect(hook).await;
+    }
+
+    /// Dispatch a plugin hook and return the per-plugin results.
+    ///
+    /// Callers that gate a host default action on plugins (e.g. deletion) use
+    /// the returned results with [`PluginManager::any_prevent_default`].
+    async fn dispatch_hook_collect(
+        &self,
+        hook: gravityfile_plugin::Hook,
+    ) -> Vec<gravityfile_plugin::HookResult> {
         let theme_name = match self.theme.variant {
             crate::theme::ThemeVariant::Dark => "dark",
             crate::theme::ThemeVariant::Light => "light",
@@ -327,7 +355,9 @@ impl App {
 
         if let Some(pm) = &self.plugin_manager {
             let pm = pm.read().await;
-            let _ = pm.dispatch_hook(&hook, &ctx).await;
+            pm.dispatch_hook(&hook, &ctx).await
+        } else {
+            Vec::new()
         }
     }
 
@@ -441,6 +471,12 @@ impl App {
 
             self.check_navigation(&old_view_root).await;
 
+            // Run the plugin veto check for a staged deletion, then start or abort it.
+            if let Some(items) = self.pending_deletion.take() {
+                self.finalize_deletion(items).await;
+                self.needs_redraw = true;
+            }
+
             // Handle pending suspend command (opening files in external apps)
             if let Some(mut cmd) = self.pending_suspend_command.take() {
                 // Check if this is a bulk rename operation
@@ -518,6 +554,7 @@ impl App {
         // self.tree = None;
         self.duplicates = None;
         self.age_report = None;
+        self.analyzing = false;
         self.warnings.clear();
         self.selected_warning = 0;
         // Don't reset cached lengths - keep them for navigation
@@ -525,8 +562,55 @@ impl App {
 
         self.scan_rx = Some(scanning::start_scan(
             self.view_root.clone(),
+            self.user_settings.show_hidden,
             self.scan_token.clone(),
         ));
+    }
+
+    /// Cancel the active scan or post-scan analysis without leaving the explorer.
+    fn cancel_background_work(&mut self) {
+        self.scan_token.cancel();
+        self.scan_token = CancellationToken::new();
+        self.scan_rx = None;
+
+        let was_scanning = self.scan_progress.is_some();
+        let was_analyzing = self.analyzing;
+
+        self.scan_progress = None;
+        self.analyzing = false;
+
+        if was_scanning {
+            self.operation_message =
+                Some((true, "Scan cancelled - showing current listing".to_string()));
+        } else if was_analyzing {
+            self.operation_message = Some((true, "Analysis cancelled".to_string()));
+        }
+    }
+
+    /// Start duplicate/age analysis for the current full scan when an analysis
+    /// surface is active. Keeping this on demand avoids a large memory and I/O
+    /// spike immediately after startup scans.
+    fn maybe_start_analysis_for_view(&mut self) {
+        if !matches!(self.view, View::Duplicates | View::Age) {
+            return;
+        }
+        self.start_analysis_for_current_tree();
+    }
+
+    fn start_analysis_for_current_tree(&mut self) {
+        if self.scan_progress.is_some() || self.analyzing || !self.has_full_scan {
+            return;
+        }
+        if self.duplicates.is_some() && self.age_report.is_some() {
+            return;
+        }
+
+        let Some(tree) = self.tree.clone() else {
+            return;
+        };
+
+        self.analyzing = true;
+        self.scan_rx = Some(scanning::start_analysis(tree, self.scan_token.clone()));
     }
 
     /// Handle a scan result from the background task.
@@ -551,6 +635,9 @@ impl App {
                 self.tree_state.expand(&root_path);
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
+                // Keep treemap selection bounded if the user is watching the
+                // treemap while partial results stream in.
+                self.update_cached_treemap_len();
 
                 // Clamp selection to valid range
                 if self.tree_state.selected >= self.cached_tree_len && self.cached_tree_len > 0 {
@@ -559,26 +646,16 @@ impl App {
             }
             ScanResult::ScanComplete(Ok(tree)) => {
                 let root_path = tree.root_path.clone();
+                let scan_path = root_path.clone();
+                let total_files = tree.stats.total_files;
+                let total_dirs = tree.stats.total_dirs;
+                let total_size = tree.stats.total_size;
 
                 // Merge any final warnings from tree
                 for warning in &tree.warnings {
                     if !self.warnings.iter().any(|w| w.path == warning.path) {
                         self.warnings.push(warning.clone());
                     }
-                }
-
-                let tree_for_analysis = tree.clone();
-
-                // Cache the scanned tree for later restoration, with eviction policy.
-                if let Some(cache) = &mut self.scanned_cache {
-                    if cache.len() >= 10 {
-                        // Evict a random entry (simple but effective for this scale)
-                        // In a future update, we could use an LRU policy.
-                        if let Some(key) = cache.keys().next().cloned() {
-                            cache.remove(&key);
-                        }
-                    }
-                    cache.insert(root_path.clone(), tree.clone());
                 }
 
                 self.tree = Some(tree);
@@ -599,6 +676,7 @@ impl App {
                 }
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
+                self.update_cached_treemap_len();
 
                 // Update cached parent tree for Miller columns display
                 self.update_cached_parent();
@@ -611,20 +689,15 @@ impl App {
                 self.error = None;
                 self.scan_progress = None;
                 self.has_full_scan = true;
+                self.analyzing = false;
+                self.scan_rx = None;
 
-                // Start background analysis
-                self.analyzing = true;
-                self.scan_rx = Some(scanning::start_analysis(
-                    tree_for_analysis.clone(),
-                    self.scan_token.clone(),
-                ));
+                // Analysis can be expensive on large scans, so run it when
+                // the user actually opens an analysis view.
+                self.maybe_start_analysis_for_view();
 
                 // Dispatch scan complete hook (extract only the stats we need)
                 if let Some(pm) = self.plugin_manager.clone() {
-                    let scan_path = tree_for_analysis.root_path.clone();
-                    let total_files = tree_for_analysis.stats.total_files;
-                    let total_dirs = tree_for_analysis.stats.total_dirs;
-                    let total_size = tree_for_analysis.stats.total_size;
                     let view_root = self.view_root.clone();
                     tokio::spawn(async move {
                         let ctx = gravityfile_plugin::HookContext::new().with_view_root(view_root);
@@ -1173,8 +1246,10 @@ impl App {
                     self.clipboard.clear();
                 } else if !self.marked.is_empty() {
                     self.marked.clear();
+                } else if self.scan_progress.is_some() || self.analyzing {
+                    self.cancel_background_work();
                 }
-                // If nothing to clear, Esc does nothing in normal mode
+                // If nothing to clear/cancel, Esc does nothing in normal mode
             }
 
             KeyAction::NextView => {
@@ -1183,6 +1258,7 @@ impl App {
                     self.update_cached_treemap_len();
                     self.treemap_state.reset();
                 }
+                self.maybe_start_analysis_for_view();
             }
             KeyAction::PrevView => {
                 self.view = self.view.prev();
@@ -1190,6 +1266,7 @@ impl App {
                     self.update_cached_treemap_len();
                     self.treemap_state.reset();
                 }
+                self.maybe_start_analysis_for_view();
             }
 
             // Directory tabs
@@ -1392,6 +1469,13 @@ impl App {
                     }
                 }
             }
+            KeyAction::DrillDown | KeyAction::OpenFile if self.view == View::Treemap => {
+                if self.is_selected_file() {
+                    self.open_selected_file();
+                } else {
+                    self.drill_into_treemap_selected();
+                }
+            }
             KeyAction::DrillDown | KeyAction::OpenFile => {}
             KeyAction::NavigateBack if self.view == View::Explorer => {
                 self.navigate_back();
@@ -1552,18 +1636,7 @@ impl App {
                     None
                 }
             }
-            View::Treemap => {
-                // For treemap, mark is based on what's currently under cursor
-                // This requires the treemap state which we don't have yet
-                // For now, just use the explorer behavior
-                if let Some((node, _)) = self.get_view_root_node() {
-                    node.children
-                        .first()
-                        .map(|child| self.view_root.join(&*child.name))
-                } else {
-                    None
-                }
-            }
+            View::Treemap => self.get_selected_treemap_child().map(|(_, path)| path),
         };
 
         if let Some(path) = path
@@ -1600,7 +1673,33 @@ impl App {
             current: paths_with_sizes.first().map(|(p, _)| p.clone()),
         });
 
-        self.scan_rx = Some(deletion::start_deletion(paths_with_sizes));
+        // Defer the actual start: the run loop dispatches the async `on_delete_start`
+        // plugin hook, and either begins the delete or aborts it if a plugin vetoes.
+        self.pending_deletion = Some(paths_with_sizes);
+    }
+
+    /// Run the `on_delete_start` plugin veto check for staged items, then either
+    /// start the background deletion or abort it if a plugin prevented the default.
+    async fn finalize_deletion(&mut self, items: Vec<(PathBuf, u64)>) {
+        let paths: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
+        let results = self
+            .dispatch_hook_collect(gravityfile_plugin::Hook::OnDeleteStart {
+                items: paths,
+                // `start_deletion` uses the recoverable trash by default.
+                use_trash: true,
+            })
+            .await;
+
+        if gravityfile_plugin::PluginManager::any_prevent_default(&results) {
+            // A plugin vetoed the deletion — roll back the optimistic UI state.
+            self.deletion_progress = None;
+            self.mode = AppMode::Normal;
+            self.deletion_message = Some((false, "Deletion cancelled by plugin".to_string()));
+            self.needs_redraw = true;
+            return;
+        }
+
+        self.scan_rx = Some(deletion::start_deletion(items));
     }
 
     /// Get the size of a path from the tree.
@@ -2049,7 +2148,7 @@ impl App {
                 self.scan_progress = None;
 
                 // Load quick tree for immediate display
-                self.tree = gravityfile_scan::quick_list(&path, None).ok();
+                self.tree = quick_list_with_settings(&path, &self.user_settings).ok();
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
 
@@ -2425,9 +2524,7 @@ impl App {
                 self.selected_warning = self.selected_warning.saturating_sub(1);
             }
             View::Treemap => {
-                // Treemap navigation handled differently
-                // For now, use explorer behavior
-                self.miller_state.move_up(1);
+                self.treemap_state.move_prev();
             }
         }
     }
@@ -2469,7 +2566,7 @@ impl App {
                 self.selected_warning = (self.selected_warning + 1).min(max);
             }
             View::Treemap => {
-                self.miller_state.move_down(1, self.cached_miller_len);
+                self.treemap_state.move_next(self.cached_treemap_len);
             }
         }
     }
@@ -2701,6 +2798,13 @@ impl App {
 
     /// Check if the currently selected item is a file (not a directory).
     fn is_selected_file(&self) -> bool {
+        if self.view == View::Treemap {
+            return self
+                .get_selected_treemap_child()
+                .map(|(child, _)| !child.is_dir())
+                .unwrap_or(false);
+        }
+
         match self.layout_mode {
             LayoutMode::Tree => {
                 if let Some((view_node, view_path)) = self.get_view_root_node() {
@@ -2734,6 +2838,10 @@ impl App {
 
     /// Get the path of the currently selected item.
     fn get_selected_path(&self) -> Option<PathBuf> {
+        if self.view == View::Treemap {
+            return self.get_selected_treemap_child().map(|(_, path)| path);
+        }
+
         match self.layout_mode {
             LayoutMode::Tree => {
                 if let Some((view_node, view_path)) = self.get_view_root_node() {
@@ -2962,7 +3070,7 @@ impl App {
 
         // Quick load directory contents for immediate display
         // When the full scan completes, it will replace this with accurate data
-        if let Ok(quick_tree) = gravityfile_scan::quick_list(path, None) {
+        if let Ok(quick_tree) = quick_list_with_settings(path, &self.user_settings) {
             // Find the node in our tree and update its children
             if let Some(tree) = &mut self.tree
                 && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
@@ -3074,7 +3182,7 @@ impl App {
         }
 
         // Load the parent directory contents
-        let Ok(mut parent_tree) = gravityfile_scan::quick_list(parent, None) else {
+        let Ok(mut parent_tree) = quick_list_with_settings(parent, &self.user_settings) else {
             return; // Can't access parent directory
         };
 
@@ -3223,7 +3331,9 @@ impl App {
             if let Some(parent_path) = self.view_root.parent() {
                 let parent_path_buf = parent_path.to_path_buf();
                 // Load the parent directory
-                if let Ok(mut parent_tree) = gravityfile_scan::quick_list(&parent_path_buf, None) {
+                if let Ok(mut parent_tree) =
+                    quick_list_with_settings(&parent_path_buf, &self.user_settings)
+                {
                     // Merge any cached scans into the parent tree's children
                     // This ensures previously scanned directories show their data
                     self.merge_cached_scans_into_tree(&mut parent_tree.root, &parent_path_buf);
@@ -3269,6 +3379,9 @@ impl App {
                 self.marked.clear();
                 self.start_scan();
             }
+            CommandAction::Analyze => {
+                self.start_analysis_for_current_tree();
+            }
             CommandAction::NavigateTo(target) => {
                 self.cd_to_path(&target);
             }
@@ -3283,6 +3396,11 @@ impl App {
             }
             CommandAction::SwitchView(view) => {
                 self.view = view;
+                if self.view == View::Treemap {
+                    self.update_cached_treemap_len();
+                    self.treemap_state.reset();
+                }
+                self.maybe_start_analysis_for_view();
             }
             CommandAction::ClearMarks => {
                 self.marked.clear();
@@ -3906,7 +4024,7 @@ impl App {
             if needs_rescan {
                 // We're jumping outside the scanned tree, need to rescan
                 self.path = path;
-                self.tree = gravityfile_scan::quick_list(&self.path, None).ok();
+                self.tree = quick_list_with_settings(&self.path, &self.user_settings).ok();
                 self.tree_state = TreeState::new(self.path.clone());
                 self.tree_state.expand(&self.path);
                 self.duplicates = None;
@@ -4186,29 +4304,17 @@ impl App {
                 }
             }
             LayoutMode::Miller => {
-                // Get direct children of current view
+                // Index children in their natural (displayed) order. Miller
+                // columns render `node.children` directly without re-sorting, so
+                // the visual range must use the same order — otherwise marks land
+                // on different files than the highlight (e.g. in quick-listed
+                // dirs, which are name-sorted while sort_mode is size-based).
                 if let Some((node, _)) = self.get_view_root_node() {
-                    // Sort children same way as Miller columns display
-                    let mut children: Vec<_> = node.children.iter().collect();
-                    let sort_mode = self.sort_mode;
-                    children.sort_by(|a, b| match sort_mode {
-                        SortMode::SizeDescending => b.size.cmp(&a.size),
-                        SortMode::SizeAscending => a.size.cmp(&b.size),
-                        SortMode::NameAscending => a.name.cmp(&b.name),
-                        SortMode::NameDescending => b.name.cmp(&a.name),
-                        SortMode::ModifiedDescending => {
-                            b.timestamps.modified.cmp(&a.timestamps.modified)
-                        }
-                        SortMode::ModifiedAscending => {
-                            a.timestamps.modified.cmp(&b.timestamps.modified)
-                        }
-                        SortMode::CountDescending => b.children.len().cmp(&a.children.len()),
-                        SortMode::CountAscending => a.children.len().cmp(&b.children.len()),
-                    });
-
                     let view_root = self.view_root.clone();
                     (start..=end)
-                        .filter_map(|i| children.get(i).map(|child| view_root.join(&*child.name)))
+                        .filter_map(|i| {
+                            node.children.get(i).map(|child| view_root.join(&*child.name))
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -4323,12 +4429,11 @@ impl App {
                 // This is a simplified implementation - a more complete version would
                 // track rendered areas from the last frame
 
-                // Estimate header height (path bar + tabs)
-                let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                let list_top = self.estimated_list_top_row();
                 let _footer_height: u16 = 1; // Reserved for future use in click calculation
 
-                if y > header_height {
-                    let relative_y = (y - header_height) as usize;
+                if y >= list_top {
+                    let relative_y = (y - list_top) as usize;
 
                     match self.layout_mode {
                         LayoutMode::Tree => {
@@ -4351,10 +4456,10 @@ impl App {
             }
             MouseAction::DoubleClick { y, .. } if self.view == View::Explorer => {
                 // Double-click to enter directory
-                let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                let list_top = self.estimated_list_top_row();
 
-                if y > header_height {
-                    let relative_y = (y - header_height) as usize;
+                if y >= list_top {
+                    let relative_y = (y - list_top) as usize;
 
                     match self.layout_mode {
                         LayoutMode::Tree => {
@@ -4376,10 +4481,10 @@ impl App {
             }
             MouseAction::RightClick { y, .. } if self.view == View::Explorer => {
                 // Right-click to toggle mark
-                let header_height: u16 = if self.tab_manager.len() > 1 { 3 } else { 2 };
+                let list_top = self.estimated_list_top_row();
 
-                if y > header_height {
-                    let relative_y = (y - header_height) as usize;
+                if y >= list_top {
+                    let relative_y = (y - list_top) as usize;
 
                     match self.layout_mode {
                         LayoutMode::Tree => {
@@ -4401,6 +4506,21 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Absolute row of the first list item, for click hit testing.
+    ///
+    /// Mirrors the renderer's vertical stack: the header row, an optional
+    /// directory-tab row, the view-tab row, an optional scan/analysis/quick-list
+    /// banner row, then the list block's top border (both the Tree and Miller
+    /// widgets draw inside a bordered block). Hit testing is lightweight, but this
+    /// must match the layout exactly or clicks land on the wrong row.
+    fn estimated_list_top_row(&self) -> u16 {
+        let chrome_rows = if self.tab_manager.len() > 1 { 3 } else { 2 };
+        let banner_rows =
+            u16::from(self.scan_progress.is_some() || self.analyzing || !self.has_full_scan);
+        let border_row = 1;
+        chrome_rows + banner_rows + border_row
     }
 
     /// Cycle to the next sort mode and apply sorting.
@@ -4699,6 +4819,9 @@ impl App {
             match self.layout_mode {
                 LayoutMode::Tree => self.update_cached_tree_len(),
                 LayoutMode::Miller => self.update_cached_miller_len(),
+            }
+            if self.view == View::Treemap {
+                self.update_cached_treemap_len();
             }
         }
     }

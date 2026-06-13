@@ -107,9 +107,22 @@ impl ConflictResolution {
     }
 }
 
+/// Returns true if nothing exists at `path` (including a dangling symlink).
+///
+/// Uses `symlink_metadata` rather than `exists()` so a broken symlink at the
+/// candidate name is treated as occupied — `exists()` follows the link and
+/// would report it free, leading us to clobber the link's would-be target.
+fn path_is_free(path: &Path) -> bool {
+    path.symlink_metadata().is_err()
+}
+
 /// Generate an auto-renamed path to avoid conflicts.
 ///
 /// For "file.txt", tries "file (1).txt", "file (2).txt", etc.
+///
+/// This is a best-effort hint: callers still create the destination with
+/// `create_new`/exclusive semantics, since any existence check is inherently
+/// racy (TOCTOU).
 pub fn auto_rename_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or(std::path::Path::new(""));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -123,24 +136,35 @@ pub fn auto_rename_path(path: &Path) -> PathBuf {
         };
 
         let new_path = parent.join(&new_name);
-        if !new_path.exists() {
+        if path_is_free(&new_path) {
             return new_path;
         }
     }
 
-    // Fallback: use timestamp
+    // Fallback: use a timestamp, still probing for a free name.
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let new_name = if let Some(ext) = extension {
-        format!("{}_{}.{}", stem, timestamp, ext)
-    } else {
-        format!("{}_{}", stem, timestamp)
-    };
+    for suffix in 0.. {
+        let base = if suffix == 0 {
+            format!("{}_{}", stem, timestamp)
+        } else {
+            format!("{}_{}_{}", stem, timestamp, suffix)
+        };
+        let new_name = match extension {
+            Some(ext) => format!("{}.{}", base, ext),
+            None => base,
+        };
+        let new_path = parent.join(&new_name);
+        if path_is_free(&new_path) {
+            return new_path;
+        }
+    }
 
-    parent.join(&new_name)
+    // Unreachable in practice (the loop above is effectively unbounded).
+    parent.join(format!("{}_{}", stem, timestamp))
 }
 
 #[cfg(test)]

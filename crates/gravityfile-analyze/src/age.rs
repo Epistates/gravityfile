@@ -324,8 +324,8 @@ impl AgeAnalyzer {
                     .unwrap_or(Duration::ZERO);
 
                 *total_files += 1;
-                *total_size += node.size;
-                // Use saturating_add to prevent u64 overflow on pathological inputs
+                // Use saturating arithmetic to prevent u64 overflow on pathological inputs
+                *total_size = total_size.saturating_add(node.size);
                 *total_age_secs = total_age_secs.saturating_add(age.as_secs());
 
                 // Place into the first bucket whose max_age >= file age
@@ -419,7 +419,7 @@ impl BucketCollector {
 
     fn add_file(&mut self, path: PathBuf, size: u64, modified: SystemTime) {
         self.file_count += 1;
-        self.total_size += size;
+        self.total_size = self.total_size.saturating_add(size);
 
         if self.max_files == 0 {
             return;
@@ -443,7 +443,7 @@ impl BucketCollector {
             .into_iter()
             .map(|(Reverse(size), path, modified)| (path, size, modified))
             .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|item| Reverse(item.1));
         v
     }
 }

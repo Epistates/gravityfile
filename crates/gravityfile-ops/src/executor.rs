@@ -259,11 +259,16 @@ pub fn execute_undo(entry: crate::UndoEntry) -> mpsc::Receiver<OperationResult> 
                                     .map_err(|e| format!("Failed to read metadata: {}", e))?;
                                 if meta.is_dir() {
                                     let mut visited = std::collections::HashSet::new();
-                                    crate::move_op::copy_dir_recursive_pub(
+                                    if let Err(e) = crate::copy::copy_dir_recursive(
                                         &cur_clone,
                                         &orig_clone,
                                         &mut visited,
-                                    )?;
+                                    ) {
+                                        // Mirror the forward move: clean up the
+                                        // partially-copied original on failure.
+                                        let _ = fs::remove_dir_all(&orig_clone);
+                                        return Err(e);
+                                    }
                                     fs::remove_dir_all(&cur_clone)
                                         .map_err(|e| format!("Failed to remove source: {}", e))
                                 } else {

@@ -17,11 +17,16 @@ use super::state::ScanResult;
 /// Start a background filesystem scan.
 ///
 /// Returns a receiver that will receive scan progress updates and the final result.
-pub fn start_scan(path: PathBuf, token: CancellationToken) -> mpsc::Receiver<ScanResult> {
+pub fn start_scan(
+    path: PathBuf,
+    include_hidden: bool,
+    token: CancellationToken,
+) -> mpsc::Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel(SCAN_CHANNEL_SIZE);
 
     tokio::spawn(async move {
-        let config = ScanConfig::new(&path);
+        let mut config = ScanConfig::new(&path);
+        config.include_hidden = include_hidden;
         let scanner = JwalkScanner::new();
         let mut progress_rx = scanner.subscribe();
 

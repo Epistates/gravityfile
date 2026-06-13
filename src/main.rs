@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
-use color_eyre::eyre::Context;
+use color_eyre::eyre::{Context, eyre};
 use gravityfile_analyze::{AgeAnalyzer, AgeConfig, DuplicateConfig, DuplicateFinder};
 use gravityfile_core::ScanConfig;
 use gravityfile_scan::JwalkScanner;
@@ -152,10 +152,12 @@ fn main() -> Result<()> {
         None => {
             // Launch TUI
             let path = cli.path.canonicalize().context("Invalid path")?;
-            let config = gravityfile_tui::TuiConfig::new()
-                .with_scan_on_startup(cli.scan)
+            let mut config = gravityfile_tui::TuiConfig::new()
                 .with_cwd_file(cli.cwd_file)
                 .with_print_cwd(cli.print_cwd);
+            if cli.scan {
+                config = config.with_scan_on_startup(true);
+            }
             gravityfile_tui::run_with_config(path, config)?;
             std::process::exit(0);
         }
@@ -415,17 +417,26 @@ fn format_size(bytes: u64) -> String {
     format_size_human(bytes, BINARY)
 }
 
+/// Parse a non-negative byte count, validating the scaled value before the
+/// `as u64` cast (which would otherwise silently saturate negatives/NaN to 0).
+fn scale_bytes(num: f64, multiplier: f64) -> Result<u64> {
+    if !num.is_finite() || num < 0.0 {
+        return Err(eyre!("size must be a non-negative number"));
+    }
+    Ok((num * multiplier) as u64)
+}
+
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.to_uppercase();
     if s.ends_with("GB") || s.ends_with("G") {
         let num: f64 = s.trim_end_matches("GB").trim_end_matches('G').parse()?;
-        Ok((num * 1024.0 * 1024.0 * 1024.0) as u64)
+        scale_bytes(num, 1024.0 * 1024.0 * 1024.0)
     } else if s.ends_with("MB") || s.ends_with("M") {
         let num: f64 = s.trim_end_matches("MB").trim_end_matches('M').parse()?;
-        Ok((num * 1024.0 * 1024.0) as u64)
+        scale_bytes(num, 1024.0 * 1024.0)
     } else if s.ends_with("KB") || s.ends_with("K") {
         let num: f64 = s.trim_end_matches("KB").trim_end_matches('K').parse()?;
-        Ok((num * 1024.0) as u64)
+        scale_bytes(num, 1024.0)
     } else if s.ends_with('B') {
         let num: u64 = s.trim_end_matches('B').parse()?;
         Ok(num)
@@ -456,6 +467,11 @@ fn parse_duration(s: &str) -> Result<std::time::Duration> {
         let num: f64 = s.parse()?;
         (num, 24.0 * 60.0 * 60.0) // Default to days
     };
+
+    // `Duration::from_secs_f64` panics on negative/NaN/infinite input.
+    if !num.is_finite() || num < 0.0 {
+        return Err(eyre!("duration must be a non-negative number"));
+    }
 
     Ok(std::time::Duration::from_secs_f64(num * multiplier))
 }

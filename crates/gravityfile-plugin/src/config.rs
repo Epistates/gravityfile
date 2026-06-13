@@ -30,6 +30,10 @@ pub struct PluginConfig {
 
     /// List of disabled plugin names.
     pub disabled_plugins: HashSet<String>,
+
+    /// Directories the plugin filesystem API may read from (e.g. the scan root).
+    /// Empty means the filesystem API denies all reads (the safe default).
+    pub fs_read_roots: Vec<PathBuf>,
 }
 
 impl Default for PluginConfig {
@@ -46,6 +50,7 @@ impl Default for PluginConfig {
             max_memory_mb: 256,
             allow_network: false,
             disabled_plugins: HashSet::new(),
+            fs_read_roots: Vec::new(),
         }
     }
 }
@@ -72,6 +77,12 @@ impl PluginConfig {
     /// Check if a plugin is disabled.
     pub fn is_disabled(&self, name: &str) -> bool {
         self.disabled_plugins.contains(name)
+    }
+
+    /// Set the directories the plugin filesystem API may read from.
+    pub fn with_fs_read_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.fs_read_roots = roots;
+        self
     }
 }
 
@@ -260,5 +271,103 @@ impl PluginPermissions {
     /// Check if plugin can run a command.
     pub fn can_run_command(&self, cmd: &str) -> bool {
         self.commands.iter().any(|c| c == cmd || c == "*")
+    }
+
+    /// Build a [`SandboxConfig`](crate::sandbox::SandboxConfig) enforcing these
+    /// declared permissions, scoped to `roots` (e.g. the scan root). This is the
+    /// bridge that turns the per-plugin permission declaration into an actually
+    /// enforced sandbox for isolated execution.
+    pub fn to_sandbox(
+        &self,
+        roots: &[PathBuf],
+        timeout_ms: u64,
+        max_memory: usize,
+    ) -> crate::sandbox::SandboxConfig {
+        use crate::sandbox::{Permission, SandboxConfig};
+
+        let mut sandbox = SandboxConfig::minimal();
+        sandbox.timeout_ms = timeout_ms;
+        sandbox.max_memory = max_memory;
+
+        match self.filesystem {
+            FilesystemPermission::None => {}
+            FilesystemPermission::Read => {
+                sandbox.permissions.insert(Permission::Read);
+                sandbox.allowed_read_paths = roots.to_vec();
+            }
+            FilesystemPermission::Write => {
+                sandbox.permissions.insert(Permission::Read);
+                sandbox.permissions.insert(Permission::Write);
+                sandbox.allowed_read_paths = roots.to_vec();
+                sandbox.allowed_write_paths = roots.to_vec();
+            }
+            FilesystemPermission::Full => {
+                sandbox.permissions.insert(Permission::Read);
+                sandbox.permissions.insert(Permission::Write);
+                sandbox.allowed_read_paths = vec![PathBuf::from("/")];
+                sandbox.allowed_write_paths = vec![PathBuf::from("/")];
+            }
+        }
+
+        if self.network {
+            sandbox.allow_network = true;
+            sandbox.permissions.insert(Permission::Network);
+        }
+        if self.env {
+            sandbox.allow_env = true;
+            sandbox.permissions.insert(Permission::Environment);
+        }
+        if !self.commands.is_empty() {
+            sandbox.permissions.insert(Permission::Execute);
+            for cmd in &self.commands {
+                sandbox.allowed_commands.insert(cmd.clone());
+            }
+        }
+
+        sandbox
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::Permission;
+
+    #[test]
+    fn permissions_none_grants_no_filesystem() {
+        let perms = PluginPermissions::default();
+        let sb = perms.to_sandbox(&[PathBuf::from("/tmp")], 1000, 0);
+        assert!(!sb.has_permission(Permission::Read));
+        assert!(!sb.has_permission(Permission::Write));
+        assert!(sb.allowed_read_paths.is_empty());
+    }
+
+    #[test]
+    fn permissions_read_scopes_to_roots() {
+        let perms = PluginPermissions {
+            filesystem: FilesystemPermission::Read,
+            ..Default::default()
+        };
+        let sb = perms.to_sandbox(&[PathBuf::from("/tmp")], 1000, 0);
+        assert!(sb.has_permission(Permission::Read));
+        assert!(!sb.has_permission(Permission::Write));
+        assert_eq!(sb.allowed_read_paths, vec![PathBuf::from("/tmp")]);
+        assert!(sb.allowed_write_paths.is_empty());
+    }
+
+    #[test]
+    fn permissions_write_grants_read_and_write_scoped() {
+        let perms = PluginPermissions {
+            filesystem: FilesystemPermission::Write,
+            env: true,
+            commands: vec!["git".to_string()],
+            ..Default::default()
+        };
+        let sb = perms.to_sandbox(&[PathBuf::from("/data")], 1000, 0);
+        assert!(sb.has_permission(Permission::Read));
+        assert!(sb.has_permission(Permission::Write));
+        assert!(sb.has_permission(Permission::Environment));
+        assert!(sb.can_execute("git"));
+        assert!(!sb.can_execute("rm"));
     }
 }

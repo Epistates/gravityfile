@@ -970,7 +970,7 @@ fn test_tree_stats_record_file() {
     let mut stats = TreeStats::new();
     let now = SystemTime::now();
 
-    stats.record_file(std::path::Path::new("/test/file.txt"), 1024, now, 2);
+    stats.record_file(std::path::Path::new("/test/file.txt"), 1024, Some(now), 2);
 
     assert_eq!(stats.total_files, 1);
     assert_eq!(stats.total_size, 1024);
@@ -984,8 +984,8 @@ fn test_tree_stats_record_file_tracks_extremes() {
     let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
     let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
 
-    stats.record_file(std::path::Path::new("/small_old"), 100, t1, 1);
-    stats.record_file(std::path::Path::new("/big_new"), 999, t2, 2);
+    stats.record_file(std::path::Path::new("/small_old"), 100, Some(t1), 1);
+    stats.record_file(std::path::Path::new("/big_new"), 999, Some(t2), 2);
 
     assert_eq!(stats.largest_file.as_ref().unwrap().1, 999);
     assert_eq!(stats.oldest_file.as_ref().unwrap().1, t1);
@@ -1023,7 +1023,7 @@ fn test_file_tree_accessors() {
     );
 
     let mut stats = TreeStats::new();
-    stats.record_file(std::path::Path::new("/file.txt"), 4096, now, 0);
+    stats.record_file(std::path::Path::new("/file.txt"), 4096, Some(now), 0);
 
     let tree = FileTree::new(
         root,

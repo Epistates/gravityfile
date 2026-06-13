@@ -396,7 +396,7 @@ pub fn get_help_sections() -> Vec<HelpSection> {
             bindings: vec![
                 KeyBinding {
                     keys: "Tab/S-Tab",
-                    description: "Switch view (Explorer/Dups/Age)",
+                    description: "Switch view",
                 },
                 KeyBinding {
                     keys: "v",
@@ -420,7 +420,28 @@ pub fn get_help_sections() -> Vec<HelpSection> {
                 },
                 KeyBinding {
                     keys: "R",
-                    description: "Refresh/rescan",
+                    description: "Full scan/rescan",
+                },
+            ],
+        },
+        HelpSection {
+            title: "Treemap View",
+            bindings: vec![
+                KeyBinding {
+                    keys: "j/k",
+                    description: "Select rectangle",
+                },
+                KeyBinding {
+                    keys: "Enter/l",
+                    description: "Drill into directory",
+                },
+                KeyBinding {
+                    keys: "Backspace/h",
+                    description: "Navigate back",
+                },
+                KeyBinding {
+                    keys: "Space",
+                    description: "Mark selected item",
                 },
             ],
         },
@@ -554,6 +575,8 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
         (":theme dark|light", "Set theme"),
         (":layout tree|miller", "Set layout"),
         (":sort <mode>", "Set sort (size/name/date/count)"),
+        (":treemap :map", "Show disk-usage treemap"),
+        (":analyze", "Run duplicate/age analysis"),
         (":bookmark [key]", "Set bookmark (or list all)"),
         (":bookmarks", "Show bookmark list"),
         (":delmark <key>", "Delete a bookmark"),

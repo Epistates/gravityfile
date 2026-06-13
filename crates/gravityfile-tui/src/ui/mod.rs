@@ -14,7 +14,7 @@ pub use tree::{TreeState, TreeView, VisibleNodeKind};
 pub use treemap::{TreemapState, TreemapView};
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Truncate a string to at most `max_width` display columns, respecting
 /// char boundaries and Unicode widths. Returns a byte-valid substring.
@@ -30,6 +30,49 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
         byte_pos += ch.len_utf8();
     }
     &s[..byte_pos]
+}
+
+/// Keep the rightmost `max_width` display columns of `s`, respecting char
+/// boundaries and Unicode widths. Returns a byte-valid suffix.
+pub fn truncate_left_to_width(s: &str, max_width: usize) -> &str {
+    let mut col_count = 0;
+    let mut start = s.len();
+    for (idx, ch) in s.char_indices().rev() {
+        let w = ch.width().unwrap_or(1);
+        if col_count + w > max_width {
+            break;
+        }
+        col_count += w;
+        start = idx;
+    }
+    &s[start..]
+}
+
+/// Fit `text` into `max_width` columns, appending a trailing `…` if truncated.
+/// Always Unicode-width and char-boundary safe.
+pub fn fit_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        String::new()
+    } else if text.width() > max_width {
+        format!("{}…", truncate_to_width(text, max_width.saturating_sub(1)))
+    } else {
+        text.to_string()
+    }
+}
+
+/// Fit `text` into `max_width` columns by dropping from the left, prepending a
+/// leading `…` if truncated. Always Unicode-width and char-boundary safe.
+pub fn fit_left_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        String::new()
+    } else if text.width() > max_width {
+        format!(
+            "…{}",
+            truncate_left_to_width(text, max_width.saturating_sub(1))
+        )
+    } else {
+        text.to_string()
+    }
 }
 
 /// Layout areas for the application.
@@ -117,6 +160,15 @@ pub fn format_relative_time(time: std::time::SystemTime) -> String {
                 format!("{}y ago", secs / 31536000)
             }
         }
-        Err(_) => "in future".to_string(),
+        // Time is in the future. Small offsets are almost always clock skew
+        // (NFS, VM clock drift), so render those as "just now" rather than the
+        // alarming "in future".
+        Err(e) => {
+            if e.duration().as_secs() < 60 {
+                "just now".to_string()
+            } else {
+                "in future".to_string()
+            }
+        }
     }
 }

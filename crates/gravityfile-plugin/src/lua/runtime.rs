@@ -7,11 +7,12 @@ use mlua::{Function, Lua, MultiValue, Table, Value as LuaValue};
 
 use crate::config::{PluginConfig, PluginMetadata};
 use crate::hooks::{Hook, HookContext, HookResult};
-use crate::runtime::{BoxFuture, IsolatedContext, PluginHandle, PluginRuntime};
+use crate::runtime::{BoxFuture, HOOK_NAMES, IsolatedContext, PluginHandle, PluginRuntime};
 use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginResult, Value};
 
 use super::bindings;
+use super::convert::{lua_to_value, value_to_lua};
 use super::isolate::LuaIsolatedContext;
 
 /// A loaded Lua plugin.
@@ -214,79 +215,6 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Convert a Lua value to our Value type.
-    fn lua_to_value(lua_val: LuaValue) -> Value {
-        match lua_val {
-            LuaValue::Nil => Value::Null,
-            LuaValue::Boolean(b) => Value::Bool(b),
-            LuaValue::Integer(i) => Value::Integer(i),
-            LuaValue::Number(n) => Value::Float(n),
-            LuaValue::String(s) => Value::String(s.to_string_lossy()),
-            LuaValue::Table(t) => {
-                // Check if it's an array or object
-                let mut is_array = true;
-                let mut max_index = 0i64;
-
-                for pair in t.clone().pairs::<i64, LuaValue>() {
-                    if let Ok((k, _)) = pair {
-                        if k > 0 {
-                            max_index = max_index.max(k);
-                        } else {
-                            is_array = false;
-                            break;
-                        }
-                    } else {
-                        is_array = false;
-                        break;
-                    }
-                }
-
-                if is_array && max_index > 0 {
-                    let mut arr = Vec::new();
-                    for i in 1..=max_index {
-                        if let Ok(v) = t.get::<LuaValue>(i) {
-                            arr.push(Self::lua_to_value(v));
-                        }
-                    }
-                    Value::Array(arr)
-                } else {
-                    let mut obj = std::collections::HashMap::new();
-                    for (k, v) in t.pairs::<String, LuaValue>().flatten() {
-                        obj.insert(k, Self::lua_to_value(v));
-                    }
-                    Value::Object(obj)
-                }
-            }
-            _ => Value::Null,
-        }
-    }
-
-    /// Convert our Value type to a Lua value.
-    fn value_to_lua(&self, lua: &Lua, val: &Value) -> mlua::Result<LuaValue> {
-        match val {
-            Value::Null => Ok(LuaValue::Nil),
-            Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
-            Value::Integer(i) => Ok(LuaValue::Integer(*i)),
-            Value::Float(f) => Ok(LuaValue::Number(*f)),
-            Value::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
-            Value::Array(arr) => {
-                let table = lua.create_table()?;
-                for (i, v) in arr.iter().enumerate() {
-                    table.set(i + 1, self.value_to_lua(lua, v)?)?;
-                }
-                Ok(LuaValue::Table(table))
-            }
-            Value::Object(obj) => {
-                let table = lua.create_table()?;
-                for (k, v) in obj {
-                    table.set(k.as_str(), self.value_to_lua(lua, v)?)?;
-                }
-                Ok(LuaValue::Table(table))
-            }
-            Value::Bytes(b) => Ok(LuaValue::String(lua.create_string(b)?)),
-        }
-    }
-
     /// Convert a Hook to a Lua table.
     fn hook_to_lua(&self, lua: &Lua, hook: &Hook) -> mlua::Result<Table> {
         let table = lua.create_table()?;
@@ -333,11 +261,34 @@ impl LuaRuntime {
 
         Ok(table)
     }
-}
 
-impl Default for LuaRuntime {
-    fn default() -> Self {
-        Self::new().expect("Failed to create Lua runtime")
+    /// Run `f` under a CPU watchdog: an instruction-count hook aborts execution
+    /// once the wall-clock deadline (from the sandbox timeout) passes. This
+    /// bounds runaway plugins on the shared Lua state without requiring the state
+    /// to be `Send` (so we avoid `spawn_blocking`). A timeout surfaces as an
+    /// execution error from the wrapped Lua call.
+    fn with_deadline<T>(&self, f: impl FnOnce() -> PluginResult<T>) -> PluginResult<T> {
+        use std::time::{Duration, Instant};
+
+        let timeout_ms = self.sandbox.timeout_ms;
+        if timeout_ms == 0 {
+            return f();
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let _ = self.lua.set_hook(
+            mlua::HookTriggers::new().every_nth_instruction(100_000),
+            move |_lua, _debug| {
+                if Instant::now() >= deadline {
+                    Err(mlua::Error::external("plugin execution timed out"))
+                } else {
+                    Ok(mlua::VmState::Continue)
+                }
+            },
+        );
+        let result = f();
+        self.lua.remove_hook();
+        result
     }
 }
 
@@ -355,13 +306,22 @@ impl PluginRuntime for LuaRuntime {
             return Ok(());
         }
 
-        // Build a sandbox from plugin config settings.
+        // Build a sandbox from plugin config settings. The default grants the
+        // Read permission but no paths; wiring the configured roots is what makes
+        // the filesystem API actually usable (and scoped).
         self.sandbox = SandboxConfig {
             timeout_ms: config.default_timeout_ms,
             max_memory: config.max_memory_mb * 1024 * 1024,
             allow_network: config.allow_network,
+            allowed_read_paths: config.fs_read_roots.clone(),
             ..SandboxConfig::default()
         };
+
+        // Bound memory on the shared Lua state so a runaway plugin can't OOM the
+        // whole TUI. 0 means "unlimited" in our config; only set a real cap.
+        if self.sandbox.max_memory > 0 {
+            let _ = self.lua.set_memory_limit(self.sandbox.max_memory);
+        }
 
         self.config = Some(config.clone());
         self.init_api()?;
@@ -382,28 +342,11 @@ impl PluginRuntime for LuaRuntime {
             message: e.to_string(),
         })?;
 
-        // Detect which hooks are implemented
+        // Detect which hooks are implemented, using the shared canonical list
+        // so Lua plugins can register every hook the host dispatches.
         let mut hooks = vec![];
-        for hook_name in [
-            "on_navigate",
-            "on_drill_down",
-            "on_back",
-            "on_scan_start",
-            "on_scan_progress",
-            "on_scan_complete",
-            "on_delete_start",
-            "on_delete_complete",
-            "on_copy_start",
-            "on_copy_complete",
-            "on_move_start",
-            "on_move_complete",
-            "on_render",
-            "on_action",
-            "on_mode_change",
-            "on_startup",
-            "on_shutdown",
-        ] {
-            if module.contains_key(hook_name).unwrap_or(false) {
+        for hook_name in HOOK_NAMES {
+            if module.contains_key(*hook_name).unwrap_or(false) {
                 hooks.push(hook_name.to_string());
             }
         }
@@ -493,13 +436,14 @@ impl PluginRuntime for LuaRuntime {
                     message: e.to_string(),
                 })?;
 
-        // Call the function
-        let result: LuaValue =
+        // Call the function under the CPU/time watchdog.
+        let result: LuaValue = self.with_deadline(|| {
             func.call((module.clone(), hook_table))
                 .map_err(|e| PluginError::ExecutionError {
                     name: plugin.name.clone(),
                     message: e.to_string(),
-                })?;
+                })
+        })?;
 
         // Convert result
         let mut hook_result = HookResult::ok();
@@ -515,7 +459,7 @@ impl PluginRuntime for LuaRuntime {
                 hook_result = hook_result.stop_propagation();
             }
             if let Ok(val) = t.get::<LuaValue>("value") {
-                hook_result.value = Some(Self::lua_to_value(val));
+                hook_result.value = Some(lua_to_value(val));
             }
         }
 
@@ -564,15 +508,15 @@ impl PluginRuntime for LuaRuntime {
             // Convert args to Lua
             let lua_args: Vec<LuaValue> = args
                 .iter()
-                .map(|v| self.value_to_lua(&self.lua, v))
+                .map(|v| value_to_lua(&self.lua, v))
                 .collect::<Result<_, _>>()
                 .map_err(|e| PluginError::ExecutionError {
                     name: plugin.name.clone(),
                     message: e.to_string(),
                 })?;
 
-            let result: LuaValue = func
-                .call(MultiValue::from_vec(
+            let result: LuaValue = self.with_deadline(|| {
+                func.call(MultiValue::from_vec(
                     std::iter::once(LuaValue::Table(module))
                         .chain(lua_args)
                         .collect(),
@@ -580,9 +524,10 @@ impl PluginRuntime for LuaRuntime {
                 .map_err(|e| PluginError::ExecutionError {
                     name: plugin.name.clone(),
                     message: e.to_string(),
-                })?;
+                })
+            })?;
 
-            Ok(Self::lua_to_value(result))
+            Ok(lua_to_value(result))
         })
     }
 
@@ -600,5 +545,79 @@ impl PluginRuntime for LuaRuntime {
     fn shutdown(&mut self) -> PluginResult<()> {
         self.plugins.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::{Hook, HookContext};
+    use std::io::Write as _;
+
+    fn lua_runtime(timeout_ms: u64) -> LuaRuntime {
+        let mut rt = LuaRuntime::new().unwrap();
+        let cfg = PluginConfig {
+            default_timeout_ms: timeout_ms,
+            ..PluginConfig::default()
+        };
+        rt.init(&cfg).unwrap();
+        rt
+    }
+
+    #[test]
+    fn deadline_aborts_infinite_loop_hook() {
+        let mut rt = lua_runtime(50);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        // on_action is a sync hook; the body loops forever and must be aborted
+        // by the instruction-count deadline watchdog rather than hanging.
+        write!(
+            file,
+            "local M = {{}}\nfunction M.on_action(self, hook) while true do end end\nreturn M\n"
+        )
+        .unwrap();
+
+        let handle = rt.load_plugin("loopy", file.path()).unwrap();
+        assert!(rt.has_hook(handle, "on_action"));
+
+        let start = std::time::Instant::now();
+        let res = rt.call_hook_sync(
+            handle,
+            &Hook::OnAction {
+                action: "x".into(),
+            },
+            &HookContext::new(),
+        );
+
+        assert!(res.is_err(), "runaway hook should abort, got {res:?}");
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "watchdog should abort promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn normal_hook_runs_under_deadline() {
+        let mut rt = lua_runtime(1000);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "local M = {{}}\nfunction M.on_action(self, hook) return {{ handled = true }} end\nreturn M\n"
+        )
+        .unwrap();
+
+        let handle = rt.load_plugin("calm", file.path()).unwrap();
+        let res = rt
+            .call_hook_sync(
+                handle,
+                &Hook::OnAction {
+                    action: "x".into(),
+                },
+                &HookContext::new(),
+            )
+            .unwrap();
+        assert!(res.is_ok());
     }
 }

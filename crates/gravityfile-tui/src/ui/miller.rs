@@ -16,7 +16,7 @@ use gravityfile_core::{FileNode, GitStatus, NodeKind};
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::preview::PreviewContent;
 use crate::theme::Theme;
-use crate::ui::{CompactSizeBar, format_size, truncate_to_width};
+use crate::ui::{CompactSizeBar, fit_to_width, format_size};
 
 /// State for Miller columns view.
 #[derive(Debug, Clone, Default)]
@@ -301,15 +301,7 @@ impl<'a> MillerColumns<'a> {
 
             // Truncate name if needed (account for git indicator, Unicode-safe)
             let name_max_len = available_for_name.saturating_sub(git_len);
-            let name = {
-                use unicode_width::UnicodeWidthStr;
-                if entry.name.width() > name_max_len {
-                    let truncated = truncate_to_width(&entry.name, name_max_len.saturating_sub(1));
-                    format!("{}…", truncated)
-                } else {
-                    entry.name.clone()
-                }
-            };
+            let name = fit_to_width(&entry.name, name_max_len);
 
             // Pad name (account for git indicator, using display widths)
             let name_display_width = {
@@ -805,52 +797,13 @@ impl StatefulWidget for MillerColumns<'_> {
     }
 }
 
-/// Format a Unix timestamp as a human-readable date string.
+/// Format a Unix timestamp as a human-readable local date-time string.
 fn format_timestamp(secs: u64) -> String {
-    // Simple formatting without chrono dependency
-    let days_since_epoch = secs / 86400;
-    let remaining_secs = secs % 86400;
-    let hours = remaining_secs / 3600;
-    let minutes = (remaining_secs % 3600) / 60;
-    let seconds = remaining_secs % 60;
-
-    // Calculate year/month/day from days since epoch (1970-01-01)
-    let mut days = days_since_epoch as i64;
-    let mut year = 1970i32;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_opt(secs as i64, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => "—".to_string(),
     }
-
-    let days_in_months: [i64; 12] = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 1u32;
-    for &dim in &days_in_months {
-        if days < dim {
-            break;
-        }
-        days -= dim;
-        month += 1;
-    }
-    let day = days + 1;
-
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, month, day, hours, minutes, seconds
-    )
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Get the selected entry from Miller state.

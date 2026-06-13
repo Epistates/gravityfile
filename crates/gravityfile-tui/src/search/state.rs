@@ -66,8 +66,6 @@ pub struct SearchState {
     pub results: Vec<SearchResult>,
     /// Currently selected result index.
     pub selected: usize,
-    /// Scroll offset for results display.
-    pub offset: usize,
     /// The nucleo matcher for fuzzy search.
     matcher: Matcher,
     /// All paths available for searching.
@@ -90,7 +88,6 @@ impl SearchState {
             cursor: 0,
             results: Vec::new(),
             selected: 0,
-            offset: 0,
             matcher: Matcher::new(Config::DEFAULT),
             all_paths: Vec::new(),
         }
@@ -103,7 +100,6 @@ impl SearchState {
         self.cursor = 0;
         self.results.clear();
         self.selected = 0;
-        self.offset = 0;
     }
 
     /// Deactivate search mode.
@@ -113,7 +109,6 @@ impl SearchState {
         self.cursor = 0;
         self.results.clear();
         self.selected = 0;
-        self.offset = 0;
     }
 
     /// Update the available paths from the file tree.
@@ -124,17 +119,32 @@ impl SearchState {
         }
     }
 
+    /// Number of characters (not bytes) in the query.
+    fn query_char_len(&self) -> usize {
+        self.query.chars().count()
+    }
+
+    /// Byte offset corresponding to the current (char-based) cursor position.
+    fn cursor_byte_offset(&self) -> usize {
+        self.query
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.query.len())
+    }
+
     /// Set the query and execute search.
     #[allow(dead_code)]
     pub fn set_query(&mut self, query: String) {
         self.query = query;
-        self.cursor = self.query.len();
+        self.cursor = self.query_char_len();
         self.execute_search();
     }
 
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, c: char) {
-        self.query.insert(self.cursor, c);
+        let byte = self.cursor_byte_offset();
+        self.query.insert(byte, c);
         self.cursor += 1;
         self.execute_search();
     }
@@ -143,15 +153,17 @@ impl SearchState {
     pub fn delete_char_before(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            self.query.remove(self.cursor);
+            let byte = self.cursor_byte_offset();
+            self.query.remove(byte);
             self.execute_search();
         }
     }
 
     /// Delete the character at the cursor.
     pub fn delete_char_at(&mut self) {
-        if self.cursor < self.query.len() {
-            self.query.remove(self.cursor);
+        if self.cursor < self.query_char_len() {
+            let byte = self.cursor_byte_offset();
+            self.query.remove(byte);
             self.execute_search();
         }
     }
@@ -163,7 +175,7 @@ impl SearchState {
 
     /// Move cursor right.
     pub fn move_cursor_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.query.len());
+        self.cursor = (self.cursor + 1).min(self.query_char_len());
     }
 
     /// Move cursor to start.
@@ -173,7 +185,7 @@ impl SearchState {
 
     /// Move cursor to end.
     pub fn move_cursor_end(&mut self) {
-        self.cursor = self.query.len();
+        self.cursor = self.query_char_len();
     }
 
     /// Clear the query.
@@ -182,7 +194,6 @@ impl SearchState {
         self.cursor = 0;
         self.results.clear();
         self.selected = 0;
-        self.offset = 0;
     }
 
     /// Cycle to the next search mode.
@@ -195,10 +206,6 @@ impl SearchState {
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
-            // Adjust offset if needed
-            if self.selected < self.offset {
-                self.offset = self.selected;
-            }
         }
     }
 
@@ -218,7 +225,6 @@ impl SearchState {
     fn execute_search(&mut self) {
         self.results.clear();
         self.selected = 0;
-        self.offset = 0;
 
         if self.query.is_empty() {
             return;
@@ -292,7 +298,11 @@ impl SearchState {
 
         for (path, display, is_dir) in &self.all_paths {
             if let Some(m) = regex.find(display) {
-                let matched_indices: Vec<usize> = (m.start()..m.end()).collect();
+                // Convert byte offsets to char indices so highlighting (which
+                // enumerates chars) lines up with multi-byte display names.
+                let start_char = display[..m.start()].chars().count();
+                let end_char = display[..m.end()].chars().count();
+                let matched_indices: Vec<usize> = (start_char..end_char).collect();
                 self.results.push(SearchResult {
                     path: path.clone(),
                     display: display.clone(),

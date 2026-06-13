@@ -13,7 +13,7 @@ use gravityfile_core::{FileNode, GitStatus, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
-use crate::ui::{CompactSizeBar, format_size, truncate_to_width};
+use crate::ui::{CompactSizeBar, fit_to_width, format_size};
 
 /// State for the tree view.
 #[derive(Debug, Default, Clone)]
@@ -367,16 +367,7 @@ impl StatefulWidget for TreeView<'_> {
                 .saturating_sub(size_text_width + 1);
 
             // Truncate name if needed (Unicode-safe)
-            let name = {
-                use unicode_width::UnicodeWidthStr;
-                let max = available_for_name as usize;
-                if item.node.name.width() > max {
-                    let truncated = truncate_to_width(&item.node.name, max.saturating_sub(1));
-                    format!("{}…", truncated)
-                } else {
-                    item.node.name.clone()
-                }
-            };
+            let name = fit_to_width(&item.node.name, available_for_name as usize);
 
             // Build line with checkbox
             let prefix_span = Span::styled(&prefix, self.theme.tree_lines);

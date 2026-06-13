@@ -181,38 +181,25 @@ async fn copy_impl(
                         .await;
                     return;
                 }
-                ConflictResolution::AutoRename => auto_rename_path(&dest_path),
+                ConflictResolution::AutoRename => (auto_rename_path(&dest_path), false),
+                // Overwrite is handled by staging into a temp sibling then
+                // atomically swapping, so a failed copy never destroys the
+                // existing destination (CRIT-3 data-loss fix).
                 ConflictResolution::Overwrite | ConflictResolution::OverwriteAll => {
-                    // CRIT-3: handle removal failure — record error and skip this source
-                    let remove_result = if let Some(ref m) = dest_meta {
-                        if m.is_symlink() || !m.is_dir() {
-                            fs::remove_file(&dest_path)
-                        } else {
-                            fs::remove_dir_all(&dest_path)
-                        }
-                    } else {
-                        Ok(())
-                    };
-                    if let Err(e) = remove_result {
-                        progress.add_error(OperationError::new(
-                            dest_path.clone(),
-                            format!("Failed to remove existing destination: {}", e),
-                        ));
-                        failed += 1;
-                        continue;
-                    }
-                    dest_path.clone()
+                    (dest_path.clone(), true)
                 }
             }
         } else {
-            dest_path.clone()
+            (dest_path.clone(), false)
         };
+
+        let (final_dest, overwrite) = final_dest;
 
         // Perform the copy
         progress.set_current_file(Some(source.clone()));
         let _ = tx.send(CopyResult::Progress(progress.clone())).await;
 
-        if let Err(e) = copy_item(&source, &final_dest, &mut progress, &tx).await {
+        if let Err(e) = copy_item(&source, &final_dest, overwrite, &mut progress, &tx).await {
             progress.add_error(OperationError::new(source.clone(), e));
             failed += 1;
         } else {
@@ -237,9 +224,14 @@ async fn copy_impl(
 }
 
 /// Copy a single item (file, directory, or symlink).
+///
+/// When `overwrite` is set and `dest` already exists, the copy is staged into a
+/// temporary sibling and atomically swapped into place, so a mid-copy failure
+/// can never destroy the pre-existing destination.
 async fn copy_item(
     source: &Path,
     dest: &Path,
+    overwrite: bool,
     progress: &mut OperationProgress,
     tx: &mpsc::Sender<CopyResult>,
 ) -> Result<(), String> {
@@ -247,34 +239,10 @@ async fn copy_item(
     let dest = dest.to_path_buf();
 
     let result = tokio::task::spawn_blocking(move || {
-        // Use symlink_metadata to avoid following symlinks
-        let metadata =
-            fs::symlink_metadata(&source).map_err(|e| format!("Failed to read metadata: {}", e))?;
-
-        if metadata.is_symlink() {
-            // For symlinks, read the target and recreate at destination
-            let target =
-                fs::read_link(&source).map_err(|e| format!("Failed to read symlink: {}", e))?;
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&target, &dest)
-                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
-            }
-            #[cfg(windows)]
-            {
-                if target.is_dir() {
-                    std::os::windows::fs::symlink_dir(&target, &dest)
-                        .map_err(|e| format!("Failed to create symlink: {}", e))?;
-                } else {
-                    std::os::windows::fs::symlink_file(&target, &dest)
-                        .map_err(|e| format!("Failed to create symlink: {}", e))?;
-                }
-            }
-            Ok(0u64) // Symlinks have no real size
-        } else if metadata.is_dir() {
-            copy_dir_recursive(&source, &dest, &mut HashSet::new())
+        if overwrite && fs::symlink_metadata(&dest).is_ok() {
+            staged_overwrite_copy(&source, &dest)
         } else {
-            copy_file(&source, &dest)
+            copy_path_blocking(&source, &dest)
         }
     })
     .await
@@ -290,10 +258,102 @@ async fn copy_item(
     }
 }
 
+/// Copy a single path (file, directory, or symlink) without following symlinks.
+/// Returns the number of bytes copied.
+pub(crate) fn copy_path_blocking(source: &Path, dest: &Path) -> Result<u64, String> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+    if metadata.is_symlink() {
+        let target = fs::read_link(source).map_err(|e| format!("Failed to read symlink: {}", e))?;
+        recreate_symlink(&target, source, dest)?;
+        Ok(0) // Symlinks have no real size
+    } else if metadata.is_dir() {
+        copy_dir_recursive(source, dest, &mut HashSet::new())
+    } else {
+        copy_file(source, dest)
+    }
+}
+
+/// Stage a copy of `source` into a temp sibling of `dest`, then atomically
+/// replace `dest`. On any failure the temp is cleaned up and `dest` is left
+/// untouched.
+fn staged_overwrite_copy(source: &Path, dest: &Path) -> Result<u64, String> {
+    let temp = unique_temp_path(dest);
+
+    let bytes = match copy_path_blocking(source, &temp) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = remove_path(&temp);
+            return Err(e);
+        }
+    };
+
+    // Remove the existing destination, then move the staged copy into place.
+    if let Err(e) = remove_path(dest) {
+        let _ = remove_path(&temp);
+        return Err(format!("Failed to remove existing destination: {}", e));
+    }
+    if let Err(e) = fs::rename(&temp, dest) {
+        let _ = remove_path(&temp);
+        return Err(format!("Failed to finalize overwrite: {}", e));
+    }
+
+    Ok(bytes)
+}
+
+/// Recreate `target` as a symlink at `dest`. `source` is the original link,
+/// used on Windows to decide between a file and directory symlink.
+pub(crate) fn recreate_symlink(target: &Path, source: &Path, dest: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let _ = source;
+        std::os::unix::fs::symlink(target, dest)
+            .map_err(|e| format!("Failed to create symlink: {}", e))
+    }
+    #[cfg(windows)]
+    {
+        // Mirror the original link kind based on what it pointed at.
+        let result = if source.is_dir() {
+            std::os::windows::fs::symlink_dir(target, dest)
+        } else {
+            std::os::windows::fs::symlink_file(target, dest)
+        };
+        result.map_err(|e| format!("Failed to create symlink: {}", e))
+    }
+}
+
+/// Remove a path whether it is a file, symlink, or directory (no symlink follow).
+pub(crate) fn remove_path(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Pick a unique temporary sibling path for staging an overwrite of `dest`.
+pub(crate) fn unique_temp_path(dest: &Path) -> PathBuf {
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "item".to_string());
+    let pid = std::process::id();
+    for n in 0u64.. {
+        let candidate = parent.join(format!(".gravityfile-tmp.{pid}.{n}.{name}"));
+        if candidate.symlink_metadata().is_err() {
+            return candidate;
+        }
+    }
+    unreachable!("temp path counter is effectively unbounded")
+}
+
 /// Copy a single file.
 ///
 /// HIGH-1: use symlink_metadata so we read the link's own size, not the target's.
-fn copy_file(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
+fn copy_file(source: &Path, dest: &Path) -> Result<u64, String> {
     // HIGH-1: use symlink_metadata to avoid following symlinks for size
     let metadata =
         fs::symlink_metadata(source).map_err(|e| format!("Failed to read metadata: {}", e))?;
@@ -304,15 +364,35 @@ fn copy_file(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
     Ok(size)
 }
 
-/// Recursively copy a directory.
+/// Recursively copy a directory. Shared by both the copy and (cross-filesystem)
+/// move paths, and by undo.
 ///
 /// CRIT-2: uses `entry.file_type()` (no symlink-follow), handles symlinks as a distinct
 /// branch, and tracks inodes via a visited set to detect hard-link / symlink loops on Unix.
-fn copy_dir_recursive(
-    source: &PathBuf,
-    dest: &PathBuf,
+pub(crate) fn copy_dir_recursive(
+    source: &Path,
+    dest: &Path,
     visited: &mut HashSet<u64>,
 ) -> Result<u64, String> {
+    copy_dir_recursive_depth(source, dest, visited, 0)
+}
+
+/// Maximum directory recursion depth. PATH_MAX is 4096 bytes on Linux, so any
+/// real path is shallower than this; the guard only fires on adversarial input
+/// and prevents a stack overflow.
+pub(crate) const MAX_RECURSION_DEPTH: usize = 4096;
+
+fn copy_dir_recursive_depth(
+    source: &Path,
+    dest: &Path,
+    visited: &mut HashSet<u64>,
+    depth: usize,
+) -> Result<u64, String> {
+    if depth >= MAX_RECURSION_DEPTH {
+        return Err(format!(
+            "Directory nesting exceeds maximum depth of {MAX_RECURSION_DEPTH}"
+        ));
+    }
     // Loop detection via inode on Unix
     #[cfg(unix)]
     {
@@ -345,31 +425,9 @@ fn copy_dir_recursive(
             // Recreate the symlink rather than following it
             let target =
                 fs::read_link(&path).map_err(|e| format!("Failed to read symlink: {}", e))?;
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&target, &dest_path)
-                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
-            }
-            #[cfg(windows)]
-            {
-                // Choose symlink_dir vs symlink_file based on what the
-                // original link pointed at, and log failures.
-                let result = if path.is_dir() {
-                    std::os::windows::fs::symlink_dir(&target, &dest_path)
-                } else {
-                    std::os::windows::fs::symlink_file(&target, &dest_path)
-                };
-                if let Err(e) = result {
-                    tracing::warn!(
-                        "Failed to create symlink {} -> {}: {}",
-                        dest_path.display(),
-                        target.display(),
-                        e
-                    );
-                }
-            }
+            recreate_symlink(&target, &path, &dest_path)?;
         } else if file_type.is_dir() {
-            total_bytes += copy_dir_recursive(&path, &dest_path, visited)?;
+            total_bytes += copy_dir_recursive_depth(&path, &dest_path, visited, depth + 1)?;
         } else {
             total_bytes += copy_file(&path, &dest_path)?;
         }

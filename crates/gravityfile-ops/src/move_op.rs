@@ -2,12 +2,13 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::conflict::{Conflict, ConflictKind, ConflictResolution, auto_rename_path};
+use crate::copy::{copy_dir_recursive, recreate_symlink, remove_path, unique_temp_path};
 use crate::progress::{OperationComplete, OperationProgress, OperationType};
 use crate::{OPERATION_CHANNEL_SIZE, OperationError};
 
@@ -186,40 +187,27 @@ async fn move_impl(
                         .await;
                     return;
                 }
-                ConflictResolution::AutoRename => auto_rename_path(&dest_path),
+                ConflictResolution::AutoRename => (auto_rename_path(&dest_path), false),
+                // Overwrite stages into a temp sibling then atomically swaps,
+                // so a failed move never destroys the existing destination.
                 ConflictResolution::Overwrite | ConflictResolution::OverwriteAll => {
-                    // CRIT-3: handle removal failure — record error and skip this source
-                    let remove_result = if let Some(ref m) = dest_meta {
-                        if m.is_symlink() || !m.is_dir() {
-                            fs::remove_file(&dest_path)
-                        } else {
-                            fs::remove_dir_all(&dest_path)
-                        }
-                    } else {
-                        Ok(())
-                    };
-                    if let Err(e) = remove_result {
-                        progress.add_error(OperationError::new(
-                            dest_path.clone(),
-                            format!("Failed to remove existing destination: {}", e),
-                        ));
-                        failed += 1;
-                        continue;
-                    }
-                    dest_path.clone()
+                    (dest_path.clone(), true)
                 }
             }
         } else {
-            dest_path.clone()
+            (dest_path.clone(), false)
         };
+
+        let (final_dest, overwrite) = final_dest;
 
         // MED-6: only send progress after the move completes, not before
         let source_clone = source.clone();
         let dest_clone = final_dest.clone();
 
-        let result = tokio::task::spawn_blocking(move || move_item(&source_clone, &dest_clone))
-            .await
-            .map_err(|e| format!("Task failed: {}", e));
+        let result =
+            tokio::task::spawn_blocking(move || move_item(&source_clone, &dest_clone, overwrite))
+                .await
+                .map_err(|e| format!("Task failed: {}", e));
 
         match result {
             Ok(Ok(bytes)) => {
@@ -252,7 +240,37 @@ async fn move_impl(
 }
 
 /// Move a single item (file, directory, or symlink).
-fn move_item(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
+///
+/// When `overwrite` is set and `dest` already exists, the new content is staged
+/// into a temp sibling and atomically swapped in, so a failed move never
+/// destroys the existing destination.
+fn move_item(source: &Path, dest: &Path, overwrite: bool) -> Result<u64, String> {
+    if overwrite && fs::symlink_metadata(dest).is_ok() {
+        let temp = unique_temp_path(dest);
+        let size = match move_to(source, &temp) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = remove_path(&temp);
+                return Err(e);
+            }
+        };
+        if let Err(e) = remove_path(dest) {
+            let _ = remove_path(&temp);
+            return Err(format!("Failed to remove existing destination: {}", e));
+        }
+        if let Err(e) = fs::rename(&temp, dest) {
+            let _ = remove_path(&temp);
+            return Err(format!("Failed to finalize overwrite: {}", e));
+        }
+        Ok(size)
+    } else {
+        move_to(source, dest)
+    }
+}
+
+/// Move `source` to `dest` (which must not exist): rename fast-path, falling
+/// back to a symlink-aware copy + delete for cross-filesystem moves.
+fn move_to(source: &Path, dest: &Path) -> Result<u64, String> {
     // HIGH-2: use symlink_metadata so we don't follow symlinks for size
     let size = get_size(source);
 
@@ -268,21 +286,7 @@ fn move_item(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
     if metadata.is_symlink() {
         // For symlinks, read the target and recreate at destination
         let target = fs::read_link(source).map_err(|e| format!("Failed to read symlink: {}", e))?;
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&target, dest)
-                .map_err(|e| format!("Failed to create symlink: {}", e))?;
-        }
-        #[cfg(windows)]
-        {
-            if target.is_dir() {
-                std::os::windows::fs::symlink_dir(&target, dest)
-                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
-            } else {
-                std::os::windows::fs::symlink_file(&target, dest)
-                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
-            }
-        }
+        recreate_symlink(&target, source, dest)?;
         fs::remove_file(source).map_err(|e| format!("Failed to remove source symlink: {}", e))?;
     } else if metadata.is_dir() {
         if let Err(e) = copy_dir_recursive(source, dest, &mut HashSet::new()) {
@@ -311,7 +315,7 @@ fn move_item(source: &PathBuf, dest: &PathBuf) -> Result<u64, String> {
 /// Get the size of a file or directory.
 ///
 /// HIGH-2: use symlink_metadata; skip symlinks.
-fn get_size(path: &PathBuf) -> u64 {
+fn get_size(path: &Path) -> u64 {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_symlink() => 0,
         Ok(m) if m.is_dir() => get_dir_size(path),
@@ -323,7 +327,7 @@ fn get_size(path: &PathBuf) -> u64 {
 /// Get the total size of a directory.
 ///
 /// HIGH-2: use entry.file_type() and symlink_metadata; skip symlinks.
-fn get_dir_size(dir: &PathBuf) -> u64 {
+fn get_dir_size(dir: &Path) -> u64 {
     let mut size = 0u64;
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -343,84 +347,3 @@ fn get_dir_size(dir: &PathBuf) -> u64 {
     size
 }
 
-/// Public wrapper for `copy_dir_recursive` used by the undo path in
-/// `executor.rs` for cross-filesystem move reversal.
-pub fn copy_dir_recursive_pub(
-    source: &PathBuf,
-    dest: &PathBuf,
-    visited: &mut HashSet<u64>,
-) -> Result<(), String> {
-    copy_dir_recursive(source, dest, visited)
-}
-
-/// Recursively copy a directory (for cross-filesystem moves).
-///
-/// Uses `entry.file_type()` (no symlink-follow), handles symlinks as a distinct
-/// branch, and tracks inodes via a visited set to detect loops on Unix.
-fn copy_dir_recursive(
-    source: &PathBuf,
-    dest: &PathBuf,
-    visited: &mut HashSet<u64>,
-) -> Result<(), String> {
-    // Loop detection via inode on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(meta) = fs::symlink_metadata(source) {
-            let inode = meta.ino();
-            if !visited.insert(inode) {
-                return Ok(()); // Already visited — break the loop
-            }
-        }
-    }
-
-    fs::create_dir_all(dest).map_err(|e| format!("Failed to create directory: {}", e))?;
-
-    let entries = fs::read_dir(source).map_err(|e| format!("Failed to read directory: {}", e))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        // CRIT-2: use entry.file_type() — does NOT follow symlinks
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Failed to read file type: {}", e))?;
-        let path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-
-        if file_type.is_symlink() {
-            // Recreate the symlink at the destination instead of following it
-            let target =
-                fs::read_link(&path).map_err(|e| format!("Failed to read symlink: {}", e))?;
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&target, &dest_path)
-                    .map_err(|e| format!("Failed to create symlink: {}", e))?;
-            }
-            #[cfg(windows)]
-            {
-                // Choose symlink_dir vs symlink_file based on what the
-                // original link pointed at, and log failures rather than
-                // silently discarding them.
-                let result = if path.is_dir() {
-                    std::os::windows::fs::symlink_dir(&target, &dest_path)
-                } else {
-                    std::os::windows::fs::symlink_file(&target, &dest_path)
-                };
-                if let Err(e) = result {
-                    tracing::warn!(
-                        "Failed to create symlink {} -> {}: {}",
-                        dest_path.display(),
-                        target.display(),
-                        e
-                    );
-                }
-            }
-        } else if file_type.is_dir() {
-            copy_dir_recursive(&path, &dest_path, visited)?;
-        } else {
-            fs::copy(&path, &dest_path).map_err(|e| format!("Failed to copy file: {}", e))?;
-        }
-    }
-
-    Ok(())
-}

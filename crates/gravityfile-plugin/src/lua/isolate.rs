@@ -13,6 +13,7 @@ use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginResult, Value};
 
 use super::bindings;
+use super::convert::{lua_to_value, value_to_lua};
 
 /// An isolated Lua context with limited API access.
 pub struct LuaIsolatedContext {
@@ -80,51 +81,6 @@ impl LuaIsolatedContext {
         globals.set("ui", ui).ok();
 
         Ok(Self { lua, sandbox })
-    }
-
-    /// Convert a Lua value to our Value type.
-    fn lua_to_value(lua_val: LuaValue) -> Value {
-        match lua_val {
-            LuaValue::Nil => Value::Null,
-            LuaValue::Boolean(b) => Value::Bool(b),
-            LuaValue::Integer(i) => Value::Integer(i),
-            LuaValue::Number(n) => Value::Float(n),
-            LuaValue::String(s) => Value::String(s.to_string_lossy()),
-            LuaValue::Table(t) => {
-                let mut obj = std::collections::HashMap::new();
-                for (k, v) in t.pairs::<String, LuaValue>().flatten() {
-                    obj.insert(k, Self::lua_to_value(v));
-                }
-                Value::Object(obj)
-            }
-            _ => Value::Null,
-        }
-    }
-
-    /// Convert our Value type to a Lua value.
-    fn value_to_lua(&self, lua: &Lua, val: &Value) -> mlua::Result<LuaValue> {
-        match val {
-            Value::Null => Ok(LuaValue::Nil),
-            Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
-            Value::Integer(i) => Ok(LuaValue::Integer(*i)),
-            Value::Float(f) => Ok(LuaValue::Number(*f)),
-            Value::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
-            Value::Array(arr) => {
-                let table = lua.create_table()?;
-                for (i, v) in arr.iter().enumerate() {
-                    table.set(i + 1, self.value_to_lua(lua, v)?)?;
-                }
-                Ok(LuaValue::Table(table))
-            }
-            Value::Object(obj) => {
-                let table = lua.create_table()?;
-                for (k, v) in obj {
-                    table.set(k.as_str(), self.value_to_lua(lua, v)?)?;
-                }
-                Ok(LuaValue::Table(table))
-            }
-            Value::Bytes(b) => Ok(LuaValue::String(lua.create_string(b)?)),
-        }
     }
 }
 
@@ -197,7 +153,7 @@ impl IsolatedContext for LuaIsolatedContext {
             };
 
             match tokio::time::timeout(timeout_dur, exec_future).await {
-                Ok(result) => Ok(Self::lua_to_value(result?)),
+                Ok(result) => Ok(lua_to_value(result?)),
                 Err(_elapsed) => Err(PluginError::Timeout {
                     name: "isolate".into(),
                     timeout_ms,
@@ -233,7 +189,7 @@ impl IsolatedContext for LuaIsolatedContext {
                 // Convert args
                 let lua_args: Vec<LuaValue> = args
                     .iter()
-                    .map(|v| self.value_to_lua(&self.lua, v))
+                    .map(|v| value_to_lua(&self.lua, v))
                     .collect::<Result<_, _>>()
                     .map_err(|e| PluginError::ExecutionError {
                         name: "isolate".into(),
@@ -247,7 +203,7 @@ impl IsolatedContext for LuaIsolatedContext {
                             message: e.to_string(),
                         })?;
 
-                Ok(Self::lua_to_value(result))
+                Ok(lua_to_value(result))
             };
 
             match tokio::time::timeout(timeout_dur, call_future).await {
@@ -262,7 +218,7 @@ impl IsolatedContext for LuaIsolatedContext {
 
     fn set_global(&mut self, name: &str, value: Value) -> PluginResult<()> {
         let lua_val =
-            self.value_to_lua(&self.lua, &value)
+            value_to_lua(&self.lua, &value)
                 .map_err(|e| PluginError::ExecutionError {
                     name: "isolate".into(),
                     message: e.to_string(),
@@ -289,6 +245,6 @@ impl IsolatedContext for LuaIsolatedContext {
                     message: e.to_string(),
                 })?;
 
-        Ok(Self::lua_to_value(val))
+        Ok(lua_to_value(val))
     }
 }

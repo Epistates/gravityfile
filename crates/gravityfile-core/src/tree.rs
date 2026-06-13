@@ -37,9 +37,19 @@ impl TreeStats {
     }
 
     /// Update stats with a file entry. Only clones the path when updating a tracked field.
-    pub fn record_file(&mut self, path: &Path, size: u64, modified: SystemTime, depth: u32) {
+    ///
+    /// `modified` is `None` when the file's modification time could not be read;
+    /// such files are excluded from oldest/newest tracking rather than being
+    /// coerced to the Unix epoch (which would poison the "oldest file" result).
+    pub fn record_file(
+        &mut self,
+        path: &Path,
+        size: u64,
+        modified: Option<SystemTime>,
+        depth: u32,
+    ) {
         self.total_files += 1;
-        self.total_size += size;
+        self.total_size = self.total_size.saturating_add(size);
         self.max_depth = self.max_depth.max(depth);
 
         // Track largest file
@@ -47,14 +57,14 @@ impl TreeStats {
             self.largest_file = Some((path.to_path_buf(), size));
         }
 
-        // Track oldest file
-        if self.oldest_file.as_ref().is_none_or(|(_, t)| modified < *t) {
-            self.oldest_file = Some((path.to_path_buf(), modified));
-        }
-
-        // Track newest file
-        if self.newest_file.as_ref().is_none_or(|(_, t)| modified > *t) {
-            self.newest_file = Some((path.to_path_buf(), modified));
+        // Track oldest/newest only for files with a real modification time.
+        if let Some(modified) = modified {
+            if self.oldest_file.as_ref().is_none_or(|(_, t)| modified < *t) {
+                self.oldest_file = Some((path.to_path_buf(), modified));
+            }
+            if self.newest_file.as_ref().is_none_or(|(_, t)| modified > *t) {
+                self.newest_file = Some((path.to_path_buf(), modified));
+            }
         }
     }
 
@@ -160,7 +170,7 @@ mod tests {
         let mut stats = TreeStats::new();
         let now = SystemTime::now();
 
-        stats.record_file(Path::new("/test/file.txt"), 1024, now, 2);
+        stats.record_file(Path::new("/test/file.txt"), 1024, Some(now), 2);
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.total_size, 1024);
@@ -174,11 +184,28 @@ mod tests {
         let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
 
-        stats.record_file(Path::new("/small_old"), 100, t1, 1);
-        stats.record_file(Path::new("/big_new"), 999, t2, 2);
+        stats.record_file(Path::new("/small_old"), 100, Some(t1), 1);
+        stats.record_file(Path::new("/big_new"), 999, Some(t2), 2);
 
         assert_eq!(stats.largest_file.as_ref().unwrap().1, 999);
         assert_eq!(stats.oldest_file.as_ref().unwrap().1, t1);
         assert_eq!(stats.newest_file.as_ref().unwrap().1, t2);
+    }
+
+    #[test]
+    fn test_record_file_unknown_mtime_does_not_poison_extremes() {
+        let mut stats = TreeStats::new();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        // A file with a real mtime, then one with an unreadable mtime (None).
+        stats.record_file(Path::new("/has_time"), 10, Some(t), 1);
+        stats.record_file(Path::new("/no_time"), 20, None, 1);
+
+        // Both files counted, but the unknown-mtime file must not become the
+        // oldest/newest (which previously happened via a Unix-epoch fallback).
+        assert_eq!(stats.total_files, 2);
+        assert_eq!(stats.total_size, 30);
+        assert_eq!(stats.oldest_file.as_ref().unwrap().0, Path::new("/has_time"));
+        assert_eq!(stats.newest_file.as_ref().unwrap().0, Path::new("/has_time"));
     }
 }

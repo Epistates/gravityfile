@@ -2,15 +2,63 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rhai::{AST, Dynamic, Engine, Scope};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{PluginConfig, PluginMetadata};
 use crate::hooks::{Hook, HookContext, HookResult};
 use crate::runtime::{BoxFuture, IsolatedContext, PluginHandle, PluginRuntime};
 use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginResult, Value};
+
+/// Read a file as a Rhai string, enforcing the sandbox read policy.
+///
+/// Shared by the main engine and isolated contexts so both apply the same
+/// guarantees: the read is denied unless the sandbox allows the path, the file
+/// is rejected if it exceeds `max_read_size`, the canonicalized path is opened
+/// (so a symlink swapped in after the policy check can't redirect the read —
+/// TOCTOU mitigation), and the read itself is capped at `max_read_size`.
+/// Returns `Dynamic::UNIT` (Rhai's nil) on any denial or error.
+fn sandboxed_read(sb: &SandboxConfig, path: &str) -> Dynamic {
+    use std::io::Read as _;
+
+    let p = std::path::Path::new(path);
+    if !sb.can_read(p) {
+        return Dynamic::UNIT;
+    }
+
+    if let Ok(meta) = std::fs::metadata(p)
+        && meta.len() > sb.max_read_size as u64
+    {
+        tracing::warn!(
+            target: "plugin",
+            "Read denied: file too large ({} bytes > {} limit)",
+            meta.len(),
+            sb.max_read_size
+        );
+        return Dynamic::UNIT;
+    }
+
+    let Ok(real) = std::fs::canonicalize(p) else {
+        return Dynamic::UNIT;
+    };
+    let Ok(file) = std::fs::File::open(&real) else {
+        return Dynamic::UNIT;
+    };
+
+    let mut content = String::new();
+    if file
+        .take(sb.max_read_size as u64)
+        .read_to_string(&mut content)
+        .is_err()
+    {
+        return Dynamic::UNIT;
+    }
+    Dynamic::from(content)
+}
 
 /// A loaded Rhai plugin.
 struct LoadedRhaiPlugin {
@@ -128,23 +176,7 @@ impl RhaiRuntime {
         let sb = Arc::clone(&self.sandbox);
         self.engine
             .register_fn("fs_read", move |path: &str| -> Dynamic {
-                let p = std::path::Path::new(path);
-                if !sb.can_read(p) {
-                    return Dynamic::UNIT;
-                }
-
-                // Check file size before reading
-                if let Ok(meta) = std::fs::metadata(path)
-                    && meta.len() > sb.max_read_size as u64
-                {
-                    tracing::warn!(target: "plugin", "Read denied: file too large ({} bytes > {} limit)", meta.len(), sb.max_read_size);
-                    return Dynamic::UNIT;
-                }
-
-                match std::fs::read_to_string(path) {
-                    Ok(content) => Dynamic::from(content),
-                    Err(_) => Dynamic::UNIT,
-                }
+                sandboxed_read(&sb, path)
             });
 
         self.engine
@@ -293,12 +325,6 @@ impl RhaiRuntime {
     }
 }
 
-impl Default for RhaiRuntime {
-    fn default() -> Self {
-        Self::new().expect("Failed to create Rhai runtime")
-    }
-}
-
 impl PluginRuntime for RhaiRuntime {
     fn name(&self) -> &'static str {
         "rhai"
@@ -313,11 +339,13 @@ impl PluginRuntime for RhaiRuntime {
             return Ok(());
         }
 
-        // Build a sandbox from plugin config settings.
+        // Build a sandbox from plugin config settings. Wiring the configured
+        // read roots is what makes the filesystem API usable (and scoped).
         self.sandbox = Arc::new(SandboxConfig {
             timeout_ms: config.default_timeout_ms,
             max_memory: config.max_memory_mb * 1024 * 1024,
             allow_network: config.allow_network,
+            allowed_read_paths: config.fs_read_roots.clone(),
             ..SandboxConfig::default()
         });
 
@@ -501,20 +529,33 @@ impl PluginRuntime for RhaiRuntime {
     }
 }
 
+/// Per-execution watchdog state shared with the engine's `on_progress` hook.
+///
+/// `execute`/`call_function` populate this before running and clear it after,
+/// so a single registered progress callback can enforce both a wall-clock
+/// deadline and cooperative cancellation for whichever call is currently
+/// running on the (single-consumer) isolate.
+#[derive(Default)]
+struct Watchdog {
+    deadline: Option<Instant>,
+    cancel: Option<CancellationToken>,
+}
+
 /// An isolated Rhai context for async execution.
 struct RhaiIsolatedContext {
     engine: Engine,
-    /// Retained for documentation and potential future per-call checks.
-    /// The Arc is cloned into registered engine closures during `new()`.
-    #[allow(dead_code)]
-    sandbox: Arc<SandboxConfig>,
+    /// Wall-clock timeout applied to each execution, in milliseconds (0 = none).
+    timeout_ms: u64,
+    /// Shared with the engine's `on_progress` hook to bound runaway scripts.
+    watchdog: Arc<Mutex<Watchdog>>,
     /// The compiled AST populated by the first `execute` call.
     /// `call_function` uses this AST via `Engine::call_fn` — no string interpolation.
-    ast: std::sync::Mutex<Option<AST>>,
+    ast: Mutex<Option<AST>>,
 }
 
 impl RhaiIsolatedContext {
     fn new(sandbox: SandboxConfig) -> PluginResult<Self> {
+        let timeout_ms = sandbox.timeout_ms;
         let sandbox = Arc::new(sandbox);
         let mut engine = Engine::new();
 
@@ -529,6 +570,33 @@ impl RhaiIsolatedContext {
 
         // Disable potentially dangerous operations
         engine.disable_symbol("eval");
+
+        // CPU/time watchdog: Rhai calls `on_progress` once per operation, so we
+        // throttle the (locked) clock/cancel check to keep per-op overhead
+        // negligible. Returning `Some` aborts evaluation with a terminated
+        // error, which `execute`/`call_function` reclassify as Timeout/Cancelled.
+        // This is the Rhai analogue of the Lua instruction-count hook and is the
+        // real bound on a runaway isolate (the eval runs synchronously, so a
+        // tokio timer could not preempt it mid-operation).
+        let watchdog: Arc<Mutex<Watchdog>> = Arc::new(Mutex::new(Watchdog::default()));
+        let wd = Arc::clone(&watchdog);
+        engine.on_progress(move |ops| {
+            if !ops.is_multiple_of(8192) {
+                return None;
+            }
+            let guard = wd.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(token) = &guard.cancel
+                && token.is_cancelled()
+            {
+                return Some(Dynamic::UNIT);
+            }
+            if let Some(deadline) = guard.deadline
+                && Instant::now() >= deadline
+            {
+                return Some(Dynamic::UNIT);
+            }
+            None
+        });
 
         // Register sandboxed filesystem functions for isolated contexts.
         let sb = Arc::clone(&sandbox);
@@ -551,14 +619,7 @@ impl RhaiIsolatedContext {
 
         let sb = Arc::clone(&sandbox);
         engine.register_fn("fs_read", move |path: &str| -> Dynamic {
-            let p = std::path::Path::new(path);
-            if !sb.can_read(p) {
-                return Dynamic::UNIT;
-            }
-            match std::fs::read_to_string(path) {
-                Ok(content) => Dynamic::from(content),
-                Err(_) => Dynamic::UNIT,
-            }
+            sandboxed_read(&sb, path)
         });
 
         let sb = Arc::clone(&sandbox);
@@ -575,9 +636,53 @@ impl RhaiIsolatedContext {
 
         Ok(Self {
             engine,
-            sandbox,
-            ast: std::sync::Mutex::new(None),
+            timeout_ms,
+            watchdog,
+            ast: Mutex::new(None),
         })
+    }
+
+    /// Arm the watchdog for one execution and return the deadline (if any).
+    /// Pairs with [`disarm_watchdog`](Self::disarm_watchdog).
+    fn arm_watchdog(&self, cancel: &CancellationToken) -> Option<Instant> {
+        let deadline = (self.timeout_ms > 0)
+            .then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
+        let mut guard = self.watchdog.lock().unwrap_or_else(|e| e.into_inner());
+        guard.deadline = deadline;
+        guard.cancel = Some(cancel.clone());
+        deadline
+    }
+
+    /// Clear the watchdog after an execution completes.
+    fn disarm_watchdog(&self) {
+        let mut guard = self.watchdog.lock().unwrap_or_else(|e| e.into_inner());
+        guard.deadline = None;
+        guard.cancel = None;
+    }
+
+    /// Map a Rhai eval error to the right [`PluginError`], distinguishing a
+    /// watchdog abort (cancellation vs. timeout) from a genuine script error.
+    fn classify_eval_error(
+        &self,
+        err: rhai::EvalAltResult,
+        cancel: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> PluginError {
+        if cancel.is_cancelled() {
+            return PluginError::Cancelled {
+                name: "isolate".into(),
+            };
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return PluginError::Timeout {
+                name: "isolate".into(),
+                timeout_ms: self.timeout_ms,
+            };
+        }
+        PluginError::ExecutionError {
+            name: "isolate".into(),
+            message: err.to_string(),
+        }
     }
 }
 
@@ -609,19 +714,20 @@ impl IsolatedContext for RhaiIsolatedContext {
                         message: e.to_string(),
                     })?;
 
+            // Arm the wall-clock/cancel watchdog for this evaluation.
+            let deadline = self.arm_watchdog(&cancel);
             let mut scope = Scope::new();
-            let result = self
+            let eval = self
                 .engine
-                .eval_ast_with_scope::<Dynamic>(&mut scope, &compiled)
-                .map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                })?;
+                .eval_ast_with_scope::<Dynamic>(&mut scope, &compiled);
+            self.disarm_watchdog();
+
+            let result = eval.map_err(|e| self.classify_eval_error(*e, &cancel, deadline))?;
 
             // Persist the compiled AST for subsequent call_function invocations.
-            if let Ok(mut guard) = self.ast.lock() {
-                *guard = Some(compiled);
-            }
+            // Recover from a poisoned mutex rather than silently dropping the AST.
+            let mut guard = self.ast.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(compiled);
 
             Ok(RhaiRuntime::dynamic_to_value(&result))
         })
@@ -644,10 +750,8 @@ impl IsolatedContext for RhaiIsolatedContext {
             let rhai_args: Vec<Dynamic> = args.iter().map(RhaiRuntime::value_to_dynamic).collect();
 
             // Retrieve the previously compiled AST (populated by execute).
-            let ast_guard = self.ast.lock().map_err(|_| PluginError::ExecutionError {
-                name: "isolate".into(),
-                message: "AST mutex poisoned".to_string(),
-            })?;
+            // Recover from poisoning for consistency with `execute`.
+            let ast_guard = self.ast.lock().unwrap_or_else(|e| e.into_inner());
 
             let ast = ast_guard
                 .as_ref()
@@ -660,14 +764,15 @@ impl IsolatedContext for RhaiIsolatedContext {
                     ),
                 })?;
 
+            // Arm the wall-clock/cancel watchdog for this call.
+            let deadline = self.arm_watchdog(&cancel);
             let mut scope = Scope::new();
-            let result = self
+            let call = self
                 .engine
-                .call_fn::<Dynamic>(&mut scope, ast, name, rhai_args)
-                .map_err(|e| PluginError::ExecutionError {
-                    name: "isolate".into(),
-                    message: e.to_string(),
-                })?;
+                .call_fn::<Dynamic>(&mut scope, ast, name, rhai_args);
+            self.disarm_watchdog();
+
+            let result = call.map_err(|e| self.classify_eval_error(*e, &cancel, deadline))?;
 
             Ok(RhaiRuntime::dynamic_to_value(&result))
         })
@@ -681,5 +786,69 @@ impl IsolatedContext for RhaiIsolatedContext {
 
     fn get_global(&self, _name: &str) -> PluginResult<Value> {
         Ok(Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::Permission;
+
+    fn isolate_with_root(root: std::path::PathBuf, timeout_ms: u64) -> RhaiIsolatedContext {
+        let mut sb = SandboxConfig::minimal();
+        sb.permissions.insert(Permission::Read);
+        sb.allowed_read_paths = vec![root];
+        sb.timeout_ms = timeout_ms;
+        RhaiIsolatedContext::new(sb).unwrap()
+    }
+
+    #[tokio::test]
+    async fn isolate_precancelled_token_is_rejected() {
+        let ctx = isolate_with_root(std::env::temp_dir(), 1000);
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = ctx.execute(b"1 + 1", token).await.unwrap_err();
+        assert!(matches!(err, PluginError::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn isolate_runaway_loop_is_bounded() {
+        // An infinite loop must terminate via the operation/time watchdog rather
+        // than hang the calling task.
+        let ctx = isolate_with_root(std::env::temp_dir(), 50);
+        let token = CancellationToken::new();
+        let res = ctx
+            .execute(b"let mut i = 0; loop { i += 1; }", token)
+            .await;
+        assert!(res.is_err(), "runaway loop should be bounded, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn isolate_fs_read_denied_outside_roots() {
+        // Root is the temp dir; /etc/hosts exists but is outside it, so the
+        // sandbox must deny the read (surfacing as Rhai nil → Value::Null).
+        let ctx = isolate_with_root(std::env::temp_dir(), 1000);
+        let token = CancellationToken::new();
+        let val = ctx
+            .execute(b"fs_read(\"/etc/hosts\")", token)
+            .await
+            .unwrap();
+        assert!(matches!(val, Value::Null), "expected denied read, got {val:?}");
+    }
+
+    #[tokio::test]
+    async fn isolate_fs_read_allowed_within_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, "hi there").unwrap();
+
+        let ctx = isolate_with_root(dir.path().to_path_buf(), 1000);
+        let token = CancellationToken::new();
+        let code = format!("fs_read({:?})", file.to_string_lossy());
+        let val = ctx.execute(code.as_bytes(), token).await.unwrap();
+        match val {
+            Value::String(s) => assert_eq!(s, "hi there"),
+            other => panic!("expected file contents, got {other:?}"),
+        }
     }
 }
