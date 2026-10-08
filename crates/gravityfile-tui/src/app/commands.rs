@@ -2,7 +2,11 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use super::state::View;
+use std::path::PathBuf;
+
+use super::App;
+use super::state::{AppMode, BookmarkListState, LayoutMode, SortMode, View};
+use crate::theme::Theme;
 
 /// Command input state, sharing Unicode editing with filename input.
 #[derive(Debug, Clone, Default)]
@@ -393,6 +397,214 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         }
 
         _ => CommandAction::Invalid("Unknown command; use :help to see available commands"),
+    }
+}
+
+impl App {
+    /// Execute a command from the command palette.
+    pub(super) fn execute_command(&mut self, cmd: &str) {
+        match parse_command(cmd) {
+            CommandAction::None => {}
+            CommandAction::Invalid(message) => {
+                self.error = Some(message.to_string());
+            }
+            CommandAction::Quit => {
+                if self.cancel_archive_operation() {
+                    return;
+                }
+                if self.archive_rx.is_some() || self.take_rx.is_some() {
+                    self.error =
+                        Some("Filesystem operation in progress; wait for it to finish".to_string());
+                } else {
+                    self.mode = AppMode::Quit;
+                }
+            }
+            CommandAction::Refresh => self.refresh_view(),
+            CommandAction::Analyze => {
+                self.start_analysis_for_current_tree();
+            }
+            CommandAction::NavigateTo(target) => {
+                self.cd_to_path(&target);
+            }
+            CommandAction::GoToRoot => {
+                self.go_to_root();
+            }
+            CommandAction::NavigateBack => {
+                self.go_back();
+            }
+            CommandAction::ShowHelp => {
+                self.mode = AppMode::Help;
+            }
+            CommandAction::SwitchView(view) => {
+                self.view = view;
+                if self.view == View::Treemap {
+                    self.update_cached_treemap_len();
+                    self.nav.treemap_state.reset();
+                }
+                self.maybe_start_analysis_for_view();
+            }
+            CommandAction::ClearMarks => {
+                self.marked.clear();
+            }
+            CommandAction::ToggleDetails => {
+                self.show_details = !self.show_details;
+            }
+            CommandAction::SetTheme(theme_cmd) => match theme_cmd {
+                ThemeCommand::Dark => self.theme = Theme::dark(),
+                ThemeCommand::Light => self.theme = Theme::light(),
+                ThemeCommand::Toggle => self.theme = self.theme.toggle(),
+            },
+            CommandAction::SetLayout(layout_cmd) => match layout_cmd {
+                LayoutCommand::Tree => {
+                    if self.layout_mode != LayoutMode::Tree {
+                        self.toggle_layout();
+                    }
+                }
+                LayoutCommand::Miller => {
+                    if self.layout_mode != LayoutMode::Miller {
+                        self.toggle_layout();
+                    }
+                }
+                LayoutCommand::Toggle => {
+                    self.toggle_layout();
+                }
+            },
+            CommandAction::SetSort(sort_cmd) => {
+                match sort_cmd {
+                    SortCommand::SizeDesc => self.sort_mode = SortMode::SizeDescending,
+                    SortCommand::SizeAsc => self.sort_mode = SortMode::SizeAscending,
+                    SortCommand::NameAsc => self.sort_mode = SortMode::NameAscending,
+                    SortCommand::NameDesc => self.sort_mode = SortMode::NameDescending,
+                    SortCommand::DateDesc => self.sort_mode = SortMode::ModifiedDescending,
+                    SortCommand::DateAsc => self.sort_mode = SortMode::ModifiedAscending,
+                    SortCommand::CountDesc => self.sort_mode = SortMode::CountDescending,
+                    SortCommand::CountAsc => self.sort_mode = SortMode::CountAscending,
+                    SortCommand::Cycle => self.sort_mode = self.sort_mode.next(),
+                    SortCommand::Reverse => self.sort_mode = self.sort_mode.reverse(),
+                }
+                self.apply_sort();
+            }
+            CommandAction::Yank => {
+                self.yank_selection();
+            }
+            CommandAction::Cut => {
+                self.cut_selection();
+            }
+            CommandAction::Paste => {
+                self.paste_clipboard();
+            }
+            CommandAction::Delete => {
+                if !self.marked.is_empty() {
+                    self.mode = AppMode::ConfirmDelete;
+                }
+            }
+            CommandAction::Rename(name) => {
+                if let Some(name) = name {
+                    // Direct rename with provided name
+                    if let Some(path) = self.get_selected_path() {
+                        self.execute_rename(path, name);
+                    }
+                } else {
+                    // Enter rename mode
+                    self.start_rename();
+                }
+            }
+            CommandAction::CreateFile(name) => {
+                if let Some(name) = name {
+                    // Direct create with provided name
+                    self.execute_create_file(self.nav.view_root.clone(), name);
+                } else {
+                    // Enter create file mode
+                    self.start_create_file();
+                }
+            }
+            CommandAction::CreateDirectory(name) => {
+                if let Some(name) = name {
+                    // Direct create with provided name
+                    self.execute_create_directory(self.nav.view_root.clone(), name);
+                } else {
+                    // Enter create directory mode
+                    self.start_create_directory();
+                }
+            }
+            CommandAction::Take(name) => {
+                if let Some(name) = name {
+                    // Direct take with provided name
+                    self.execute_take(self.nav.view_root.clone(), name);
+                } else {
+                    // Enter take mode
+                    self.start_take();
+                }
+            }
+            CommandAction::Undo => {
+                self.execute_undo();
+            }
+            CommandAction::ShowBookmarks => {
+                self.bookmark_list_state =
+                    Some(BookmarkListState::new(&self.user_settings.bookmarks));
+                self.mode = AppMode::BookmarkList;
+            }
+            CommandAction::SetBookmark(key) => {
+                if let Some(k) = key {
+                    self.set_bookmark(k);
+                } else {
+                    self.mode = AppMode::SettingBookmark;
+                }
+            }
+            CommandAction::JumpToBookmark(key) => {
+                if let Some(k) = key {
+                    self.jump_to_bookmark(k);
+                } else {
+                    self.mode = AppMode::JumpingToBookmark;
+                }
+            }
+            CommandAction::DeleteBookmark(key) => {
+                self.user_settings.bookmarks.remove(key);
+                if let Err(error) = self.user_settings.save() {
+                    self.error = Some(format!("Failed to save bookmarks: {error}"));
+                }
+            }
+            CommandAction::BulkRename => {
+                self.start_bulk_rename();
+            }
+            CommandAction::Extract(destination) => {
+                self.extract_archive(destination);
+            }
+            CommandAction::Compress(archive_name) => {
+                self.compress_files(&archive_name);
+            }
+        }
+    }
+
+    /// Validate a user-provided path for safety.
+    /// Returns error message if path is invalid.
+    pub(super) fn validate_user_path(path_str: &str) -> Result<PathBuf, String> {
+        // Reject empty paths
+        if path_str.is_empty() {
+            return Err("Path cannot be empty".to_string());
+        }
+
+        // Reject paths with null bytes (security)
+        if path_str.contains('\0') {
+            return Err("Invalid characters in path".to_string());
+        }
+
+        let path = PathBuf::from(path_str);
+
+        // Reject paths with parent directory components (prevents escape attempts)
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("Parent directory references (..) not allowed".to_string());
+        }
+
+        // Reject paths starting with ~ (could expand to home directory unexpectedly)
+        if path_str.starts_with('~') {
+            return Err("Tilde expansion not supported, use absolute path".to_string());
+        }
+
+        Ok(path)
     }
 }
 
