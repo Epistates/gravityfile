@@ -68,6 +68,8 @@ pub struct TuiConfig {
     pub cwd_file: Option<std::path::PathBuf>,
     /// Whether to print the last working directory to stdout on exit.
     pub print_cwd: bool,
+    /// What happens to an item the user chooses to overwrite on paste.
+    pub replace_policy: gravityfile_ops::ReplacePolicy,
 }
 
 impl TuiConfig {

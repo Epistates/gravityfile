@@ -248,26 +248,6 @@ impl ScanOptions {
 enum Command {
     #[command(name = "__plugin-worker", hide = true)]
     PluginWorker { language: String },
-    /// Inspect overwrite/copy-undo recovery records, or restore saved content exclusively
-    Recover {
-        /// Directory to inspect, or a specific transaction with --restore-original
-        path: PathBuf,
-        /// Restore the saved original only if its destination is unoccupied
-        #[arg(long, conflicts_with = "restore_payload_to")]
-        restore_original: bool,
-        /// Restore a staged payload to this explicitly chosen, unoccupied path
-        #[arg(long)]
-        restore_payload_to: Option<PathBuf>,
-        /// Restore an interrupted bulk-rename batch after validating all identities
-        #[arg(long, conflicts_with_all = ["restore_original", "restore_payload_to", "json"])]
-        rollback_rename: bool,
-        /// Retain interrupted extraction output in its journal without deleting data
-        #[arg(long, conflicts_with_all = ["restore_original", "restore_payload_to", "rollback_rename", "json"])]
-        retain_extraction: bool,
-        /// Emit a versioned inspection report with native paths and completeness
-        #[arg(long, conflicts_with_all = ["restore_original", "restore_payload_to"])]
-        json: bool,
-    },
     /// Quick scan summary
     Scan {
         #[command(flatten)]
@@ -430,137 +410,6 @@ pub fn run() -> Result<()> {
     let result: Result<()> = (|| {
         match cli.command {
             Some(Command::PluginWorker { .. }) => return Err(eyre!("invalid worker dispatch")),
-            Some(Command::Recover {
-                path,
-                restore_original,
-                restore_payload_to,
-                rollback_rename,
-                retain_extraction,
-                json,
-            }) => {
-                if output.envelope || output.strict {
-                    return Err(eyre!("recover does not support --envelope or --strict"));
-                }
-                if retain_extraction {
-                    let retained = gravityfile_ops::retain_archive_extraction(&path)?;
-                    let mut writer = std::io::stdout().lock();
-                    writeln!(writer, "Extraction output retained; inspect {}", escape_filename(retained.as_os_str()))
-                        .and_then(|_| writer.flush())
-                        .wrap_err("Recovery completed, but its acknowledgement could not be written; inspect retained data before retrying")?;
-                } else if rollback_rename {
-                    let restored = gravityfile_ops::restore_rename_batch(&path)?;
-                    let mut writer = std::io::stdout().lock();
-                    writeln!(writer, "Restored {} bulk rename items; retained records in {}",
-                        restored.restored_items, escape_filename(restored.coordinator.as_os_str()))
-                        .and_then(|_| writer.flush())
-                        .wrap_err("Recovery completed, but its acknowledgement could not be written; inspect original paths before retrying")?;
-                } else if restore_original {
-                    let destination = gravityfile_ops::restore_original(&path)?;
-                    write_recovery_acknowledgement(
-                        &mut std::io::stdout().lock(),
-                        &destination,
-                        &path,
-                        false,
-                    )?;
-                } else if let Some(destination) = restore_payload_to {
-                    gravityfile_ops::restore_payload(&path, &destination)?;
-                    write_recovery_acknowledgement(
-                        &mut std::io::stdout().lock(),
-                        &destination,
-                        &path,
-                        true,
-                    )?;
-                } else {
-                    let report = gravityfile_ops::discover_recovery_report(&path)?;
-                    if json {
-                        let mut writer = BufWriter::new(std::io::stdout().lock());
-                        report.write_json(&path, &mut writer)?;
-                        writeln!(writer)?;
-                        writer.flush()?;
-                    } else if report.records.is_empty()
-                        && report.rename_intents.is_empty()
-                        && report.archive_records.is_empty()
-                        && report.issues.is_empty()
-                    {
-                        println!(
-                            "No recovery records in {}",
-                            escape_filename(path.as_os_str())
-                        );
-                    }
-                    for record in report.records.iter().filter(|_| !json) {
-                        println!("{}", escape_filename(record.transaction.as_os_str()));
-                        println!("  purpose: {:?}", record.purpose);
-                        println!(
-                            "  destination: {}",
-                            escape_filename(record.destination.as_os_str())
-                        );
-                        println!(
-                            "  original: {} | payload: {} | destination occupied: {} | publication recorded: {}",
-                            record.original_available,
-                            record.payload_available,
-                            record.destination_occupied,
-                            record.published
-                        );
-                        if let Some(source) = &record.move_source {
-                            println!("  move source: {}", escape_filename(source.as_os_str()));
-                        }
-                        if record.published && record.original_available {
-                            println!(
-                                "  saved original may be incomplete: committed cleanup may have started"
-                            );
-                        }
-                    }
-                    for intent in report.rename_intents.iter().filter(|_| !json) {
-                        println!("{}", escape_filename(intent.intent.as_os_str()));
-                        println!(
-                            "  bulk rename intent: outcome unverified; inspect manually, do not replay"
-                        );
-                        println!(
-                            "  locked during inspection: {}",
-                            intent.locked_during_inspection
-                        );
-                        if let Some(phase) = intent.last_recorded_phase {
-                            println!(
-                                "  last recorded phase: {phase:?} (historical; verify current paths)"
-                            );
-                        }
-                        println!("  source: {}", escape_filename(intent.source.as_os_str()));
-                        println!("  staged: {}", escape_filename(intent.staged.as_os_str()));
-                        println!(
-                            "  destination: {}",
-                            escape_filename(intent.destination.as_os_str())
-                        );
-                    }
-                    for record in report.archive_records.iter().filter(|_| !json) {
-                        println!("{}", escape_filename(record.transaction.as_os_str()));
-                        println!(
-                            "  extraction journal: {} ({} planned items)",
-                            record.status, record.entry_count
-                        );
-                        println!(
-                            "  destination: {}",
-                            escape_filename(record.destination.as_os_str())
-                        );
-                        println!(
-                            "  staged data: {}",
-                            escape_filename(record.staging.as_os_str())
-                        );
-                    }
-                    for issue in &report.issues {
-                        eprintln!(
-                            "Cannot inspect {}: {}",
-                            escape_filename(issue.path.as_os_str()),
-                            issue.error
-                        );
-                    }
-                    if !report.issues.is_empty() {
-                        return Err(eyre!(
-                            "Recovery listing incomplete: {} inspection errors",
-                            report.issues.len()
-                        ));
-                    }
-                }
-            }
             Some(Command::Scan {
                 scan_options,
                 path,
@@ -633,30 +482,6 @@ pub fn run() -> Result<()> {
         Err(error) if observation && !output.strict && is_broken_pipe(&error) => Ok(()),
         result => result,
     }
-}
-
-/// Publication has already completed; an output failure must not imply rollback.
-fn write_recovery_acknowledgement(
-    writer: &mut impl Write,
-    destination: &Path,
-    transaction: &Path,
-    payload: bool,
-) -> Result<()> {
-    let result = (|| -> std::io::Result<()> {
-        writeln!(
-            writer,
-            "{} {}. Recovery record retained at {} for review.",
-            if payload {
-                "Restored payload to"
-            } else {
-                "Restored"
-            },
-            escape_filename(destination.as_os_str()),
-            escape_filename(transaction.as_os_str()),
-        )?;
-        writer.flush()
-    })();
-    result.wrap_err("Recovery completed, but its acknowledgement could not be written; inspect the restored destination before retrying")
 }
 
 fn is_broken_pipe(error: &color_eyre::Report) -> bool {
@@ -1260,38 +1085,6 @@ fn parse_duration(s: &str) -> Result<std::time::Duration> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn recovery_acknowledgement_reports_flush_failure_after_successful_write() {
-        struct FailFlush(Vec<u8>);
-        impl std::io::Write for FailFlush {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::Error::other("injected flush failure"))
-            }
-        }
-        let mut writer = FailFlush(Vec::new());
-        let error = super::write_recovery_acknowledgement(
-            &mut writer,
-            std::path::Path::new("restored"),
-            std::path::Path::new("journal"),
-            false,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("Recovery completed"));
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.to_string().contains("injected flush failure"))
-        );
-        assert_eq!(
-            writer.0,
-            b"Restored restored. Recovery record retained at journal for review.\n"
-        );
-    }
-
     #[test]
     fn analysis_text_reports_preserve_escaping_and_stop_on_output_cancellation() {
         let directory = tempfile::tempdir().unwrap();

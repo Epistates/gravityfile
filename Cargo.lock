@@ -1223,7 +1223,6 @@ dependencies = [
  "getrandom 0.4.3",
  "gravityfile-analyze",
  "gravityfile-core",
- "gravityfile-ops",
  "gravityfile-plugin",
  "gravityfile-scan",
  "gravityfile-tui",
@@ -1273,6 +1272,7 @@ dependencies = [
  "filetime",
  "flate2",
  "libc",
+ "reflink-copy",
  "serde",
  "serde_json",
  "tar",
@@ -1281,9 +1281,12 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "trash",
  "windows-sys 0.61.2",
+ "xattr",
  "xz2",
  "zip",
+ "zstd 0.14.0",
 ]
 
 [[package]]
@@ -1357,7 +1360,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "trash",
  "unicode-segmentation",
  "unicode-width",
  "which",
@@ -2653,6 +2655,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "reflink-copy"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9dd7ab4af0363d5ccfd2838d782a28196cf32a5cc2e4fe3c5dc83f2be588b8b"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "rustix 1.1.5",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4164,7 +4178,7 @@ dependencies = [
  "typed-path",
  "zeroize",
  "zopfli",
- "zstd",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -4197,7 +4211,16 @@ version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
- "zstd-safe",
+ "zstd-safe 7.3.0",
+]
+
+[[package]]
+name = "zstd"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
+dependencies = [
+ "zstd-safe 8.0.0",
 ]
 
 [[package]]
@@ -4205,6 +4228,15 @@ name = "zstd-safe"
 version = "7.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
 dependencies = [
  "zstd-sys",
 ]

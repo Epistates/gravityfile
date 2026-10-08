@@ -517,8 +517,7 @@ impl App {
                     .map(|p| usize::try_from(p.errors_count).unwrap_or(usize::MAX))
                     .unwrap_or(0),
             )
-            .saturating_add(self.operation_warnings.len())
-            .saturating_add(self.undo_review_warnings.len());
+            .saturating_add(self.operation_warnings.len());
 
         let titles: Vec<String> = View::iter()
             .map(|v| {
@@ -1106,7 +1105,6 @@ impl App {
                 usize::try_from(count)
                     .unwrap_or(usize::MAX)
                     .saturating_add(self.operation_warnings.len())
-                    .saturating_add(self.undo_review_warnings.len())
             )
         } else if self.warning_count() > 0 {
             format!(
@@ -1172,9 +1170,8 @@ impl App {
         };
 
         for (i, warning) in self
-            .undo_review_warnings
+            .operation_warnings
             .iter()
-            .chain(self.operation_warnings.iter())
             .chain(self.warnings.iter())
             .enumerate()
             .skip(scroll_offset)
@@ -1183,9 +1180,7 @@ impl App {
             let base_y = inner.y + ((i - scroll_offset) * lines_per_item) as u16;
             let is_selected = i == self.selected_warning;
 
-            let (icon, kind_label, can_delete) = if i < self.undo_review_warnings.len() {
-                ("!", "Undo Review", false)
-            } else if i < self.undo_review_warnings.len() + self.operation_warnings.len() {
+            let (icon, kind_label, can_delete) = if i < self.operation_warnings.len() {
                 ("!", "Operation", false)
             } else {
                 match warning.kind {

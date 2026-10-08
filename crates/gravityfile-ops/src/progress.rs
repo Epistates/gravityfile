@@ -1,6 +1,7 @@
 //! Progress reporting types for file operations.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +15,8 @@ pub enum OperationType {
     Copy,
     Move,
     Delete,
-    /// Move data into a persistent recovery journal without deleting it.
-    Retain,
+    /// Items restored from the system Trash.
+    Restore,
     Rename,
     CreateFile,
     CreateDirectory,
@@ -27,7 +28,7 @@ impl std::fmt::Display for OperationType {
             Self::Copy => write!(f, "Copy"),
             Self::Move => write!(f, "Move"),
             Self::Delete => write!(f, "Delete"),
-            Self::Retain => write!(f, "Retain for recovery"),
+            Self::Restore => write!(f, "Restore"),
             Self::Rename => write!(f, "Rename"),
             Self::CreateFile => write!(f, "Create file"),
             Self::CreateDirectory => write!(f, "Create directory"),
@@ -52,6 +53,8 @@ pub struct OperationProgress {
     pub current_file: Option<PathBuf>,
     /// Errors encountered so far.
     pub errors: Vec<OperationError>,
+    /// When the operation started; the basis for throughput and ETA.
+    pub started_at: Instant,
 }
 
 impl OperationProgress {
@@ -65,7 +68,31 @@ impl OperationProgress {
             bytes_total,
             current_file: None,
             errors: Vec::new(),
+            started_at: Instant::now(),
         }
+    }
+
+    /// Average bytes per second since the operation started.
+    pub fn bytes_per_second(&self) -> f64 {
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            self.bytes_processed as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    /// Estimated time remaining, when the byte total and rate are known.
+    pub fn eta(&self) -> Option<Duration> {
+        let rate = self.bytes_per_second();
+        let remaining = self.bytes_total.checked_sub(self.bytes_processed)?;
+        (rate >= 1.0 && self.bytes_total > 0)
+            .then(|| Duration::from_secs_f64(remaining as f64 / rate))
+    }
+
+    /// Record bytes transferred within the current item.
+    pub fn add_bytes(&mut self, bytes: u64) {
+        self.bytes_processed = self.bytes_processed.saturating_add(bytes);
     }
 
     /// Get the estimated progress as a percentage (0.0 to 100.0).
@@ -170,7 +197,7 @@ impl OperationComplete {
             OperationType::Copy => "Copied",
             OperationType::Move => "Moved",
             OperationType::Delete => "Deleted",
-            OperationType::Retain => "Retained for recovery",
+            OperationType::Restore => "Restored",
             OperationType::Rename => "Renamed",
             OperationType::CreateFile => "Created",
             OperationType::CreateDirectory => "Created",

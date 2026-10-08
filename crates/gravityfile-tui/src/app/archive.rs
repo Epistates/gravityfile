@@ -94,10 +94,7 @@ impl App {
                     self.error =
                         Some("Archive extraction cancelled before publication".to_string());
                 }
-                Err(
-                    error @ (gravityfile_ops::ArchiveError::ExtractionRollback { .. }
-                    | gravityfile_ops::ArchiveError::ExtractionRecovery { .. }),
-                ) => {
+                Err(error @ gravityfile_ops::ArchiveError::ExtractionRollback { .. }) => {
                     self.error = Some(Self::sanitize_archive_error(&error));
                     self.request_archive_refresh();
                 }
@@ -132,12 +129,6 @@ impl App {
                 Err(gravityfile_ops::ArchiveError::Cancelled) => {
                     self.error = Some("Archive creation cancelled before publication".to_string());
                 }
-                Err(error @ gravityfile_ops::ArchiveError::PublishedDurability { .. }) => {
-                    self.error = Some(Self::sanitize_archive_error(&error));
-                    // The archive exists despite uncertain persistence. Refresh
-                    // without clearing the user's selection or replaying work.
-                    self.request_archive_refresh();
-                }
                 Err(error) => {
                     self.error = Some(format!(
                         "Failed to create archive: {}",
@@ -152,10 +143,10 @@ impl App {
     fn sanitize_archive_error(err: &gravityfile_ops::ArchiveError) -> String {
         use gravityfile_ops::ArchiveError;
         match err {
-            ArchiveError::ExtractionRecovery {..} => "Extraction outcome requires inspection; recovery data retained, inspect before retrying".into(),
-            ArchiveError::ExtractionRollback { .. } => {
-                "Archive extraction failed and rollback was incomplete; inspect the destination before retrying".to_string()
-            }
+            ArchiveError::ExtractionRollback { left_behind, .. } => format!(
+                "Archive extraction failed; {} extracted entries could not be withdrawn, inspect the destination",
+                left_behind.len()
+            ),
             ArchiveError::Cancelled => "Archive operation cancelled".to_string(),
             ArchiveError::Io(e) => {
                 // Extract just the error kind, not the full message which may contain paths
@@ -167,10 +158,6 @@ impl App {
                     std::io::ErrorKind::InvalidData => "Invalid or corrupted archive".to_string(),
                     _ => format!("I/O error: {}", kind),
                 }
-            }
-            ArchiveError::PublishedDurability { .. } => {
-                "Archive created, but persistence is uncertain; inspect it before retrying"
-                    .to_string()
             }
             ArchiveError::Zip(_) => "Invalid or corrupted ZIP archive".to_string(),
             ArchiveError::UnsupportedFormat(fmt) => format!("Unsupported format: {}", fmt),

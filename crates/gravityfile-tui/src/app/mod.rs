@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::{FileNode, FileTree};
-use gravityfile_ops::{ConflictRequest, CopyOptions, MoveOptions, OperationProgress, UndoLog};
+use gravityfile_ops::{ConflictRequest, OperationProgress, TransferOptions, UndoLog};
 use gravityfile_scan::ScanProgress;
 
 use crate::TuiConfig;
@@ -141,9 +141,9 @@ pub struct App {
     clipboard: ClipboardState,
     active_paste_mode: ClipboardMode,
     /// Undo log for reversible operations.
-    #[allow(dead_code)]
     undo_log: UndoLog,
-    pending_undo: Option<gravityfile_ops::UndoEntry>,
+    /// Disposal of items replaced by an approved overwrite.
+    replace_policy: gravityfile_ops::ReplacePolicy,
     /// Layout mode (tree vs miller).
     layout_mode: LayoutMode,
     /// Miller columns state.
@@ -173,7 +173,6 @@ pub struct App {
     warnings: Vec<gravityfile_core::ScanWarning>,
     /// Latest operation diagnostics survive the automatic scan refresh.
     operation_warnings: Vec<gravityfile_core::ScanWarning>,
-    undo_review_warnings: Vec<gravityfile_core::ScanWarning>,
     /// Selected warning index.
     selected_warning: usize,
     /// Whether analysis is running.
@@ -198,7 +197,6 @@ pub struct App {
     /// Completion channel for a background archive operation.
     archive_rx: Option<oneshot::Receiver<ArchiveCompletion>>,
     archive_cancel: Option<ArchiveCancellation>,
-    undo_export_rx: Option<oneshot::Receiver<(PathBuf, Result<(), String>)>>,
     pending_archive_refresh: bool,
     /// Whether to auto-scan on startup.
     scan_on_startup: bool,
@@ -337,7 +335,7 @@ impl App {
             clipboard: ClipboardState::default(),
             active_paste_mode: ClipboardMode::Empty,
             undo_log: UndoLog::new(100),
-            pending_undo: None,
+            replace_policy: config.replace_policy,
             layout_mode: LayoutMode::default(),
             miller_state: crate::ui::MillerState::new(),
             cached_miller_len: 0,
@@ -353,7 +351,6 @@ impl App {
             scan_token: CancellationToken::new(),
             warnings: Vec::new(),
             operation_warnings: Vec::new(),
-            undo_review_warnings: Vec::new(),
             selected_warning: 0,
             analyzing: false,
             has_full_scan: false,
@@ -367,7 +364,6 @@ impl App {
             pending_preview: None,
             archive_rx: None,
             archive_cancel: None,
-            undo_export_rx: None,
             pending_archive_refresh: false,
             scan_on_startup,
             user_settings,
@@ -592,13 +588,6 @@ impl App {
                     self.needs_redraw = true;
                 }
 
-                exported = async {
-                    self.undo_export_rx.as_mut().expect("guarded export receiver").await.ok()
-                }, if self.undo_export_rx.is_some() => {
-                    self.finish_undo_export(exported);
-                    self.needs_redraw = true;
-                }
-
                 archive = async {
                     if let Some(rx) = &mut self.archive_rx {
                         rx.await.ok()
@@ -806,9 +795,6 @@ impl App {
 
     /// Release dead worker state without interpreting missing completion as success.
     fn handle_background_channel_closed(&mut self) {
-        if let Some(entry) = self.pending_undo.take() {
-            self.undo_log.retain_for_review(entry);
-        }
         self.scan_token.cancel();
         self.scan_rx = None;
         self.scan_progress = None;
@@ -844,8 +830,10 @@ impl App {
             ScanResult::BulkRenameComplete(result) => {
                 self.scan_rx = None;
                 self.operation_message = Some(match result {
-                    Ok(count) => {
+                    Ok(renames) => {
                         self.marked.clear();
+                        let count = renames.len();
+                        self.undo_log.record_renames(renames);
                         (true, format!("Renamed {count} items"))
                     }
                     Err(error) => (false, format!("Bulk rename failed: {error}")),
@@ -987,7 +975,10 @@ impl App {
                 self.scan_rx = None;
 
                 let (success, msg) =
-                    deletion::format_deletion_result(mode, deleted, failed, bytes_freed);
+                    deletion::format_deletion_result(mode, deleted.len(), failed, bytes_freed);
+                if mode == gravityfile_ops::DeleteMode::Trash {
+                    self.undo_log.record_trash(deleted);
+                }
                 self.deletion_message = Some((success, msg));
                 self.mode = AppMode::Normal;
 
@@ -1012,42 +1003,23 @@ impl App {
                 succeeded,
                 failed,
                 skipped,
-                bytes_processed,
+                bytes_processed: _,
                 errors,
                 undo_info,
+                undo_remaining,
             } => {
                 self.operation_progress = None;
                 self.scan_rx = None;
                 let error_count = errors.iter().fold(0usize, |total, error| {
                     total.saturating_add(error.represented_count())
                 });
-                let undo_incomplete = self.pending_undo.as_ref().is_some_and(|entry| {
-                    cancelled
-                        || failed > 0
-                        || skipped > 0
-                        || error_count > 0
-                        || succeeded != entry.operation.item_count()
-                });
-                let copy_undo = self.pending_undo.as_ref().is_some_and(|entry| {
-                    matches!(
-                        entry.operation,
-                        gravityfile_ops::UndoableOperation::FilesCopied { .. }
-                    )
-                });
-                if let Some(mut entry) = self.pending_undo.take()
-                    && undo_incomplete
-                {
-                    entry.last_attempt = Some(gravityfile_ops::UndoAttempt {
-                        observed_at: std::time::SystemTime::now(),
-                        cancelled,
-                        succeeded,
-                        failed,
-                        skipped,
-                        bytes_processed,
-                        errors: errors.clone(),
-                    });
-                    self.undo_log.retain_for_review(entry);
-                    self.error = Some("Undo incomplete; use :undo-review to inspect the retained record. Automatic replay is disabled.".into());
+                let undo_incomplete = undo_remaining.is_some();
+                if let Some(entry) = undo_remaining {
+                    let count = entry.operation.item_count();
+                    self.undo_log.push(entry);
+                    self.error = Some(format!(
+                        "Undo incomplete: {count} item(s) were not restored; fix the cause and press u to retry"
+                    ));
                 }
                 self.set_operation_errors(operation_type, errors);
 
@@ -1074,7 +1046,7 @@ impl App {
                     gravityfile_ops::OperationType::Copy => "Copied",
                     gravityfile_ops::OperationType::Move => "Moved",
                     gravityfile_ops::OperationType::Delete => "Deleted",
-                    gravityfile_ops::OperationType::Retain => "Retained for recovery",
+                    gravityfile_ops::OperationType::Restore => "Restored",
                     gravityfile_ops::OperationType::Rename => "Renamed",
                     gravityfile_ops::OperationType::CreateFile => "Created file",
                     gravityfile_ops::OperationType::CreateDirectory => "Created directory",
@@ -1083,15 +1055,9 @@ impl App {
                 // Skipping is a user decision, not a failure, so it is reported
                 // separately and does not mark the operation unsuccessful.
                 let success = failed == 0 && error_count == 0 && !cancelled && !undo_incomplete;
-                let mut msg = if copy_undo {
-                    format!(
-                        "Retained {succeeded} copied items in sibling recovery journals; use grav recover"
-                    )
-                } else {
-                    format!("{action} {succeeded} items")
-                };
+                let mut msg = format!("{action} {succeeded} items");
                 if undo_incomplete {
-                    msg.push_str("; undo requires review");
+                    msg.push_str("; undo incomplete");
                 }
                 if skipped > 0 {
                     msg.push_str(&format!(", {skipped} skipped"));
@@ -1121,8 +1087,6 @@ impl App {
         operation_type: gravityfile_ops::OperationType,
         errors: Vec<gravityfile_ops::OperationError>,
     ) {
-        // A new operation's diagnostics take precedence over an old review snapshot.
-        self.undo_review_warnings.clear();
         self.operation_warnings = errors
             .into_iter()
             .map(|error| {
@@ -1140,14 +1104,10 @@ impl App {
     }
 
     fn warning_count(&self) -> usize {
-        self.undo_review_warnings.len() + self.operation_warnings.len() + self.warnings.len()
+        self.operation_warnings.len() + self.warnings.len()
     }
 
     fn displayed_warning(&self, index: usize) -> Option<&gravityfile_core::ScanWarning> {
-        if index < self.undo_review_warnings.len() {
-            return self.undo_review_warnings.get(index);
-        }
-        let index = index - self.undo_review_warnings.len();
         if index < self.operation_warnings.len() {
             self.operation_warnings.get(index)
         } else {
@@ -1709,10 +1669,7 @@ impl App {
 
         match action {
             KeyAction::Quit => {
-                if self.archive_rx.is_some()
-                    || self.take_rx.is_some()
-                    || self.undo_export_rx.is_some()
-                {
+                if self.archive_rx.is_some() || self.take_rx.is_some() {
                     self.error =
                         Some("Filesystem operation in progress; wait for it to finish".to_string());
                 } else {
@@ -2255,33 +2212,31 @@ impl App {
         self.active_paste_mode = mode;
         self.prepare_operation();
 
+        let options = TransferOptions {
+            conflict_resolution: resolution,
+            replace_policy: self.replace_policy,
+            ..TransferOptions::default()
+        };
         match mode {
             ClipboardMode::Copy => {
                 self.mode = AppMode::Copying;
-                let options = CopyOptions {
-                    conflict_resolution: resolution,
-                    preserve_timestamps: true,
-                };
                 let rx = gravityfile_ops::start_copy(
                     sources,
                     destination,
                     options,
                     self.scan_token.clone(),
                 );
-                self.scan_rx = Some(Self::adapt_copy_rx(rx));
+                self.scan_rx = Some(Self::adapt_transfer_rx(rx));
             }
             ClipboardMode::Cut => {
                 self.mode = AppMode::Moving;
-                let options = MoveOptions {
-                    conflict_resolution: resolution,
-                };
                 let rx = gravityfile_ops::start_move(
                     sources,
                     destination,
                     options,
                     self.scan_token.clone(),
                 );
-                self.scan_rx = Some(Self::adapt_move_rx(rx));
+                self.scan_rx = Some(Self::adapt_transfer_rx(rx));
                 self.clipboard.clear();
             }
             ClipboardMode::Empty => {}
@@ -2309,10 +2264,11 @@ impl App {
         self.view_root.clone()
     }
 
-    /// Adapt copy result channel to ScanResult channel.
-    fn adapt_copy_rx(
-        mut rx: mpsc::Receiver<gravityfile_ops::CopyResult>,
+    /// Adapt a copy or move channel to the ScanResult channel.
+    fn adapt_transfer_rx(
+        mut rx: mpsc::Receiver<gravityfile_ops::TransferResult>,
     ) -> mpsc::Receiver<ScanResult> {
+        use gravityfile_ops::{OperationType, TransferResult, UndoableOperation};
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
             loop {
@@ -2325,73 +2281,35 @@ impl App {
                     },
                 };
                 let scan_result = match result {
-                    gravityfile_ops::CopyResult::Progress(p) => ScanResult::OperationProgress(p),
-                    gravityfile_ops::CopyResult::Conflict(c) => ScanResult::OperationConflict(c),
-                    gravityfile_ops::CopyResult::Complete(cc) => {
-                        let undo_info = if !cc.created_paths.is_empty() {
-                            Some(gravityfile_ops::UndoableOperation::FilesCopied {
-                                created: cc.created_paths,
-                            })
-                        } else {
-                            None
-                        };
-
+                    TransferResult::Progress(p) => ScanResult::OperationProgress(p),
+                    TransferResult::Conflict(c) => ScanResult::OperationConflict(c),
+                    TransferResult::Complete(complete) => {
+                        let inner = complete.inner;
+                        let undo_info = (!complete.completed.is_empty()).then(|| {
+                            if inner.operation_type == OperationType::Move {
+                                UndoableOperation::FilesMoved {
+                                    moves: complete.completed,
+                                }
+                            } else {
+                                UndoableOperation::FilesCopied {
+                                    created: complete
+                                        .completed
+                                        .into_iter()
+                                        .map(|(_, destination)| destination)
+                                        .collect(),
+                                }
+                            }
+                        });
                         ScanResult::OperationComplete {
-                            cancelled: cc.inner.cancelled,
-                            operation_type: cc.inner.operation_type,
-                            succeeded: cc.inner.succeeded,
-                            failed: cc.inner.failed,
-                            skipped: cc.inner.skipped,
-                            bytes_processed: cc.inner.bytes_processed,
-                            errors: cc.inner.errors,
+                            cancelled: inner.cancelled,
+                            operation_type: inner.operation_type,
+                            succeeded: inner.succeeded,
+                            failed: inner.failed,
+                            skipped: inner.skipped,
+                            bytes_processed: inner.bytes_processed,
+                            errors: inner.errors,
                             undo_info,
-                        }
-                    }
-                };
-                if tx.send(scan_result).await.is_err() {
-                    break;
-                }
-            }
-        });
-        result_rx
-    }
-
-    /// Adapt move result channel to ScanResult channel.
-    fn adapt_move_rx(
-        mut rx: mpsc::Receiver<gravityfile_ops::MoveResult>,
-    ) -> mpsc::Receiver<ScanResult> {
-        let (tx, result_rx) = mpsc::channel(100);
-        tokio::spawn(async move {
-            loop {
-                let result = tokio::select! {
-                    biased;
-                    _ = tx.closed() => break,
-                    result = rx.recv() => match result {
-                        Some(result) => result,
-                        None => break,
-                    },
-                };
-                let scan_result = match result {
-                    gravityfile_ops::MoveResult::Progress(p) => ScanResult::OperationProgress(p),
-                    gravityfile_ops::MoveResult::Conflict(c) => ScanResult::OperationConflict(c),
-                    gravityfile_ops::MoveResult::Complete(mc) => {
-                        let undo_info = if !mc.moved_pairs.is_empty() {
-                            Some(gravityfile_ops::UndoableOperation::FilesMoved {
-                                moves: mc.moved_pairs,
-                            })
-                        } else {
-                            None
-                        };
-
-                        ScanResult::OperationComplete {
-                            cancelled: mc.inner.cancelled,
-                            operation_type: mc.inner.operation_type,
-                            succeeded: mc.inner.succeeded,
-                            failed: mc.inner.failed,
-                            skipped: mc.inner.skipped,
-                            bytes_processed: mc.inner.bytes_processed,
-                            errors: mc.inner.errors,
-                            undo_info,
+                            undo_remaining: None,
                         }
                     }
                 };
@@ -2600,303 +2518,60 @@ impl App {
         }
     }
 
-    /// Show a bounded snapshot of original paths, without replacing diagnostics.
-    fn show_undo_review(&mut self, page: usize) {
-        use gravityfile_ops::UndoableOperation;
-        const PAGE_SIZE: usize = 1000;
-        let total = self
-            .undo_log
-            .iter()
-            .filter(|entry| entry.review_required)
-            .fold(0usize, |sum, entry| {
-                sum.saturating_add(entry.operation.item_count())
-            });
-        let pages = total.div_ceil(PAGE_SIZE).max(1);
-        if page == 0 || page > pages {
-            self.error = Some(format!("Undo review page must be between 1 and {pages}"));
-            return;
-        }
-        let Some(mut offset) = (page - 1).checked_mul(PAGE_SIZE) else {
-            self.error = Some("Undo review page is too large".into());
-            return;
-        };
-        self.undo_review_warnings.clear();
-        'records: for entry in self.undo_log.iter().filter(|entry| entry.review_required) {
-            let count = entry.operation.item_count();
-            if offset >= count {
-                offset -= count;
-                continue;
-            }
-            let attempt = entry.last_attempt.as_ref().map_or_else(
-                || "completion not observed".to_owned(),
-                |attempt| {
-                    format!(
-                        "reported: {} succeeded, {} failed, {} skipped, cancelled={}, {} errors",
-                        attempt.succeeded,
-                        attempt.failed,
-                        attempt.skipped,
-                        attempt.cancelled,
-                        attempt.errors.iter().fold(0usize, |total, error| total
-                            .saturating_add(error.represented_count()))
-                    )
-                },
-            );
-            let mut add = |path: &Path, action: String| {
-                if self.undo_review_warnings.len() == PAGE_SIZE {
-                    return false;
-                }
-                self.undo_review_warnings
-                    .push(gravityfile_core::ScanWarning::new(
-                        path.to_path_buf(),
-                        gravityfile_core::WarningKind::ReadError,
-                        format!(
-                            "Undo #{} review: {action}. Original record; item outcome unverified; {attempt}.",
-                            entry.id
-                        ),
-                    ));
-                true
-            };
-            match &entry.operation {
-                UndoableOperation::FilesMoved { moves } => {
-                    for (original, current) in moves.iter().skip(offset) {
-                        if !add(current, format!("move back to {}", original.display())) {
-                            break 'records;
-                        }
-                    }
-                }
-                UndoableOperation::FilesCopied { created } => {
-                    for path in created.iter().skip(offset) {
-                        if !add(
-                            path,
-                            "retain copied item in a sibling recovery journal".into(),
-                        ) {
-                            break 'records;
-                        }
-                    }
-                }
-                UndoableOperation::FilesDeleted { paths } => {
-                    for path in paths.iter().skip(offset) {
-                        if !add(path, "OS trash recovery required".into()) {
-                            break 'records;
-                        }
-                    }
-                }
-                UndoableOperation::FileRenamed { path, old_path, .. } => {
-                    if !add(path, format!("rename back to {}", old_path.display())) {
-                        break 'records;
-                    }
-                }
-                UndoableOperation::FileCreated { path }
-                | UndoableOperation::DirectoryCreated { path } => {
-                    if !add(path, "remove created item if unchanged and empty".into()) {
-                        break 'records;
-                    }
-                }
-            }
-            offset = 0;
-        }
-        self.selected_warning = 0;
-        if self.undo_review_warnings.is_empty() {
-            self.operation_message = Some((true, "No retained undo paths require review".into()));
-        } else {
-            self.view = View::Errors;
-            self.operation_message = Some((
-                false,
-                format!(
-                    "Undo review page {page}/{pages} ({total} original paths); :undo-review <page>. Outcomes unverified; replay disabled"
-                ),
-            ));
-        }
-    }
-
-    fn show_undo_errors(&mut self, page: usize) {
-        const PAGE_SIZE: usize = 1000;
-        let total = self
-            .undo_log
-            .iter()
-            .filter(|entry| entry.review_required)
-            .filter_map(|entry| entry.last_attempt.as_ref())
-            .fold(0usize, |sum, attempt| {
-                sum.saturating_add(attempt.errors.len())
-            });
-        let pages = total.div_ceil(PAGE_SIZE).max(1);
-        if page == 0 || page > pages {
-            self.error = Some(format!(
-                "Undo error review page must be between 1 and {pages}"
-            ));
-            return;
-        }
-        let Some(mut offset) = (page - 1).checked_mul(PAGE_SIZE) else {
-            self.error = Some("Undo error review page is too large".into());
-            return;
-        };
-        self.undo_review_warnings.clear();
-        for entry in self.undo_log.iter().filter(|entry| entry.review_required) {
-            let Some(attempt) = &entry.last_attempt else {
-                continue;
-            };
-            if offset >= attempt.errors.len() {
-                offset -= attempt.errors.len();
-                continue;
-            }
-            for error in attempt
-                .errors
-                .iter()
-                .skip(offset)
-                .take(PAGE_SIZE - self.undo_review_warnings.len())
-            {
-                self.undo_review_warnings
-                    .push(gravityfile_core::ScanWarning::new(
-                        error.path.clone(),
-                        gravityfile_core::WarningKind::ReadError,
-                        format!("Undo #{} reported error: {}", entry.id, error.message),
-                    ));
-            }
-            if self.undo_review_warnings.len() == PAGE_SIZE {
-                break;
-            }
-            offset = 0;
-        }
-        self.selected_warning = 0;
-        if total == 0 {
-            self.operation_message = Some((true,
-                "No retained error diagnostics; use :undo-review for original records and completion status".into()));
-        } else {
-            self.view = View::Errors;
-            self.operation_message = Some((
-                false,
-                format!(
-                    "Undo errors page {page}/{pages} ({total} diagnostics); :undo-review errors <page>. Errors may describe partial changes"
-                ),
-            ));
-        }
-    }
-
-    fn export_undo_review(&mut self, path: &str) {
-        if self.undo_export_rx.is_some() {
-            self.error = Some("Undo review export is already in progress".into());
-            return;
-        }
-        let snapshot = self.undo_log.review_snapshot();
-        if snapshot.is_empty() {
-            self.error = Some("No retained undo records require review".into());
-            return;
-        }
-        let destination = self.view_root.join(path);
-        let (sender, receiver) = oneshot::channel();
-        self.undo_export_rx = Some(receiver);
-        self.operation_message = Some((true, "Exporting undo review…".into()));
-        tokio::spawn(async move {
-            let output_path = destination.clone();
-            let result =
-                tokio::task::spawn_blocking(move || snapshot.export_review_json(&destination))
-                    .await
-                    .map_err(|error| format!("Export worker failed: {error}"))
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-            let _ = sender.send((output_path, result));
-        });
-    }
-
-    fn finish_undo_export(&mut self, exported: Option<(PathBuf, Result<(), String>)>) {
-        self.undo_export_rx = None;
-        match exported {
-            Some((path, Ok(()))) => {
-                self.operation_message = Some((
-                    true,
-                    format!(
-                        "Undo review exported to {} (inspection only; outcomes unverified)",
-                        path.display()
-                    ),
-                ))
-            }
-            Some((path, Err(error))) => {
-                self.operation_message = None;
-                self.error = Some(format!(
-                    "Cannot export undo review to {}: {error}",
-                    path.display()
-                ));
-            }
-            None => {
-                self.operation_message = None;
-                self.error = Some(
-                    "Undo review export ended without a result; inspect the destination".into(),
-                );
-            }
-        }
-    }
-
     /// Execute undo of the last operation.
     fn execute_undo(&mut self) {
         if self.mode == AppMode::Undoing {
             return;
         }
-        if let Some(entry) = self.undo_log.pop() {
-            self.pending_undo = Some(entry.clone());
-            let msg = format!("Undoing: {}", entry.description);
-            self.operation_message = Some((true, msg));
-
-            self.prepare_operation();
-
-            let rx =
-                gravityfile_ops::execute_undo_with_cancellation(entry, self.scan_token.clone());
-
-            // Adapt the generic OperationResult to ScanResult
-            let (tx, adapted_rx) = tokio::sync::mpsc::channel(100);
-            let token = self.scan_token.clone();
-            tokio::spawn(async move {
-                let mut rx = rx;
-                loop {
-                    let result = tokio::select! {
-                        biased;
-                        _ = tx.closed() => { token.cancel(); break; }
-                        result = rx.recv() => match result {
-                            Some(result) => result,
-                            None => break,
-                        },
-                    };
-                    // Keep the receiver alive through cancellation so the worker
-                    // can finish active calls and deliver its partial completion.
-                    let scan_result = match result {
-                        gravityfile_ops::OperationResult::Progress(p) => {
-                            ScanResult::OperationProgress(p)
-                        }
-                        gravityfile_ops::OperationResult::Conflict(c) => {
-                            ScanResult::OperationConflict(c)
-                        }
-                        gravityfile_ops::OperationResult::Complete(c) => {
-                            ScanResult::OperationComplete {
-                                cancelled: c.cancelled,
-                                operation_type: c.operation_type,
-                                succeeded: c.succeeded,
-                                failed: c.failed,
-                                skipped: c.skipped,
-                                bytes_processed: c.bytes_processed,
-                                errors: c.errors,
-                                undo_info: None, // Don't record undos of undos in this simple impl
-                            }
-                        }
-                    };
-                    if tx.send(scan_result).await.is_err() {
-                        token.cancel();
-                        break;
-                    }
-                }
-            });
-
-            self.scan_rx = Some(adapted_rx);
-            self.mode = AppMode::Undoing;
-        } else {
-            let message = if self
-                .undo_log
-                .peek()
-                .is_some_and(|entry| entry.review_required)
-            {
-                "Previous undo is incomplete; use :undo-review to inspect original paths"
-            } else {
-                "Nothing to undo"
+        let Some(entry) = self.undo_log.pop() else {
+            let message = match self.undo_log.peek() {
+                Some(entry) => format!("Cannot undo here: {}", entry.operation.undo_description()),
+                None => "Nothing to undo".to_owned(),
             };
-            self.operation_message = Some((false, message.to_owned()));
-        }
+            self.operation_message = Some((false, message));
+            return;
+        };
+        self.operation_message = Some((true, format!("Undoing: {}", entry.description)));
+        self.prepare_operation();
+        let mut rx = gravityfile_ops::execute_undo(entry, self.scan_token.clone());
+
+        let (tx, adapted_rx) = tokio::sync::mpsc::channel(100);
+        let token = self.scan_token.clone();
+        tokio::spawn(async move {
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    _ = tx.closed() => { token.cancel(); break; }
+                    result = rx.recv() => match result {
+                        Some(result) => result,
+                        None => break,
+                    },
+                };
+                let scan_result = match result {
+                    gravityfile_ops::UndoResult::Progress(p) => ScanResult::OperationProgress(p),
+                    gravityfile_ops::UndoResult::Complete(complete) => {
+                        let c = complete.inner;
+                        ScanResult::OperationComplete {
+                            cancelled: c.cancelled,
+                            operation_type: c.operation_type,
+                            succeeded: c.succeeded,
+                            failed: c.failed,
+                            skipped: c.skipped,
+                            bytes_processed: c.bytes_processed,
+                            errors: c.errors,
+                            undo_info: None,
+                            undo_remaining: complete.remaining,
+                        }
+                    }
+                };
+                if tx.send(scan_result).await.is_err() {
+                    token.cancel();
+                    break;
+                }
+            }
+        });
+        self.scan_rx = Some(adapted_rx);
+        self.mode = AppMode::Undoing;
     }
 
     /// Handle key events in input modes (Renaming, CreatingFile, CreatingDirectory).
@@ -2992,11 +2667,8 @@ impl App {
                     gravityfile_ops::RenameResult::Complete(complete) => {
                         let undo_info = if complete.succeeded > 0 && complete.is_success() {
                             let parent = source_path.parent().unwrap_or(std::path::Path::new(""));
-                            let new_path = parent.join(&new_name);
-                            Some(gravityfile_ops::UndoableOperation::FileRenamed {
-                                path: new_path,
-                                old_path: source_path.clone(),
-                                new_name: new_name.clone(),
+                            Some(gravityfile_ops::UndoableOperation::FilesRenamed {
+                                renames: vec![(source_path.clone(), parent.join(&new_name))],
                             })
                         } else {
                             None
@@ -3011,6 +2683,7 @@ impl App {
                             bytes_processed: complete.bytes_processed,
                             errors: complete.errors,
                             undo_info,
+                            undo_remaining: None,
                         }
                     }
                 };
@@ -3188,6 +2861,7 @@ impl App {
                             bytes_processed: complete.bytes_processed,
                             errors: complete.errors,
                             undo_info,
+                            undo_remaining: None,
                         }
                     }
                 };
@@ -4105,10 +3779,7 @@ impl App {
                 if self.cancel_archive_operation() {
                     return;
                 }
-                if self.archive_rx.is_some()
-                    || self.take_rx.is_some()
-                    || self.undo_export_rx.is_some()
-                {
+                if self.archive_rx.is_some() || self.take_rx.is_some() {
                     self.error =
                         Some("Filesystem operation in progress; wait for it to finish".to_string());
                 } else {
@@ -4242,9 +3913,6 @@ impl App {
             CommandAction::Undo => {
                 self.execute_undo();
             }
-            CommandAction::UndoReview(page) => self.show_undo_review(page),
-            CommandAction::UndoReviewErrors(page) => self.show_undo_errors(page),
-            CommandAction::UndoExport(path) => self.export_undo_review(&path),
             CommandAction::ShowBookmarks => {
                 self.bookmark_list_state =
                     Some(BookmarkListState::new(&self.user_settings.bookmarks));
@@ -5854,415 +5522,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undo_completion_requires_exact_original_item_accounting() {
-        for succeeded in [0, 1, 2, 3] {
-            let (_fixture, mut app) = scanned_app();
-            app.pending_undo = Some(gravityfile_ops::UndoEntry::new(
-                17,
-                gravityfile_ops::UndoableOperation::FilesCopied {
-                    created: vec![app.path.join("first"), app.path.join("second")],
-                },
-                "copied two items",
-            ));
-            app.mode = AppMode::Undoing;
-            app.handle_scan_result(ScanResult::OperationComplete {
-                operation_type: gravityfile_ops::OperationType::Delete,
-                cancelled: false,
-                succeeded,
-                failed: 0,
-                skipped: 0,
-                bytes_processed: 0,
-                errors: Vec::new(),
-                undo_info: None,
-            });
-            assert!(app.pending_undo.is_none());
-            assert_eq!(app.operation_message.as_ref().unwrap().0, succeeded == 2);
-            assert!(
-                app.operation_message
-                    .as_ref()
-                    .unwrap()
-                    .1
-                    .contains("recovery journals")
-            );
-            assert!(
-                !app.operation_message
-                    .as_ref()
-                    .unwrap()
-                    .1
-                    .starts_with("Deleted")
-            );
-            if succeeded == 2 {
-                assert!(app.undo_log.is_empty());
-            } else {
-                let entry = app.undo_log.peek().unwrap();
-                assert_eq!(entry.operation.item_count(), 2);
-                assert!(entry.review_required);
-                assert_eq!(entry.last_attempt.as_ref().unwrap().succeeded, succeeded);
-                assert!(app.error.as_ref().unwrap().contains("Undo incomplete"));
-                assert!(
-                    app.operation_message
-                        .as_ref()
-                        .unwrap()
-                        .1
-                        .contains("requires review")
-                );
-                assert!(app.undo_log.pop().is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn retained_undo_errors_are_paged_separately_from_original_paths() {
-        let fixture = sample_dir_on_disk();
-        let mut app = App::with_loaded_settings(
-            fixture.path().to_path_buf(),
-            crate::TuiConfig::default(),
-            Ok(UserSettings::default()),
-        );
-        let mut entry = gravityfile_ops::UndoEntry::new(
-            11,
-            gravityfile_ops::UndoableOperation::FileCreated {
-                path: "original".into(),
+    async fn incomplete_undo_requeues_the_remainder_for_retry() {
+        let (_dir, mut app) = scanned_app();
+        let remaining = gravityfile_ops::UndoEntry::new(
+            7,
+            gravityfile_ops::UndoableOperation::FilesMoved {
+                moves: vec![(PathBuf::from("/a"), PathBuf::from("/b"))],
             },
-            "created",
+            "Moved 2 item(s) (undo incomplete)",
         );
-        entry.last_attempt = Some(gravityfile_ops::UndoAttempt {
-            observed_at: std::time::UNIX_EPOCH,
-            cancelled: true,
+        app.handle_scan_result(ScanResult::OperationComplete {
+            cancelled: false,
+            operation_type: gravityfile_ops::OperationType::Move,
             succeeded: 1,
-            failed: 1002,
+            failed: 1,
             skipped: 0,
             bytes_processed: 0,
-            errors: (0..1002)
-                .map(|index| {
-                    gravityfile_ops::OperationError::new(
-                        PathBuf::from(format!("error-{index}")),
-                        format!("detail-{index} 日本"),
-                    )
-                })
-                .collect(),
+            errors: vec![gravityfile_ops::OperationError::new(
+                "/b".into(),
+                "occupied",
+            )],
+            undo_info: None,
+            undo_remaining: Some(remaining),
         });
-        app.undo_log.retain_for_review(entry);
-        app.set_operation_errors(
-            gravityfile_ops::OperationType::Copy,
-            vec![gravityfile_ops::OperationError::new(
-                "live".into(),
-                "fresh failure",
-            )],
-        );
-        app.execute_command("undo-review errors");
-        assert_eq!(app.undo_review_warnings.len(), 1000);
-        assert_eq!(
-            app.displayed_warning(0).unwrap().path,
-            PathBuf::from("error-0")
-        );
-        assert!(
-            app.displayed_warning(1000)
-                .unwrap()
-                .message
-                .contains("fresh failure")
-        );
-        app.execute_command("undo-review errors 2");
-        assert_eq!(app.undo_review_warnings.len(), 2);
-        assert_eq!(
-            app.displayed_warning(0).unwrap().path,
-            PathBuf::from("error-1000")
-        );
-        assert_eq!(
-            app.displayed_warning(1).unwrap().message,
-            "Undo #11 reported error: detail-1001 日本"
-        );
-        assert!(
-            app.operation_message
-                .as_ref()
-                .unwrap()
-                .1
-                .contains("page 2/2")
-        );
-        for command in [
-            "undo-review errors 0",
-            "undo-review errors 3",
-            "undo-review errors x",
-            "undo-review errors 2 extra",
-        ] {
-            app.execute_command(command);
-            assert!(app.error.is_some());
-            assert_eq!(app.undo_review_warnings.len(), 2);
-        }
-        app.execute_command("undo-review");
-        assert_eq!(app.undo_review_warnings.len(), 1);
-        assert_eq!(
-            app.displayed_warning(0).unwrap().path,
-            PathBuf::from("original")
-        );
-        assert_eq!(app.undo_log.len(), 1);
-        app.undo_log.clear();
-        app.execute_command("undo-review errors");
-        assert!(app.undo_review_warnings.is_empty());
-        assert!(
-            app.operation_message
-                .as_ref()
-                .unwrap()
-                .1
-                .contains("completion status")
-        );
-    }
-
-    #[tokio::test]
-    async fn undo_export_runs_independently_and_preserves_existing_destinations() {
-        let fixture = sample_dir_on_disk();
-        let mut app = App::with_loaded_settings(
-            fixture.path().to_path_buf(),
-            crate::TuiConfig::default(),
-            Ok(UserSettings::default()),
-        );
-        app.undo_log
-            .retain_for_review(gravityfile_ops::UndoEntry::new(
-                7,
-                gravityfile_ops::UndoableOperation::FileCreated {
-                    path: app.path.join("original"),
-                },
-                "retained",
-            ));
-        let destination = app.path.join("review  日本.json");
-        app.execute_command("undo-export review  日本.json");
-        assert!(app.undo_export_rx.is_some());
-        app.execute_command("undo-export second.json");
-        assert!(app.error.as_ref().unwrap().contains("already in progress"));
-        app.handle_action(KeyAction::Quit);
-        assert_ne!(app.mode, AppMode::Quit);
-        app.execute_command("quit");
-        assert_ne!(app.mode, AppMode::Quit);
-        app.undo_log.clear();
-        let receiver = app.undo_export_rx.take().unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
-            .await
-            .unwrap()
-            .unwrap();
-        app.finish_undo_export(Some(result));
-        assert!(
-            app.operation_message
-                .as_ref()
-                .unwrap()
-                .1
-                .contains("exported")
-        );
-        let bytes = std::fs::read(&destination).unwrap();
-        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(document["entries"][0]["id"], 7);
-        assert!(!app.path.join("second.json").exists());
-        app.undo_log
-            .retain_for_review(gravityfile_ops::UndoEntry::new(
-                8,
-                gravityfile_ops::UndoableOperation::FileCreated {
-                    path: "later".into(),
-                },
-                "later",
-            ));
-        app.execute_command("undo-export review  日本.json");
-        let receiver = app.undo_export_rx.take().unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
-            .await
-            .unwrap()
-            .unwrap();
-        app.finish_undo_export(Some(result));
-        assert!(app.error.as_ref().unwrap().contains("already exists"));
-        assert_eq!(std::fs::read(destination).unwrap(), bytes);
-        assert_eq!(app.undo_log.len(), 1);
-        app.execute_command("undo-export");
-        assert!(app.error.as_ref().unwrap().contains("Usage"));
-    }
-
-    #[test]
-    fn undo_review_shows_original_paths_without_mutation_or_diagnostic_loss() {
-        use gravityfile_ops::{UndoEntry, UndoableOperation};
-        let fixture = sample_dir_on_disk();
-        let mut app = App::with_loaded_settings(
-            fixture.path().to_path_buf(),
-            crate::TuiConfig::default(),
-            Ok(UserSettings::default()),
-        );
-        let current = app.path.join("review-current");
-        let original = app.path.join("original 日本");
-        std::fs::write(&current, "preserve me").unwrap();
-        app.operation_warnings
-            .push(gravityfile_core::ScanWarning::new(
-                current.clone(),
-                gravityfile_core::WarningKind::ReadError,
-                "original diagnostic",
-            ));
-        app.undo_log.retain_for_review(UndoEntry::new(
-            1,
-            UndoableOperation::FilesMoved {
-                moves: vec![(original.clone(), current.clone())],
-            },
-            "moved",
-        ));
-        app.undo_log.retain_for_review(UndoEntry::new(
-            2,
-            UndoableOperation::FileRenamed {
-                path: current.clone(),
-                old_path: original.clone(),
-                new_name: "review-current".into(),
-            },
-            "renamed",
-        ));
-        app.execute_command("undo-review");
-        assert_eq!(app.view, View::Errors);
-        assert_eq!(app.undo_review_warnings.len(), 2);
-        assert_eq!(app.displayed_warning(0).unwrap().path, current);
-        assert!(
-            app.displayed_warning(0)
-                .unwrap()
-                .message
-                .contains(&original.display().to_string())
-        );
-        assert!(
-            app.displayed_warning(1)
-                .unwrap()
-                .message
-                .contains("rename back")
-        );
-        assert!(
-            app.displayed_warning(1)
-                .unwrap()
-                .message
-                .contains("outcome unverified")
-        );
-        assert_eq!(
-            app.displayed_warning(2).unwrap().message,
-            "original diagnostic"
-        );
-        assert_eq!(app.undo_log.len(), 2);
-        app.undo_log.retain_for_review(UndoEntry::new(
-            3,
-            UndoableOperation::FilesCopied {
-                created: (0..1001)
-                    .map(|index| app.path.join(format!("copy-{index}")))
-                    .collect(),
-            },
-            "copied",
-        ));
-        app.execute_command("undo-review");
-        assert_eq!(app.undo_review_warnings.len(), 1000);
-        assert!(
-            app.operation_message
-                .as_ref()
-                .unwrap()
-                .1
-                .contains("page 1/2")
-        );
-        assert_eq!(
-            app.displayed_warning(1000).unwrap().message,
-            "original diagnostic"
-        );
-        assert_eq!(std::fs::read(&current).unwrap(), b"preserve me");
-        assert!(!original.exists());
-        app.execute_command("undo-review 2");
-        assert_eq!(app.undo_review_warnings.len(), 3);
-        assert_eq!(app.undo_review_warnings[0].path, app.path.join("copy-998"));
-        assert_eq!(app.undo_review_warnings[2].path, app.path.join("copy-1000"));
-        assert_eq!(
-            app.displayed_warning(3).unwrap().message,
-            "original diagnostic"
-        );
-        for command in [
-            "undo-review 0",
-            "undo-review extra",
-            "undo-review -1",
-            "undo-review 1 extra",
-            "undo-review 18446744073709551615",
-        ] {
-            app.execute_command(command);
-            assert!(app.error.is_some());
-            assert_eq!(app.undo_review_warnings.len(), 3);
-        }
-        app.set_operation_errors(
-            gravityfile_ops::OperationType::Copy,
-            vec![gravityfile_ops::OperationError::new(
-                current,
-                "fresh failure",
-            )],
-        );
-        assert!(app.undo_review_warnings.is_empty());
-        assert!(
-            app.displayed_warning(0)
-                .unwrap()
-                .message
-                .contains("fresh failure")
-        );
-    }
-
-    #[tokio::test]
-    async fn partial_undo_retains_original_record_without_replaying_completed_items() {
-        let (_fixture, mut app) = scanned_app();
-        let created = app.path.join("undo-created");
-        let missing = app.path.join("undo-missing");
-        std::fs::write(&created, "copied").unwrap();
-        let id = app
-            .undo_log
-            .record_copy(vec![created.clone(), missing.clone()]);
-        app.execute_undo();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            pump_until_complete(&mut app),
-        )
-        .await
-        .unwrap();
-        assert!(!created.exists());
-        let retained = app.undo_log.peek().unwrap();
-        assert_eq!(retained.id, id);
-        assert!(retained.review_required);
-        let gravityfile_ops::UndoableOperation::FilesCopied { created: paths } =
-            &retained.operation
-        else {
-            panic!("copy record expected");
-        };
-        assert_eq!(paths, &vec![created.clone(), missing.clone()]);
-        let attempt = retained.last_attempt.as_ref().unwrap();
-        assert_eq!(
-            (attempt.succeeded, attempt.failed, attempt.skipped),
-            (1, 1, 0)
-        );
-        assert!(!attempt.cancelled);
-        assert_eq!(attempt.errors.len(), 1);
-        assert_eq!(attempt.errors[0].path, missing);
-        app.set_operation_errors(gravityfile_ops::OperationType::Copy, Vec::new());
-        assert_eq!(
-            app.undo_log
-                .peek()
-                .unwrap()
-                .last_attempt
-                .as_ref()
-                .unwrap()
-                .errors[0]
-                .path,
-            missing
-        );
-        let mut exported = Vec::new();
-        app.undo_log.write_review_json(&mut exported).unwrap();
-        let exported: serde_json::Value = serde_json::from_slice(&exported).unwrap();
-        assert_eq!(exported["entries"][0]["last_attempt"]["succeeded"], 1);
-        assert_eq!(exported["entries"][0]["last_attempt"]["failed"], 1);
-        assert!(app.pending_undo.is_none());
-        std::fs::write(&created, "new data").unwrap();
-        app.execute_undo();
-        assert!(app.operation_message.as_ref().unwrap().1.contains("review"));
-        assert_eq!(std::fs::read(&created).unwrap(), b"new data");
-        assert_eq!(app.undo_log.len(), 1);
-
-        let entry = gravityfile_ops::UndoEntry::new(
-            99,
-            gravityfile_ops::UndoableOperation::FileCreated { path: created },
-            "interrupted",
-        );
-        app.pending_undo = Some(entry);
-        app.mode = AppMode::Undoing;
-        app.handle_background_channel_closed();
-        assert!(app.pending_undo.is_none());
-        assert_eq!(app.undo_log.peek().unwrap().id, 99);
-        assert!(app.undo_log.peek().unwrap().review_required);
-        assert!(app.undo_log.peek().unwrap().last_attempt.is_none());
+        assert_eq!(app.undo_log.peek().unwrap().id, 7);
+        assert!(app.error.as_deref().unwrap().contains("press u to retry"));
+        let (success, message) = app.operation_message.clone().unwrap();
+        assert!(!success && message.contains("undo incomplete"));
     }
 
     #[test]
@@ -6822,7 +6108,14 @@ mod tests {
         // node and the explorer silently renders nothing.
         let root = dir.path().canonicalize().expect("canonicalize temp dir");
 
-        let mut app = App::with_config(root.clone(), crate::TuiConfig::default());
+        // Tests must never move fixtures into the user's real Trash.
+        let mut app = App::with_config(
+            root.clone(),
+            crate::TuiConfig {
+                replace_policy: gravityfile_ops::ReplacePolicy::Permanent,
+                ..crate::TuiConfig::default()
+            },
+        );
 
         let config = gravityfile_core::ScanConfig::new(&root);
         let tree = gravityfile_scan::JwalkScanner::new()
@@ -6941,6 +6234,7 @@ mod tests {
             undo_info: Some(gravityfile_ops::UndoableOperation::FilesCopied {
                 created: vec![path],
             }),
+            undo_remaining: None,
         });
         let (success, message) = app.operation_message.as_ref().unwrap();
         assert!(!success);
@@ -7214,76 +6508,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_archive_warning_refreshes_without_clearing_selection() {
-        for active_creation in [false, true] {
-            let (_directory, mut app) = scanned_app();
-            let root = app.view_root.clone();
-            let source = root.join("copy-a.bin");
-            let archive = root.join("result.zip");
-            gravityfile_ops::create_archive(
-                std::slice::from_ref(&source),
-                &archive,
-                gravityfile_ops::ArchiveFormat::Zip,
-            )
-            .unwrap();
-            app.marked.insert(source.clone());
-            if active_creation {
-                app.execute_create_file(root.clone(), "created".into());
-            }
-            let token = app.scan_token.clone();
-            app.handle_archive_completion(ArchiveCompletion::Compress {
-                archive_path: archive.clone(),
-                sources: vec![source.clone()],
-                result: Err(gravityfile_ops::ArchiveError::PublishedDurability {
-                    destination: archive,
-                    source: std::io::Error::other("private/path must not appear"),
-                }),
-            });
-            let message = app.error.as_deref().unwrap();
-            assert!(
-                message.starts_with("Archive created, but persistence is uncertain"),
-                "{message}"
-            );
-            assert!(!message.contains("private/path"));
-            assert!(app.marked.contains(&source));
-            assert!(app.scan_rx.is_some());
-            if active_creation {
-                assert!(!token.is_cancelled());
-                assert!(app.pending_archive_refresh);
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                // Unlike the operation-only helper, allow its follow-up
-                // scan to finish so the assertion observes the actual tree.
-                while let Some(receiver) = app.scan_rx.as_mut() {
-                    let Some(result) = receiver.recv().await else {
-                        break;
-                    };
-                    app.handle_scan_result(result);
-                }
-            })
-            .await
-            .unwrap();
-            assert!(
-                app.tree
-                    .as_ref()
-                    .unwrap()
-                    .root
-                    .children
-                    .iter()
-                    .any(|node| node.name == "result.zip")
-            );
-            assert!(app.marked.contains(&source));
-            assert!(!app.pending_archive_refresh);
-            assert!(
-                app.error
-                    .as_deref()
-                    .unwrap()
-                    .contains("persistence is uncertain")
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn incomplete_extraction_rollback_refreshes_without_clearing_selection() {
         for active_creation in [false, true] {
             let (_directory, mut app) = scanned_app();
@@ -7304,15 +6528,12 @@ mod tests {
                     source: Box::new(
                         std::io::Error::other("private/path publication failure").into(),
                     ),
-                    cleanup_errors: vec![(
-                        archive.clone(),
-                        std::io::Error::other("private/path removal failure"),
-                    )],
+                    left_behind: vec![archive.clone()],
                 }),
             });
             let message = app.error.as_deref().unwrap();
             assert!(
-                message.starts_with("Archive extraction failed and rollback was incomplete"),
+                message.starts_with("Archive extraction failed; 1 extracted entries"),
                 "{message}"
             );
             assert!(!message.contains("private/path"));
@@ -7349,7 +6570,7 @@ mod tests {
                 app.error
                     .as_deref()
                     .unwrap()
-                    .contains("rollback was incomplete")
+                    .contains("could not be withdrawn")
             );
         }
     }
@@ -7714,7 +6935,7 @@ mod tests {
         app.operation_message = Some((true, "Old copy summary".into()));
         let mut rx = deletion::start_deletion_with_mode(
             vec![(missing.clone(), 0), (removed.clone(), 9)],
-            deletion::DeletionMode::Permanent,
+            gravityfile_ops::DeleteMode::Permanent,
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -7751,8 +6972,8 @@ mod tests {
         assert!(rendered.contains("Cannot access path"), "{rendered}");
         assert!(!rendered.contains("Old copy summary"));
         app.handle_scan_result(ScanResult::DeletionComplete {
-            mode: deletion::DeletionMode::Trash,
-            deleted: 1,
+            mode: gravityfile_ops::DeleteMode::Trash,
+            deleted: vec![removed.clone()],
             failed: 0,
             bytes_freed: 9,
             errors: Vec::new(),
@@ -8171,6 +7392,7 @@ mod tests {
             bytes_processed: 1024,
             errors: Vec::new(),
             undo_info: None,
+            undo_remaining: None,
         });
         let (success, message) = app.operation_message.clone().expect("a message is set");
         assert!(success, "skipping is a user decision, not a failure");
@@ -8186,6 +7408,7 @@ mod tests {
             bytes_processed: 1024,
             errors: Vec::new(),
             undo_info: None,
+            undo_remaining: None,
         });
         let (success, message) = app.operation_message.clone().expect("a message is set");
         assert!(!success, "a failure marks the operation unsuccessful");
@@ -8840,9 +8063,12 @@ mod tests {
         ));
         app.handle_scan_result(result);
         assert_eq!(app.mode, AppMode::Normal);
+        // Nothing was attempted, so the whole entry is back for a retry.
         assert_eq!(app.undo_log.len(), 2);
-        assert!(app.undo_log.peek().unwrap().review_required);
-        assert!(app.undo_log.pop().is_none());
+        assert_eq!(
+            app.undo_log.peek().unwrap().operation,
+            gravityfile_ops::UndoableOperation::FileCreated { path: path.clone() }
+        );
         assert!(path.exists());
     }
 
@@ -8871,11 +8097,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
         app.view = View::Errors;
-        app.undo_review_warnings = vec![ScanWarning::new(
-            "review-entry",
-            WarningKind::ReadError,
-            "review detail",
-        )];
         app.operation_warnings = vec![ScanWarning::new(
             "operation-entry",
             WarningKind::ReadError,
@@ -8886,21 +8107,19 @@ mod tests {
             WarningKind::BrokenSymlink,
             "scan detail",
         )];
-        for selected in 0..3 {
+        for selected in 0..2 {
             app.selected_warning = selected;
             let area = Rect::new(0, 0, 120, 30);
             let mut buffer = Buffer::empty(area);
             app.render(area, &mut buffer);
             let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-            let review = rendered.find("review-entry").expect("review row visible");
             let operation = rendered
                 .find("operation-entry")
                 .expect("operation row visible");
             let scan = rendered.find("scan-entry").expect("scan row visible");
-            assert!(review < operation && operation < scan);
-            assert!(rendered.contains("Undo Review"));
-            assert_eq!(rendered.contains("[d to delete]"), selected == 2);
-            let expected = ["review-entry", "operation-entry", "scan-entry"][selected];
+            assert!(operation < scan);
+            assert_eq!(rendered.contains("[d to delete]"), selected == 1);
+            let expected = ["operation-entry", "scan-entry"][selected];
             assert_eq!(
                 app.displayed_warning(selected).unwrap().path,
                 PathBuf::from(expected)
@@ -8908,7 +8127,7 @@ mod tests {
             app.mode = AppMode::Normal;
             app.marked.clear();
             app.handle_action(KeyAction::Delete);
-            if selected == 2 {
+            if selected == 1 {
                 assert_eq!(app.mode, AppMode::ConfirmDelete);
                 assert_eq!(app.marked.len(), 1);
                 assert!(app.marked.contains(&PathBuf::from("scan-entry")));
@@ -9096,16 +8315,11 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_tui_operation_adapters_closes_idle_upstream_channels() {
-        let (copy_tx, copy_rx) = mpsc::channel(1);
-        drop(App::adapt_copy_rx(copy_rx));
-        tokio::time::timeout(Duration::from_secs(5), copy_tx.closed())
+        let (transfer_tx, transfer_rx) = mpsc::channel(1);
+        drop(App::adapt_transfer_rx(transfer_rx));
+        tokio::time::timeout(Duration::from_secs(5), transfer_tx.closed())
             .await
-            .expect("idle copy adapter must release its upstream receiver");
-        let (move_tx, move_rx) = mpsc::channel(1);
-        drop(App::adapt_move_rx(move_rx));
-        tokio::time::timeout(Duration::from_secs(5), move_tx.closed())
-            .await
-            .expect("idle move adapter must release its upstream receiver");
+            .expect("idle transfer adapter must release its upstream receiver");
     }
 
     #[tokio::test]
@@ -9122,6 +8336,7 @@ mod tests {
             undo_info: Some(gravityfile_ops::UndoableOperation::FilesCopied {
                 created: vec![app.path.join("copied")],
             }),
+            undo_remaining: None,
         });
         let (success, message) = app.operation_message.as_ref().unwrap();
         assert!(!success);

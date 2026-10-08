@@ -148,8 +148,9 @@ async fn complete_analysis(
     let _ = destination.send(result).await;
 }
 
-/// Run a rename transaction off the event-loop thread. Once started it is
-/// awaited through rollback, including when cancellation is requested.
+/// Run a rename batch off the event-loop thread. Once started it is awaited
+/// through rollback, including when cancellation is requested. Success
+/// returns the pairs for the undo log.
 pub(super) fn start_bulk_rename(
     renames: Vec<(PathBuf, PathBuf)>,
     token: CancellationToken,
@@ -157,8 +158,7 @@ pub(super) fn start_bulk_rename(
     let (tx, rx) = mpsc::channel(1);
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            gravityfile_ops::rename_paths_with_cancellation(&renames, &token)
-                .map(|()| renames.len())
+            gravityfile_ops::rename_paths(&renames, &token).map(|()| renames)
         })
         .await
         .unwrap_or_else(|error| Err(format!("Bulk rename worker failed: {error}")));

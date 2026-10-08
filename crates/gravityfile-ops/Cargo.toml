@@ -16,6 +16,8 @@ serde_json.workspace = true
 tracing.workspace = true
 filetime.workspace = true
 tempfile.workspace = true
+trash.workspace = true
+reflink-copy.workspace = true
 
 # Archive support
 zip.workspace = true
@@ -23,9 +25,11 @@ tar.workspace = true
 flate2.workspace = true
 xz2.workspace = true
 bzip2.workspace = true
+zstd.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+xattr.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

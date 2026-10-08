@@ -369,8 +369,9 @@ pub enum ScanResult {
     DeletionProgress(DeletionProgress),
     /// Deletion completed.
     DeletionComplete {
-        mode: super::deletion::DeletionMode,
-        deleted: usize,
+        mode: gravityfile_ops::DeleteMode,
+        /// Paths that were removed.
+        deleted: Vec<PathBuf>,
         failed: usize,
         bytes_freed: u64,
         errors: Vec<gravityfile_ops::OperationError>,
@@ -385,7 +386,7 @@ pub enum ScanResult {
         result: Result<bool, String>,
     },
     /// Bulk rename completed or failed after rollback attempts.
-    BulkRenameComplete(Result<usize, String>),
+    BulkRenameComplete(Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String>),
     /// File operation completed.
     OperationComplete {
         cancelled: bool,
@@ -395,8 +396,10 @@ pub enum ScanResult {
         skipped: usize,
         bytes_processed: u64,
         errors: Vec<gravityfile_ops::OperationError>,
-        /// OPTIONAL: Information for the undo log.
+        /// Information for the undo log.
         undo_info: Option<gravityfile_ops::UndoableOperation>,
+        /// Items an undo could not reverse, to push back for a retry.
+        undo_remaining: Option<gravityfile_ops::UndoEntry>,
     },
 }
 

@@ -120,12 +120,6 @@ pub enum CommandAction {
     Take(Option<String>),
     /// Undo last operation.
     Undo,
-    /// Inspect retained incomplete undo records.
-    UndoReview(usize),
-    /// Inspect retained error evidence from incomplete undo attempts.
-    UndoReviewErrors(usize),
-    /// Export incomplete undo records to a new file.
-    UndoExport(String),
     /// Bulk rename marked items.
     BulkRename,
 
@@ -375,21 +369,6 @@ pub fn parse_command(cmd: &str) -> CommandAction {
 
         // Undo
         "undo" | "u" => CommandAction::Undo,
-        "undo-export" if !argument.is_empty() => CommandAction::UndoExport(argument.to_owned()),
-        "undo-export" => CommandAction::Invalid("Usage: undo-export <new-file.json>"),
-        "undo-review" => match parts.as_slice() {
-            [_] => CommandAction::UndoReview(1),
-            [_, "errors"] => CommandAction::UndoReviewErrors(1),
-            [_, "errors", page] => match page.parse::<usize>() {
-                Ok(page) if page > 0 => CommandAction::UndoReviewErrors(page),
-                _ => CommandAction::Invalid("undo-review page must be a positive integer"),
-            },
-            [_, page] => match page.parse::<usize>() {
-                Ok(page) if page > 0 => CommandAction::UndoReview(page),
-                _ => CommandAction::Invalid("undo-review page must be a positive integer"),
-            },
-            _ => CommandAction::Invalid("Usage: undo-review [errors] [page]"),
-        },
 
         // Bulk rename
         "rename-bulk" | "bulk-rename" | "bulkrename" | "brn" => CommandAction::BulkRename,

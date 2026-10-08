@@ -1,156 +1,118 @@
-//! Undo log for file operations.
+//! Session undo history.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-/// Reported completion evidence for an incomplete undo attempt. Counts do not
-/// identify which individual paths succeeded, and errors may describe partial work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UndoAttempt {
-    /// Time the caller received completion, not a filesystem commit timestamp.
-    pub observed_at: SystemTime,
-    /// Whether cancellation was reported.
-    pub cancelled: bool,
-    /// Reported successful item count.
-    pub succeeded: usize,
-    /// Reported failed item count.
-    pub failed: usize,
-    /// Reported skipped item count.
-    pub skipped: usize,
-    /// Reported bytes processed.
-    pub bytes_processed: u64,
-    /// Original path-specific diagnostics.
-    pub errors: Vec<crate::OperationError>,
+use crate::progress::{OperationComplete, OperationProgress, OperationType, publish_progress};
+use crate::{OPERATION_CHANNEL_SIZE, OperationError};
+
+/// An operation that can be reversed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoableOperation {
+    /// `(original, current)` locations of moved items.
+    FilesMoved { moves: Vec<(PathBuf, PathBuf)> },
+    /// Items created by a copy; undo moves them to the Trash.
+    FilesCopied { created: Vec<PathBuf> },
+    /// Items moved to the Trash at `at`; restorable where the platform
+    /// exposes the Trash (Linux, Windows).
+    FilesTrashed { paths: Vec<PathBuf>, at: SystemTime },
+    /// `(original, current)` paths of renamed items.
+    FilesRenamed { renames: Vec<(PathBuf, PathBuf)> },
+    /// A file that is removed on undo only while still empty.
+    FileCreated { path: PathBuf },
+    /// A directory that is removed on undo only while still empty.
+    DirectoryCreated { path: PathBuf },
 }
 
-/// An entry in the undo log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl UndoableOperation {
+    /// Number of top-level items in the record.
+    pub fn item_count(&self) -> usize {
+        match self {
+            Self::FilesMoved { moves } => moves.len(),
+            Self::FilesCopied { created } => created.len(),
+            Self::FilesTrashed { paths, .. } => paths.len(),
+            Self::FilesRenamed { renames } => renames.len(),
+            Self::FileCreated { .. } | Self::DirectoryCreated { .. } => 1,
+        }
+    }
+
+    /// Whether undo is possible on this platform.
+    pub fn can_undo(&self) -> bool {
+        match self {
+            Self::FilesTrashed { .. } => TRASH_RESTORE_SUPPORTED,
+            _ => true,
+        }
+    }
+
+    /// What undo will do, for display.
+    pub fn undo_description(&self) -> String {
+        let count = self.item_count();
+        match self {
+            Self::FilesMoved { .. } => format!("Move {count} item(s) back"),
+            Self::FilesCopied { .. } => format!("Move {count} copied item(s) to the Trash"),
+            Self::FilesTrashed { .. } if TRASH_RESTORE_SUPPORTED => {
+                format!("Restore {count} item(s) from the Trash")
+            }
+            Self::FilesTrashed { .. } => {
+                format!("{count} item(s) are in the Trash; restore them from Finder")
+            }
+            Self::FilesRenamed { .. } => format!("Rename {count} item(s) back"),
+            Self::FileCreated { .. } => "Remove the new file if still empty".into(),
+            Self::DirectoryCreated { .. } => "Remove the new directory if still empty".into(),
+        }
+    }
+
+    fn operation_type(&self) -> OperationType {
+        match self {
+            Self::FilesMoved { .. } => OperationType::Move,
+            Self::FilesTrashed { .. } => OperationType::Restore,
+            Self::FilesRenamed { .. } => OperationType::Rename,
+            Self::FilesCopied { .. } | Self::FileCreated { .. } | Self::DirectoryCreated { .. } => {
+                OperationType::Delete
+            }
+        }
+    }
+}
+
+const TRASH_RESTORE_SUPPORTED: bool = cfg!(any(
+    windows,
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+));
+
+/// A recorded operation.
+#[derive(Debug, Clone)]
 pub struct UndoEntry {
-    /// Unique ID for this entry.
     pub id: u64,
-    /// When the operation was performed.
     pub timestamp: SystemTime,
-    /// The operation that was performed.
     pub operation: UndoableOperation,
-    /// Human-readable description.
     pub description: String,
-    /// An incomplete undo needs manual review and must not be replayed.
-    #[serde(default)]
-    pub review_required: bool,
-    /// Completion evidence, or None if no completion was observed.
-    #[serde(default)]
-    pub last_attempt: Option<UndoAttempt>,
 }
 
 impl UndoEntry {
-    /// Create a new undo entry.
     pub fn new(id: u64, operation: UndoableOperation, description: impl Into<String>) -> Self {
         Self {
             id,
             timestamp: SystemTime::now(),
             operation,
             description: description.into(),
-            review_required: false,
-            last_attempt: None,
         }
     }
 }
 
-/// An operation that can be undone.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UndoableOperation {
-    /// Files were moved from one location to another.
-    FilesMoved {
-        /// List of (original_path, new_path) pairs.
-        moves: Vec<(PathBuf, PathBuf)>,
-    },
-    /// Files were copied to a destination.
-    FilesCopied {
-        /// List of created files/directories.
-        created: Vec<PathBuf>,
-    },
-    /// Files were moved to trash or permanently deleted.
-    FilesDeleted {
-        /// List of paths that were deleted.
-        paths: Vec<PathBuf>,
-    },
-    /// A file or directory was renamed.
-    FileRenamed {
-        /// The full path with the new name (after rename).
-        path: PathBuf,
-        /// The full original path (before rename) — used to undo.
-        // HIGH-5: store full old path instead of bare old_name string
-        old_path: PathBuf,
-        /// The new name (informational).
-        new_name: String,
-    },
-    /// A file was created.
-    FileCreated {
-        /// Path to the created file.
-        path: PathBuf,
-    },
-    /// A directory was created.
-    DirectoryCreated {
-        /// Path to the created directory.
-        path: PathBuf,
-    },
-}
-
-impl UndoableOperation {
-    /// Number of original top-level items represented by this record.
-    pub fn item_count(&self) -> usize {
-        match self {
-            Self::FilesMoved { moves } => moves.len(),
-            Self::FilesCopied { created } => created.len(),
-            Self::FilesDeleted { paths } => paths.len(),
-            Self::FileRenamed { .. } | Self::FileCreated { .. } | Self::DirectoryCreated { .. } => {
-                1
-            }
-        }
-    }
-
-    /// Get a description of how to undo this operation.
-    pub fn undo_description(&self) -> String {
-        match self {
-            Self::FilesMoved { moves } => {
-                format!("Move {} items back to original location", moves.len())
-            }
-            Self::FilesCopied { created } => {
-                format!("Retain {} copied items in recovery journals", created.len())
-            }
-            Self::FilesDeleted { paths } => {
-                format!("Deleted {} items (recover via OS trash)", paths.len())
-            }
-            Self::FileRenamed { old_path, .. } => {
-                format!(
-                    "Rename back to '{}'",
-                    old_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                )
-            }
-            Self::FileCreated { .. } => "Delete the created file if still empty".to_string(),
-            Self::DirectoryCreated { .. } => {
-                "Delete the created directory if still empty".to_string()
-            }
-        }
-    }
-
-    /// Check if this operation can be undone.
-    pub fn can_undo(&self) -> bool {
-        !matches!(self, Self::FilesDeleted { .. })
-    }
-}
-
-/// Undo log with configurable maximum depth.
+/// Bounded, most-recent-last undo history.
 #[derive(Debug)]
 pub struct UndoLog {
-    entries: VecDeque<Arc<UndoEntry>>,
+    entries: VecDeque<UndoEntry>,
     max_entries: usize,
     next_id: u64,
 }
@@ -162,312 +124,446 @@ impl Default for UndoLog {
 }
 
 impl UndoLog {
-    /// Create a new undo log with the specified maximum entries.
-    /// A zero limit disables retention. The limit counts operations, not paths
-    /// within an operation or their memory usage.
+    /// A log keeping at most `max_entries` operations; zero disables history.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: VecDeque::with_capacity(max_entries.min(1000)),
+            entries: VecDeque::with_capacity(max_entries.min(128)),
             max_entries,
             next_id: 0,
         }
     }
 
-    /// Record an operation in the undo log.
-    ///
-    /// Returns the ID assigned to this entry.
+    /// Record an operation; empty operations are ignored. Returns its id.
     pub fn record(&mut self, operation: UndoableOperation, description: impl Into<String>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-
-        if self.max_entries == 0 {
-            return id;
+        if operation.item_count() > 0 {
+            self.push(UndoEntry::new(id, operation, description));
         }
-
-        // Remove oldest entry if at capacity
-        if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
-        }
-
-        self.entries
-            .push_back(Arc::new(UndoEntry::new(id, operation, description)));
-
         id
     }
 
-    /// Record a move operation.
-    pub fn record_move(&mut self, moves: Vec<(PathBuf, PathBuf)>) -> u64 {
-        let count = moves.len();
-        self.record(
-            UndoableOperation::FilesMoved { moves },
-            format!("Moved {} items", count),
-        )
-    }
-
-    /// Record a copy operation.
-    pub fn record_copy(&mut self, created: Vec<PathBuf>) -> u64 {
-        let count = created.len();
-        self.record(
-            UndoableOperation::FilesCopied { created },
-            format!("Copied {} items", count),
-        )
-    }
-
-    /// Record a delete operation.
-    pub fn record_delete(&mut self, paths: Vec<PathBuf>) -> u64 {
-        let count = paths.len();
-        self.record(
-            UndoableOperation::FilesDeleted { paths },
-            format!("Deleted {} items", count),
-        )
-    }
-
-    /// Record a rename operation.
-    ///
-    /// `source` is the full original path before the rename.
-    /// `new_name` is the new name component (used for the description).
-    pub fn record_rename(&mut self, source: PathBuf, new_name: String) -> u64 {
-        let parent = source.parent().unwrap_or(std::path::Path::new(""));
-        let new_path = parent.join(&new_name);
-        let old_name = source
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let description = format!("Renamed '{}' to '{}'", old_name, new_name);
-        self.record(
-            UndoableOperation::FileRenamed {
-                path: new_path,
-                old_path: source,
-                new_name,
-            },
-            description,
-        )
-    }
-
-    /// Record a file creation.
-    pub fn record_create_file(&mut self, path: PathBuf) -> u64 {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        self.record(
-            UndoableOperation::FileCreated { path },
-            format!("Created file '{}'", name),
-        )
-    }
-
-    /// Record a directory creation.
-    pub fn record_create_directory(&mut self, path: PathBuf) -> u64 {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        self.record(
-            UndoableOperation::DirectoryCreated { path },
-            format!("Created directory '{}'", name),
-        )
-    }
-
-    /// Pop the most recent undoable entry.
-    ///
-    /// Returns `None` if empty, review is required, or the back entry cannot be undone.
-    /// Does NOT drain through non-undoable entries — only examines the back.
-    pub fn pop(&mut self) -> Option<UndoEntry> {
-        // HIGH-4: only look at the back entry; don't consume non-undoable ones
-        if !self.entries.back()?.review_required && self.entries.back()?.operation.can_undo() {
-            self.entries.pop_back().map(Arc::unwrap_or_clone)
-        } else {
-            None
-        }
-    }
-
-    /// Retain the original record after an incomplete undo, without permitting
-    /// a blind replay of items that may already have completed. Retention uses
-    /// the same operation-count limit as ordinary history; it is not durable.
-    pub fn retain_for_review(&mut self, mut entry: UndoEntry) {
-        entry.review_required = true;
+    /// Put an entry back, e.g. the remainder of a partially failed undo.
+    pub fn push(&mut self, entry: UndoEntry) {
         if self.max_entries == 0 {
             return;
         }
         if self.entries.len() >= self.max_entries {
             self.entries.pop_front();
         }
-        self.entries.push_back(Arc::new(entry));
+        self.entries.push_back(entry);
     }
 
-    /// Peek at the most recent entry without removing it.
+    pub fn record_move(&mut self, moves: Vec<(PathBuf, PathBuf)>) -> u64 {
+        let description = format!("Moved {} item(s)", moves.len());
+        self.record(UndoableOperation::FilesMoved { moves }, description)
+    }
+
+    pub fn record_copy(&mut self, created: Vec<PathBuf>) -> u64 {
+        let description = format!("Copied {} item(s)", created.len());
+        self.record(UndoableOperation::FilesCopied { created }, description)
+    }
+
+    pub fn record_trash(&mut self, paths: Vec<PathBuf>) -> u64 {
+        let description = format!("Moved {} item(s) to the Trash", paths.len());
+        let at = SystemTime::now();
+        self.record(UndoableOperation::FilesTrashed { paths, at }, description)
+    }
+
+    pub fn record_renames(&mut self, renames: Vec<(PathBuf, PathBuf)>) -> u64 {
+        let description = match renames.as_slice() {
+            [(from, to)] => format!("Renamed '{}' to '{}'", file_name(from), file_name(to)),
+            _ => format!("Renamed {} item(s)", renames.len()),
+        };
+        self.record(UndoableOperation::FilesRenamed { renames }, description)
+    }
+
+    pub fn record_create_file(&mut self, path: PathBuf) -> u64 {
+        let description = format!("Created file '{}'", file_name(&path));
+        self.record(UndoableOperation::FileCreated { path }, description)
+    }
+
+    pub fn record_create_directory(&mut self, path: PathBuf) -> u64 {
+        let description = format!("Created directory '{}'", file_name(&path));
+        self.record(UndoableOperation::DirectoryCreated { path }, description)
+    }
+
+    /// Remove and return the most recent entry if it can be undone here.
+    pub fn pop(&mut self) -> Option<UndoEntry> {
+        if self.entries.back()?.operation.can_undo() {
+            self.entries.pop_back()
+        } else {
+            None
+        }
+    }
+
     pub fn peek(&self) -> Option<&UndoEntry> {
-        self.entries.back().map(AsRef::as_ref)
+        self.entries.back()
     }
 
-    /// Get the number of entries in the log.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Check if the log is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Clear all entries from the log.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
-    /// Share immutable incomplete records without cloning path vectors. The
-    /// snapshot remains valid if the live history changes.
-    pub fn review_snapshot(&self) -> Self {
-        Self {
-            entries: self
-                .entries
+    /// Entries, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &UndoEntry> {
+        self.entries.iter()
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Message sent while an undo runs.
+#[derive(Debug)]
+pub enum UndoResult {
+    Progress(OperationProgress),
+    Complete(UndoComplete),
+}
+
+/// Completion of an undo.
+#[derive(Debug)]
+pub struct UndoComplete {
+    pub inner: OperationComplete,
+    /// The items that could not be undone, ready to [`UndoLog::push`] back so
+    /// the user can retry after fixing the cause.
+    pub remaining: Option<UndoEntry>,
+}
+
+/// Reverse `entry`. Items are processed independently; failures are reported
+/// and returned in [`UndoComplete::remaining`].
+pub fn execute_undo(entry: UndoEntry, token: CancellationToken) -> mpsc::Receiver<UndoResult> {
+    let (tx, rx) = mpsc::channel(OPERATION_CHANNEL_SIZE);
+    tokio::spawn(async move {
+        let operation_type = entry.operation.operation_type();
+        if token.is_cancelled() {
+            // Nothing was attempted: report no failures and hand the whole
+            // entry back for a later retry.
+            let complete = UndoComplete {
+                inner: OperationComplete {
+                    cancelled: true,
+                    operation_type,
+                    succeeded: 0,
+                    failed: 0,
+                    skipped: 0,
+                    bytes_processed: 0,
+                    errors: Vec::new(),
+                },
+                remaining: Some(entry),
+            };
+            let _ = tx.send(UndoResult::Complete(complete)).await;
+            return;
+        }
+        let mut progress = OperationProgress::new(operation_type, entry.operation.item_count(), 0);
+        publish_progress(&tx, || UndoResult::Progress(progress.clone()), &token);
+        let work_token = token.clone();
+        let work = entry.clone();
+        let (left, errors) = tokio::task::spawn_blocking(move || undo_blocking(&work, &work_token))
+            .await
+            .unwrap_or_else(|error| {
+                (
+                    Some(entry.operation.clone()),
+                    vec![OperationError::new(
+                        PathBuf::new(),
+                        format!("worker failed: {error}"),
+                    )],
+                )
+            });
+        for error in errors {
+            progress.add_error(error);
+        }
+        let failed = left.as_ref().map_or(0, UndoableOperation::item_count);
+        const INCOMPLETE: &str = " (undo incomplete)";
+        let remaining = left.map(|operation| UndoEntry {
+            operation,
+            description: format!(
+                "{}{INCOMPLETE}",
+                entry.description.trim_end_matches(INCOMPLETE)
+            ),
+            ..entry.clone()
+        });
+        let complete = UndoComplete {
+            inner: OperationComplete {
+                cancelled: token.is_cancelled(),
+                operation_type,
+                succeeded: entry.operation.item_count().saturating_sub(failed),
+                failed,
+                skipped: 0,
+                bytes_processed: 0,
+                errors: progress.errors,
+            },
+            remaining,
+        };
+        let _ = tx.send(UndoResult::Complete(complete)).await;
+    });
+    rx
+}
+
+/// Returns the part of `entry` that was not undone (if any), plus errors.
+fn undo_blocking(
+    entry: &UndoEntry,
+    token: &CancellationToken,
+) -> (Option<UndoableOperation>, Vec<OperationError>) {
+    let mut errors = Vec::new();
+    let mut fail = |path: &Path, message: String| {
+        errors.push(OperationError::new(path.into(), message));
+    };
+    let all_or_nothing =
+        |result: Result<(), String>, path: &Path, fail: &mut dyn FnMut(&Path, String)| {
+            result.err().map(|error| {
+                fail(path, error);
+                entry.operation.clone()
+            })
+        };
+    let remaining = match &entry.operation {
+        UndoableOperation::FilesMoved { moves } => {
+            let mut left = Vec::new();
+            for (original, current) in moves {
+                let result = if token.is_cancelled() {
+                    Err(crate::fs::CANCELLED.to_string())
+                } else {
+                    move_back(current, original)
+                };
+                if let Err(error) = result {
+                    fail(current, error);
+                    left.push((original.clone(), current.clone()));
+                }
+            }
+            (!left.is_empty()).then_some(UndoableOperation::FilesMoved { moves: left })
+        }
+        UndoableOperation::FilesCopied { created } => {
+            let mut left = Vec::new();
+            for path in created {
+                let result = if token.is_cancelled() {
+                    Err(crate::fs::CANCELLED.to_string())
+                } else {
+                    crate::delete::trash_context()
+                        .delete(path)
+                        .map_err(|error| format!("could not move to the Trash: {error}"))
+                };
+                if let Err(error) = result {
+                    fail(path, error);
+                    left.push(path.clone());
+                }
+            }
+            (!left.is_empty()).then_some(UndoableOperation::FilesCopied { created: left })
+        }
+        UndoableOperation::FilesTrashed { paths, at } => all_or_nothing(
+            restore_from_trash(paths, *at),
+            paths.first().map_or(Path::new(""), PathBuf::as_path),
+            &mut fail,
+        ),
+        UndoableOperation::FilesRenamed { renames } => {
+            let reverse: Vec<_> = renames
                 .iter()
-                .filter(|entry| entry.review_required)
-                .cloned()
-                .collect(),
-            max_entries: self.max_entries,
-            next_id: self.next_id,
+                .map(|(original, current)| (current.clone(), original.clone()))
+                .collect();
+            all_or_nothing(
+                crate::rename::rename_paths(&reverse, token),
+                reverse.first().map_or(Path::new(""), |(path, _)| path),
+                &mut fail,
+            )
+        }
+        UndoableOperation::FileCreated { path } => {
+            all_or_nothing(remove_created(path, false), path, &mut fail)
+        }
+        UndoableOperation::DirectoryCreated { path } => {
+            all_or_nothing(remove_created(path, true), path, &mut fail)
+        }
+    };
+    (remaining, errors)
+}
+
+fn move_back(current: &Path, original: &Path) -> Result<(), String> {
+    if let Some(parent) = original.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("cannot recreate parent: {error}"))?;
+    }
+    match crate::fs::rename_noreplace(current, original) {
+        Ok(()) => Ok(()),
+        Err(crate::fs::RenameError::CrossDevice) => {
+            // The original move crossed filesystems; reverse it the same way.
+            let token = CancellationToken::new();
+            let bytes = std::sync::atomic::AtomicU64::new(0);
+            let mut transfer = crate::transfer::Transfer::new(
+                &token,
+                &bytes,
+                crate::transfer::Preserve {
+                    times: true,
+                    xattrs: true,
+                },
+            );
+            transfer
+                .copy_staged(current, original, None)
+                .map_err(|error| error.to_string())?;
+            let errors = transfer.into_errors();
+            if !errors.is_empty() {
+                return Err(format!(
+                    "copied back with {} problem(s); '{}' was kept",
+                    errors.len(),
+                    current.display()
+                ));
+            }
+            crate::fs::remove_path(current).map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn remove_created(path: &Path, directory: bool) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if directory {
+        if !metadata.is_dir() {
+            return Err("replaced by something that is not a directory".into());
+        }
+        // The filesystem refuses non-empty directories atomically.
+        fs::remove_dir(path).map_err(|error| format!("not removed (no longer empty?): {error}"))
+    } else {
+        if !metadata.is_file() {
+            return Err("replaced by something that is not a file".into());
+        }
+        if metadata.len() != 0 {
+            return Err("now contains data; kept".into());
+        }
+        fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn restore_from_trash(paths: &[PathBuf], at: SystemTime) -> Result<(), String> {
+    use std::collections::HashMap;
+    let since = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64 - 2)
+        .unwrap_or(0);
+    let wanted: std::collections::HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    // Newest matching trash item per original path.
+    let mut matches: HashMap<PathBuf, trash::TrashItem> = HashMap::new();
+    for item in trash::os_limited::list().map_err(|error| error.to_string())? {
+        let original = item.original_path();
+        if item.time_deleted >= since && wanted.contains(original.as_path()) {
+            match matches.get(&original) {
+                Some(existing) if existing.time_deleted >= item.time_deleted => {}
+                _ => {
+                    matches.insert(original, item);
+                }
+            }
         }
     }
-
-    /// Stream a versioned review-only JSON document for incomplete attempts.
-    /// Native path bytes/code units are authoritative; display strings may be
-    /// lossy. This is not an import/replay format. Errors can leave partial output;
-    /// callers publishing files must stage and atomically publish them separately.
-    pub fn write_review_json(&self, writer: impl std::io::Write) -> Result<(), serde_json::Error> {
-        crate::undo_review::write(self, writer)
+    if matches.len() != paths.len() {
+        return Err(format!(
+            "found {} of {} item(s) in the Trash",
+            matches.len(),
+            paths.len()
+        ));
     }
+    trash::os_limited::restore_all(matches.into_values()).map_err(|error| error.to_string())
+}
 
-    /// Export review-only JSON through private same-directory staging, syncing
-    /// file contents before atomic no-replace publication. Existing destinations
-    /// are preserved. Parent-directory durability and concurrent ancestor
-    /// replacement protection are not provided. This synchronous API should run
-    /// on a worker when called from an interactive application.
-    pub fn export_review_json(&self, destination: &std::path::Path) -> std::io::Result<()> {
-        crate::undo_review::export(self, destination)
-    }
-
-    /// Get an iterator over all entries (oldest first).
-    pub fn iter(&self) -> impl Iterator<Item = &UndoEntry> {
-        self.entries.iter().map(AsRef::as_ref)
-    }
+#[cfg(not(any(
+    windows,
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+fn restore_from_trash(_paths: &[PathBuf], _at: SystemTime) -> Result<(), String> {
+    Err("restoring from the Trash is not supported on this platform".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn review_snapshot_shares_records_and_survives_live_history_changes() {
-        let mut log = UndoLog::new(2);
-        log.record_create_file("ordinary".into());
-        log.retain_for_review(UndoEntry::new(
-            9,
-            UndoableOperation::FilesCopied {
-                created: vec!["retained".into()],
-            },
-            "review",
-        ));
-        let snapshot = log.review_snapshot();
-        assert_eq!(snapshot.len(), 1);
-        assert!(std::ptr::eq(log.peek().unwrap(), snapshot.peek().unwrap()));
-        log.clear();
-        log.record_create_file("new".into());
-        assert_eq!(snapshot.peek().unwrap().id, 9);
-        assert!(snapshot.peek().unwrap().review_required);
-        assert!(!log.peek().unwrap().review_required);
-    }
-
-    #[test]
-    fn retention_limit_holds_across_record_pop_and_clear() {
-        for limit in 0..=3 {
-            let mut log = UndoLog::new(limit);
-            for id in 0..10 {
-                assert_eq!(
-                    log.record_create_file(PathBuf::from(format!("file-{id}"))),
-                    id
-                );
-                assert_eq!(log.len(), limit.min(id as usize + 1));
-                assert!(log.len() <= limit);
+    async fn undo(entry: UndoEntry) -> UndoComplete {
+        let mut rx = execute_undo(entry, CancellationToken::new());
+        loop {
+            if let Some(UndoResult::Complete(complete)) = rx.recv().await {
+                return complete;
             }
-            let retained: Vec<_> = log.iter().map(|entry| entry.id).collect();
-            assert_eq!(retained, ((10 - limit as u64)..10).collect::<Vec<_>>());
-            for expected in retained.into_iter().rev() {
-                assert_eq!(log.pop().unwrap().id, expected);
-            }
-            assert!(log.pop().is_none());
-            assert!(log.peek().is_none());
-            log.record_create_directory(PathBuf::from("directory"));
-            log.clear();
-            assert!(log.is_empty());
-            assert_eq!(log.record_delete(vec![PathBuf::from("deleted")]), 11);
-            assert_eq!(log.len(), limit.min(1));
-            assert!(log.pop().is_none());
         }
     }
 
     #[test]
-    fn test_undo_log_record() {
-        let mut log = UndoLog::new(10);
-
-        let id = log.record_create_file(PathBuf::from("/test/file.txt"));
-        assert_eq!(id, 0);
-        assert_eq!(log.len(), 1);
-
-        let id = log.record_create_directory(PathBuf::from("/test/dir"));
-        assert_eq!(id, 1);
+    fn log_is_bounded_and_ignores_empty_records() {
+        let mut log = UndoLog::new(2);
+        log.record_copy(Vec::new());
+        assert!(log.is_empty());
+        for index in 0..3 {
+            log.record_create_file(PathBuf::from(format!("f{index}")));
+        }
         assert_eq!(log.len(), 2);
+        assert_eq!(
+            log.pop().unwrap().operation,
+            UndoableOperation::FileCreated { path: "f2".into() }
+        );
     }
 
-    #[test]
-    fn test_undo_log_max_entries() {
-        let mut log = UndoLog::new(3);
-
-        log.record_create_file(PathBuf::from("/test/1.txt"));
-        log.record_create_file(PathBuf::from("/test/2.txt"));
-        log.record_create_file(PathBuf::from("/test/3.txt"));
-        assert_eq!(log.len(), 3);
-
-        log.record_create_file(PathBuf::from("/test/4.txt"));
-        assert_eq!(log.len(), 3);
-
-        // First entry should be removed
-        let entry = log.pop().unwrap();
-        assert!(entry.description.contains("4.txt"));
+    #[tokio::test]
+    async fn partial_move_undo_requeues_only_failed_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a_orig, a_now) = (dir.path().join("a"), dir.path().join("moved/a"));
+        let (b_orig, b_now) = (dir.path().join("b"), dir.path().join("moved/b"));
+        fs::create_dir(dir.path().join("moved")).unwrap();
+        fs::write(&a_now, "a").unwrap();
+        fs::write(&b_now, "b").unwrap();
+        fs::write(&b_orig, "occupied").unwrap();
+        let mut log = UndoLog::default();
+        log.record_move(vec![
+            (a_orig.clone(), a_now),
+            (b_orig.clone(), b_now.clone()),
+        ]);
+        let complete = undo(log.pop().unwrap()).await;
+        assert_eq!((complete.inner.succeeded, complete.inner.failed), (1, 1));
+        assert!(a_orig.exists());
+        let remaining = complete.remaining.unwrap();
+        assert_eq!(
+            remaining.operation,
+            UndoableOperation::FilesMoved {
+                moves: vec![(b_orig.clone(), b_now)]
+            }
+        );
+        fs::remove_file(&b_orig).unwrap();
+        let complete = undo(remaining).await;
+        assert!(complete.inner.is_success() && complete.remaining.is_none());
+        assert_eq!(fs::read_to_string(b_orig).unwrap(), "b");
     }
 
-    #[test]
-    fn test_undo_log_pop() {
-        let mut log = UndoLog::new(10);
+    #[tokio::test]
+    async fn rename_undo_and_created_item_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (dir.path().join("old"), dir.path().join("new"));
+        fs::write(&new, "x").unwrap();
+        let mut log = UndoLog::default();
+        log.record_renames(vec![(old.clone(), new.clone())]);
+        assert!(undo(log.pop().unwrap()).await.inner.is_success());
+        assert!(old.exists() && !new.exists());
 
-        log.record_create_file(PathBuf::from("/test/file.txt"));
-        log.record_rename(PathBuf::from("/test/old.txt"), "new.txt".to_string());
-
-        let entry = log.pop().unwrap();
-        assert!(matches!(
-            entry.operation,
-            UndoableOperation::FileRenamed { .. }
-        ));
-
-        let entry = log.pop().unwrap();
-        assert!(matches!(
-            entry.operation,
-            UndoableOperation::FileCreated { .. }
-        ));
-
-        assert!(log.pop().is_none());
-    }
-
-    #[test]
-    fn test_pop_does_not_drain_non_undoable() {
-        let mut log = UndoLog::new(10);
-        log.record_create_file(PathBuf::from("/test/file.txt"));
-        // Delete is non-undoable; push it last so it is the back entry
-        log.record_delete(vec![PathBuf::from("/test/other.txt")]);
-
-        // pop() should return None because the back entry is non-undoable
-        assert!(log.pop().is_none());
-        // The undoable create entry must still be present
-        assert_eq!(log.len(), 2);
+        let file = dir.path().join("created");
+        fs::write(&file, "data").unwrap();
+        log.record_create_file(file.clone());
+        let complete = undo(log.pop().unwrap()).await;
+        assert_eq!(complete.inner.failed, 1);
+        assert!(file.exists());
     }
 }

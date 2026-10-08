@@ -1,61 +1,51 @@
-//! File operations engine for gravityfile.
+//! File operations for gravityfile: copy, move, rename, create, delete,
+//! undo and archives.
 //!
-//! This crate provides async file operations (copy, move, rename, create, delete)
-//! with progress reporting via channels, following the same pattern as the
-//! existing deletion implementation.
+//! Long-running operations run on blocking threads and report through a
+//! channel: best-effort [`OperationProgress`] snapshots, interactive
+//! [`ConflictRequest`]s, and one reliable completion message. Dropping the
+//! receiver cancels the operation.
+//!
+//! # Safety model
+//!
+//! - New content is assembled in a private staging directory beside its
+//!   destination and published with a single no-clobber rename, so a failed
+//!   or cancelled operation never leaves a partial item at a visible path and
+//!   never silently replaces anything.
+//! - Overwrites the user approves move the replaced item to the system Trash
+//!   (or delete it permanently, if configured) only after the replacement is
+//!   complete.
+//! - Copies skip entries they cannot read and report each one instead of
+//!   discarding everything that did copy; cross-filesystem moves keep the
+//!   source unless every entry arrived.
 
 pub mod archive;
-mod archive_journal;
+mod batch;
 mod conflict;
-mod copy;
-#[cfg(test)]
-mod copy_bench;
 mod create;
-mod executor;
-mod move_op;
-mod native_path;
-mod object_identity;
-mod operation;
+mod delete;
+mod error;
+mod fs;
 mod progress;
-mod recovery;
-mod recovery_report;
 mod rename;
-mod rename_batch;
-mod rename_journal;
-mod rename_review;
-mod staging;
+mod transfer;
 mod undo;
-mod undo_review;
 
 pub use archive::{
-    ArchiveError, ArchiveFormat, ArchiveResult, create_archive, create_archive_cancellable,
-    extract_archive, extract_archive_cancellable,
+    ArchiveError, ArchiveFormat, ArchiveResult, ExtractLimits, create_archive,
+    create_archive_cancellable, extract_archive, extract_archive_cancellable, extract_archive_with,
 };
-pub use archive_journal::{ArchiveRecoveryRecord, retain_archive_extraction};
-pub use conflict::{Conflict, ConflictKind, ConflictRequest, ConflictResolution};
-pub use copy::{CopyOptions, CopyResult, start_copy};
+pub use batch::{TransferComplete, TransferOptions, TransferResult, start_copy, start_move};
+pub use conflict::{Conflict, ConflictKind, ConflictRequest, ConflictResolution, auto_rename_path};
 pub use create::{CreateResult, start_create_directory, start_create_file};
-pub use executor::{
-    OperationExecutor, OperationResult, execute_undo, execute_undo_with_cancellation,
-};
-pub use move_op::{MoveComplete, MoveOptions, MoveResult, start_move};
-pub use object_identity::{ObjectIdentity, ObjectKind};
-pub use operation::{FileOperation, OperationError};
+pub use delete::{DeleteComplete, DeleteMode, DeleteResult, start_delete};
+pub use error::OperationError;
+pub use fs::STAGING_PREFIX;
 pub use progress::{OperationComplete, OperationProgress, OperationType};
-pub use recovery::{
-    RecoveryDiscovery, RecoveryDurabilityError, RecoveryIssue, RecoveryPurpose, RecoveryRecord,
-    discover_recovery, discover_recovery_report, inspect_recovery, restore_original,
-    restore_payload,
-};
-pub use rename::{
-    RenameResult, rename_paths_transactional, rename_paths_with_cancellation, start_rename,
-    validate_filename,
-};
-pub use rename_batch::{RenameRecovery, restore_rename_batch};
-pub use rename_journal::RenamePhase;
-pub use rename_review::RenameIntentRecord;
+pub use rename::{RenameResult, rename_paths, start_rename, validate_filename};
 pub use tokio_util::sync::CancellationToken;
-pub use undo::{UndoAttempt, UndoEntry, UndoLog, UndoableOperation};
+pub use transfer::ReplacePolicy;
+pub use undo::{UndoComplete, UndoEntry, UndoLog, UndoResult, UndoableOperation, execute_undo};
 
-/// Default channel buffer size for operation progress updates.
+/// Channel capacity for operation messages.
 pub const OPERATION_CHANNEL_SIZE: usize = 100;
