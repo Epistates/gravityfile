@@ -248,6 +248,61 @@ impl FileTree {
         })
     }
 
+    /// The entry at `path`, if it is the root or below it.
+    pub fn find(&self, path: &Path) -> Option<&FileNode> {
+        let mut node = &self.root;
+        for name in relative_names(&self.root_path, path)? {
+            node = node
+                .children
+                .iter()
+                .find(|child| child.file_name() == name)?;
+        }
+        Some(node)
+    }
+
+    /// Take the entry at `path` out of the tree, keeping every ancestor's size
+    /// and counts consistent. The root cannot be removed. Call
+    /// [`Self::recount`] after a batch of changes.
+    pub fn remove(&mut self, path: &Path) -> Option<FileNode> {
+        let mut names = relative_names(&self.root_path, path)?;
+        let name = names.pop()?;
+        let parent = descend_mut(&mut self.root, &names)?;
+        let index = parent
+            .children
+            .iter()
+            .position(|child| child.file_name() == name)?;
+        let removed = parent.children.remove(index);
+        adjust_chain(&mut self.root, &names, Contribution::of(&removed), false);
+        Some(removed)
+    }
+
+    /// Put `node` into the directory at `parent`, replacing any entry with
+    /// the same name, and keep every ancestor's size and counts consistent.
+    /// Returns false, dropping `node`, if `parent` is not a directory in the
+    /// tree. Call [`Self::recount`] after a batch of changes.
+    pub fn insert(&mut self, parent: &Path, node: FileNode) -> bool {
+        let Some(names) = relative_names(&self.root_path, parent) else {
+            return false;
+        };
+        match descend_mut(&mut self.root, &names) {
+            Some(directory) if directory.is_dir() => {}
+            _ => return false,
+        }
+        let mut path = parent.to_path_buf();
+        path.push(node.file_name());
+        self.remove(&path);
+        let added = Contribution::of(&node);
+        let directory = descend_mut(&mut self.root, &names).expect("checked above");
+        directory.children.push(node);
+        adjust_chain(&mut self.root, &names, added, true);
+        true
+    }
+
+    /// Recompute the summary statistics from the tree, after changes.
+    pub fn recount(&mut self) {
+        self.stats = TreeStats::collect(&self.root, &self.root_path);
+    }
+
     /// Re-express every size in another measure without rescanning: apparent
     /// lengths or allocated blocks, with hard links counted once or each time.
     pub fn remeasure(&mut self, apparent: bool, count_hard_links: bool) {
@@ -258,9 +313,175 @@ impl FileTree {
     }
 }
 
+/// The names leading from `root` to `path`, or `None` if `path` is not
+/// `root` or below it.
+fn relative_names<'a>(root: &Path, path: &'a Path) -> Option<Vec<&'a std::ffi::OsStr>> {
+    path.strip_prefix(root)
+        .ok()?
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+fn descend_mut<'a>(
+    mut node: &'a mut FileNode,
+    names: &[&std::ffi::OsStr],
+) -> Option<&'a mut FileNode> {
+    for name in names {
+        node = node
+            .children
+            .iter_mut()
+            .find(|child| child.file_name() == *name)?;
+    }
+    Some(node)
+}
+
+/// What an entry adds to each of its ancestors.
+#[derive(Clone, Copy)]
+struct Contribution {
+    size: u64,
+    files: u64,
+    dirs: u64,
+}
+
+impl Contribution {
+    fn of(node: &FileNode) -> Self {
+        Self {
+            size: node.size,
+            files: if node.is_dir() { node.file_count() } else { 1 },
+            dirs: if node.is_dir() {
+                node.dir_count() + 1
+            } else {
+                0
+            },
+        }
+    }
+}
+
+/// Add or subtract `change` along the root and the directories named by
+/// `names`, re-sorting each one's children by size, largest first.
+fn adjust_chain(root: &mut FileNode, names: &[&std::ffi::OsStr], change: Contribution, add: bool) {
+    let apply = |node: &mut FileNode| {
+        let step = |value: u64, by: u64| {
+            if add {
+                value.saturating_add(by)
+            } else {
+                value.saturating_sub(by)
+            }
+        };
+        node.size = step(node.size, change.size);
+        if let NodeKind::Directory {
+            file_count,
+            dir_count,
+        } = &mut node.kind
+        {
+            *file_count = step(*file_count, change.files);
+            *dir_count = step(*dir_count, change.dirs);
+        }
+    };
+    let sort = |node: &mut FileNode| {
+        node.children
+            .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.compare_name(b)));
+    };
+    // Sizes first, top-down; then each level's order, which depends on the
+    // updated sizes of its children.
+    let mut node = &mut *root;
+    apply(node);
+    for name in names {
+        node = node
+            .children
+            .iter_mut()
+            .find(|child| child.file_name() == *name)
+            .expect("the chain exists");
+        apply(node);
+    }
+    for depth in (0..=names.len()).rev() {
+        sort(descend_mut(root, &names[..depth]).expect("the chain exists"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::Timestamps;
+
+    fn sample() -> FileTree {
+        let time = Timestamps::with_modified(SystemTime::UNIX_EPOCH);
+        let file = |name: &str, size| FileNode::new_file(name, size, 0, time, false);
+        let mut sub = FileNode::new_directory("sub", time);
+        sub.children = vec![file("a", 300), file("b", 100)];
+        let mut root = FileNode::new_directory("root", time);
+        root.children = vec![sub, file("c", 200)];
+        root.update_counts();
+        root.size = 600;
+        root.children[0].size = 400;
+        let mut tree = FileTree::new(
+            root,
+            PathBuf::from("/root"),
+            ScanConfig::new("/root"),
+            TreeStats::new(),
+            Duration::ZERO,
+            Vec::new(),
+        );
+        tree.recount();
+        tree
+    }
+
+    #[test]
+    fn removing_an_entry_updates_every_ancestor_and_order() {
+        let mut tree = sample();
+        let removed = tree.remove(Path::new("/root/sub/a")).unwrap();
+        assert_eq!(removed.name, "a");
+        assert_eq!(tree.root.size, 300);
+        let sub = tree.find(Path::new("/root/sub")).unwrap();
+        assert_eq!((sub.size, sub.file_count()), (100, 1));
+        assert_eq!(tree.root.file_count(), 2);
+        assert_eq!(
+            tree.root.children[0].name, "c",
+            "c (200) now outranks sub (100)"
+        );
+        tree.recount();
+        assert_eq!(tree.stats.total_files, 2);
+        assert_eq!(tree.stats.total_size, 300);
+        // A directory takes its whole subtree with it.
+        tree.remove(Path::new("/root/sub")).unwrap();
+        assert_eq!(
+            (
+                tree.root.size,
+                tree.root.file_count(),
+                tree.root.dir_count()
+            ),
+            (200, 1, 0)
+        );
+        assert!(tree.remove(Path::new("/root")).is_none());
+        assert!(tree.remove(Path::new("/elsewhere/c")).is_none());
+        assert!(tree.remove(Path::new("/root/missing")).is_none());
+    }
+
+    #[test]
+    fn inserting_an_entry_replaces_one_of_the_same_name() {
+        let mut tree = sample();
+        let time = Timestamps::with_modified(SystemTime::UNIX_EPOCH);
+        let mut grown = FileNode::new_directory("sub", time);
+        grown.children = vec![FileNode::new_file("x", 1000, 0, time, false)];
+        grown.update_counts();
+        grown.size = 1000;
+        assert!(tree.insert(Path::new("/root"), grown));
+        assert_eq!(tree.root.size, 1200);
+        assert_eq!(tree.root.file_count(), 2);
+        assert_eq!(tree.find(Path::new("/root/sub/x")).unwrap().size, 1000);
+        assert!(tree.find(Path::new("/root/sub/a")).is_none());
+
+        let new = FileNode::new_file("d", 50, 0, time, false);
+        assert!(tree.insert(Path::new("/root/sub"), new));
+        assert_eq!(tree.root.size, 1250);
+        assert_eq!(tree.find(Path::new("/root/sub")).unwrap().file_count(), 2);
+        let file = FileNode::new_file("e", 1, 0, time, false);
+        assert!(!tree.insert(Path::new("/root/c"), file), "c is a file");
+    }
 
     #[test]
     fn tied_extremes_are_independent_of_arrival_order() {

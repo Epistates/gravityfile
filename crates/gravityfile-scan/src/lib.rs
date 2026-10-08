@@ -55,7 +55,7 @@ pub mod snapshot;
 pub use git::{GitStatusCache, apply_git_status};
 pub use inode::InodeTracker;
 pub use progress::ScanProgress;
-pub use scanner::{JwalkScanner, quick_list};
+pub use scanner::{JwalkScanner, ScannedEntry, quick_list, scan_entry};
 
 // Re-export core types for convenience
 pub use gravityfile_core::{

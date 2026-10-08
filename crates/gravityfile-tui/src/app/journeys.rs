@@ -46,7 +46,6 @@ async fn declining_a_delete_keeps_the_marks_you_made() {
 }
 
 #[tokio::test]
-#[ignore = "operations rescan the viewed directory; fixed by in-place tree updates"]
 async fn deleting_inside_a_subdirectory_keeps_the_whole_scan() {
     let mut harness = Harness::scanned().await;
     let root = harness.root().to_path_buf();
@@ -231,4 +230,107 @@ async fn right_clicking_marks_the_row_under_the_pointer_after_scrolling() {
     harness.right_click(10, row).await;
     assert!(harness.app.marked.contains(&harness.path("copy-b.bin")));
     assert_eq!(harness.app.marked.len(), 1);
+}
+
+// --- Changing files keeps the rest of the scan --------------------------
+
+/// The size shown for `name` in the tree, as opposed to the details pane.
+fn size_on_screen(harness: &Harness, name: &str) -> String {
+    let screen = harness.screen();
+    let after = screen
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(name)?;
+            (before.contains("├─") || before.contains("└─")).then_some(after)
+        })
+        .next()
+        .unwrap_or_else(|| panic!("{name} is not a tree row:\n{screen}"));
+    after
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[tokio::test]
+async fn pasting_into_a_subdirectory_updates_sizes_in_place() {
+    let mut harness = Harness::scanned().await;
+    let root = harness.root().to_path_buf();
+    let before = harness.app.tree.as_ref().unwrap().root.size;
+    harness.select("copy-a.bin").await;
+    harness.press("y").await;
+    harness.select("src").await;
+    harness.press("<enter>p").await;
+    assert!(harness.path("src/copy-a.bin").is_file());
+    assert_eq!(harness.app.path, root, "the scan root is unchanged");
+    assert!(
+        harness.screen().contains("copy-a.bin"),
+        "{}",
+        harness.screen()
+    );
+    let tree = harness.app.tree.as_ref().unwrap();
+    let copied = tree.find(&harness.path("src/copy-a.bin")).unwrap().size;
+    assert!(copied > 0);
+    assert_eq!(tree.root.size, before + copied);
+    assert_eq!(
+        tree.find(&harness.path("src")).unwrap().file_count(),
+        3,
+        "nested/deep.txt, modified.rs and the copy"
+    );
+    // Nothing else was rescanned away: the sibling still has its size.
+    harness.press("<bs>").await;
+    assert_eq!(size_on_screen(&harness, "copy-b.bin"), "8.19 kB");
+}
+
+#[tokio::test]
+async fn renaming_updates_the_entry_in_place() {
+    let mut harness = Harness::scanned().await;
+    harness.select("copy-b.bin").await;
+    harness.press("r<c-u>").await;
+    harness.type_text("renamed.bin").await;
+    harness.press("<enter>").await;
+    assert!(harness.path("renamed.bin").is_file());
+    let screen = harness.screen();
+    assert!(
+        screen.contains("renamed.bin") && !screen.contains("copy-b.bin"),
+        "{screen}"
+    );
+    assert_eq!(size_on_screen(&harness, "renamed.bin"), "8.19 kB");
+}
+
+#[tokio::test]
+async fn creating_a_file_adds_it_in_place() {
+    let mut harness = Harness::scanned().await;
+    let files = harness.app.tree.as_ref().unwrap().root.file_count();
+    harness.press("a").await;
+    harness.type_text("notes.txt").await;
+    harness.press("<enter>").await;
+    assert!(harness.path("notes.txt").is_file());
+    assert!(
+        harness.screen().contains("notes.txt"),
+        "{}",
+        harness.screen()
+    );
+    assert_eq!(
+        harness.app.tree.as_ref().unwrap().root.file_count(),
+        files + 1
+    );
+}
+
+#[tokio::test]
+async fn rescanning_a_subdirectory_keeps_the_rest_of_the_scan() {
+    let mut harness = Harness::scanned().await;
+    let root = harness.root().to_path_buf();
+    harness.select("src").await;
+    harness.press("<enter>").await;
+    std::fs::write(harness.path("src/added.bin"), vec![0u8; 50_000]).unwrap();
+    harness.press("R").await;
+    assert_eq!(harness.app.path, root);
+    assert!(
+        harness.screen().contains("added.bin"),
+        "{}",
+        harness.screen()
+    );
+    harness.press("<bs>").await;
+    assert_eq!(size_on_screen(&harness, "copy-a.bin"), "8.19 kB");
 }

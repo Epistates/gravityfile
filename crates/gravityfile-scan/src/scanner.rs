@@ -540,6 +540,55 @@ fn metadata_warning(path: PathBuf, error: &std::io::Error) -> ScanWarning {
     ScanWarning::new(path, kind, error.to_string())
 }
 
+/// An entry scanned on its own, for grafting into an existing tree.
+#[derive(Debug)]
+pub struct ScannedEntry {
+    pub node: FileNode,
+    pub warnings: Vec<ScanWarning>,
+}
+
+/// Scan the entry at `path` as `config` measures it: a directory with
+/// everything below it, or anything else on its own. `None` if `path` no
+/// longer exists. `config.root` is ignored.
+///
+/// Hard links are counted once within the entry; links shared with the rest
+/// of a tree it is grafted into are not known here.
+pub fn scan_entry(
+    path: &Path,
+    config: &ScanConfig,
+    token: CancellationToken,
+) -> Result<Option<ScannedEntry>, ScanError> {
+    let metadata = if config.follow_symlinks {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    };
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ScanError::io(path, error)),
+    };
+    let name = path.file_name().unwrap_or(path.as_os_str());
+    if metadata.is_dir() {
+        let mut subtree = config.clone();
+        subtree.root = path.to_path_buf();
+        let FileTree {
+            mut root, warnings, ..
+        } = JwalkScanner::new().scan(&subtree, token)?;
+        root.set_file_name(name);
+        return Ok(Some(ScannedEntry {
+            node: root,
+            warnings,
+        }));
+    }
+    let entry = Entry::from_metadata(&metadata, || path.to_path_buf());
+    let size = entry.counted_size(config, &mut InodeTracker::new());
+    Ok(Some(ScannedEntry {
+        node: entry.node(name, size),
+        warnings: Vec::new(),
+    }))
+}
+
 /// Create a quick, non-recursive directory listing for immediate display.
 /// This function reads only the immediate children of a directory without
 /// recursing into subdirectories. Directory sizes cover only their own
@@ -928,6 +977,41 @@ mod tests {
             config.count_hard_links = true;
             assert_eq!(linked(&scan(&config)), 2 * one, "apparent={apparent}");
         }
+    }
+
+    #[test]
+    fn grafting_scanned_entries_matches_a_fresh_scan() {
+        let temp = create_test_tree();
+        let root = temp.path().canonicalize().unwrap();
+        let config = ScanConfig::new(&root);
+        let mut tree = scan(&config);
+        // Change a directory and a file, and delete another file.
+        fs::write(root.join("dir1/subdir/new.bin"), vec![1u8; 20_000]).unwrap();
+        fs::write(root.join("file1.txt"), vec![2u8; 9_000]).unwrap();
+        fs::remove_file(root.join("dir2/file4.txt")).unwrap();
+        for changed in ["dir1/subdir", "file1.txt", "dir2/file4.txt"] {
+            let path = root.join(changed);
+            tree.remove(&path);
+            if let Some(entry) = scan_entry(&path, &config, CancellationToken::new()).unwrap() {
+                assert!(tree.insert(path.parent().unwrap(), entry.node));
+            }
+        }
+        tree.recount();
+        let fresh = scan(&config);
+        assert_eq!(tree.root.size, fresh.root.size);
+        assert_eq!(tree.root.file_count(), fresh.root.file_count());
+        assert_eq!(tree.stats.total_size, fresh.stats.total_size);
+        for directory in ["dir1", "dir2"] {
+            assert_eq!(
+                child(&tree.root, directory).size,
+                child(&fresh.root, directory).size
+            );
+        }
+        assert!(
+            scan_entry(&root.join("missing"), &config, CancellationToken::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

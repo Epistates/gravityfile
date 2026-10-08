@@ -45,9 +45,9 @@ impl App {
                 "Archive worker ended without a result; inspect the destination before retrying"
                     .to_string(),
             );
-            // Loss of the reply says nothing about publication. Rescan without
-            // replaying work or interrupting a mutation already in progress.
-            self.request_archive_refresh();
+            // Loss of the reply says nothing about publication, or where.
+            // Rescan the viewed directory without replaying work.
+            self.refresh_paths(vec![self.view_root.clone()]);
         }
     }
 
@@ -59,13 +59,6 @@ impl App {
         self.error = Some("Cancelling archive operation; waiting for completion".to_string());
         self.needs_redraw = true;
         true
-    }
-
-    pub(super) fn request_archive_refresh(&mut self) {
-        self.pending_archive_refresh = true;
-        if self.scan_rx.is_none() {
-            self.start_scan();
-        }
     }
 
     pub(super) fn handle_archive_completion(&mut self, completion: ArchiveCompletion) {
@@ -88,7 +81,7 @@ impl App {
                             .to_string_lossy(),
                         destination.display()
                     ));
-                    self.request_archive_refresh();
+                    self.refresh_paths(vec![destination]);
                 }
                 Err(gravityfile_ops::ArchiveError::Cancelled) => {
                     self.error =
@@ -96,7 +89,7 @@ impl App {
                 }
                 Err(error @ gravityfile_ops::ArchiveError::ExtractionRollback { .. }) => {
                     self.error = Some(Self::sanitize_archive_error(&error));
-                    self.request_archive_refresh();
+                    self.refresh_paths(vec![destination]);
                 }
                 Err(error) => {
                     self.error = Some(format!(
@@ -124,7 +117,7 @@ impl App {
                     for source in &sources {
                         self.marked.remove(source);
                     }
-                    self.request_archive_refresh();
+                    self.refresh_paths(vec![archive_path]);
                 }
                 Err(gravityfile_ops::ArchiveError::Cancelled) => {
                     self.error = Some("Archive creation cancelled before publication".to_string());

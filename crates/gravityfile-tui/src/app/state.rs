@@ -409,7 +409,16 @@ pub enum ScanResult {
         undo_info: Option<gravityfile_ops::UndoableOperation>,
         /// Items an undo could not reverse, to push back for a retry.
         undo_remaining: Option<gravityfile_ops::UndoEntry>,
+        /// Paths whose contents may have changed, to refresh in the tree.
+        touched: Vec<PathBuf>,
     },
+}
+
+/// The state of one changed path, scanned again.
+pub struct Refreshed {
+    pub path: PathBuf,
+    /// `None` when the path no longer exists.
+    pub entry: Result<Option<gravityfile_scan::ScannedEntry>, String>,
 }
 
 /// Information about the currently selected item.

@@ -41,6 +41,20 @@ impl UndoableOperation {
         }
     }
 
+    /// Every path the operation, or undoing it, can change.
+    pub fn touched_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::FilesMoved { moves: pairs } | Self::FilesRenamed { renames: pairs } => pairs
+                .iter()
+                .flat_map(|(original, current)| [original.clone(), current.clone()])
+                .collect(),
+            Self::FilesCopied { created: paths } | Self::FilesTrashed { paths, .. } => {
+                paths.clone()
+            }
+            Self::FileCreated { path } | Self::DirectoryCreated { path } => vec![path.clone()],
+        }
+    }
+
     /// Whether undo is possible on this platform.
     pub fn can_undo(&self) -> bool {
         match self {

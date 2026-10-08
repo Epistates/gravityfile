@@ -64,9 +64,23 @@ pub struct TransferComplete {
     /// destination. Overwrites are excluded: they cannot be undone by deleting
     /// or moving the new item back.
     pub completed: Vec<(PathBuf, PathBuf)>,
+    /// `(source, destination)` for every item that replaced an existing one.
+    pub replaced: Vec<(PathBuf, PathBuf)>,
 }
 
 impl TransferComplete {
+    /// Every path whose contents the operation changed: destinations, and
+    /// sources that a move took away.
+    pub fn touched_paths(&self, moved: bool) -> Vec<PathBuf> {
+        let mut touched = Vec::new();
+        for (source, destination) in self.completed.iter().chain(&self.replaced) {
+            if moved {
+                touched.push(source.clone());
+            }
+            touched.push(destination.clone());
+        }
+        touched
+    }
     /// Destinations created by the operation.
     pub fn created_paths(&self) -> impl Iterator<Item = &Path> {
         self.completed
@@ -148,6 +162,7 @@ struct Batch {
     failed: usize,
     skipped: usize,
     completed: Vec<(PathBuf, PathBuf)>,
+    replaced: Vec<(PathBuf, PathBuf)>,
 }
 
 enum Plan {
@@ -174,6 +189,7 @@ impl Batch {
             failed: 0,
             skipped: 0,
             completed: Vec::new(),
+            replaced: Vec::new(),
         }
     }
 
@@ -339,7 +355,9 @@ impl Batch {
                 for error in errors {
                     self.progress.add_error(error);
                 }
-                if !replace {
+                if replace {
+                    self.replaced.push((source, destination));
+                } else {
                     self.completed.push((source, destination));
                 }
             }
@@ -401,6 +419,7 @@ impl Batch {
                 errors: self.progress.errors,
             },
             completed: self.completed,
+            replaced: self.replaced,
         };
         let _ = self.tx.send(TransferResult::Complete(complete)).await;
     }
@@ -602,7 +621,7 @@ mod tests {
         assert_eq!(complete.completed[0].1, destination.join("f (1)"));
         let complete = drain(
             start_copy(
-                vec![source],
+                vec![source.clone()],
                 destination.clone(),
                 options(),
                 CancellationToken::new(),
@@ -611,6 +630,12 @@ mod tests {
         )
         .await;
         assert!(complete.completed.is_empty());
+        assert_eq!(complete.replaced, [(source.clone(), destination.join("f"))]);
+        assert_eq!(complete.touched_paths(false), [destination.join("f")]);
+        assert_eq!(
+            complete.touched_paths(true),
+            [source, destination.join("f")]
+        );
         assert_eq!(fs::read_to_string(destination.join("f")).unwrap(), "new");
     }
 

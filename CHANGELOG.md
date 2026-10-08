@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate group keeps one copy.
 - Mouse clicks select the row under the pointer after scrolling.
 - `grav scan`'s total is the full disk usage of the root, not just its files.
+- **Deleting, copying, moving, renaming or creating anything in the explorer
+  no longer throws away the scan.** Each operation used to rescan the directory
+  being viewed and replace the whole tree with it, so a delete inside a
+  subdirectory of a ten-minute scan of `~` left only that subdirectory. Now only
+  the changed entries are scanned again and updated in place, with every
+  parent's size recomputed. `R` likewise rescans just the directory being
+  viewed.
 - Explorer search found nothing when the query had a capital letter. It now
   uses smart case (a capital makes the query case-sensitive) and fzf syntax:
   space-separated terms, `^prefix`, `suffix$`, `!exclude`, `'exact`.

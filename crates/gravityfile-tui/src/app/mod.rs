@@ -96,6 +96,7 @@ enum Background {
     Take(Option<ScanResult>),
     Preview(Option<PreviewLoad>),
     Archive(Option<ArchiveCompletion>),
+    Refresh(Option<Vec<state::Refreshed>>),
 }
 
 /// Main application state.
@@ -221,7 +222,10 @@ pub struct App {
     /// Completion channel for a background archive operation.
     archive_rx: Option<oneshot::Receiver<ArchiveCompletion>>,
     archive_cancel: Option<ArchiveCancellation>,
-    pending_archive_refresh: bool,
+    /// Completion channel for re-scanning paths changed by an operation.
+    refresh_rx: Option<oneshot::Receiver<Vec<state::Refreshed>>>,
+    /// Changed paths waiting for the running refresh to finish.
+    queued_refresh: Vec<PathBuf>,
     /// Whether to auto-scan on startup.
     scan_on_startup: bool,
     /// User settings (persistent configuration).
@@ -386,7 +390,8 @@ impl App {
             pending_preview: None,
             archive_rx: None,
             archive_cancel: None,
-            pending_archive_refresh: false,
+            refresh_rx: None,
+            queued_refresh: Vec::new(),
             scan_on_startup,
             user_settings,
             settings_state: None,
@@ -679,6 +684,7 @@ impl App {
             || self.take_rx.is_some()
             || self.preview_rx.is_some()
             || self.archive_rx.is_some()
+            || self.refresh_rx.is_some()
     }
 
     /// The next result from a background task. Never completes when
@@ -697,6 +703,9 @@ impl App {
             archive = async {
                 self.archive_rx.as_mut().expect("guarded archive receiver").await.ok()
             }, if self.archive_rx.is_some() => Background::Archive(archive),
+            refreshed = async {
+                self.refresh_rx.as_mut().expect("guarded refresh receiver").await.ok()
+            }, if self.refresh_rx.is_some() => Background::Refresh(refreshed),
             else => std::future::pending().await,
         }
     }
@@ -716,8 +725,143 @@ impl App {
             }
             Background::Preview(preview) => self.finish_preview(preview),
             Background::Archive(archive) => self.finish_archive_task(archive),
+            Background::Refresh(refreshed) => {
+                self.refresh_rx = None;
+                self.apply_refresh(refreshed.unwrap_or_default());
+            }
+        }
+        // Changes that waited for this task can be picked up now.
+        if !self.queued_refresh.is_empty() {
+            self.refresh_paths(Vec::new());
         }
         self.needs_redraw = true;
+    }
+
+    /// Bring the tree up to date for `paths`, which an operation may have
+    /// changed, without rescanning anything else: each one still on disk is
+    /// scanned again and grafted in place, and the rest are removed.
+    fn refresh_paths(&mut self, paths: Vec<PathBuf>) {
+        self.queued_refresh.extend(paths);
+        // Wait for a running refresh, and for an operation or scan in
+        // progress: one could still be changing these paths, and a full scan
+        // would cancel it.
+        if self.refresh_rx.is_some() || self.scan_rx.is_some() {
+            return;
+        }
+        let Some(tree) = &self.tree else {
+            self.queued_refresh.clear();
+            return;
+        };
+        let root = tree.root_path.clone();
+        if self.queued_refresh.contains(&root) {
+            self.start_scan();
+            return;
+        }
+        let mut paths: Vec<PathBuf> = std::mem::take(&mut self.queued_refresh)
+            .into_iter()
+            .filter(|path| path.starts_with(&root))
+            .collect();
+        // Ancestors sort before their descendants; refreshing one covers both.
+        paths.sort();
+        paths.dedup_by(|later, earlier| later.starts_with(earlier));
+        if paths.is_empty() {
+            return;
+        }
+        let config = tree.config.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let refreshed = paths
+                .into_iter()
+                .map(|path| state::Refreshed {
+                    entry: gravityfile_scan::scan_entry(&path, &config, CancellationToken::new())
+                        .map_err(|error| error.to_string()),
+                    path,
+                })
+                .collect();
+            let _ = tx.send(refreshed);
+        });
+        self.refresh_rx = Some(rx);
+    }
+
+    /// Rescan the directory being viewed: the whole scan at the scan root,
+    /// otherwise just that directory, in place.
+    fn refresh_view(&mut self) {
+        self.marked.clear();
+        if self.tree.is_some() {
+            self.refresh_paths(vec![self.view_root.clone()]);
+        } else {
+            self.start_scan();
+        }
+    }
+
+    /// Graft re-scanned entries into the tree.
+    fn apply_refresh(&mut self, refreshed: Vec<state::Refreshed>) {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let mut changed = Vec::new();
+        if let Some(tree) = self.tree.as_mut() {
+            let tree = Arc::make_mut(tree);
+            for state::Refreshed { path, entry } in refreshed {
+                tree.remove(&path);
+                match entry {
+                    Ok(Some(entry)) => {
+                        warnings.extend(entry.warnings);
+                        if let Some(parent) = path.parent() {
+                            // A parent outside the loaded tree has nothing to update.
+                            tree.insert(parent, entry.node);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => errors.push(format!("{}: {error}", path.display())),
+                }
+                changed.push(path);
+            }
+            tree.recount();
+            Self::order_new_subtree(&mut tree.root, self.sort_mode);
+        }
+        self.merge_scan_warnings(&warnings);
+        if !errors.is_empty() {
+            self.error = Some(format!("Cannot refresh {}", errors.join("; ")));
+        }
+        // Results derived from the previous contents no longer hold.
+        self.duplicates = None;
+        self.age_report = None;
+        if let Some(cache) = &mut self.scanned_cache {
+            cache.retain(|cached, _| {
+                !changed
+                    .iter()
+                    .any(|path| path.starts_with(cached) || cached.starts_with(path))
+            });
+        }
+        self.leave_vanished_view();
+        self.update_cached_tree_len();
+        self.update_cached_miller_len();
+        if self.view == View::Treemap {
+            self.update_cached_treemap_len();
+        }
+    }
+
+    /// If the viewed directory is no longer in the tree, show its nearest
+    /// remaining ancestor.
+    fn leave_vanished_view(&mut self) {
+        let Some(tree) = &self.tree else {
+            return;
+        };
+        let mut view = self.view_root.clone();
+        while !tree.find(&view).is_some_and(|node| node.is_dir()) {
+            if !view.pop() || !view.starts_with(&tree.root_path) {
+                view = tree.root_path.clone();
+                break;
+            }
+        }
+        if view != self.view_root {
+            self.view_root = view;
+            self.tree_state.selected = 0;
+            self.tree_state.offset = 0;
+            self.tree_state.expand(&self.view_root);
+            self.miller_state.reset();
+            self.sync_to_active_tab();
+        }
     }
 
     /// Start a background scan of the current view_root directory.
@@ -725,13 +869,12 @@ impl App {
     /// The UI will detect scanning state via `scan_progress.is_some()`.
     /// If we have a quick tree, it remains visible during scanning.
     fn start_scan(&mut self) {
-        self.pending_archive_refresh = false;
         // Cancel any existing scan
         self.scan_token.cancel();
         self.scan_token = CancellationToken::new();
-
-        // Update the scan root to the current view_root
-        self.path = self.view_root.clone();
+        // A full scan supersedes any refresh of part of the old tree.
+        self.refresh_rx = None;
+        self.queued_refresh.clear();
 
         self.scan_progress = Some(ScanProgress::new());
         // Don't clear tree - keep quick listing visible during scan
@@ -745,7 +888,7 @@ impl App {
         // self.cached_tree_len = 0;
 
         self.scan_rx = Some(scanning::start_scan(
-            self.view_root.clone(),
+            self.path.clone(),
             self.user_settings.show_hidden,
             self.user_settings.max_scan_entries,
             self.scan_token.clone(),
@@ -857,17 +1000,24 @@ impl App {
         match result {
             ScanResult::BulkRenameComplete(result) => {
                 self.scan_rx = None;
+                // After a failure, rollback may have left any of the viewed
+                // directory's entries renamed.
+                let mut touched = vec![self.view_root.clone()];
                 self.operation_message = Some(match result {
                     Ok(renames) => {
                         self.marked.clear();
                         let count = renames.len();
+                        touched = renames
+                            .iter()
+                            .flat_map(|(from, to)| [from.clone(), to.clone()])
+                            .collect();
                         self.undo_log.record_renames(renames);
                         (true, format!("Renamed {count} items"))
                     }
                     Err(error) => (false, format!("Bulk rename failed: {error}")),
                 });
                 self.mode = AppMode::Normal;
-                self.start_scan();
+                self.refresh_paths(touched);
             }
             ScanResult::Progress(progress) => {
                 self.scan_progress = Some(progress);
@@ -1004,14 +1154,13 @@ impl App {
 
                 let (success, msg) =
                     deletion::format_deletion_result(mode, deleted.len(), failed, bytes_freed);
+                let touched = deleted.clone();
                 if mode == gravityfile_ops::DeleteMode::Trash {
                     self.undo_log.record_trash(deleted);
                 }
                 self.deletion_message = Some((success, msg));
                 self.mode = AppMode::Normal;
-
-                // Refresh scan after deletion
-                self.start_scan();
+                self.refresh_paths(touched);
             }
             ScanResult::TakeComplete { path, result } => self.finish_take(path, result),
             ScanResult::OperationProgress(progress) => {
@@ -1035,6 +1184,7 @@ impl App {
                 errors,
                 undo_info,
                 undo_remaining,
+                touched,
             } => {
                 self.operation_progress = None;
                 self.scan_rx = None;
@@ -1100,13 +1250,8 @@ impl App {
                 }
                 self.operation_message = Some((success, msg));
                 self.mode = AppMode::Normal;
-
-                // Refresh scan after operation
-                self.start_scan();
+                self.refresh_paths(touched);
             }
-        }
-        if self.pending_archive_refresh && self.scan_rx.is_none() {
-            self.start_scan();
         }
     }
 
@@ -1996,10 +2141,7 @@ impl App {
                 self.settings_state = Some(SettingsState::new(self.user_settings.clone()));
                 self.mode = AppMode::Settings;
             }
-            KeyAction::Refresh => {
-                self.marked.clear();
-                self.start_scan();
-            }
+            KeyAction::Refresh => self.refresh_view(),
             KeyAction::Sort => {
                 self.cycle_sort_mode();
             }
@@ -2323,6 +2465,8 @@ impl App {
                     TransferResult::Progress(p) => ScanResult::OperationProgress(p),
                     TransferResult::Conflict(c) => ScanResult::OperationConflict(c),
                     TransferResult::Complete(complete) => {
+                        let touched = complete
+                            .touched_paths(complete.inner.operation_type == OperationType::Move);
                         let inner = complete.inner;
                         let undo_info = (!complete.completed.is_empty()).then(|| {
                             if inner.operation_type == OperationType::Move {
@@ -2349,6 +2493,7 @@ impl App {
                             errors: inner.errors,
                             undo_info,
                             undo_remaining: None,
+                            touched,
                         }
                     }
                 };
@@ -2512,6 +2657,7 @@ impl App {
         };
         self.operation_message = Some((true, format!("Undoing: {}", entry.description)));
         self.prepare_operation();
+        let mut touched = Some(entry.operation.touched_paths());
         let mut rx = gravityfile_ops::execute_undo(entry, self.scan_token.clone());
 
         let (tx, adapted_rx) = tokio::sync::mpsc::channel(100);
@@ -2540,6 +2686,7 @@ impl App {
                             errors: c.errors,
                             undo_info: None,
                             undo_remaining: complete.remaining,
+                            touched: touched.take().unwrap_or_default(),
                         }
                     }
                 };
@@ -2644,10 +2791,11 @@ impl App {
                         ScanResult::OperationProgress(progress)
                     }
                     gravityfile_ops::RenameResult::Complete(complete) => {
+                        let parent = source_path.parent().unwrap_or(std::path::Path::new(""));
+                        let renamed = parent.join(&new_name);
                         let undo_info = if complete.succeeded > 0 && complete.is_success() {
-                            let parent = source_path.parent().unwrap_or(std::path::Path::new(""));
                             Some(gravityfile_ops::UndoableOperation::FilesRenamed {
-                                renames: vec![(source_path.clone(), parent.join(&new_name))],
+                                renames: vec![(source_path.clone(), renamed.clone())],
                             })
                         } else {
                             None
@@ -2663,6 +2811,7 @@ impl App {
                             errors: complete.errors,
                             undo_info,
                             undo_remaining: None,
+                            touched: vec![source_path.clone(), renamed],
                         }
                     }
                 };
@@ -2790,9 +2939,7 @@ impl App {
         }
 
         self.sync_to_active_tab();
-
-        // Refresh to show new directory in tree
-        self.start_scan();
+        self.refresh_paths(vec![self.view_root.clone()]);
     }
 
     /// Adapt create result receiver to ScanResult.
@@ -2841,6 +2988,7 @@ impl App {
                             errors: complete.errors,
                             undo_info,
                             undo_remaining: None,
+                            touched: vec![path.clone()],
                         }
                     }
                 };
@@ -3768,10 +3916,7 @@ impl App {
                     self.mode = AppMode::Quit;
                 }
             }
-            CommandAction::Refresh => {
-                self.marked.clear();
-                self.start_scan();
-            }
+            CommandAction::Refresh => self.refresh_view(),
             CommandAction::Analyze => {
                 self.start_analysis_for_current_tree();
             }
@@ -5555,6 +5700,7 @@ mod tests {
             )],
             undo_info: None,
             undo_remaining: Some(remaining),
+            touched: Vec::new(),
         });
         assert_eq!(app.undo_log.peek().unwrap().id, 7);
         assert!(app.error.as_deref().unwrap().contains("press u to retry"));
@@ -6337,6 +6483,7 @@ mod tests {
                 created: vec![path],
             }),
             undo_remaining: None,
+            touched: Vec::new(),
         });
         let (success, message) = app.operation_message.as_ref().unwrap();
         assert!(!success);
@@ -6600,7 +6747,7 @@ mod tests {
                     .any(|node| node.name == "uncertain-output")
             );
             assert!(app.marked.contains(&source));
-            assert!(!app.pending_archive_refresh);
+            assert!(app.queued_refresh.is_empty());
             assert!(
                 !app.operation_message
                     .as_ref()
@@ -6643,7 +6790,7 @@ mod tests {
             assert!(app.scan_rx.is_some());
             if active_creation {
                 assert!(!token.is_cancelled());
-                assert!(app.pending_archive_refresh);
+                assert!(!app.queued_refresh.is_empty());
             }
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 // Unlike the operation-only helper, allow its follow-up
@@ -6667,7 +6814,7 @@ mod tests {
                     .any(|node| node.name == "result.zip")
             );
             assert!(app.marked.contains(&source));
-            assert!(!app.pending_archive_refresh);
+            assert!(app.queued_refresh.is_empty());
             assert!(
                 app.error
                     .as_deref()
@@ -6678,7 +6825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_completion_defers_refresh_until_active_creation_finishes() {
+    async fn archive_completion_refresh_waits_for_an_active_creation() {
         for compress in [false, true] {
             let (_directory, mut app) = scanned_app();
             let root = app.view_root.clone();
@@ -6709,7 +6856,7 @@ mod tests {
             assert!(app.scan_rx.is_some());
             assert!(!token.is_cancelled());
             assert_eq!(app.operation_message, message);
-            assert!(app.pending_archive_refresh);
+            assert!(!app.queued_refresh.is_empty());
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 pump_until_complete(&mut app),
@@ -6718,7 +6865,7 @@ mod tests {
             .unwrap();
             assert!(root.join("created").is_file());
             assert_eq!(app.undo_log.len(), 1);
-            assert!(!app.pending_archive_refresh);
+            assert!(app.queued_refresh.is_empty());
         }
     }
 
@@ -7486,6 +7633,7 @@ mod tests {
             errors: Vec::new(),
             undo_info: None,
             undo_remaining: None,
+            touched: Vec::new(),
         });
         let (success, message) = app.operation_message.clone().expect("a message is set");
         assert!(success, "skipping is a user decision, not a failure");
@@ -7502,6 +7650,7 @@ mod tests {
             errors: Vec::new(),
             undo_info: None,
             undo_remaining: None,
+            touched: Vec::new(),
         });
         let (success, message) = app.operation_message.clone().expect("a message is set");
         assert!(!success, "a failure marks the operation unsuccessful");
@@ -8431,6 +8580,7 @@ mod tests {
                 created: vec![app.path.join("copied")],
             }),
             undo_remaining: None,
+            touched: Vec::new(),
         });
         let (success, message) = app.operation_message.as_ref().unwrap();
         assert!(!success);
