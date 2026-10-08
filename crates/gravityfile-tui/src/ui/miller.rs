@@ -59,12 +59,6 @@ impl MillerState {
             self.offset = self.selected - viewport_height + 1;
         }
     }
-
-    /// Reset selection when directory changes.
-    pub fn reset(&mut self) {
-        self.selected = 0;
-        self.offset = 0;
-    }
 }
 
 /// A lightweight entry for display in columns.
@@ -986,16 +980,6 @@ mod tests {
         state.selected = 2;
         state.ensure_visible(8);
         assert_eq!(state.offset, 2);
-    }
-
-    #[test]
-    fn reset_clears_scroll_as_well_as_selection() {
-        let mut state = MillerState {
-            selected: 9,
-            offset: 4,
-        };
-        state.reset();
-        assert_eq!((state.selected, state.offset), (0, 0));
     }
 
     #[test]

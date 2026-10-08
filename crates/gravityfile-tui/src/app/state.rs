@@ -522,9 +522,17 @@ impl DuplicatesViewState {
     }
 }
 
-/// A place in a tab's back/forward history: the directory viewed, the
-/// selected row and the expanded directories.
-pub type Visit = (PathBuf, usize, HashSet<PathBuf>);
+/// A place in a tab's back/forward history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visit {
+    /// The directory viewed.
+    pub dir: PathBuf,
+    /// The selected entry. Kept as a path rather than a row so returning
+    /// finds it in any layout, and after the listing has changed.
+    pub selected: Option<PathBuf>,
+    /// The directories expanded in the tree layout.
+    pub expanded: HashSet<PathBuf>,
+}
 
 /// What one tab is looking at and how it got there. The active tab's
 /// navigation is owned by the app; [`TabManager`] keeps the others.

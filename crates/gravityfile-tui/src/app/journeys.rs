@@ -125,6 +125,38 @@ async fn sort_order_survives_a_rescan() {
 // --- Navigating ---------------------------------------------------------
 
 #[tokio::test]
+async fn going_back_selects_the_directory_left_after_a_resort_and_layout_switch() {
+    let mut harness = Harness::scanned().await;
+    harness.select("src").await;
+    harness.press("<enter>").await;
+    // Inside src, re-sort by name and switch to Miller columns.
+    while harness.app.sort_mode != SortMode::NameAscending {
+        harness.press("s").await;
+    }
+    harness.press("v").await;
+    assert_eq!(harness.app.layout_mode, LayoutMode::Miller);
+    harness.press("<bs>").await;
+    assert_eq!(harness.app.nav.view_root, harness.root());
+    assert_eq!(harness.selected(), Some(harness.path("src")));
+    // Entering again and coming back the other way round works too.
+    harness.press("<enter>v<bs>").await;
+    assert_eq!(harness.app.layout_mode, LayoutMode::Tree);
+    assert_eq!(harness.selected(), Some(harness.path("src")));
+}
+
+#[tokio::test]
+async fn backspace_goes_back_in_the_treemap() {
+    let mut harness = Harness::scanned().await;
+    harness.select("src").await;
+    harness.press("<enter>").await;
+    while harness.app.view != super::View::Treemap {
+        harness.press("<tab>").await;
+    }
+    harness.press("<bs>").await;
+    assert_eq!(harness.app.nav.view_root, harness.root());
+}
+
+#[tokio::test]
 async fn going_to_an_ancestor_of_the_scan_root_lists_it() {
     // The fixture is a hidden `.tmp…` directory.
     let settings = UserSettings {

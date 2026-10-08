@@ -170,24 +170,39 @@ impl<'a> TreeView<'a> {
     /// over expanded directories, not an allocation per visible entry.
     pub fn rows(&self, state: &TreeState, range: std::ops::Range<usize>) -> Vec<VisibleItem> {
         let mut items = Vec::new();
-        self.walk(state, range, |item| items.push(item()));
+        self.walk(state, range, |_, item| items.push(item()));
         items
     }
 
     /// The number of visible rows.
     pub fn flatten_count(&self, state: &TreeState) -> usize {
-        self.walk(state, usize::MAX..usize::MAX, |_| {})
+        self.walk(state, usize::MAX..usize::MAX, |_, _| {})
     }
 
-    /// Visit the visible rows in `range`, in order, giving `visit` a way to
-    /// build each one. Rows before the range are only counted. Iterative, so
-    /// deep expanded trees cannot exhaust the stack. Returns the number of
-    /// rows walked.
+    /// The row showing `target`, if it is visible.
+    pub fn position(&self, state: &TreeState, target: &Path) -> Option<usize> {
+        if !target.starts_with(self.root_path) {
+            return None;
+        }
+        let (mut index, mut found) = (0, None);
+        self.walk(state, 0..usize::MAX, |path, _| {
+            if found.is_none() && path == target {
+                found = Some(index);
+            }
+            index += 1;
+        });
+        found
+    }
+
+    /// Visit the visible rows in `range`, in order, giving `visit` each row's
+    /// path and a way to build it. Rows before the range are only counted.
+    /// Iterative, so deep expanded trees cannot exhaust the stack. Returns
+    /// the number of rows walked.
     fn walk(
         &self,
         state: &TreeState,
         range: std::ops::Range<usize>,
-        mut visit: impl FnMut(&dyn Fn() -> VisibleItem),
+        mut visit: impl FnMut(&Path, &dyn Fn() -> VisibleItem),
     ) -> usize {
         let stop = range.end;
         let build =
@@ -218,7 +233,9 @@ impl<'a> TreeView<'a> {
         let mut path = self.root_path.clone();
         let root_expanded = state.is_expanded(&path);
         if range.contains(&0) {
-            visit(&|| build(self.root, &path, 0, true, &[], root_expanded));
+            visit(&path, &|| {
+                build(self.root, &path, 0, true, &[], root_expanded)
+            });
         }
         let mut index = 1;
         if !(root_expanded && self.root.is_dir()) {
@@ -252,7 +269,9 @@ impl<'a> TreeView<'a> {
             path.push(child.file_name());
             let expanded = child.is_dir() && state.is_expanded(&path);
             if index >= range.start {
-                visit(&|| build(child, &path, depth, is_last, &lasts, expanded));
+                visit(&path, &|| {
+                    build(child, &path, depth, is_last, &lasts, expanded)
+                });
             }
             index += 1;
             if expanded && !child.children.is_empty() {
@@ -574,11 +593,12 @@ mod tests {
 
         // Rows before a window are skipped without being built, which must
         // not shift guide lines, depths or paths of the rows inside it.
-        let all: Vec<String> = view
-            .flatten(&state)
-            .iter()
-            .map(|item| format!("{item:?}"))
-            .collect();
+        let items = view.flatten(&state);
+        for (index, item) in items.iter().enumerate() {
+            assert_eq!(view.position(&state, &item.path), Some(index));
+        }
+        assert_eq!(view.position(&state, &root_path.join("missing")), None);
+        let all: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
         for start in 0..=all.len() {
             for end in start..=all.len() + 1 {
                 let window: Vec<String> = view

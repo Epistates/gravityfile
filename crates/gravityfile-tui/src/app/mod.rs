@@ -11,6 +11,7 @@ mod harness;
 pub mod input;
 #[cfg(test)]
 mod journeys;
+mod navigate;
 mod render;
 mod scanning;
 pub mod state;
@@ -53,18 +54,6 @@ use self::state::{
 
 /// Application result type.
 pub type AppResult<T> = color_eyre::Result<T>;
-
-/// Data collected for synchronizing selection between layout modes.
-struct LayoutSyncData {
-    /// Current view root path.
-    view_path: PathBuf,
-    /// Index in miller view (when switching from tree to miller).
-    miller_index: Option<usize>,
-    /// Index in tree view (when switching from miller to tree).
-    tree_index: Option<usize>,
-    /// New view root if we need to change it to show the selected item.
-    new_view_root: Option<PathBuf>,
-}
 
 struct PreviewLoad {
     path: PathBuf,
@@ -842,28 +831,6 @@ impl App {
         }
     }
 
-    /// If the viewed directory is no longer in the tree, show its nearest
-    /// remaining ancestor.
-    fn leave_vanished_view(&mut self) {
-        let Some(tree) = &self.tree else {
-            return;
-        };
-        let mut view = self.nav.view_root.clone();
-        while !tree.find(&view).is_some_and(|node| node.is_dir()) {
-            if !view.pop() || !view.starts_with(&tree.root_path) {
-                view = tree.root_path.clone();
-                break;
-            }
-        }
-        if view != self.nav.view_root {
-            self.nav.view_root = view;
-            self.nav.tree_state.selected = 0;
-            self.nav.tree_state.offset = 0;
-            self.nav.tree_state.expand(&self.nav.view_root);
-            self.nav.miller_state.reset();
-        }
-    }
-
     /// Start a background scan of the current view_root directory.
     /// Note: Scanning runs in the background while the app remains in Normal mode.
     /// The UI will detect scanning state via `scan_progress.is_some()`.
@@ -1330,250 +1297,6 @@ impl App {
         Some((*child, path))
     }
 
-    /// Drill down into selected treemap item if it's a directory.
-    fn drill_into_treemap_selected(&mut self) {
-        // Get selected child info
-        let drill_info = {
-            let Some((child, path)) = self.get_selected_treemap_child() else {
-                return;
-            };
-
-            if child.is_dir() {
-                Some((
-                    path,
-                    self.nav.view_root.clone(),
-                    self.nav.treemap_state.selected,
-                ))
-            } else {
-                None
-            }
-        };
-
-        if let Some((new_root, old_root, old_selected)) = drill_info {
-            // Save current state to history
-            self.nav.back.push((old_root, old_selected, HashSet::new()));
-            self.nav.forward.clear();
-
-            // Navigate to the new directory
-            self.nav.view_root = new_root;
-            self.nav.treemap_state.reset();
-            self.update_cached_treemap_len();
-        }
-    }
-
-    /// Navigate back in treemap view.
-    fn navigate_treemap_back(&mut self) {
-        if let Some((prev_root, prev_selected, _)) = self.nav.back.pop() {
-            // Save current state to forward history
-            self.nav.forward.push((
-                self.nav.view_root.clone(),
-                self.nav.treemap_state.selected,
-                HashSet::new(),
-            ));
-
-            // Restore previous state
-            self.nav.view_root = prev_root;
-            self.nav.treemap_state.selected = prev_selected;
-            self.update_cached_treemap_len();
-        } else if self.nav.view_root != self.path {
-            // No history, but we can go to parent
-            if let Some(parent) = self.nav.view_root.parent() {
-                let old_selected = self.nav.treemap_state.selected;
-                self.nav
-                    .forward
-                    .push((self.nav.view_root.clone(), old_selected, HashSet::new()));
-                self.nav.view_root = parent.to_path_buf();
-                self.nav.treemap_state.reset();
-                self.update_cached_treemap_len();
-            }
-        }
-    }
-
-    /// Synchronize selection state when toggling between Tree and Miller layouts.
-    /// Maintains the same selected item across layout switches.
-    fn sync_layout_selection(&mut self) {
-        // Collect all data needed before mutating self
-        let sync_data = self.collect_layout_sync_data();
-
-        let Some(data) = sync_data else {
-            // No view node, just toggle and reset
-            self.layout_mode = self.layout_mode.toggle();
-            if self.layout_mode == LayoutMode::Miller {
-                self.nav.miller_state.reset();
-                self.update_cached_miller_len();
-                self.update_preview();
-            } else {
-                self.update_cached_tree_len();
-                self.clear_preview();
-            }
-            return;
-        };
-
-        match self.layout_mode {
-            LayoutMode::Tree => {
-                // Switching Tree → Miller
-                self.layout_mode = LayoutMode::Miller;
-
-                // If we need to change view_root to show the selected item
-                if let Some(new_view_root) = data.new_view_root {
-                    self.nav.view_root = new_view_root;
-                    self.nav.tree_state.expand(&self.nav.view_root);
-                }
-
-                if let Some(miller_idx) = data.miller_index {
-                    self.nav.miller_state.selected = miller_idx;
-                    self.nav.miller_state.offset = 0;
-                    self.update_cached_miller_len();
-                    self.nav.miller_state.ensure_visible(self.viewport_height);
-                    self.update_preview();
-                } else {
-                    // Fallback: reset miller state
-                    self.nav.miller_state.reset();
-                    self.update_cached_miller_len();
-                    self.update_preview();
-                }
-            }
-            LayoutMode::Miller => {
-                // Switching Miller → Tree
-                self.layout_mode = LayoutMode::Tree;
-                self.clear_preview();
-
-                // Ensure the view_root is expanded in tree
-                self.nav.tree_state.expand(&data.view_path);
-
-                if let Some(tree_idx) = data.tree_index {
-                    self.nav.tree_state.selected = tree_idx;
-                    self.nav.tree_state.offset = 0;
-                    self.nav.tree_state.ensure_visible(self.viewport_height);
-                }
-                self.update_cached_tree_len();
-            }
-        }
-    }
-
-    /// Collect data needed for layout synchronization without holding borrows.
-    fn collect_layout_sync_data(&self) -> Option<LayoutSyncData> {
-        let (view_node, view_path) = self.get_view_root_node()?;
-
-        match self.layout_mode {
-            LayoutMode::Tree => {
-                // Get the currently selected path in tree view
-                let items = TreeView::new(
-                    view_node,
-                    &view_path,
-                    &self.theme,
-                    &self.marked,
-                    &self.clipboard,
-                )
-                .flatten(&self.nav.tree_state);
-
-                let selected_path = items
-                    .get(self.nav.tree_state.selected)
-                    .map(|item| item.path.clone());
-
-                let Some(selected) = selected_path else {
-                    return Some(LayoutSyncData {
-                        view_path: view_path.clone(),
-                        miller_index: None,
-                        tree_index: None,
-                        new_view_root: None,
-                    });
-                };
-
-                // If we're on the root itself, preserve current miller selection
-                if selected == view_path {
-                    let miller_index = if self.nav.miller_state.selected < view_node.children.len()
-                    {
-                        Some(self.nav.miller_state.selected)
-                    } else if view_node.children.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                    return Some(LayoutSyncData {
-                        view_path: view_path.clone(),
-                        miller_index,
-                        tree_index: None,
-                        new_view_root: None,
-                    });
-                }
-
-                // Check if selected is a direct child of view_root
-                let is_direct_child = selected.parent() == Some(view_path.as_path());
-
-                if is_direct_child {
-                    // Direct child - find it in miller
-                    let name = selected.file_name()?;
-                    let miller_index = view_node
-                        .children
-                        .iter()
-                        .position(|c| c.file_name() == name);
-                    Some(LayoutSyncData {
-                        view_path: view_path.clone(),
-                        miller_index,
-                        tree_index: None,
-                        new_view_root: None,
-                    })
-                } else {
-                    // Nested item - need to change view_root to the parent of selected
-                    // so that Miller can display the selected item
-                    let new_view_root = selected.parent()?.to_path_buf();
-
-                    // Find the selected item's name to locate it in the new view
-                    let selected_name = selected.file_name()?;
-
-                    // We need to find the node at new_view_root to get its children
-                    let tree = self.tree.as_ref()?;
-                    let new_view_node =
-                        Self::find_node_at_path(&tree.root, &new_view_root, &tree.root_path)?;
-                    let miller_index = new_view_node
-                        .children
-                        .iter()
-                        .position(|c| c.file_name() == selected_name);
-
-                    Some(LayoutSyncData {
-                        view_path: view_path.clone(),
-                        miller_index,
-                        tree_index: None,
-                        new_view_root: Some(new_view_root),
-                    })
-                }
-            }
-            LayoutMode::Miller => {
-                // Get the target path from miller selection
-                let target_path = view_node
-                    .children
-                    .get(self.nav.miller_state.selected)
-                    .map(|c| view_path.join(c.file_name()));
-
-                // Use existing tree_state expansion to find the index
-                // First ensure view_path is expanded
-                let mut tree_state_for_search = self.nav.tree_state.clone();
-                tree_state_for_search.expand(&view_path);
-
-                let items = TreeView::new(
-                    view_node,
-                    &view_path,
-                    &self.theme,
-                    &self.marked,
-                    &self.clipboard,
-                )
-                .flatten(&tree_state_for_search);
-
-                let tree_index = target_path
-                    .as_ref()
-                    .and_then(|target| items.iter().position(|item| &item.path == target));
-
-                Some(LayoutSyncData {
-                    view_path: view_path.clone(),
-                    miller_index: None,
-                    tree_index,
-                    new_view_root: None,
-                })
-            }
-        }
-    }
-
     /// Update the file preview for the currently selected item in Miller mode.
     fn update_preview(&mut self) {
         // Only update preview in Miller mode for non-directory items
@@ -1935,7 +1658,7 @@ impl App {
                 if self.view == View::Explorer {
                     match self.layout_mode {
                         LayoutMode::Tree => self.expand_selected(),
-                        LayoutMode::Miller => self.drill_into_miller_selected(),
+                        LayoutMode::Miller => self.enter_selected(),
                     }
                 } else if self.view == View::Duplicates {
                     // l expands group in duplicates view
@@ -1946,15 +1669,14 @@ impl App {
                         self.duplicates_state.toggle_expand();
                     }
                 } else if self.view == View::Treemap {
-                    // Drill into selected directory
-                    self.drill_into_treemap_selected();
+                    self.enter_selected();
                 }
             }
             KeyAction::MoveLeft => {
                 if self.view == View::Explorer {
                     match self.layout_mode {
                         LayoutMode::Tree => self.collapse_selected(),
-                        LayoutMode::Miller => self.navigate_back(),
+                        LayoutMode::Miller => self.go_back(),
                     }
                 } else if self.view == View::Duplicates {
                     // h collapses expanded group in duplicates view
@@ -1965,8 +1687,7 @@ impl App {
                         self.duplicates_state.toggle_expand();
                     }
                 } else if self.view == View::Treemap {
-                    // Navigate back
-                    self.navigate_treemap_back();
+                    self.go_back();
                 }
             }
             KeyAction::ToggleExpand => {
@@ -2086,28 +1807,16 @@ impl App {
                 self.execute_undo();
             }
 
-            KeyAction::DrillDown if self.view == View::Explorer => {
-                // Check if selected item is a file or directory
-                let is_file = self.is_selected_file();
-                if is_file {
-                    self.open_selected_file();
-                } else {
-                    match self.layout_mode {
-                        LayoutMode::Tree => self.drill_into_selected(),
-                        LayoutMode::Miller => self.drill_into_miller_selected(),
-                    }
-                }
-            }
-            KeyAction::DrillDown if self.view == View::Treemap => {
+            KeyAction::DrillDown if matches!(self.view, View::Explorer | View::Treemap) => {
                 if self.is_selected_file() {
                     self.open_selected_file();
                 } else {
-                    self.drill_into_treemap_selected();
+                    self.enter_selected();
                 }
             }
             KeyAction::DrillDown => {}
-            KeyAction::NavigateBack if self.view == View::Explorer => {
-                self.navigate_back();
+            KeyAction::NavigateBack if matches!(self.view, View::Explorer | View::Treemap) => {
+                self.go_back();
             }
             KeyAction::NavigateBack => {}
 
@@ -2126,7 +1835,7 @@ impl App {
                 self.theme = self.theme.toggle();
             }
             KeyAction::ToggleLayout => {
-                self.sync_layout_selection();
+                self.toggle_layout();
             }
             KeyAction::CyclePreviewMode => {
                 self.preview_state.cycle_mode();
@@ -2617,7 +2326,7 @@ impl App {
         // Canonicalize to resolve .. and .
         let path = path.canonicalize().unwrap_or(path);
         if path.is_dir() {
-            self.navigate_to(path);
+            self.go_to(path);
         } else {
             self.error = Some(format!("Not a directory: {}", path.display()));
         }
@@ -2876,20 +2585,6 @@ impl App {
         self.operation_message = Some((true, format!("Creating or opening {name}...")));
     }
 
-    /// Start a new history branch using the cursor of the active layout.
-    fn record_navigation_origin(&mut self) {
-        let selected = match self.layout_mode {
-            LayoutMode::Tree => self.nav.tree_state.selected,
-            LayoutMode::Miller => self.nav.miller_state.selected,
-        };
-        self.nav.back.push((
-            self.nav.view_root.clone(),
-            selected,
-            self.nav.tree_state.expanded.clone(),
-        ));
-        self.nav.forward.clear();
-    }
-
     fn finish_take(&mut self, path: PathBuf, result: Result<bool, String>) {
         self.take_rx = None;
         let created = match result {
@@ -2909,26 +2604,9 @@ impl App {
         }
         self.operation_message = Some((true, format!("Entered {}", path.display())));
 
-        // Navigate into the new directory
-        // Save current state to history
-        self.record_navigation_origin();
-
-        // Update view root to the new directory
-        self.nav.view_root = path;
-
-        // Reset state for new directory
-        match self.layout_mode {
-            LayoutMode::Tree => {
-                self.nav.tree_state.selected = 0;
-                self.nav.tree_state.offset = 0;
-                self.nav.tree_state.expand(&self.nav.view_root);
-            }
-            LayoutMode::Miller => {
-                self.nav.miller_state.reset();
-            }
-        }
-
-        self.refresh_paths(vec![self.nav.view_root.clone()]);
+        // The directory is not in the tree until the refresh grafts it in.
+        self.enter(path.clone(), None);
+        self.refresh_paths(vec![path]);
     }
 
     /// Adapt create result receiver to ScanResult.
@@ -3195,23 +2873,7 @@ impl App {
                 TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
                     .row(&self.nav.tree_state, self.nav.tree_state.selected);
             if let Some(item) = selected.as_ref() {
-                // Lazy load directory contents if directory has no children
-                if matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. }) {
-                    let needs_lazy_load = if let Some(tree) = &self.tree {
-                        if let Some(node) =
-                            Self::find_node_at_path(&tree.root, &item.path, &tree.root_path)
-                        {
-                            node.children.is_empty()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if needs_lazy_load {
-                        self.lazy_load_directory(&item.path);
-                    }
-                }
+                self.load_children(&item.path);
                 self.nav.tree_state.expand(&item.path);
                 self.update_cached_tree_len();
             }
@@ -3238,7 +2900,7 @@ impl App {
                     self.update_cached_tree_len();
                 } else {
                     // Not expanded or not a directory - navigate back to parent
-                    self.navigate_back();
+                    self.go_back();
                 }
             }
         }
@@ -3356,419 +3018,6 @@ impl App {
         self.pending_suspend_command = Some(cmd);
     }
 
-    /// Drill into the currently selected directory.
-    fn drill_into_selected(&mut self) {
-        let Some((view_node, view_path)) = self.get_view_root_node() else {
-            return;
-        };
-
-        let selected = TreeView::new(
-            view_node,
-            &view_path,
-            &self.theme,
-            &self.marked,
-            &self.clipboard,
-        )
-        .row(&self.nav.tree_state, self.nav.tree_state.selected);
-        let Some(item) = selected.as_ref() else {
-            return;
-        };
-
-        if !matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. }) {
-            return;
-        }
-
-        // Check if directory needs lazy loading (has no children loaded yet)
-        let needs_lazy_load = if let Some(tree) = &self.tree {
-            if let Some(node) = Self::find_node_at_path(&tree.root, &item.path, &tree.root_path) {
-                node.children.is_empty()
-            } else {
-                true
-            }
-        } else {
-            true
-        };
-
-        // Lazy load directory contents if needed
-        if needs_lazy_load {
-            self.lazy_load_directory(&item.path);
-        }
-
-        if item.path == self.nav.view_root {
-            self.nav.tree_state.expand(&item.path);
-            self.update_cached_tree_len();
-            return;
-        }
-
-        let saved_expanded = self.nav.tree_state.expanded.clone();
-        let saved_selected = self.nav.tree_state.selected;
-        self.nav
-            .back
-            .push((self.nav.view_root.clone(), saved_selected, saved_expanded));
-
-        let target_path = item.path.clone();
-
-        // Check if forward history has this path - if so, restore that state
-        if let Some(forward_idx) = self
-            .nav
-            .forward
-            .iter()
-            .rposition(|(p, _, _)| p == &target_path)
-        {
-            let (_, fwd_selected, fwd_expanded) = self.nav.forward.remove(forward_idx);
-            // Clear any forward history entries after this one
-            self.nav.forward.truncate(forward_idx);
-
-            self.nav.view_root = target_path;
-            self.nav.tree_state.selected = fwd_selected;
-            self.nav.tree_state.offset = 0;
-            self.nav.tree_state.expanded = fwd_expanded;
-            self.nav.tree_state.expand(&self.nav.view_root);
-            self.update_cached_tree_len();
-            return;
-        }
-
-        // Clear forward history - user is navigating to a new location
-        self.nav.forward.clear();
-
-        self.nav.view_root = target_path;
-
-        self.nav.tree_state.selected = 0;
-        self.nav.tree_state.offset = 0;
-        self.nav.tree_state.expand(&self.nav.view_root);
-        self.update_cached_tree_len();
-    }
-
-    /// Drill into the selected directory in Miller columns mode.
-    fn drill_into_miller_selected(&mut self) {
-        let Some((view_node, _)) = self.get_view_root_node() else {
-            return;
-        };
-
-        let Some(selected_child) = view_node.children.get(self.nav.miller_state.selected) else {
-            return;
-        };
-
-        // Only drill into directories
-        if !selected_child.is_dir() {
-            return;
-        }
-
-        let target_path = self.nav.view_root.join(selected_child.file_name());
-
-        // Lazy loading: if directory has no children (from quick_list), load them now
-        if selected_child.children.is_empty() {
-            self.lazy_load_directory(&target_path);
-        }
-
-        // Save current state to history
-        let saved_expanded = self.nav.tree_state.expanded.clone();
-        let saved_selected = self.nav.miller_state.selected;
-        self.nav
-            .back
-            .push((self.nav.view_root.clone(), saved_selected, saved_expanded));
-
-        // Check if forward history has this path - if so, restore that state
-        if let Some(forward_idx) = self
-            .nav
-            .forward
-            .iter()
-            .rposition(|(p, _, _)| p == &target_path)
-        {
-            let (_, fwd_selected, fwd_expanded) = self.nav.forward.remove(forward_idx);
-            // Clear any forward history entries after this one
-            self.nav.forward.truncate(forward_idx);
-
-            self.nav.view_root = target_path;
-            self.nav.miller_state.selected = fwd_selected;
-            self.nav.miller_state.offset = 0;
-            self.nav.tree_state.expanded = fwd_expanded;
-            self.update_cached_miller_len();
-            self.nav.miller_state.ensure_visible(self.viewport_height);
-            self.update_preview();
-            return;
-        }
-
-        // Clear forward history - user is navigating to a new location
-        self.nav.forward.clear();
-
-        // Update view root
-        self.nav.view_root = target_path;
-        self.nav.miller_state.reset();
-        self.update_cached_miller_len();
-        self.update_preview();
-    }
-
-    /// Lazy load a directory's children using quick_list.
-    /// This updates the tree in-place with the new children.
-    fn lazy_load_directory(&mut self, path: &Path) {
-        // Captured up front: the mutable borrow taken by `Arc::make_mut` below
-        // rules out reading the tree's own root path at the same time.
-        let Some(root_path) = self.tree.as_ref().map(|tree| tree.root_path.clone()) else {
-            return;
-        };
-        let sort_mode = self.sort_mode;
-
-        // First check if we have cached scan data for this directory
-        if let Some(cached_tree) = self
-            .scanned_cache
-            .as_ref()
-            .and_then(|c| c.get(path))
-            .cloned()
-        {
-            // Use cached scan data - it has full size/structure information
-            if let Some(tree) = &mut self.tree
-                && let Some(node) =
-                    Self::find_node_mut(&mut Arc::make_mut(tree).root, path, &root_path)
-            {
-                // Replace with the cached node (preserves all scan data)
-                *node = cached_tree.root.clone();
-                Self::order_new_subtree(node, sort_mode);
-            }
-            return;
-        }
-
-        // Quick load directory contents for immediate display
-        // When the full scan completes, it will replace this with accurate data
-        if let Some(mut quick_tree) = self.load_directory_listing(path) {
-            // Find the node in our tree and update its children
-            if let Some(tree) = &mut self.tree
-                && let Some(node) =
-                    Self::find_node_mut(&mut Arc::make_mut(tree).root, path, &root_path)
-            {
-                node.children = std::mem::take(&mut quick_tree.root.children);
-                Self::order_new_subtree(node, sort_mode);
-            }
-        }
-    }
-
-    fn load_directory_listing(&mut self, path: &Path) -> Option<gravityfile_core::FileTree> {
-        match quick_list_with_settings(path, &self.user_settings) {
-            Ok(tree) => Some(tree),
-            Err(error) => {
-                self.error = Some(format!("Cannot list {}: {error}", path.display()));
-                self.needs_redraw = true;
-                None
-            }
-        }
-    }
-
-    /// Find a mutable reference to a node by path.
-    fn find_node_mut<'a>(
-        node: &'a mut gravityfile_core::FileNode,
-        target: &Path,
-        current_path: &Path,
-    ) -> Option<&'a mut gravityfile_core::FileNode> {
-        let relative = target.strip_prefix(current_path).ok()?;
-        let mut found = node;
-        for component in relative.components() {
-            let std::path::Component::Normal(name) = component else {
-                return None;
-            };
-            found = found
-                .children
-                .iter_mut()
-                .find(|child| child.file_name() == name)?;
-        }
-        Some(found)
-    }
-
-    /// Navigate back up to the previous view root.
-    /// Supports navigation beyond the scan root, all the way to filesystem root.
-    fn navigate_back(&mut self) {
-        // Prepare current state for forward history (will be pushed if navigation succeeds)
-        let current_selected = match self.layout_mode {
-            LayoutMode::Tree => self.nav.tree_state.selected,
-            LayoutMode::Miller => self.nav.miller_state.selected,
-        };
-        let current_state = (
-            self.nav.view_root.clone(),
-            current_selected,
-            self.nav.tree_state.expanded.clone(),
-        );
-
-        // First, try to use view history if available
-        if let Some((prev_root, saved_selected, saved_expanded)) = self.nav.back.last().cloned() {
-            let loaded = self.tree.as_ref().is_some_and(|tree| {
-                Self::find_node_at_path(&tree.root, &prev_root, &tree.root_path)
-                    .is_some_and(|node| node.is_dir())
-            });
-            let prev_root = if loaded {
-                prev_root
-            } else {
-                let Some(tree) = self.load_directory_listing(&prev_root) else {
-                    return;
-                };
-                self.cancel_scan();
-                self.path = tree.root_path.clone();
-                self.install_tree(tree);
-                self.duplicates = None;
-                self.age_report = None;
-                self.has_full_scan = false;
-                self.path.clone()
-            };
-            self.nav.back.pop();
-            // Destination is usable; only now commit both history stacks.
-            self.nav.forward.push(current_state);
-            self.nav.view_root = prev_root;
-            self.nav.tree_state.expanded = saved_expanded;
-
-            // Restore selection based on layout mode
-            match self.layout_mode {
-                LayoutMode::Tree => {
-                    self.nav.tree_state.selected = saved_selected;
-                    self.nav.tree_state.offset = 0;
-                    self.update_cached_tree_len();
-                }
-                LayoutMode::Miller => {
-                    self.nav.miller_state.selected = saved_selected;
-                    self.nav.miller_state.offset = 0;
-                    self.update_cached_miller_len();
-                }
-            }
-            return;
-        }
-
-        // No history - try to navigate to parent
-        let Some(parent) = self.nav.view_root.parent() else {
-            return; // Already at root
-        };
-
-        let parent = parent.to_path_buf();
-        let dir_we_came_from = self.nav.view_root.clone();
-
-        // Check if parent is within our current tree
-        let parent_in_tree = parent.starts_with(&self.path) || parent == self.path;
-
-        if parent_in_tree {
-            // Navigate within existing tree
-            self.nav.tree_state.collapse(&dir_we_came_from);
-            self.nav.view_root = parent;
-            self.nav.tree_state.expand(&self.nav.view_root);
-        } else {
-            // Navigate beyond scan root - need to extend our tree
-            if self.navigate_to_parent_beyond_scan_root(&parent, &dir_we_came_from) {
-                self.nav.forward.push(current_state);
-            }
-            return;
-        }
-        self.nav.forward.push(current_state);
-
-        // Select the directory we just came from
-        self.select_child_by_name(&dir_we_came_from);
-    }
-
-    /// Navigate to a parent directory that's outside the current scan root.
-    /// This extends the tree by lazy-loading the parent.
-    fn navigate_to_parent_beyond_scan_root(
-        &mut self,
-        parent: &Path,
-        dir_we_came_from: &Path,
-    ) -> bool {
-        // Cache current tree before navigating away (if we have scan data)
-        if let Some(tree) = &self.tree
-            && self.has_full_scan
-            && let Some(cache) = &mut self.scanned_cache
-        {
-            cache.insert(tree.root_path.clone(), Arc::clone(tree));
-        }
-
-        // Load the parent directory contents
-        let Some(mut parent_tree) = self.load_directory_listing(parent) else {
-            return false; // Preserve the current tree and histories on failure.
-        };
-
-        // Merge any cached scans into the parent tree's children
-        self.merge_cached_scans_into_tree(&mut parent_tree.root, parent);
-
-        // Create a new tree rooted at the resolved parent.
-        self.cancel_scan();
-        self.path = parent_tree.root_path.clone();
-        self.install_tree(parent_tree);
-        self.nav.view_root = self.path.clone();
-        self.duplicates = None;
-        self.age_report = None;
-        self.nav.back.clear();
-        // Note: don't clear forward_history here - we want to allow navigating back
-
-        // The parent tree is quick-listed, not fully scanned
-        self.has_full_scan = false;
-
-        // Reset tree state for the new root
-        self.nav.tree_state = TreeState::new(self.path.clone());
-
-        // Update cached parent for Miller columns display
-        self.update_cached_parent();
-
-        // Select the directory we came from
-        self.select_child_by_name(dir_we_came_from);
-        true
-    }
-
-    /// Merge cached scan data into a tree node's children.
-    /// For each child directory in the node, if we have cached scan data,
-    /// replace the placeholder child with the fully scanned version.
-    fn merge_cached_scans_into_tree(
-        &self,
-        node: &mut gravityfile_core::FileNode,
-        node_path: &Path,
-    ) {
-        for child in &mut node.children {
-            if child.is_dir() {
-                let child_path = node_path.join(child.file_name());
-                if let Some(cached_tree) =
-                    self.scanned_cache.as_ref().and_then(|c| c.get(&child_path))
-                {
-                    // Replace this child with the cached scan data
-                    *child = cached_tree.root.clone();
-                }
-            }
-        }
-    }
-
-    /// Select a child entry by matching its name.
-    fn select_child_by_name(&mut self, target_path: &Path) {
-        let dir_name = target_path.file_name().unwrap_or_default();
-
-        match self.layout_mode {
-            LayoutMode::Tree => {
-                // In tree view, find the index of the target in flattened list
-                if let Some((node, root_path)) = self.get_view_root_node() {
-                    let items =
-                        TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                            .flatten(&self.nav.tree_state);
-                    if let Some(idx) = items
-                        .iter()
-                        .position(|item| item.path.file_name() == Some(dir_name))
-                    {
-                        self.nav.tree_state.selected = idx;
-                    } else {
-                        self.nav.tree_state.selected = 0;
-                    }
-                } else {
-                    self.nav.tree_state.selected = 0;
-                }
-                self.nav.tree_state.offset = 0;
-                self.update_cached_tree_len();
-            }
-            LayoutMode::Miller => {
-                // In miller view, find the index in children
-                if let Some((node, _)) = self.get_view_root_node() {
-                    let idx = node
-                        .children
-                        .iter()
-                        .position(|c| c.file_name() == dir_name)
-                        .unwrap_or(0);
-                    self.nav.miller_state.selected = idx;
-                } else {
-                    self.nav.miller_state.selected = 0;
-                }
-                self.nav.miller_state.offset = 0;
-                self.update_cached_miller_len();
-            }
-        }
-    }
-
     /// Find a node by path in the tree.
     fn find_node_at_path<'a>(
         node: &'a gravityfile_core::FileNode,
@@ -3835,33 +3084,6 @@ impl App {
         None
     }
 
-    /// Update the cached parent tree for Miller columns display.
-    /// Called when navigating to ensure the parent column can be shown.
-    fn update_cached_parent(&mut self) {
-        // Never retain a previous location's parent when refresh fails.
-        self.cached_parent_tree = None;
-        let Some(tree) = &self.tree else { return };
-
-        // Only need to cache parent if we're at or near the tree root
-        if self.nav.view_root == tree.root_path {
-            if let Some(parent_path) = self.nav.view_root.parent() {
-                let parent_path_buf = parent_path.to_path_buf();
-                // Load the parent directory
-                if let Ok(mut parent_tree) =
-                    quick_list_with_settings(&parent_path_buf, &self.user_settings)
-                {
-                    // Merge any cached scans into the parent tree's children
-                    // This ensures previously scanned directories show their data
-                    self.merge_cached_scans_into_tree(&mut parent_tree.root, &parent_path_buf);
-                    self.cached_parent_tree = Some(parent_tree);
-                }
-            }
-        } else {
-            // Don't need cached parent when navigating within the tree
-            self.cached_parent_tree = None;
-        }
-    }
-
     /// Get the current directory name for highlighting in parent column.
     fn get_current_dir_name(&self) -> Option<String> {
         self.nav
@@ -3914,7 +3136,7 @@ impl App {
                 self.go_to_root();
             }
             CommandAction::NavigateBack => {
-                self.navigate_back();
+                self.go_back();
             }
             CommandAction::ShowHelp => {
                 self.mode = AppMode::Help;
@@ -3938,25 +3160,21 @@ impl App {
                 ThemeCommand::Light => self.theme = Theme::light(),
                 ThemeCommand::Toggle => self.theme = self.theme.toggle(),
             },
-            CommandAction::SetLayout(layout_cmd) => {
-                match layout_cmd {
-                    LayoutCommand::Tree => {
-                        if self.layout_mode != LayoutMode::Tree {
-                            // Use sync to preserve selection when switching to tree
-                            self.sync_layout_selection();
-                        }
-                    }
-                    LayoutCommand::Miller => {
-                        if self.layout_mode != LayoutMode::Miller {
-                            // Use sync to preserve selection when switching to miller
-                            self.sync_layout_selection();
-                        }
-                    }
-                    LayoutCommand::Toggle => {
-                        self.sync_layout_selection();
+            CommandAction::SetLayout(layout_cmd) => match layout_cmd {
+                LayoutCommand::Tree => {
+                    if self.layout_mode != LayoutMode::Tree {
+                        self.toggle_layout();
                     }
                 }
-            }
+                LayoutCommand::Miller => {
+                    if self.layout_mode != LayoutMode::Miller {
+                        self.toggle_layout();
+                    }
+                }
+                LayoutCommand::Toggle => {
+                    self.toggle_layout();
+                }
+            },
             CommandAction::SetSort(sort_cmd) => {
                 match sort_cmd {
                     SortCommand::SizeDesc => self.sort_mode = SortMode::SizeDescending,
@@ -4191,78 +3409,6 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Go to the scan root.
-    fn go_to_root(&mut self) {
-        self.nav.view_root = self.path.clone();
-        self.nav.back.clear();
-        self.nav.forward.clear();
-        self.nav.tree_state.selected = 0;
-        self.nav.tree_state.offset = 0;
-        self.nav.tree_state.expand(&self.nav.view_root);
-        self.update_cached_tree_len();
-    }
-
-    /// Change directory within the loaded scan tree. Leading `/` is scan-root relative.
-    fn cd_to_path(&mut self, target: &str) {
-        if target == "/" || target == "~" {
-            self.go_to_root();
-            return;
-        }
-        if target == ".." {
-            self.navigate_back();
-            return;
-        }
-        let Some(tree) = &self.tree else {
-            self.error = Some("Cannot change directory: no directory tree is loaded".into());
-            return;
-        };
-        let mut target_path = if target.starts_with('/') {
-            self.path.clone()
-        } else {
-            self.nav.view_root.clone()
-        };
-        for component in Path::new(target.trim_start_matches('/')).components() {
-            match component {
-                std::path::Component::CurDir => {}
-                std::path::Component::Normal(name) => target_path.push(name),
-                std::path::Component::ParentDir => {
-                    if target_path == self.path || !target_path.starts_with(&self.path) {
-                        self.error =
-                            Some("Cannot change directory: path leaves the scan root".into());
-                        return;
-                    }
-                    target_path.pop();
-                }
-                _ => {
-                    self.error = Some("Cannot change directory: unsupported path prefix".into());
-                    return;
-                }
-            }
-        }
-        let Some(node) = Self::find_node_at_path(&tree.root, &target_path, &tree.root_path) else {
-            self.error = Some(format!(
-                "Directory is not in the loaded tree: {}",
-                target_path.display()
-            ));
-            return;
-        };
-        if !node.is_dir() {
-            self.error = Some(format!("Not a directory: {}", target_path.display()));
-            return;
-        }
-        if target_path == self.nav.view_root {
-            return;
-        }
-        self.record_navigation_origin();
-        self.nav.view_root = target_path;
-        self.nav.tree_state.selected = 0;
-        self.nav.tree_state.offset = 0;
-        self.nav.tree_state.expand(&self.nav.view_root);
-        self.nav.miller_state.reset();
-        self.update_cached_tree_len();
-        self.update_cached_miller_len();
-    }
-
     /// Check if a path is marked for deletion.
     pub fn is_marked(&self, path: &PathBuf) -> bool {
         self.marked.contains(path)
@@ -4322,63 +3468,7 @@ impl App {
             self.error = Some(format!("Bookmark '{key}' is not a directory"));
             return;
         }
-        self.navigate_to(path);
-    }
-
-    /// Show the directory `path` (canonical), remembering where we came from.
-    /// Within the loaded tree this only moves the view; anywhere else, such as
-    /// an ancestor of the scan root or a directory not yet listed, it lists
-    /// `path` and scans it if scanning on open is enabled. Marks and the
-    /// clipboard are kept.
-    fn navigate_to(&mut self, path: PathBuf) {
-        self.show_directory(path, true);
-    }
-
-    /// View `path`, listing it and moving the scan there when it is not in
-    /// the current tree. `record` pushes the current place onto the history.
-    fn show_directory(&mut self, path: PathBuf, record: bool) {
-        let loaded = self.tree.as_ref().is_some_and(|tree| {
-            Self::find_node_at_path(&tree.root, &path, &tree.root_path)
-                .is_some_and(|node| node.is_dir())
-        });
-        // A descendant can be absent from a quick/partial tree even when its
-        // path is under the scan root. Prepare a usable listing in that case.
-        let replacement = if loaded {
-            None
-        } else {
-            let Some(tree) = self.load_directory_listing(&path) else {
-                return;
-            };
-            Some(tree)
-        };
-        let destination = replacement
-            .as_ref()
-            .map_or_else(|| path.clone(), |tree| tree.root_path.clone());
-        if loaded && destination == self.nav.view_root {
-            return;
-        }
-        if record {
-            self.record_navigation_origin();
-        }
-        self.nav.view_root = destination;
-        self.nav.tree_state.selected = 0;
-        self.nav.tree_state.offset = 0;
-        self.nav.miller_state.reset();
-        if let Some(tree) = replacement {
-            self.cancel_scan();
-            self.path = tree.root_path.clone();
-            self.install_tree(tree);
-            self.nav.tree_state = TreeState::new(self.path.clone());
-            self.duplicates = None;
-            self.age_report = None;
-            self.has_full_scan = false;
-            if self.scan_on_startup {
-                self.start_scan();
-            }
-        }
-        self.nav.tree_state.expand(&self.nav.view_root);
-        self.update_cached_tree_len();
-        self.update_cached_miller_len();
+        self.go_to(path);
     }
 
     /// Handle input in the bookmark list modal.
@@ -4824,14 +3914,14 @@ impl App {
                             let new_selected = self.nav.tree_state.offset + relative_y;
                             if new_selected < self.cached_tree_len {
                                 self.nav.tree_state.selected = new_selected;
-                                self.drill_into_selected();
+                                self.enter_selected();
                             }
                         }
                         LayoutMode::Miller => {
                             let new_selected = self.nav.miller_state.offset + relative_y;
                             if new_selected < self.cached_miller_len {
                                 self.nav.miller_state.selected = new_selected;
-                                self.drill_into_miller_selected();
+                                self.enter_selected();
                             }
                         }
                     }
@@ -4891,27 +3981,6 @@ impl App {
     fn reverse_sort_mode(&mut self) {
         self.sort_mode = self.sort_mode.reverse();
         self.apply_sort();
-    }
-
-    /// Bring everything derived from the view up to date after another tab
-    /// became active. A tab whose directory has since been removed moves to
-    /// its nearest surviving ancestor; one outside the current scan has its
-    /// directory listed and scanned, as going there would.
-    fn after_tab_switch(&mut self) {
-        let outside_scan = self
-            .tree
-            .as_ref()
-            .is_some_and(|tree| !self.nav.view_root.starts_with(&tree.root_path));
-        if outside_scan {
-            self.show_directory(self.nav.view_root.clone(), false);
-        } else {
-            self.leave_vanished_view();
-        }
-        self.update_cached_tree_len();
-        self.update_cached_miller_len();
-        self.update_cached_treemap_len();
-        self.update_cached_parent();
-        self.update_preview();
     }
 
     /// Start fuzzy search mode.
@@ -5036,77 +4105,6 @@ impl App {
                 self.search_state.insert_char(c);
             }
             _ => {}
-        }
-    }
-
-    /// Navigate to a search result path.
-    fn navigate_to_search_result(&mut self, target: &Path) {
-        // If it's a directory, drill into it
-        // If it's a file, navigate to its parent and select it
-        if target.is_dir() {
-            // Save current state
-            self.record_navigation_origin();
-
-            // Navigate to directory
-            self.nav.view_root = target.to_path_buf();
-            self.nav.tree_state.selected = 0;
-            self.nav.tree_state.offset = 0;
-            self.nav.tree_state.expand(&self.nav.view_root);
-            self.nav.miller_state.reset();
-
-            match self.layout_mode {
-                LayoutMode::Tree => self.update_cached_tree_len(),
-                LayoutMode::Miller => self.update_cached_miller_len(),
-            }
-        } else {
-            // It's a file - navigate to parent and select it
-            if let Some(parent) = target.parent() {
-                // Save current state
-                self.record_navigation_origin();
-
-                // Navigate to parent
-                self.nav.view_root = parent.to_path_buf();
-                self.nav.tree_state.expand(&self.nav.view_root);
-
-                // Get file name before borrowing for position search
-                let file_name = target.file_name().map(|s| s.to_os_string());
-                match self.layout_mode {
-                    LayoutMode::Tree => {
-                        // For tree view, we need to find the index in flattened list
-                        self.nav.tree_state.selected = 0;
-                        self.update_cached_tree_len();
-
-                        // Find position in flattened tree
-                        if let Some((node, _)) = self.get_view_root_node() {
-                            let items = TreeView::new(
-                                node,
-                                &self.nav.view_root,
-                                &self.theme,
-                                &self.marked,
-                                &self.clipboard,
-                            )
-                            .flatten(&self.nav.tree_state);
-                            if let Some(pos) = items.iter().position(|i| i.path == target) {
-                                self.nav.tree_state.selected = pos;
-                            }
-                        }
-                    }
-                    LayoutMode::Miller => {
-                        // Find the index of the file in the parent's children
-                        if let (Some(file_name), Some((node, _))) =
-                            (&file_name, self.get_view_root_node())
-                        {
-                            let idx = node
-                                .children
-                                .iter()
-                                .position(|c| c.file_name() == file_name)
-                                .unwrap_or(0);
-                            self.nav.miller_state.selected = idx;
-                        }
-                        self.update_cached_miller_len();
-                    }
-                }
-            }
         }
     }
 
@@ -5430,7 +4428,7 @@ mod tests {
                     .file_name(),
                 name
             );
-            app.select_child_by_name(&path);
+            app.select_entry(Some(&path));
             assert_eq!(app.nav.miller_state.selected, index);
         }
         let displayed = text(&render(&app, Rect::new(0, 0, 200, 30)));
@@ -5779,8 +4777,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn back_reloads_replaced_tree_and_retains_unavailable_history() {
+    #[tokio::test]
+    async fn back_reloads_replaced_tree_and_retains_unavailable_history() {
         for layout in [LayoutMode::Tree, LayoutMode::Miller] {
             let fixture = tempfile::tempdir().unwrap();
             let origin = fixture.path().join("origin");
@@ -5800,7 +4798,7 @@ mod tests {
             app.jump_to_bookmark('d');
             let current = app.nav.view_root.clone();
             let token = app.scan_token.clone();
-            app.navigate_back();
+            app.go_back();
             assert!(token.is_cancelled());
             assert_eq!(app.nav.view_root, origin);
             assert_eq!(app.tree.as_ref().unwrap().root_path, origin);
@@ -5813,13 +4811,13 @@ mod tests {
                     .any(|node| &*node.name == "original-file")
             );
             assert!(app.nav.back.is_empty());
-            assert_eq!(app.nav.forward.last().unwrap().0, current);
+            assert_eq!(app.nav.forward.last().unwrap().dir, current);
             app.jump_to_bookmark('d');
             let before = Arc::clone(app.tree.as_ref().unwrap());
             let history = app.nav.back.clone();
             let forward = app.nav.forward.clone();
             std::fs::rename(&origin, fixture.path().join("moved-origin")).unwrap();
-            app.navigate_back();
+            app.go_back();
             assert_eq!(app.nav.view_root, current);
             assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &before));
             assert_eq!(app.nav.back, history);
@@ -6586,7 +5584,7 @@ mod tests {
             app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
             app.scan_rx = None;
             app.layout_mode = LayoutMode::Miller;
-            app.select_child_by_name(&archive);
+            app.select_entry(Some(&archive));
             assert_eq!(app.get_selected_path(), Some(archive.clone()));
             app.marked.insert(archive.clone());
             app.extract_archive(Some("extracted".into()));
@@ -7063,10 +6061,10 @@ mod tests {
 
         let src_index = tree_row(&app, "src");
         app.nav.tree_state.selected = src_index;
-        app.drill_into_selected();
+        app.enter_selected();
         assert_eq!(app.nav.view_root, original_root.join("src"));
 
-        app.navigate_back();
+        app.go_back();
         assert_eq!(app.nav.view_root, original_root);
         assert_eq!(
             app.nav.tree_state.selected, src_index,
@@ -7088,10 +6086,10 @@ mod tests {
             .expect("src is a child");
         app.nav.miller_state.selected = src_index;
 
-        app.drill_into_miller_selected();
+        app.enter_selected();
         assert_eq!(app.nav.view_root, original_root.join("src"));
 
-        app.navigate_back();
+        app.go_back();
         assert_eq!(app.nav.view_root, original_root);
         assert_eq!(app.nav.miller_state.selected, src_index);
     }
@@ -7103,7 +6101,7 @@ mod tests {
         let root = app.nav.view_root.clone();
 
         app.nav.tree_state.selected = tree_row(&app, "empty");
-        app.drill_into_selected();
+        app.enter_selected();
         assert_eq!(
             app.nav.view_root, root,
             "a file is not a directory to enter"
@@ -7120,7 +6118,7 @@ mod tests {
             .expect("the temp dir has a parent")
             .to_path_buf();
 
-        app.navigate_back();
+        app.go_back();
         assert_eq!(app.nav.view_root, parent);
     }
 
@@ -7506,11 +6504,11 @@ mod tests {
         let selected_before = app.get_selected_path();
         assert!(selected_before.is_some());
 
-        app.sync_layout_selection();
+        app.toggle_layout();
         assert_eq!(app.layout_mode, LayoutMode::Miller);
         assert_eq!(app.get_selected_path(), selected_before);
 
-        app.sync_layout_selection();
+        app.toggle_layout();
         assert_eq!(app.layout_mode, LayoutMode::Tree);
         assert_eq!(app.get_selected_path(), selected_before);
     }
@@ -7880,10 +6878,13 @@ mod tests {
                 app.layout_mode = layout;
                 app.nav.tree_state.selected = 1;
                 app.nav.miller_state.selected = 2;
-                let expected_cursor = if layout == LayoutMode::Tree { 1 } else { 2 };
-                app.nav
-                    .forward
-                    .push((root.join("obsolete"), 0, HashSet::new()));
+                let expected_cursor = app.get_selected_path();
+                assert!(expected_cursor.is_some());
+                app.nav.forward.push(state::Visit {
+                    dir: root.join("obsolete"),
+                    selected: None,
+                    expanded: HashSet::new(),
+                });
                 let destination = if action == "search-file" {
                     root.join("src/nested")
                 } else {
@@ -7903,8 +6904,8 @@ mod tests {
                 assert_eq!(app.nav.view_root, destination, "{action}");
                 assert!(app.nav.forward.is_empty(), "{action}");
                 let origin = app.nav.back.last().unwrap();
-                assert_eq!(origin.0, root, "{action}");
-                assert_eq!(origin.1, expected_cursor, "{action}");
+                assert_eq!(origin.dir, root, "{action}");
+                assert_eq!(origin.selected, expected_cursor, "{action}");
                 if action == "cd" && layout == LayoutMode::Miller {
                     assert_eq!(app.nav.miller_state.selected, 0);
                     assert_eq!(app.cached_miller_len, 2);

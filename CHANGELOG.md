@@ -97,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Switching tabs used to reset the selection, and every tab shared one
   history, so Backspace could jump to a place visited in another tab. A tab
   whose directory was deleted from another tab opens on what remains.
+- Going back selects the entry you left, even after re-sorting, a refresh or
+  switching between the tree and Miller layouts; it used to restore a row
+  number, which could land on a different entry. Backspace now goes back in
+  the treemap too, and the Miller preview and parent column follow every way
+  of moving (`:cd`, going to the root, create-and-enter), not just some.
 - The `default_layout` setting was ignored at startup.
 - Directory sizes in the tree were shifted out of their column.
 - Double-click enters a directory, as the help says.
