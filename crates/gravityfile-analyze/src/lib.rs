@@ -13,15 +13,17 @@
 //! 2. Compute partial hash (first + last 4KB) for size-matched files
 //! 3. Compute full BLAKE3 hash for partial-hash matches
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use gravityfile_analyze::{DuplicateFinder, DuplicateConfig};
-//! use gravityfile_scan::{JwalkScanner, ScanConfig};
+//! use gravityfile_scan::JwalkScanner;
+//! use gravityfile_core::ScanConfig;
+//! use tokio_util::sync::CancellationToken;
 //!
 //! let scan_config = ScanConfig::new("/path/to/scan");
-//! let tree = JwalkScanner::new().scan(&scan_config).unwrap();
+//! let tree = JwalkScanner::new().scan(&scan_config, CancellationToken::new()).unwrap();
 //!
 //! let finder = DuplicateFinder::new();
-//! let report = finder.find_duplicates(&tree);
+//! let report = finder.find_duplicates(&tree, CancellationToken::new());
 //!
 //! println!("Found {} duplicate groups", report.group_count);
 //! println!("Wasted space: {} bytes", report.total_wasted_space);
@@ -31,15 +33,17 @@
 //!
 //! Categorizes files into age buckets and identifies stale directories:
 //!
-//! ```rust,ignore
+//! ```no_run
 //! use gravityfile_analyze::{AgeAnalyzer, format_age};
-//! use gravityfile_scan::{JwalkScanner, ScanConfig};
+//! use gravityfile_scan::JwalkScanner;
+//! use gravityfile_core::ScanConfig;
+//! use tokio_util::sync::CancellationToken;
 //!
 //! let scan_config = ScanConfig::new("/path/to/scan");
-//! let tree = JwalkScanner::new().scan(&scan_config).unwrap();
+//! let tree = JwalkScanner::new().scan(&scan_config, CancellationToken::new()).unwrap();
 //!
 //! let analyzer = AgeAnalyzer::new();
-//! let report = analyzer.analyze(&tree);
+//! let report = analyzer.analyze(&tree, CancellationToken::new());
 //!
 //! for bucket in &report.buckets {
 //!     println!("{}: {} files", bucket.name, bucket.file_count);
@@ -52,12 +56,17 @@
 
 pub mod age;
 mod duplicates;
+mod status;
+
+pub use status::{AnalysisIssue, AnalysisState, AnalysisStatus};
 
 pub use age::{
-    AgeAnalyzer, AgeBucket, AgeBucketStats, AgeConfig, AgeReport, StaleDirectory, format_age,
+    AgeAnalyzer, AgeBucket, AgeBucketStats, AgeConfig, AgeReport, StaleDirectory,
+    StaleDirectoryStatus, format_age,
 };
 pub use duplicates::{
-    DuplicateConfig, DuplicateFinder, DuplicateGroup, DuplicateReport, HashProgress,
+    DuplicateConfig, DuplicateFinder, DuplicateGroup, DuplicateReport, DuplicateTimings,
+    HashProgress,
 };
 
 // Re-export core types

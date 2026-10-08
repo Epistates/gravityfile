@@ -2,9 +2,30 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+
+/// Reported completion evidence for an incomplete undo attempt. Counts do not
+/// identify which individual paths succeeded, and errors may describe partial work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoAttempt {
+    /// Time the caller received completion, not a filesystem commit timestamp.
+    pub observed_at: SystemTime,
+    /// Whether cancellation was reported.
+    pub cancelled: bool,
+    /// Reported successful item count.
+    pub succeeded: usize,
+    /// Reported failed item count.
+    pub failed: usize,
+    /// Reported skipped item count.
+    pub skipped: usize,
+    /// Reported bytes processed.
+    pub bytes_processed: u64,
+    /// Original path-specific diagnostics.
+    pub errors: Vec<crate::OperationError>,
+}
 
 /// An entry in the undo log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +38,12 @@ pub struct UndoEntry {
     pub operation: UndoableOperation,
     /// Human-readable description.
     pub description: String,
+    /// An incomplete undo needs manual review and must not be replayed.
+    #[serde(default)]
+    pub review_required: bool,
+    /// Completion evidence, or None if no completion was observed.
+    #[serde(default)]
+    pub last_attempt: Option<UndoAttempt>,
 }
 
 impl UndoEntry {
@@ -27,6 +54,8 @@ impl UndoEntry {
             timestamp: SystemTime::now(),
             operation,
             description: description.into(),
+            review_required: false,
+            last_attempt: None,
         }
     }
 }
@@ -72,6 +101,18 @@ pub enum UndoableOperation {
 }
 
 impl UndoableOperation {
+    /// Number of original top-level items represented by this record.
+    pub fn item_count(&self) -> usize {
+        match self {
+            Self::FilesMoved { moves } => moves.len(),
+            Self::FilesCopied { created } => created.len(),
+            Self::FilesDeleted { paths } => paths.len(),
+            Self::FileRenamed { .. } | Self::FileCreated { .. } | Self::DirectoryCreated { .. } => {
+                1
+            }
+        }
+    }
+
     /// Get a description of how to undo this operation.
     pub fn undo_description(&self) -> String {
         match self {
@@ -79,7 +120,7 @@ impl UndoableOperation {
                 format!("Move {} items back to original location", moves.len())
             }
             Self::FilesCopied { created } => {
-                format!("Delete {} copied items", created.len())
+                format!("Retain {} copied items in recovery journals", created.len())
             }
             Self::FilesDeleted { paths } => {
                 format!("Deleted {} items (recover via OS trash)", paths.len())
@@ -93,8 +134,10 @@ impl UndoableOperation {
                         .unwrap_or_default()
                 )
             }
-            Self::FileCreated { .. } => "Delete the created file".to_string(),
-            Self::DirectoryCreated { .. } => "Delete the created directory".to_string(),
+            Self::FileCreated { .. } => "Delete the created file if still empty".to_string(),
+            Self::DirectoryCreated { .. } => {
+                "Delete the created directory if still empty".to_string()
+            }
         }
     }
 
@@ -107,7 +150,7 @@ impl UndoableOperation {
 /// Undo log with configurable maximum depth.
 #[derive(Debug)]
 pub struct UndoLog {
-    entries: VecDeque<UndoEntry>,
+    entries: VecDeque<Arc<UndoEntry>>,
     max_entries: usize,
     next_id: u64,
 }
@@ -120,6 +163,8 @@ impl Default for UndoLog {
 
 impl UndoLog {
     /// Create a new undo log with the specified maximum entries.
+    /// A zero limit disables retention. The limit counts operations, not paths
+    /// within an operation or their memory usage.
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: VecDeque::with_capacity(max_entries.min(1000)),
@@ -135,13 +180,17 @@ impl UndoLog {
         let id = self.next_id;
         self.next_id += 1;
 
+        if self.max_entries == 0 {
+            return id;
+        }
+
         // Remove oldest entry if at capacity
         if self.entries.len() >= self.max_entries {
             self.entries.pop_front();
         }
 
         self.entries
-            .push_back(UndoEntry::new(id, operation, description));
+            .push_back(Arc::new(UndoEntry::new(id, operation, description)));
 
         id
     }
@@ -221,20 +270,34 @@ impl UndoLog {
 
     /// Pop the most recent undoable entry.
     ///
-    /// Returns `None` if the log is empty or the back entry cannot be undone.
+    /// Returns `None` if empty, review is required, or the back entry cannot be undone.
     /// Does NOT drain through non-undoable entries — only examines the back.
     pub fn pop(&mut self) -> Option<UndoEntry> {
         // HIGH-4: only look at the back entry; don't consume non-undoable ones
-        if self.entries.back()?.operation.can_undo() {
-            self.entries.pop_back()
+        if !self.entries.back()?.review_required && self.entries.back()?.operation.can_undo() {
+            self.entries.pop_back().map(Arc::unwrap_or_clone)
         } else {
             None
         }
     }
 
+    /// Retain the original record after an incomplete undo, without permitting
+    /// a blind replay of items that may already have completed. Retention uses
+    /// the same operation-count limit as ordinary history; it is not durable.
+    pub fn retain_for_review(&mut self, mut entry: UndoEntry) {
+        entry.review_required = true;
+        if self.max_entries == 0 {
+            return;
+        }
+        if self.entries.len() >= self.max_entries {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(Arc::new(entry));
+    }
+
     /// Peek at the most recent entry without removing it.
     pub fn peek(&self) -> Option<&UndoEntry> {
-        self.entries.back()
+        self.entries.back().map(AsRef::as_ref)
     }
 
     /// Get the number of entries in the log.
@@ -252,15 +315,96 @@ impl UndoLog {
         self.entries.clear();
     }
 
+    /// Share immutable incomplete records without cloning path vectors. The
+    /// snapshot remains valid if the live history changes.
+    pub fn review_snapshot(&self) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| entry.review_required)
+                .cloned()
+                .collect(),
+            max_entries: self.max_entries,
+            next_id: self.next_id,
+        }
+    }
+
+    /// Stream a versioned review-only JSON document for incomplete attempts.
+    /// Native path bytes/code units are authoritative; display strings may be
+    /// lossy. This is not an import/replay format. Errors can leave partial output;
+    /// callers publishing files must stage and atomically publish them separately.
+    pub fn write_review_json(&self, writer: impl std::io::Write) -> Result<(), serde_json::Error> {
+        crate::undo_review::write(self, writer)
+    }
+
+    /// Export review-only JSON through private same-directory staging, syncing
+    /// file contents before atomic no-replace publication. Existing destinations
+    /// are preserved. Parent-directory durability and concurrent ancestor
+    /// replacement protection are not provided. This synchronous API should run
+    /// on a worker when called from an interactive application.
+    pub fn export_review_json(&self, destination: &std::path::Path) -> std::io::Result<()> {
+        crate::undo_review::export(self, destination)
+    }
+
     /// Get an iterator over all entries (oldest first).
     pub fn iter(&self) -> impl Iterator<Item = &UndoEntry> {
-        self.entries.iter()
+        self.entries.iter().map(AsRef::as_ref)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_snapshot_shares_records_and_survives_live_history_changes() {
+        let mut log = UndoLog::new(2);
+        log.record_create_file("ordinary".into());
+        log.retain_for_review(UndoEntry::new(
+            9,
+            UndoableOperation::FilesCopied {
+                created: vec!["retained".into()],
+            },
+            "review",
+        ));
+        let snapshot = log.review_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(std::ptr::eq(log.peek().unwrap(), snapshot.peek().unwrap()));
+        log.clear();
+        log.record_create_file("new".into());
+        assert_eq!(snapshot.peek().unwrap().id, 9);
+        assert!(snapshot.peek().unwrap().review_required);
+        assert!(!log.peek().unwrap().review_required);
+    }
+
+    #[test]
+    fn retention_limit_holds_across_record_pop_and_clear() {
+        for limit in 0..=3 {
+            let mut log = UndoLog::new(limit);
+            for id in 0..10 {
+                assert_eq!(
+                    log.record_create_file(PathBuf::from(format!("file-{id}"))),
+                    id
+                );
+                assert_eq!(log.len(), limit.min(id as usize + 1));
+                assert!(log.len() <= limit);
+            }
+            let retained: Vec<_> = log.iter().map(|entry| entry.id).collect();
+            assert_eq!(retained, ((10 - limit as u64)..10).collect::<Vec<_>>());
+            for expected in retained.into_iter().rev() {
+                assert_eq!(log.pop().unwrap().id, expected);
+            }
+            assert!(log.pop().is_none());
+            assert!(log.peek().is_none());
+            log.record_create_directory(PathBuf::from("directory"));
+            log.clear();
+            assert!(log.is_empty());
+            assert_eq!(log.record_delete(vec![PathBuf::from("deleted")]), 11);
+            assert_eq!(log.len(), limit.min(1));
+            assert!(log.pop().is_none());
+        }
+    }
 
     #[test]
     fn test_undo_log_record() {

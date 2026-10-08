@@ -38,7 +38,7 @@ pub enum Permission {
 }
 
 /// Configuration for plugin sandboxing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// Paths the plugin is allowed to read from.
     pub allowed_read_paths: Vec<PathBuf>,

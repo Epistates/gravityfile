@@ -1,0 +1,91 @@
+{
+  "baseline": {
+    "distinct_contents": 256,
+    "file_bytes": 256,
+    "files": 100000,
+    "files_per_directory": 1000,
+    "fixture_removed": true,
+    "method": "one scan followed by three analyses; warm-cache possible; fixture setup, report serialization and cleanup excluded; no RSS measurement",
+    "samples": [
+      {
+        "collection_seconds": 0.2459455,
+        "elapsed_seconds": 2.529316667,
+        "finalization_seconds": 0.006729875,
+        "grouping_seconds": 0.00168825,
+        "hashing_seconds": 2.274951792,
+        "run": 0
+      },
+      {
+        "collection_seconds": 0.244592542,
+        "elapsed_seconds": 2.631610958,
+        "finalization_seconds": 0.005612416,
+        "grouping_seconds": 0.001750083,
+        "hashing_seconds": 2.379655375,
+        "run": 1
+      },
+      {
+        "collection_seconds": 0.239014083,
+        "elapsed_seconds": 2.617950167,
+        "finalization_seconds": 0.006114459,
+        "grouping_seconds": 0.001497042,
+        "hashing_seconds": 2.3713233750000002,
+        "run": 2
+      }
+    ],
+    "scan_seconds": 0.327957708,
+    "test_binary_sha256": "6ab937e06943baac4d3f2dc5bb661e9c68447af538e230a272adfcc7c497fa8f",
+    "medians": {
+      "elapsed_seconds": 2.617950167,
+      "hashing_seconds": 2.3713233750000002,
+      "collection_seconds": 0.244592542,
+      "grouping_seconds": 0.00168825,
+      "finalization_seconds": 0.006114459
+    }
+  },
+  "after": {
+    "distinct_contents": 256,
+    "file_bytes": 256,
+    "files": 100000,
+    "files_per_directory": 1000,
+    "fixture_removed": true,
+    "method": "one scan followed by three analyses; warm-cache possible; fixture setup, report serialization and cleanup excluded; no RSS measurement",
+    "samples": [
+      {
+        "collection_seconds": 0.26931025,
+        "elapsed_seconds": 2.557561125,
+        "finalization_seconds": 0.005649125,
+        "grouping_seconds": 0.001640375,
+        "hashing_seconds": 2.280960167,
+        "run": 0
+      },
+      {
+        "collection_seconds": 0.235118875,
+        "elapsed_seconds": 2.490619875,
+        "finalization_seconds": 0.005943583,
+        "grouping_seconds": 0.001592625,
+        "hashing_seconds": 2.247963167,
+        "run": 1
+      },
+      {
+        "collection_seconds": 0.2500745,
+        "elapsed_seconds": 2.4927414580000002,
+        "finalization_seconds": 0.005716,
+        "grouping_seconds": 0.001477417,
+        "hashing_seconds": 2.235471875,
+        "run": 2
+      }
+    ],
+    "scan_seconds": 0.308239833,
+    "test_binary_sha256": "99b67164805acaef47f2d72eea5332aa8b027fb8b17e965c27752c0cd12c695b",
+    "medians": {
+      "elapsed_seconds": 2.4927414580000002,
+      "hashing_seconds": 2.247963167,
+      "collection_seconds": 0.2500745,
+      "grouping_seconds": 0.001592625,
+      "finalization_seconds": 0.005716
+    }
+  },
+  "source_before": "53f0aa64d7f2b8441a50f1201744d54e92a6c80117d7dc5d7100726919c02c3f",
+  "source_after": "16fe8e0e429fd8a5ac5a72ed375cddd3e80c73cea8966ebaf302090cc8260c52",
+  "method": "Sequential baseline then changed binary; separate equivalent 100K fixtures, three samples each, shared macOS host and warm caches; no RSS measurement."
+}

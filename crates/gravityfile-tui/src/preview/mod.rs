@@ -4,9 +4,12 @@
 //! hex views for binary files, and directory listings.
 
 mod content;
+mod image;
 mod syntax;
 
-pub use content::{PreviewContent, PreviewMode, PreviewState};
+pub use content::{ImageContext, PreviewContent, PreviewMode, PreviewState};
+#[allow(unused_imports)]
+pub use image::{ImageProtocol, is_image_path};
 
 // Re-export for potential future use
 #[allow(unused_imports)]

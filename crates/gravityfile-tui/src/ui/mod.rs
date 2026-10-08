@@ -14,31 +14,52 @@ pub use tree::{TreeState, TreeView, VisibleNodeKind};
 pub use treemap::{TreemapState, TreemapView};
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+#[cfg(test)]
+mod terminal_text_tests {
+    use super::*;
+
+    #[test]
+    fn fitting_escapes_untrusted_text_before_measuring_both_edges() {
+        let name = "résumé\n\u{1b}]52;\u{202e}txt";
+        let escaped = gravityfile_core::escape_terminal_text(name);
+        assert_eq!(fit_to_width(name, 100), escaped);
+        assert_eq!(fit_left_to_width(name, 100), escaped);
+        for width in 0..100 {
+            for fitted in [fit_to_width(name, width), fit_left_to_width(name, width)] {
+                assert!(fitted.width() <= width);
+                assert_eq!(gravityfile_core::escape_terminal_text(&fitted), fitted);
+            }
+        }
+        assert_eq!(name, "résumé\n\u{1b}]52;\u{202e}txt");
+    }
+}
 
 /// Truncate a string to at most `max_width` display columns, respecting
-/// char boundaries and Unicode widths. Returns a byte-valid substring.
+/// grapheme boundaries and Unicode widths. Returns a byte-valid substring.
 pub fn truncate_to_width(s: &str, max_width: usize) -> &str {
     let mut byte_pos = 0;
     let mut col_count = 0;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(1);
+    for grapheme in s.graphemes(true) {
+        let w = grapheme.width();
         if col_count + w > max_width {
             break;
         }
         col_count += w;
-        byte_pos += ch.len_utf8();
+        byte_pos += grapheme.len();
     }
     &s[..byte_pos]
 }
 
-/// Keep the rightmost `max_width` display columns of `s`, respecting char
+/// Keep the rightmost `max_width` display columns of `s`, respecting grapheme
 /// boundaries and Unicode widths. Returns a byte-valid suffix.
 pub fn truncate_left_to_width(s: &str, max_width: usize) -> &str {
     let mut col_count = 0;
     let mut start = s.len();
-    for (idx, ch) in s.char_indices().rev() {
-        let w = ch.width().unwrap_or(1);
+    for (idx, grapheme) in s.grapheme_indices(true).rev() {
+        let w = grapheme.width();
         if col_count + w > max_width {
             break;
         }
@@ -49,8 +70,11 @@ pub fn truncate_left_to_width(s: &str, max_width: usize) -> &str {
 }
 
 /// Fit `text` into `max_width` columns, appending a trailing `…` if truncated.
-/// Always Unicode-width and char-boundary safe.
+/// Always Unicode-width and grapheme-boundary safe.
+/// Terminal controls and directional formatting are escaped before measuring.
 pub fn fit_to_width(text: &str, max_width: usize) -> String {
+    let escaped = gravityfile_core::escape_terminal_text(text);
+    let text = escaped.as_ref();
     if max_width == 0 {
         String::new()
     } else if text.width() > max_width {
@@ -61,8 +85,11 @@ pub fn fit_to_width(text: &str, max_width: usize) -> String {
 }
 
 /// Fit `text` into `max_width` columns by dropping from the left, prepending a
-/// leading `…` if truncated. Always Unicode-width and char-boundary safe.
+/// leading `…` if truncated. Always Unicode-width and grapheme-boundary safe.
+/// Terminal controls and directional formatting are escaped before measuring.
 pub fn fit_left_to_width(text: &str, max_width: usize) -> String {
+    let escaped = gravityfile_core::escape_terminal_text(text);
+    let text = escaped.as_ref();
     if max_width == 0 {
         String::new()
     } else if text.width() > max_width {
@@ -73,6 +100,33 @@ pub fn fit_left_to_width(text: &str, max_width: usize) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Visible prefix, cursor grapheme, and suffix within a terminal-column budget.
+/// Clamp external byte cursors to a preceding grapheme boundary.
+pub(crate) fn visible_input_parts(text: &str, cursor: usize, width: usize) -> (&str, &str, &str) {
+    let cursor = text
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .take_while(|&index| index <= cursor)
+        .last()
+        .unwrap_or(0);
+    let current = text[cursor..].graphemes(true).next();
+    let cursor_text = current.unwrap_or(" ");
+    let cursor_text = if cursor_text.width() <= width {
+        cursor_text
+    } else if width > 0 {
+        " "
+    } else {
+        ""
+    };
+    let before = truncate_left_to_width(&text[..cursor], width.saturating_sub(cursor_text.width()));
+    let after = truncate_to_width(
+        &text[cursor + current.map_or(0, str::len)..],
+        width.saturating_sub(before.width() + cursor_text.width()),
+    );
+    (before, cursor_text, after)
 }
 
 /// Layout areas for the application.

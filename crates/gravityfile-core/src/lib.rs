@@ -41,9 +41,12 @@
 mod config;
 mod error;
 mod node;
+pub mod path_serde;
+mod terminal;
 mod tree;
 
 pub use config::{ScanConfig, ScanConfigBuilder};
 pub use error::{ScanError, ScanWarning, WarningKind};
 pub use node::{ContentHash, FileNode, GitStatus, InodeInfo, NodeId, NodeKind, Timestamps};
+pub use terminal::{escape_filename, escape_terminal_text};
 pub use tree::{FileTree, TreeStats};

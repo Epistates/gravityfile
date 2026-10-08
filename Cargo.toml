@@ -3,8 +3,9 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/gravityfile"
 keywords = ["disk", "usage", "analyzer", "tui", "cli"]
@@ -16,19 +17,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 color-eyre = "0.6"
-compact_str = { version = "0.9", features = ["serde"] }
+compact_str = { version = "0.10", features = ["serde"] }
 
 # Scanning
-jwalk = "0.8"
+jwalk = "0.9"
 rayon = "1.12"
-dashmap = "6"
 
 # Hashing
-blake3 = { version = "1", features = ["rayon", "mmap"] }
+blake3 = { version = "1", features = ["rayon"] }
 
 # Async (minimal features for smaller binary)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["full"] }
 
 # TUI
@@ -42,17 +41,18 @@ clap = { version = "4", features = ["derive"] }
 humansize = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 strum = { version = "0.28", features = ["derive"] }
-itertools = "0.14"
 derive_builder = "0.20"
 tempfile = "3"
+libc = "0.2"
+filetime = "0.2"
 
 # Internal crates
-gravityfile-core = { version = "0.3.0", path = "crates/gravityfile-core" }
-gravityfile-scan = { version = "0.3.0", path = "crates/gravityfile-scan" }
-gravityfile-analyze = { version = "0.3.0", path = "crates/gravityfile-analyze" }
-gravityfile-ops = { version = "0.3.0", path = "crates/gravityfile-ops" }
-gravityfile-plugin = { version = "0.3.0", path = "crates/gravityfile-plugin" }
-gravityfile-tui = { version = "0.3.0", path = "crates/gravityfile-tui" }
+gravityfile-core = { version = "0.3.1", path = "crates/gravityfile-core" }
+gravityfile-scan = { version = "0.3.1", path = "crates/gravityfile-scan" }
+gravityfile-analyze = { version = "0.3.1", path = "crates/gravityfile-analyze" }
+gravityfile-ops = { version = "0.3.1", path = "crates/gravityfile-ops" }
+gravityfile-plugin = { version = "0.3.1", path = "crates/gravityfile-plugin" }
+gravityfile-tui = { version = "0.3.1", path = "crates/gravityfile-tui" }
 
 # Logging
 tracing = "0.1"
@@ -65,7 +65,6 @@ indexmap = "2"
 globset = "0.4"
 
 # File operations
-fs_extra = "1.3"
 trash = "5"
 
 # Archive support
@@ -76,22 +75,25 @@ xz2 = "0.1"
 bzip2 = "0.6"
 
 # Git integration
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21", default-features = false }
 
 [package]
 name = "gravityfile"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "A state-of-the-art file system analyzer with TUI"
 autobins = false
+# Internal working notes and planning material are not part of the package.
+exclude = ["AUDIT_FIXES.md", ".strategy/", ".claude/", ".codex/", ".agents/", "scripts/"]
 
 [[bin]]
 name = "grav"
-path = "src/main.rs"
+path = "src/grav.rs"
 
 [[bin]]
 name = "gravityfile"
@@ -101,15 +103,23 @@ path = "src/main.rs"
 gravityfile-core.workspace = true
 gravityfile-scan.workspace = true
 gravityfile-analyze.workspace = true
+gravityfile-ops.workspace = true
+gravityfile-plugin.workspace = true
 gravityfile-tui.workspace = true
 clap.workspace = true
 color-eyre.workspace = true
-tokio.workspace = true
 tokio-util = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 humansize.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+getrandom = "0.4"
 
 [profile.release]
 lto = true

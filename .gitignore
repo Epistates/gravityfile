@@ -1,3 +1,9 @@
 /target
 .strategy
 .DS_Store
+# Local tooling state and generated artifacts
+.claude/
+__pycache__/
+*.pyc
+/docs/qualification/
+/ci-qualification/

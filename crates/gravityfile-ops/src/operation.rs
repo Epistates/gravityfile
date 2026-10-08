@@ -78,14 +78,34 @@ pub struct OperationError {
     pub path: PathBuf,
     /// A human-readable error message.
     pub message: String,
+    /// Number of diagnostics represented by an omission record; zero for a
+    /// normal path-specific diagnostic. Omission records have no associated path.
+    #[serde(default)]
+    pub omitted_count: usize,
 }
 
 impl OperationError {
+    /// Number of reported diagnostics represented by this record.
+    pub fn represented_count(&self) -> usize {
+        self.omitted_count.max(1)
+    }
+
+    pub(crate) fn omitted(count: usize) -> Self {
+        Self {
+            path: PathBuf::new(),
+            message: format!(
+                "{count} additional operation diagnostics omitted from retained detail"
+            ),
+            omitted_count: count,
+        }
+    }
+
     /// Create a new operation error.
     pub fn new(path: PathBuf, message: impl Into<String>) -> Self {
         Self {
             path,
             message: message.into(),
+            omitted_count: 0,
         }
     }
 }

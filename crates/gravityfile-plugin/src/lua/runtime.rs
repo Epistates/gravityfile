@@ -275,7 +275,9 @@ impl LuaRuntime {
             return f();
         }
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(timeout_ms)) else {
+            return f();
+        };
         let _ = self.lua.set_hook(
             mlua::HookTriggers::new().every_nth_instruction(100_000),
             move |_lua, _debug| {
@@ -311,7 +313,7 @@ impl PluginRuntime for LuaRuntime {
         // the filesystem API actually usable (and scoped).
         self.sandbox = SandboxConfig {
             timeout_ms: config.default_timeout_ms,
-            max_memory: config.max_memory_mb * 1024 * 1024,
+            max_memory: config.max_memory_mb.saturating_mul(1024 * 1024),
             allow_network: config.allow_network,
             allowed_read_paths: config.fs_read_roots.clone(),
             ..SandboxConfig::default()
@@ -332,7 +334,7 @@ impl PluginRuntime for LuaRuntime {
 
     fn load_plugin(&mut self, id: &str, source: &Path) -> PluginResult<PluginHandle> {
         // Read the plugin source
-        let code = std::fs::read_to_string(source)?;
+        let code = crate::runtime::read_plugin_source(source)?;
 
         // Load and execute the plugin
         let chunk = self.lua.load(&code).set_name(id);
@@ -472,8 +474,9 @@ impl PluginRuntime for LuaRuntime {
         hook: &'a Hook,
         ctx: &'a HookContext,
     ) -> BoxFuture<'a, PluginResult<HookResult>> {
-        // For now, just call sync version
-        // TODO: Implement true async with spawn_blocking
+        // The main Lua state is shared with synchronous render hooks, so calls
+        // remain serialized. `with_deadline` enforces the VM instruction/time
+        // budget even though this future resolves synchronously.
         Box::pin(async move { self.call_hook_sync(handle, hook, ctx) })
     }
 

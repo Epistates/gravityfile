@@ -1,8 +1,11 @@
 //! Main application state and logic.
 
+mod archive;
+mod bulk_edit;
 mod commands;
 mod constants;
 mod deletion;
+mod duplicate_filter;
 pub mod input;
 mod navigation;
 mod render;
@@ -14,25 +17,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::event::{EnableMouseCapture, Event};
 use crossterm::execute;
-use futures::{FutureExt, StreamExt};
 use ratatui::{DefaultTerminal, Frame};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::{FileNode, FileTree};
-use gravityfile_ops::{Conflict, CopyOptions, MoveOptions, OperationProgress, UndoLog};
+use gravityfile_ops::{ConflictRequest, CopyOptions, MoveOptions, OperationProgress, UndoLog};
 use gravityfile_scan::ScanProgress;
 
 use crate::TuiConfig;
 use crate::event::{KeyAction, MouseAction};
-use crate::preview::PreviewState;
+use crate::preview::{ImageContext, PreviewContent, PreviewLoader, PreviewMode, PreviewState};
 use crate::search::SearchState;
 use crate::theme::Theme;
 use crate::ui::{TreeState, TreeView};
 
+use self::archive::{ArchiveCancellation, ArchiveCompletion};
 use self::commands::{
     CommandAction, CommandInput, CommandKeyResult, LayoutCommand, SortCommand, ThemeCommand,
     parse_command,
@@ -41,8 +44,8 @@ use self::constants::{PAGE_SIZE, TICK_INTERVAL_MS};
 use self::input::{InputResult, InputState};
 use self::state::{
     AppMode, BookmarkListState, ClipboardMode, ClipboardState, DeletionProgress,
-    DuplicatesViewState, LayoutMode, PendingOperation, ScanResult, SelectedInfo, SettingsState,
-    SortMode, TabManager, UserSettings, View,
+    DuplicatesViewState, LayoutMode, ScanResult, SelectedInfo, SettingsState, SortMode, TabManager,
+    UserSettings, View,
 };
 
 /// Application result type.
@@ -60,12 +63,25 @@ struct LayoutSyncData {
     new_view_root: Option<PathBuf>,
 }
 
+struct PreviewLoad {
+    path: PathBuf,
+    mode: PreviewMode,
+    result: Result<PreviewContent, crate::preview::PreviewError>,
+}
+
+struct PreviewRequest {
+    path: PathBuf,
+    mode: PreviewMode,
+    image_context: Option<ImageContext>,
+}
+
 fn quick_list_with_settings(
     path: &Path,
     settings: &UserSettings,
 ) -> Result<FileTree, gravityfile_scan::ScanError> {
     let mut config = gravityfile_scan::ScanConfig::new(path);
     config.include_hidden = settings.show_hidden;
+    config.max_entries = settings.max_scan_entries;
     gravityfile_scan::quick_list(path, Some(&config))
 }
 
@@ -85,14 +101,30 @@ pub struct App {
     view: View,
     /// Color theme.
     theme: Theme,
+    /// Detected terminal graphics capabilities, queried once at startup.
+    ///
+    /// `None` when the terminal could not be queried, in which case image
+    /// files fall back to the ordinary binary preview.
+    image_picker: Option<ratatui_image::picker::Picker>,
+    /// Size of the preview pane at the last render, in character cells.
+    ///
+    /// Images are encoded to fit this, so it is captured during draw and used
+    /// by the next preview load. `Cell` because rendering takes `&self`.
+    preview_area: std::cell::Cell<ratatui::layout::Size>,
     /// Scanned file tree.
-    tree: Option<FileTree>,
+    ///
+    /// Shared rather than owned: `FileTree::clone` is a deep copy of every
+    /// node, and this tree is handed to background analysis and stashed in the
+    /// navigation cache. Mutation goes through `Arc::make_mut`, which only
+    /// copies when a background task still holds a reference.
+    tree: Option<Arc<FileTree>>,
     /// Tree view state.
     tree_state: TreeState,
     /// Cached count of visible tree items (to avoid flatten on every nav).
     cached_tree_len: usize,
     /// Duplicate analysis report.
-    duplicates: Option<DuplicateReport>,
+    duplicates: Option<Arc<DuplicateReport>>,
+    duplicate_filter: duplicate_filter::DuplicateFilter,
     /// Age analysis report.
     age_report: Option<AgeReport>,
     /// Duplicates view state (expanded groups, selected files).
@@ -107,9 +139,11 @@ pub struct App {
     marked: HashSet<PathBuf>,
     /// Clipboard state for yank/cut/paste.
     clipboard: ClipboardState,
+    active_paste_mode: ClipboardMode,
     /// Undo log for reversible operations.
     #[allow(dead_code)]
     undo_log: UndoLog,
+    pending_undo: Option<gravityfile_ops::UndoEntry>,
     /// Layout mode (tree vs miller).
     layout_mode: LayoutMode,
     /// Miller columns state.
@@ -121,9 +155,7 @@ pub struct App {
     /// Current file operation progress (copy/move).
     operation_progress: Option<OperationProgress>,
     /// Pending conflict requiring resolution.
-    pending_conflict: Option<Conflict>,
-    /// Pending operation that needs conflict resolution before proceeding.
-    pending_operation: Option<PendingOperation>,
+    pending_conflict: Option<ConflictRequest>,
     /// Last operation result message.
     operation_message: Option<(bool, String)>,
     /// Last deletion result message.
@@ -134,10 +166,14 @@ pub struct App {
     scan_progress: Option<ScanProgress>,
     /// Channel for receiving scan results.
     scan_rx: Option<mpsc::Receiver<ScanResult>>,
+    take_rx: Option<mpsc::Receiver<ScanResult>>,
     /// Token for cancelling active scan.
     scan_token: CancellationToken,
     /// Scan warnings/errors (populated in real-time during scan).
     warnings: Vec<gravityfile_core::ScanWarning>,
+    /// Latest operation diagnostics survive the automatic scan refresh.
+    operation_warnings: Vec<gravityfile_core::ScanWarning>,
+    undo_review_warnings: Vec<gravityfile_core::ScanWarning>,
     /// Selected warning index.
     selected_warning: usize,
     /// Whether analysis is running.
@@ -156,6 +192,14 @@ pub struct App {
     tab_manager: TabManager,
     /// File preview state.
     preview_state: PreviewState,
+    /// Completion channel for the latest off-thread preview load.
+    preview_rx: Option<oneshot::Receiver<PreviewLoad>>,
+    pending_preview: Option<PreviewRequest>,
+    /// Completion channel for a background archive operation.
+    archive_rx: Option<oneshot::Receiver<ArchiveCompletion>>,
+    archive_cancel: Option<ArchiveCancellation>,
+    undo_export_rx: Option<oneshot::Receiver<(PathBuf, Result<(), String>)>>,
+    pending_archive_refresh: bool,
     /// Whether to auto-scan on startup.
     scan_on_startup: bool,
     /// User settings (persistent configuration).
@@ -175,9 +219,10 @@ pub struct App {
     /// Cache of scanned directories by path.
     /// This preserves scan data when navigating to parent directories and allows
     /// restoring it when navigating back.
-    scanned_cache: Option<HashMap<PathBuf, FileTree>>,
+    scanned_cache: Option<HashMap<PathBuf, Arc<FileTree>>>,
     /// Bulk rename state for the confirmation modal.
     bulk_rename_state: Option<state::BulkRenameState>,
+    bulk_rename_edit: Option<bulk_edit::BulkRenameEdit>,
     /// Treemap view state.
     treemap_state: crate::ui::TreemapState,
     /// Cached count of treemap rectangles for navigation.
@@ -202,11 +247,42 @@ impl App {
     /// Immediately loads a quick directory listing for instant display,
     /// and optionally starts a full recursive scan based on config.
     pub fn with_config(path: PathBuf, config: TuiConfig) -> Self {
-        // Load user settings from disk
-        let user_settings = UserSettings::load();
+        Self::with_loaded_settings(path, config, UserSettings::try_load())
+    }
+
+    fn with_loaded_settings(
+        path: PathBuf,
+        config: TuiConfig,
+        loaded: std::io::Result<UserSettings>,
+    ) -> Self {
+        let (user_settings, settings_error) = match loaded {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                UserSettings {
+                    scan_on_startup: false,
+                    ..UserSettings::default()
+                },
+                Some(format!(
+                    "Cannot load settings; automatic scanning disabled unless explicitly requested: {error}"
+                )),
+            ),
+        };
 
         // Load quick tree immediately for instant display.
-        let quick_tree = quick_list_with_settings(&path, &user_settings).ok();
+        let (quick_tree, listing_error) = match quick_list_with_settings(&path, &user_settings) {
+            Ok(tree) => (Some(tree), None),
+            Err(error) => (
+                None,
+                Some(format!("Cannot list {}: {error}", path.display())),
+            ),
+        };
+
+        // The quick listing resolves relative paths and directory aliases. Use
+        // that same identity for every navigation owner; retaining the supplied
+        // spelling would make subtree lookup reject the freshly loaded tree.
+        let path = quick_tree
+            .as_ref()
+            .map_or(path, |tree| tree.root_path.clone());
 
         // Determine scan_on_startup: CLI flag (Some) overrides user settings; None defers to settings.
         let scan_on_startup = config
@@ -219,11 +295,17 @@ impl App {
         let plugin_config =
             gravityfile_plugin::PluginConfig::default().with_fs_read_roots(vec![path.clone()]);
         let mut pm_inner = gravityfile_plugin::PluginManager::new(plugin_config);
-        if let Ok(rt) = gravityfile_plugin::lua::LuaRuntime::new() {
-            let _ = pm_inner.register_runtime(Box::new(rt));
-        }
-        if let Ok(rt) = gravityfile_plugin::rhai::RhaiRuntime::new() {
-            let _ = pm_inner.register_runtime(Box::new(rt));
+        if let Some(executable) = &config.plugin_worker_executable {
+            for language in ["lua", "rhai"] {
+                match gravityfile_plugin::ProcessRuntime::new(executable.clone(), language)
+                    .and_then(|runtime| pm_inner.register_runtime(Box::new(runtime)))
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::error!(%language, %error, "Plugin worker registration failed")
+                    }
+                }
+            }
         }
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
@@ -236,32 +318,42 @@ impl App {
             mode: AppMode::default(),
             view: View::default(),
             theme: Theme::dark(),
-            tree: quick_tree,
+            image_picker: None,
+            preview_area: std::cell::Cell::new(ratatui::layout::Size::new(40, 20)),
+            tree: quick_tree.map(Arc::new),
             tree_state: TreeState::new(path.clone()),
             cached_tree_len: 0,
             duplicates: None,
+            duplicate_filter: duplicate_filter::DuplicateFilter::default(),
             age_report: None,
             duplicates_state: DuplicatesViewState::new(),
             selected_stale_dir: 0,
             show_details: true,
-            error: None,
+            error: match (settings_error, listing_error) {
+                (Some(settings), Some(listing)) => Some(format!("{settings}; {listing}")),
+                (settings, listing) => settings.or(listing),
+            },
             marked: HashSet::new(),
             clipboard: ClipboardState::default(),
+            active_paste_mode: ClipboardMode::Empty,
             undo_log: UndoLog::new(100),
+            pending_undo: None,
             layout_mode: LayoutMode::default(),
             miller_state: crate::ui::MillerState::new(),
             cached_miller_len: 0,
             input_state: None,
             operation_progress: None,
             pending_conflict: None,
-            pending_operation: None,
             operation_message: None,
             deletion_message: None,
             deletion_progress: None,
             scan_progress: None,
             scan_rx: None,
+            take_rx: None,
             scan_token: CancellationToken::new(),
             warnings: Vec::new(),
+            operation_warnings: Vec::new(),
+            undo_review_warnings: Vec::new(),
             selected_warning: 0,
             analyzing: false,
             has_full_scan: false,
@@ -271,6 +363,12 @@ impl App {
             search_state: SearchState::new(),
             tab_manager: TabManager::with_initial_tab(path, 10),
             preview_state: PreviewState::new(),
+            preview_rx: None,
+            pending_preview: None,
+            archive_rx: None,
+            archive_cancel: None,
+            undo_export_rx: None,
+            pending_archive_refresh: false,
             scan_on_startup,
             user_settings,
             settings_state: None,
@@ -280,6 +378,7 @@ impl App {
             pending_deletion: None,
             scanned_cache: Some(HashMap::new()),
             bulk_rename_state: None,
+            bulk_rename_edit: None,
             treemap_state: crate::ui::TreemapState::new(),
             cached_treemap_len: 0,
             visual_state: None,
@@ -379,6 +478,19 @@ impl App {
         }
     }
 
+    pub(crate) fn image_previews_enabled(&self) -> bool {
+        self.user_settings.image_previews
+    }
+
+    /// Attach the terminal's detected graphics capabilities.
+    ///
+    /// Queried by the caller after the terminal is in raw mode, since
+    /// detection writes control sequences and reads the reply.
+    pub fn with_image_picker(mut self, picker: Option<ratatui_image::picker::Picker>) -> Self {
+        self.image_picker = picker;
+        self
+    }
+
     /// Run the application with async event loop.
     pub async fn run(self, terminal: DefaultTerminal) -> AppResult<()> {
         self.run_and_return_exit_data(terminal).await.map(|_| ())
@@ -389,6 +501,7 @@ impl App {
         mut self,
         mut terminal: DefaultTerminal,
     ) -> AppResult<crate::ExitData> {
+        self.search_state.enable_background();
         self.init_plugins().await;
         self.dispatch_hook(gravityfile_plugin::Hook::OnStartup)
             .await;
@@ -401,7 +514,9 @@ impl App {
 
         let period = Duration::from_millis(TICK_INTERVAL_MS);
         let mut interval = tokio::time::interval(period);
-        let mut events = EventStream::new();
+        // Redraw the latest state; missed frames do not need to be replayed.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut events = crate::event_source::EventSource::new()?;
 
         while self.mode != AppMode::Quit {
             if self.needs_redraw {
@@ -411,55 +526,93 @@ impl App {
 
             let old_view_root = self.view_root.clone();
 
+            // Keep Tokio's randomized polling order: fixed input priority can
+            // starve completions even when each input drain is bounded.
             tokio::select! {
-                biased;
+                event = events.next() => {
+                    let event = event
+                        .ok_or_else(|| color_eyre::eyre::eyre!("terminal event stream closed"))??;
+                    self.handle_terminal_event(event);
 
-                Some(Ok(event)) = events.next() => {
-                    match event {
-                        Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                            self.dispatch_key_event(key_event);
+                    // Drain a bounded batch. An unbounded drain can starve scan,
+                    // operation, and preview completions while input is busy.
+                    for _ in 0..32 {
+                        if self.mode == AppMode::Quit {
+                            break;
                         }
-                        Event::Mouse(mouse_event) if self.mode == AppMode::Normal => {
-                            let action = MouseAction::from_mouse_event(mouse_event);
-                            self.handle_mouse_action(action);
-                        }
-                        _ => {}
-                    }
-
-                    // Batch-drain pending events (async-only to avoid sync/async conflict)
-                    if self.mode != AppMode::Quit {
-                        while let Some(Some(Ok(next_event))) = events.next().now_or_never() {
-                            match next_event {
-                                Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
-                                    self.dispatch_key_event(key_event);
-                                    if self.mode == AppMode::Quit {
-                                        break;
-                                    }
-                                }
-                                Event::Mouse(mouse_event) if self.mode == AppMode::Normal => {
-                                    let action = MouseAction::from_mouse_event(mouse_event);
-                                    self.handle_mouse_action(action);
-                                }
-                                _ => {}
+                        match events.try_next() {
+                            Ok(Ok(event)) => self.handle_terminal_event(event),
+                            Ok(Err(error)) => return Err(error.into()),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                return Err(color_eyre::eyre::eyre!(
+                                    "terminal event stream closed"
+                                ));
                             }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         }
                     }
                     self.needs_redraw = true;
                 }
 
-                Some(result) = async {
+                result = async {
                     if let Some(rx) = &mut self.scan_rx {
                         rx.recv().await
                     } else {
                         std::future::pending().await
                     }
-                } => {
-                    self.handle_scan_result(result);
+                }, if self.scan_rx.is_some() => {
+                    if let Some(result) = result {
+                        self.handle_scan_result(result);
+                    } else {
+                        self.handle_background_channel_closed();
+                    }
                     self.needs_redraw = true;
                 }
 
-                _ = interval.tick(), if self.scan_progress.is_some() || self.deletion_progress.is_some() => {
-                    // Periodic tick only when background work is active (avoids busy-waking CPU)
+                take = async {
+                    self.take_rx.as_mut().expect("guarded take receiver").recv().await
+                }, if self.take_rx.is_some() => {
+                    self.take_rx = None;
+                    if let Some(ScanResult::TakeComplete { path, result }) = take {
+                        self.finish_take(path, result);
+                    } else {
+                        self.error = Some("Create-and-enter ended without completion; outcome unknown".into());
+                    }
+                    self.needs_redraw = true;
+                }
+
+                preview = async {
+                    if let Some(rx) = &mut self.preview_rx {
+                        rx.await.ok()
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if self.preview_rx.is_some() => {
+                    self.finish_preview(preview);
+                    self.needs_redraw = true;
+                }
+
+                exported = async {
+                    self.undo_export_rx.as_mut().expect("guarded export receiver").await.ok()
+                }, if self.undo_export_rx.is_some() => {
+                    self.finish_undo_export(exported);
+                    self.needs_redraw = true;
+                }
+
+                archive = async {
+                    if let Some(rx) = &mut self.archive_rx {
+                        rx.await.ok()
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if self.archive_rx.is_some() => {
+                    self.finish_archive_task(archive);
+                    self.needs_redraw = true;
+                }
+
+                _ = interval.tick(), if self.scan_progress.is_some() || self.deletion_progress.is_some() || self.search_state.has_background_work() => {
+                    // Poll search completions without blocking input or accumulating queries.
+                    self.search_state.poll_background();
                     self.needs_redraw = true;
                 }
             }
@@ -480,29 +633,41 @@ impl App {
             // Handle pending suspend command (opening files in external apps)
             if let Some(mut cmd) = self.pending_suspend_command.take() {
                 // Check if this is a bulk rename operation
-                let is_bulk_rename = self.bulk_rename_state.is_some();
+                let is_bulk_rename = self.bulk_rename_edit.is_some();
 
-                // Restore terminal before running external command
-                let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-                    let _ = crossterm::event::read();
-                }
-                let _ = ratatui::try_restore();
+                // Join the only terminal reader before handing stdin to the editor.
+                // Dropping also discards queued browser input; do not drain an
+                // unbounded live terminal stream while a producer can refill it.
+                drop(events);
+                crate::terminal_session::restore_terminal()?;
 
                 // Run the command and wait for it to complete
-                let _ = cmd.status();
+                let command_result = cmd.status();
 
                 // Reinitialize terminal
-                if let Ok(new_terminal) = ratatui::try_init() {
-                    terminal = new_terminal;
-                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                } else {
-                    self.error = Some("Failed to reinitialize terminal".to_string());
+                terminal = ratatui::try_init()?;
+                execute!(std::io::stdout(), EnableMouseCapture)?;
+                events = crate::event_source::EventSource::new()?;
+
+                let command_succeeded =
+                    command_result.as_ref().is_ok_and(|status| status.success());
+                match command_result {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        self.error = Some(format!("External command exited with status {status}"));
+                    }
+                    Err(error) => {
+                        self.error = Some(format!("Failed to run external command: {error}"));
+                    }
                 }
 
                 // If this was bulk rename, process the edited file
                 if is_bulk_rename {
-                    self.process_bulk_rename_from_editor();
+                    if command_succeeded {
+                        self.process_bulk_rename_from_editor();
+                    } else {
+                        self.bulk_rename_edit = None;
+                    }
                 }
 
                 self.needs_redraw = true;
@@ -513,6 +678,7 @@ impl App {
             .await;
 
         self.scan_token.cancel();
+        self.cancel_archive_operation();
 
         // Take heavy structures — they'll be dropped when the runtime shuts down
         // in the background, avoiding any delay on the main thread.
@@ -542,6 +708,7 @@ impl App {
     /// The UI will detect scanning state via `scan_progress.is_some()`.
     /// If we have a quick tree, it remains visible during scanning.
     fn start_scan(&mut self) {
+        self.pending_archive_refresh = false;
         // Cancel any existing scan
         self.scan_token.cancel();
         self.scan_token = CancellationToken::new();
@@ -563,8 +730,18 @@ impl App {
         self.scan_rx = Some(scanning::start_scan(
             self.view_root.clone(),
             self.user_settings.show_hidden,
+            self.user_settings.max_scan_entries,
             self.scan_token.clone(),
         ));
+    }
+
+    /// Transfer the background result slot to a filesystem operation.
+    fn prepare_operation(&mut self) {
+        self.scan_token.cancel();
+        self.scan_token = CancellationToken::new();
+        self.scan_rx = None;
+        self.scan_progress = None;
+        self.analyzing = false;
     }
 
     /// Cancel the active scan or post-scan analysis without leaving the explorer.
@@ -605,7 +782,8 @@ impl App {
             return;
         }
 
-        let Some(tree) = self.tree.clone() else {
+        // Cloning the Arc, not the tree: analysis reads it concurrently.
+        let Some(tree) = self.tree.as_ref().map(Arc::clone) else {
             return;
         };
 
@@ -613,9 +791,68 @@ impl App {
         self.scan_rx = Some(scanning::start_analysis(tree, self.scan_token.clone()));
     }
 
+    /// Merge final warnings without quadratic path scans or loss of distinct
+    /// warning kinds/messages. Borrow keys to avoid duplicating stored strings.
+    fn merge_scan_warnings(&mut self, warnings: &[gravityfile_core::ScanWarning]) {
+        let mut seen: HashSet<&gravityfile_core::ScanWarning> = self.warnings.iter().collect();
+        let additional: Vec<_> = warnings
+            .iter()
+            .filter(|warning| seen.insert(warning))
+            .cloned()
+            .collect();
+        drop(seen);
+        self.warnings.extend(additional);
+    }
+
+    /// Release dead worker state without interpreting missing completion as success.
+    fn handle_background_channel_closed(&mut self) {
+        if let Some(entry) = self.pending_undo.take() {
+            self.undo_log.retain_for_review(entry);
+        }
+        self.scan_token.cancel();
+        self.scan_rx = None;
+        self.scan_progress = None;
+        self.deletion_progress = None;
+        self.operation_progress = None;
+        self.analyzing = false;
+        self.pending_conflict = None;
+        self.operation_message = None;
+        self.deletion_message = None;
+        self.active_paste_mode = ClipboardMode::Empty;
+        if matches!(
+            self.mode,
+            AppMode::Copying
+                | AppMode::UpdatingEntry
+                | AppMode::Moving
+                | AppMode::Undoing
+                | AppMode::Deleting
+                | AppMode::BulkRenaming
+                | AppMode::ConflictResolution
+        ) {
+            self.mode = AppMode::Normal;
+        }
+        self.error = Some(
+            "Background operation ended without completion; outcome unknown. Inspect affected paths before retrying."
+                .to_string(),
+        );
+        self.needs_redraw = true;
+    }
+
     /// Handle a scan result from the background task.
     fn handle_scan_result(&mut self, result: ScanResult) {
         match result {
+            ScanResult::BulkRenameComplete(result) => {
+                self.scan_rx = None;
+                self.operation_message = Some(match result {
+                    Ok(count) => {
+                        self.marked.clear();
+                        (true, format!("Renamed {count} items"))
+                    }
+                    Err(error) => (false, format!("Bulk rename failed: {error}")),
+                });
+                self.mode = AppMode::Normal;
+                self.start_scan();
+            }
             ScanResult::Progress(progress) => {
                 self.scan_progress = Some(progress);
             }
@@ -626,7 +863,7 @@ impl App {
                 // Update tree with partial results during scanning
                 // This allows the UI to show progressive updates as directories are scanned
                 let root_path = tree.root_path.clone();
-                self.tree = Some(tree);
+                self.tree = Some(Arc::new(tree));
 
                 // Preserve selection position if possible
                 if self.tree_state.expanded.is_empty() {
@@ -651,14 +888,9 @@ impl App {
                 let total_dirs = tree.stats.total_dirs;
                 let total_size = tree.stats.total_size;
 
-                // Merge any final warnings from tree
-                for warning in &tree.warnings {
-                    if !self.warnings.iter().any(|w| w.path == warning.path) {
-                        self.warnings.push(warning.clone());
-                    }
-                }
+                self.merge_scan_warnings(&tree.warnings);
 
-                self.tree = Some(tree);
+                self.tree = Some(Arc::new(tree));
 
                 // Preserve tree state (selection, expanded) across rescans
                 // Only reset if this is a different root path
@@ -685,8 +917,6 @@ impl App {
                 if self.tree_state.selected >= self.cached_tree_len && self.cached_tree_len > 0 {
                     self.tree_state.selected = self.cached_tree_len - 1;
                 }
-                self.mode = AppMode::Normal;
-                self.error = None;
                 self.scan_progress = None;
                 self.has_full_scan = true;
                 self.analyzing = false;
@@ -716,7 +946,6 @@ impl App {
             }
             ScanResult::ScanComplete(Err(e)) => {
                 self.error = Some(e.to_string());
-                self.mode = AppMode::Normal;
                 self.scan_progress = None;
                 self.scan_rx = None;
                 self.analyzing = false;
@@ -724,9 +953,21 @@ impl App {
             ScanResult::AnalysisComplete {
                 duplicates,
                 age_report,
+                duplicate_scope: (root, counts),
             } => {
+                let duplicates = Arc::new(duplicates);
+                self.duplicate_filter.seed(&duplicates, root, counts);
                 self.duplicates = Some(duplicates);
                 self.age_report = Some(age_report);
+                self.analyzing = false;
+                self.scan_rx = None;
+            }
+            ScanResult::AnalysisFailed(error) => {
+                self.analyzing = false;
+                self.scan_rx = None;
+                self.error = Some(format!("Analysis failed: {error}"));
+            }
+            ScanResult::AnalysisCancelled => {
                 self.analyzing = false;
                 self.scan_rx = None;
             }
@@ -734,36 +975,81 @@ impl App {
                 self.deletion_progress = Some(progress);
             }
             ScanResult::DeletionComplete {
+                mode,
                 deleted,
                 failed,
                 bytes_freed,
+                errors,
             } => {
+                self.set_operation_errors(gravityfile_ops::OperationType::Delete, errors);
+                self.operation_message = None;
                 self.deletion_progress = None;
                 self.scan_rx = None;
 
-                let (success, msg) = deletion::format_deletion_result(deleted, failed, bytes_freed);
+                let (success, msg) =
+                    deletion::format_deletion_result(mode, deleted, failed, bytes_freed);
                 self.deletion_message = Some((success, msg));
                 self.mode = AppMode::Normal;
 
                 // Refresh scan after deletion
                 self.start_scan();
             }
+            ScanResult::TakeComplete { path, result } => self.finish_take(path, result),
             ScanResult::OperationProgress(progress) => {
                 self.operation_progress = Some(progress);
             }
             ScanResult::OperationConflict(conflict) => {
+                if self.scan_token.is_cancelled() {
+                    conflict.resolve(gravityfile_ops::ConflictResolution::Abort);
+                    return;
+                }
                 self.pending_conflict = Some(conflict);
                 self.mode = AppMode::ConflictResolution;
             }
             ScanResult::OperationComplete {
+                cancelled,
                 operation_type,
                 succeeded,
                 failed,
-                bytes_processed: _,
+                skipped,
+                bytes_processed,
+                errors,
                 undo_info,
             } => {
                 self.operation_progress = None;
                 self.scan_rx = None;
+                let error_count = errors.iter().fold(0usize, |total, error| {
+                    total.saturating_add(error.represented_count())
+                });
+                let undo_incomplete = self.pending_undo.as_ref().is_some_and(|entry| {
+                    cancelled
+                        || failed > 0
+                        || skipped > 0
+                        || error_count > 0
+                        || succeeded != entry.operation.item_count()
+                });
+                let copy_undo = self.pending_undo.as_ref().is_some_and(|entry| {
+                    matches!(
+                        entry.operation,
+                        gravityfile_ops::UndoableOperation::FilesCopied { .. }
+                    )
+                });
+                if let Some(mut entry) = self.pending_undo.take()
+                    && undo_incomplete
+                {
+                    entry.last_attempt = Some(gravityfile_ops::UndoAttempt {
+                        observed_at: std::time::SystemTime::now(),
+                        cancelled,
+                        succeeded,
+                        failed,
+                        skipped,
+                        bytes_processed,
+                        errors: errors.clone(),
+                    });
+                    self.undo_log.retain_for_review(entry);
+                    self.error = Some("Undo incomplete; use :undo-review to inspect the retained record. Automatic replay is disabled.".into());
+                }
+                self.set_operation_errors(operation_type, errors);
 
                 // Record in undo log if successful
                 if let Some(undo) = undo_info {
@@ -788,23 +1074,84 @@ impl App {
                     gravityfile_ops::OperationType::Copy => "Copied",
                     gravityfile_ops::OperationType::Move => "Moved",
                     gravityfile_ops::OperationType::Delete => "Deleted",
+                    gravityfile_ops::OperationType::Retain => "Retained for recovery",
                     gravityfile_ops::OperationType::Rename => "Renamed",
                     gravityfile_ops::OperationType::CreateFile => "Created file",
                     gravityfile_ops::OperationType::CreateDirectory => "Created directory",
                 };
 
-                let success = failed == 0;
-                let msg = if success {
-                    format!("{} {} items", action, succeeded)
+                // Skipping is a user decision, not a failure, so it is reported
+                // separately and does not mark the operation unsuccessful.
+                let success = failed == 0 && error_count == 0 && !cancelled && !undo_incomplete;
+                let mut msg = if copy_undo {
+                    format!(
+                        "Retained {succeeded} copied items in sibling recovery journals; use grav recover"
+                    )
                 } else {
-                    format!("{} {} items, {} failed", action, succeeded, failed)
+                    format!("{action} {succeeded} items")
                 };
+                if undo_incomplete {
+                    msg.push_str("; undo requires review");
+                }
+                if skipped > 0 {
+                    msg.push_str(&format!(", {skipped} skipped"));
+                }
+                if failed > 0 {
+                    msg.push_str(&format!(", {failed} failed"));
+                } else if error_count > 0 {
+                    msg.push_str(&format!(", {error_count} errors"));
+                }
+                if cancelled {
+                    msg.push_str("; operation cancelled");
+                }
                 self.operation_message = Some((success, msg));
                 self.mode = AppMode::Normal;
 
                 // Refresh scan after operation
                 self.start_scan();
             }
+        }
+        if self.pending_archive_refresh && self.scan_rx.is_none() {
+            self.start_scan();
+        }
+    }
+
+    fn set_operation_errors(
+        &mut self,
+        operation_type: gravityfile_ops::OperationType,
+        errors: Vec<gravityfile_ops::OperationError>,
+    ) {
+        // A new operation's diagnostics take precedence over an old review snapshot.
+        self.undo_review_warnings.clear();
+        self.operation_warnings = errors
+            .into_iter()
+            .map(|error| {
+                gravityfile_core::ScanWarning::new(
+                    error.path,
+                    gravityfile_core::WarningKind::ReadError,
+                    format!("{operation_type}: {}", error.message),
+                )
+            })
+            .collect();
+        self.selected_warning = 0;
+        if !self.operation_warnings.is_empty() {
+            self.view = View::Errors;
+        }
+    }
+
+    fn warning_count(&self) -> usize {
+        self.undo_review_warnings.len() + self.operation_warnings.len() + self.warnings.len()
+    }
+
+    fn displayed_warning(&self, index: usize) -> Option<&gravityfile_core::ScanWarning> {
+        if index < self.undo_review_warnings.len() {
+            return self.undo_review_warnings.get(index);
+        }
+        let index = index - self.undo_review_warnings.len();
+        if index < self.operation_warnings.len() {
+            self.operation_warnings.get(index)
+        } else {
+            self.warnings.get(index - self.operation_warnings.len())
         }
     }
 
@@ -844,10 +1191,10 @@ impl App {
 
         // Sort children by size descending (same order as treemap layout)
         let mut children: Vec<&FileNode> = node.children.iter().collect();
-        children.sort_by_key(|child| std::cmp::Reverse(child.size));
+        children.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.compare_name(b)));
 
         let child = children.get(self.treemap_state.selected)?;
-        let path = root_path.join(&*child.name);
+        let path = root_path.join(child.file_name());
         Some((*child, path))
     }
 
@@ -921,7 +1268,7 @@ impl App {
                 self.update_preview();
             } else {
                 self.update_cached_tree_len();
-                self.preview_state.content = crate::preview::PreviewContent::Empty;
+                self.clear_preview();
             }
             return;
         };
@@ -953,7 +1300,7 @@ impl App {
             LayoutMode::Miller => {
                 // Switching Miller → Tree
                 self.layout_mode = LayoutMode::Tree;
-                self.preview_state.content = crate::preview::PreviewContent::Empty;
+                self.clear_preview();
 
                 // Ensure the view_root is expanded in tree
                 self.tree_state.expand(&data.view_path);
@@ -1019,11 +1366,11 @@ impl App {
 
                 if is_direct_child {
                     // Direct child - find it in miller
-                    let name = selected.file_name()?.to_string_lossy();
+                    let name = selected.file_name()?;
                     let miller_index = view_node
                         .children
                         .iter()
-                        .position(|c| c.name.as_str() == name);
+                        .position(|c| c.file_name() == name);
                     Some(LayoutSyncData {
                         view_path: view_path.clone(),
                         miller_index,
@@ -1036,7 +1383,7 @@ impl App {
                     let new_view_root = selected.parent()?.to_path_buf();
 
                     // Find the selected item's name to locate it in the new view
-                    let selected_name = selected.file_name()?.to_string_lossy().to_string();
+                    let selected_name = selected.file_name()?;
 
                     // We need to find the node at new_view_root to get its children
                     let tree = self.tree.as_ref()?;
@@ -1045,7 +1392,7 @@ impl App {
                     let miller_index = new_view_node
                         .children
                         .iter()
-                        .position(|c| c.name.as_str() == selected_name);
+                        .position(|c| c.file_name() == selected_name);
 
                     Some(LayoutSyncData {
                         view_path: view_path.clone(),
@@ -1060,7 +1407,7 @@ impl App {
                 let target_path = view_node
                     .children
                     .get(self.miller_state.selected)
-                    .map(|c| view_path.join(&*c.name));
+                    .map(|c| view_path.join(c.file_name()));
 
                 // Use existing tree_state expansion to find the index
                 // First ensure view_path is expanded
@@ -1094,32 +1441,92 @@ impl App {
     fn update_preview(&mut self) {
         // Only update preview in Miller mode for non-directory items
         if self.layout_mode != LayoutMode::Miller {
-            self.preview_state.content = crate::preview::PreviewContent::Empty;
+            self.clear_preview();
             return;
         }
 
         let Some((view_node, _)) = self.get_view_root_node() else {
-            self.preview_state.content = crate::preview::PreviewContent::Empty;
+            self.clear_preview();
             return;
         };
 
         let Some(selected_child) = view_node.children.get(self.miller_state.selected) else {
-            self.preview_state.content = crate::preview::PreviewContent::Empty;
+            self.clear_preview();
             return;
         };
 
         // Only show file preview for non-directories
         if selected_child.is_dir() {
             // For directories, we show child list directly via miller columns
-            self.preview_state.content = crate::preview::PreviewContent::Empty;
+            self.clear_preview();
             return;
         }
 
         // Get the full path to the selected file
-        let file_path = self.view_root.join(&*selected_child.name);
+        let file_path = self.view_root.join(selected_child.file_name());
 
-        // Update preview if path changed
-        self.preview_state.update(Some(&file_path));
+        self.schedule_preview(file_path, false);
+    }
+
+    fn schedule_preview(&mut self, path: PathBuf, force: bool) {
+        if !self.preview_state.begin_update(&path, force) {
+            return;
+        }
+
+        let mode = self.preview_state.mode;
+        // Decoding and protocol encoding run in the background task with the
+        // rest of the preview work, never inside `terminal.draw`.
+        let image_context = self.image_picker.as_ref().map(|picker| ImageContext {
+            picker: picker.clone(),
+            area: self.preview_area.get(),
+        });
+        let request = PreviewRequest {
+            path,
+            mode,
+            image_context,
+        };
+        if self.preview_rx.is_some() {
+            self.pending_preview = Some(request);
+        } else {
+            self.start_preview(request);
+        }
+    }
+
+    fn start_preview(&mut self, request: PreviewRequest) {
+        let PreviewRequest {
+            path,
+            mode,
+            image_context,
+        } = request;
+        let (tx, rx) = oneshot::channel();
+        self.preview_rx = Some(rx);
+        tokio::task::spawn_blocking(move || {
+            let result = PreviewLoader::load_with_mode(&path, mode, image_context.as_ref());
+            let _ = tx.send(PreviewLoad { path, mode, result });
+        });
+    }
+
+    fn finish_preview(&mut self, preview: Option<PreviewLoad>) {
+        self.preview_rx = None;
+        if let Some(request) = self.pending_preview.take() {
+            // A newer request supersedes this result even when path/mode match
+            // (forced reload, or leaving and returning to the same selection).
+            self.start_preview(request);
+        } else if let Some(preview) = preview {
+            self.preview_state
+                .complete_update(&preview.path, preview.mode, preview.result);
+        } else if self.preview_state.loading {
+            self.preview_state.loading = false;
+            self.preview_state.content =
+                PreviewContent::Error("Preview worker ended without a result".into());
+        }
+    }
+
+    fn clear_preview(&mut self) {
+        // Keep observing the active load so switching views cannot spawn a
+        // second worker while the first is still reading or decoding.
+        self.pending_preview = None;
+        self.preview_state.clear();
     }
 
     /// Draw the application into the given frame, updating `viewport_height` first.
@@ -1173,6 +1580,19 @@ impl App {
         }
     }
 
+    fn handle_terminal_event(&mut self, event: Event) {
+        match event {
+            Event::Key(key_event) if key_event.kind == crossterm::event::KeyEventKind::Press => {
+                self.dispatch_key_event(key_event);
+            }
+            Event::Mouse(mouse_event) if self.mode == AppMode::Normal => {
+                let action = MouseAction::from_mouse_event(mouse_event);
+                self.handle_mouse_action(action);
+            }
+            _ => {}
+        }
+    }
+
     /// Handle a key action.
     fn handle_action(&mut self, action: KeyAction) {
         // Clear deletion message on any action
@@ -1180,6 +1600,19 @@ impl App {
 
         // Handle special modes
         match self.mode {
+            AppMode::BulkRenaming => {
+                if matches!(
+                    action,
+                    KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
+                ) {
+                    self.scan_token.cancel();
+                    self.operation_message =
+                        Some((false, "Cancelling bulk rename; waiting for rollback".into()));
+                    self.needs_redraw = true;
+                }
+                // Keep the result channel until rollback and cleanup complete.
+                return;
+            }
             AppMode::Help => {
                 match action {
                     KeyAction::ToggleHelp | KeyAction::Quit | KeyAction::Cancel => {
@@ -1226,23 +1659,75 @@ impl App {
                 // Handled in run loop via handle_conflict_key
                 return;
             }
+            AppMode::Undoing => {
+                if matches!(
+                    action,
+                    KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
+                ) {
+                    self.scan_token.cancel();
+                    self.operation_message =
+                        Some((false, "Cancelling undo; waiting for completion".into()));
+                    self.needs_redraw = true;
+                }
+                return;
+            }
+            AppMode::UpdatingEntry => {
+                if matches!(
+                    action,
+                    KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
+                ) {
+                    self.operation_message = Some((
+                        false,
+                        "Waiting for the filesystem operation to finish".into(),
+                    ));
+                    self.needs_redraw = true;
+                }
+                return;
+            }
             AppMode::Copying | AppMode::Moving => {
-                // Operations in progress - ignore most input
+                if matches!(
+                    action,
+                    KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
+                ) {
+                    self.scan_token.cancel();
+                    self.operation_message =
+                        Some((false, "Cancelling operation; waiting for completion".into()));
+                    self.needs_redraw = true;
+                }
                 return;
             }
             _ => {}
         }
 
+        if matches!(action, KeyAction::Cancel | KeyAction::Quit) && self.cancel_archive_operation()
+        {
+            return;
+        }
+        if matches!(action, KeyAction::ForceQuit) {
+            self.cancel_archive_operation();
+        }
+
         match action {
             KeyAction::Quit => {
-                self.mode = AppMode::Quit;
+                if self.archive_rx.is_some()
+                    || self.take_rx.is_some()
+                    || self.undo_export_rx.is_some()
+                {
+                    self.error =
+                        Some("Filesystem operation in progress; wait for it to finish".to_string());
+                } else {
+                    self.mode = AppMode::Quit;
+                }
             }
             KeyAction::ForceQuit => {
                 self.mode = AppMode::Quit;
             }
             KeyAction::Cancel => {
-                // Esc clears clipboard first, then marks - does NOT quit
-                if !self.clipboard.is_empty() {
+                // Acknowledge a visible error without also clearing selection
+                // or cancelling work. Subsequent Esc retains normal behavior.
+                if self.error.take().is_some() {
+                    self.needs_redraw = true;
+                } else if !self.clipboard.is_empty() {
                     self.clipboard.clear();
                 } else if !self.marked.is_empty() {
                     self.marked.clear();
@@ -1416,7 +1901,7 @@ impl App {
                         }
                     } else if self.view == View::Errors {
                         // In Errors view, get the selected warning's path
-                        if let Some(warning) = self.warnings.get(self.selected_warning) {
+                        if let Some(warning) = self.displayed_warning(self.selected_warning) {
                             // Only allow deleting broken symlinks, not permission errors etc.
                             if warning.kind == gravityfile_core::WarningKind::BrokenSymlink {
                                 self.marked.insert(warning.path.clone());
@@ -1501,6 +1986,11 @@ impl App {
             }
             KeyAction::CyclePreviewMode => {
                 self.preview_state.cycle_mode();
+                if let Some(path) = self.preview_state.path.clone() {
+                    self.schedule_preview(path, true);
+                } else {
+                    self.update_preview();
+                }
             }
             KeyAction::OpenSettings => {
                 self.settings_state = Some(SettingsState::new(self.user_settings.clone()));
@@ -1557,62 +2047,50 @@ impl App {
                         LayoutMode::Miller => node
                             .children
                             .get(self.miller_state.selected)
-                            .map(|child| self.view_root.join(&*child.name)),
+                            .map(|child| self.view_root.join(child.file_name())),
                     }
                 } else {
                     None
                 }
             }
             View::Duplicates => {
-                // Collect data first to avoid borrow issues
-                let (is_on_header, group_paths, selected_file) =
-                    if let Some((filtered, _)) = self.get_filtered_duplicates() {
-                        let is_on_header = !self
-                            .duplicates_state
-                            .is_expanded(self.duplicates_state.selected_group)
-                            || self
-                                .duplicates_state
-                                .selected_item(self.duplicates_state.selected_group)
-                                == 0;
-
-                        let group_paths: Vec<PathBuf> = filtered
-                            .get(self.duplicates_state.selected_group)
-                            .map(|g| g.paths.clone())
-                            .unwrap_or_default();
-
-                        let selected_file = if !is_on_header {
-                            self.duplicates_state.selected_file_path(&filtered).cloned()
-                        } else {
-                            None
-                        };
-
-                        (is_on_header, group_paths, selected_file)
-                    } else {
-                        return;
-                    };
-
+                // Hold the immutable report independently of App so marking can
+                // mutate the selection set without cloning the group's paths.
+                let Some(report) = self.duplicates.clone() else {
+                    return;
+                };
+                let Some(group_index) = self
+                    .duplicate_filter
+                    .get(&report, &self.view_root, &self.path)
+                    .groups
+                    .get(self.duplicates_state.selected_group)
+                    .map(|(index, _)| *index)
+                else {
+                    return;
+                };
+                let group = &report.groups[group_index];
+                let selected = self
+                    .duplicates_state
+                    .selected_item(self.duplicates_state.selected_group);
+                let is_on_header = !self
+                    .duplicates_state
+                    .is_expanded(self.duplicates_state.selected_group)
+                    || selected == 0;
                 if is_on_header {
-                    // Header selected - toggle ALL files in the group
-                    let any_marked = group_paths.iter().any(|p| self.marked.contains(p));
-
-                    if any_marked {
-                        // Unmark all files in the group
-                        for path in &group_paths {
+                    if group.paths.iter().any(|path| self.marked.contains(path)) {
+                        for path in &group.paths {
                             self.marked.remove(path);
                         }
                     } else {
-                        // Mark all files in the group
-                        for path in group_paths {
-                            if path != self.path {
-                                self.marked.insert(path);
+                        for path in &group.paths {
+                            if path != &self.path {
+                                self.marked.insert(path.clone());
                             }
                         }
                     }
-                    return; // Early return since we handled it here
-                } else {
-                    // Specific file selected within expanded group
-                    selected_file
+                    return;
                 }
+                group.paths.get(selected - 1).cloned()
             }
             View::Age => {
                 if let Some(filtered) = self.get_filtered_stale_dirs() {
@@ -1626,7 +2104,7 @@ impl App {
             }
             View::Errors => {
                 // Only allow marking broken symlinks for deletion
-                if let Some(warning) = self.warnings.get(self.selected_warning) {
+                if let Some(warning) = self.displayed_warning(self.selected_warning) {
                     if warning.kind == gravityfile_core::WarningKind::BrokenSymlink {
                         Some(warning.path.clone())
                     } else {
@@ -1699,6 +2177,7 @@ impl App {
             return;
         }
 
+        self.prepare_operation();
         self.scan_rx = Some(deletion::start_deletion(items));
     }
 
@@ -1715,7 +2194,7 @@ impl App {
                 return Some(node.size);
             }
             for child in &node.children {
-                let child_path = current.join(&*child.name);
+                let child_path = current.join(child.file_name());
                 if let Some(size) = find_size(child, target, &child_path) {
                     return Some(size);
                 }
@@ -1761,7 +2240,8 @@ impl App {
         self.paste_with_resolution(None);
     }
 
-    /// Paste with a specific conflict resolution (or None to check for conflicts).
+    /// Start a paste. Conflicts are resolved per item by the operation itself,
+    /// which pauses and asks rather than being restarted with a blanket answer.
     fn paste_with_resolution(&mut self, resolution: Option<gravityfile_ops::ConflictResolution>) {
         if self.clipboard.is_empty() {
             return;
@@ -1772,34 +2252,21 @@ impl App {
 
         let sources = self.clipboard.paths.clone();
         let mode = self.clipboard.mode;
-
-        // Pre-flight conflict detection (only if no resolution provided)
-        if resolution.is_none()
-            && let Some(conflict) = self.check_paste_conflict(&sources, &destination)
-        {
-            // Store the pending operation and show conflict modal
-            self.pending_operation = Some(PendingOperation::Paste {
-                sources: sources.clone(),
-                destination: destination.clone(),
-                mode,
-            });
-            self.pending_conflict = Some(conflict);
-            self.mode = AppMode::ConflictResolution;
-            return;
-        }
+        self.active_paste_mode = mode;
+        self.prepare_operation();
 
         match mode {
             ClipboardMode::Copy => {
                 self.mode = AppMode::Copying;
                 let options = CopyOptions {
                     conflict_resolution: resolution,
-                    preserve_timestamps: false,
+                    preserve_timestamps: true,
                 };
                 let rx = gravityfile_ops::start_copy(
                     sources,
                     destination,
                     options,
-                    gravityfile_ops::CancellationToken::new(),
+                    self.scan_token.clone(),
                 );
                 self.scan_rx = Some(Self::adapt_copy_rx(rx));
             }
@@ -1812,40 +2279,13 @@ impl App {
                     sources,
                     destination,
                     options,
-                    gravityfile_ops::CancellationToken::new(),
+                    self.scan_token.clone(),
                 );
                 self.scan_rx = Some(Self::adapt_move_rx(rx));
                 self.clipboard.clear();
             }
             ClipboardMode::Empty => {}
         }
-    }
-
-    /// Check if pasting would cause a conflict with an existing file.
-    fn check_paste_conflict(&self, sources: &[PathBuf], destination: &Path) -> Option<Conflict> {
-        use gravityfile_ops::ConflictKind;
-
-        for source in sources {
-            if let Some(filename) = source.file_name() {
-                let dest_path = destination.join(filename);
-
-                // Check if destination already exists
-                if dest_path.exists() {
-                    // Determine conflict kind
-                    let kind = if source == &dest_path {
-                        // Same file - source and destination are identical
-                        ConflictKind::SameFile
-                    } else if dest_path.is_dir() {
-                        ConflictKind::DirectoryExists
-                    } else {
-                        ConflictKind::FileExists
-                    };
-
-                    return Some(Conflict::new(source.clone(), dest_path, kind));
-                }
-            }
-        }
-        None
     }
 
     /// Get the appropriate paste destination based on current selection.
@@ -1875,12 +2315,20 @@ impl App {
     ) -> mpsc::Receiver<ScanResult> {
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    result = rx.recv() => match result {
+                        Some(result) => result,
+                        None => break,
+                    },
+                };
                 let scan_result = match result {
                     gravityfile_ops::CopyResult::Progress(p) => ScanResult::OperationProgress(p),
                     gravityfile_ops::CopyResult::Conflict(c) => ScanResult::OperationConflict(c),
                     gravityfile_ops::CopyResult::Complete(cc) => {
-                        let undo_info = if cc.inner.is_success() {
+                        let undo_info = if !cc.created_paths.is_empty() {
                             Some(gravityfile_ops::UndoableOperation::FilesCopied {
                                 created: cc.created_paths,
                             })
@@ -1889,10 +2337,13 @@ impl App {
                         };
 
                         ScanResult::OperationComplete {
+                            cancelled: cc.inner.cancelled,
                             operation_type: cc.inner.operation_type,
                             succeeded: cc.inner.succeeded,
                             failed: cc.inner.failed,
+                            skipped: cc.inner.skipped,
                             bytes_processed: cc.inner.bytes_processed,
+                            errors: cc.inner.errors,
                             undo_info,
                         }
                     }
@@ -1911,12 +2362,20 @@ impl App {
     ) -> mpsc::Receiver<ScanResult> {
         let (tx, result_rx) = mpsc::channel(100);
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    result = rx.recv() => match result {
+                        Some(result) => result,
+                        None => break,
+                    },
+                };
                 let scan_result = match result {
                     gravityfile_ops::MoveResult::Progress(p) => ScanResult::OperationProgress(p),
                     gravityfile_ops::MoveResult::Conflict(c) => ScanResult::OperationConflict(c),
                     gravityfile_ops::MoveResult::Complete(mc) => {
-                        let undo_info = if mc.inner.is_success() {
+                        let undo_info = if !mc.moved_pairs.is_empty() {
                             Some(gravityfile_ops::UndoableOperation::FilesMoved {
                                 moves: mc.moved_pairs,
                             })
@@ -1925,10 +2384,13 @@ impl App {
                         };
 
                         ScanResult::OperationComplete {
+                            cancelled: mc.inner.cancelled,
                             operation_type: mc.inner.operation_type,
                             succeeded: mc.inner.succeeded,
                             failed: mc.inner.failed,
+                            skipped: mc.inner.skipped,
                             bytes_processed: mc.inner.bytes_processed,
+                            errors: mc.inner.errors,
                             undo_info,
                         }
                     }
@@ -1942,110 +2404,77 @@ impl App {
     }
 
     /// Handle key press during conflict resolution mode.
+    ///
+    /// The operation is paused waiting on this answer, so resolving one item
+    /// resumes the same operation rather than restarting it. Only `Abort`
+    /// stops the batch.
     fn handle_conflict_key(&mut self, event: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
-        use gravityfile_ops::ConflictResolution;
+        use gravityfile_ops::{ConflictKind, ConflictResolution};
 
-        // Check if this is a SameFile conflict - only Skip and Abort are valid
-        let is_same_file = self
-            .pending_conflict
-            .as_ref()
-            .map(|c| matches!(c.kind, gravityfile_ops::ConflictKind::SameFile))
-            .unwrap_or(false);
+        let Some(kind) = self.pending_conflict.as_ref().map(|request| request.kind()) else {
+            return;
+        };
+
+        // A same-file or self-nesting conflict cannot be satisfied by
+        // overwriting or renaming, so those answers are not offered.
+        let is_unsatisfiable = matches!(
+            kind,
+            ConflictKind::SameFile | ConflictKind::SourceIsAncestor
+        );
 
         let resolution = match event.code {
-            // Skip
             KeyCode::Char('s') => Some(ConflictResolution::Skip),
-            // Skip All (not valid for same file)
-            KeyCode::Char('S') if !is_same_file => Some(ConflictResolution::SkipAll),
-            // Overwrite (not valid for same file)
-            KeyCode::Char('o') if !is_same_file => Some(ConflictResolution::Overwrite),
-            // Overwrite All (not valid for same file)
-            KeyCode::Char('O') if !is_same_file => Some(ConflictResolution::OverwriteAll),
-            // Rename (auto-rename)
-            KeyCode::Char('r') => Some(ConflictResolution::AutoRename),
-            // Abort/Cancel
+            KeyCode::Char('S') if !is_unsatisfiable => Some(ConflictResolution::SkipAll),
+            KeyCode::Char('o') if !is_unsatisfiable => Some(ConflictResolution::Overwrite),
+            KeyCode::Char('O') if !is_unsatisfiable => Some(ConflictResolution::OverwriteAll),
+            KeyCode::Char('r') if !is_unsatisfiable => Some(ConflictResolution::AutoRename),
             KeyCode::Esc => Some(ConflictResolution::Abort),
-            // Enter also acts as skip for same-file conflicts
-            KeyCode::Enter if is_same_file => Some(ConflictResolution::Skip),
-            // For SourceIsAncestor, Enter also acknowledges
-            KeyCode::Enter => {
-                if let Some(conflict) = &self.pending_conflict {
-                    if matches!(
-                        conflict.kind,
-                        gravityfile_ops::ConflictKind::SourceIsAncestor
-                    ) {
-                        Some(ConflictResolution::Abort)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+            // Enter acknowledges a conflict that has only one sensible answer.
+            KeyCode::Enter if is_unsatisfiable => Some(ConflictResolution::Skip),
             _ => None,
         };
 
-        if let Some(res) = resolution {
-            // Clear the pending conflict
-            self.pending_conflict = None;
+        let Some(resolution) = resolution else {
+            return;
+        };
 
-            // Take the pending operation
-            let pending = self.pending_operation.take();
-
-            // If aborting or skipping, cancel the operation and return to normal mode
-            if matches!(
-                res,
-                ConflictResolution::Abort | ConflictResolution::Skip | ConflictResolution::SkipAll
-            ) {
-                self.mode = AppMode::Normal;
-                self.scan_rx = None;
-                self.operation_progress = None;
-                // Keep clipboard for Abort (user might want to try elsewhere)
-                // Clear for Skip only if it was a cut operation that we're fully canceling
-                return;
-            }
-
-            // Resume the pending operation with the chosen resolution
-            if let Some(pending_op) = pending {
-                match pending_op {
-                    PendingOperation::Paste {
-                        sources,
-                        destination: _,
-                        mode,
-                    } => {
-                        // Temporarily set clipboard to resume the paste
-                        let old_clipboard = self.clipboard.clone();
-                        self.clipboard.paths = sources;
-                        self.clipboard.mode = mode;
-
-                        // Execute paste with the chosen resolution
-                        self.paste_with_resolution(Some(res));
-
-                        // For Copy mode, restore clipboard after paste starts
-                        // For Cut mode, the paste_with_resolution already clears it
-                        if mode == ClipboardMode::Copy {
-                            self.clipboard = old_clipboard;
-                        }
-                    }
-                }
-            } else {
-                // No pending operation, just return to normal
-                self.mode = AppMode::Normal;
-                self.scan_rx = None;
-                self.operation_progress = None;
-            }
+        // Answering unblocks the operation, which then continues with the
+        // remaining items and reports completion through the usual channel.
+        if let Some(request) = self.pending_conflict.take() {
+            request.resolve(resolution);
         }
+
+        if matches!(resolution, ConflictResolution::Abort) {
+            self.scan_token.cancel();
+            self.operation_message =
+                Some((false, "Cancelling operation; waiting for completion".into()));
+        }
+
+        // Return to the progress view; the operation is still running.
+        self.mode = match self.active_paste_mode {
+            ClipboardMode::Cut => AppMode::Moving,
+            _ => AppMode::Copying,
+        };
     }
 
     /// Start rename operation for current selection.
     fn start_rename(&mut self) {
         if let Some(path) = self.get_selected_path() {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let mut input = InputState::with_initial(&name);
+            let Some(name) = path.file_name() else {
+                self.operation_message =
+                    Some((false, "The filesystem root cannot be renamed".into()));
+                return;
+            };
+            let mut input = if let Some(name) = name.to_str() {
+                InputState::with_initial(name)
+            } else {
+                self.operation_message = Some((
+                    false,
+                    "This filename is not UTF-8. Enter a new name to rename it.".into(),
+                ));
+                InputState::new()
+            };
             input.context_path = Some(path);
             self.input_state = Some(input);
             self.mode = AppMode::Renaming;
@@ -2124,7 +2553,7 @@ impl App {
                 self.miller_state.reset();
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
-                self.preview_state.content = crate::preview::PreviewContent::Empty;
+                self.clear_preview();
 
                 // Update the active tab view_root but keep the tree
                 if let Some(tab) = self.tab_manager.active_tab_mut() {
@@ -2144,11 +2573,11 @@ impl App {
                 self.duplicates = None;
                 self.age_report = None;
                 self.warnings.clear();
-                self.preview_state.content = crate::preview::PreviewContent::Empty;
+                self.clear_preview();
                 self.scan_progress = None;
 
                 // Load quick tree for immediate display
-                self.tree = quick_list_with_settings(&path, &self.user_settings).ok();
+                self.tree = self.load_directory_listing(&path).map(Arc::new);
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
 
@@ -2171,27 +2600,262 @@ impl App {
         }
     }
 
+    /// Show a bounded snapshot of original paths, without replacing diagnostics.
+    fn show_undo_review(&mut self, page: usize) {
+        use gravityfile_ops::UndoableOperation;
+        const PAGE_SIZE: usize = 1000;
+        let total = self
+            .undo_log
+            .iter()
+            .filter(|entry| entry.review_required)
+            .fold(0usize, |sum, entry| {
+                sum.saturating_add(entry.operation.item_count())
+            });
+        let pages = total.div_ceil(PAGE_SIZE).max(1);
+        if page == 0 || page > pages {
+            self.error = Some(format!("Undo review page must be between 1 and {pages}"));
+            return;
+        }
+        let Some(mut offset) = (page - 1).checked_mul(PAGE_SIZE) else {
+            self.error = Some("Undo review page is too large".into());
+            return;
+        };
+        self.undo_review_warnings.clear();
+        'records: for entry in self.undo_log.iter().filter(|entry| entry.review_required) {
+            let count = entry.operation.item_count();
+            if offset >= count {
+                offset -= count;
+                continue;
+            }
+            let attempt = entry.last_attempt.as_ref().map_or_else(
+                || "completion not observed".to_owned(),
+                |attempt| {
+                    format!(
+                        "reported: {} succeeded, {} failed, {} skipped, cancelled={}, {} errors",
+                        attempt.succeeded,
+                        attempt.failed,
+                        attempt.skipped,
+                        attempt.cancelled,
+                        attempt.errors.iter().fold(0usize, |total, error| total
+                            .saturating_add(error.represented_count()))
+                    )
+                },
+            );
+            let mut add = |path: &Path, action: String| {
+                if self.undo_review_warnings.len() == PAGE_SIZE {
+                    return false;
+                }
+                self.undo_review_warnings
+                    .push(gravityfile_core::ScanWarning::new(
+                        path.to_path_buf(),
+                        gravityfile_core::WarningKind::ReadError,
+                        format!(
+                            "Undo #{} review: {action}. Original record; item outcome unverified; {attempt}.",
+                            entry.id
+                        ),
+                    ));
+                true
+            };
+            match &entry.operation {
+                UndoableOperation::FilesMoved { moves } => {
+                    for (original, current) in moves.iter().skip(offset) {
+                        if !add(current, format!("move back to {}", original.display())) {
+                            break 'records;
+                        }
+                    }
+                }
+                UndoableOperation::FilesCopied { created } => {
+                    for path in created.iter().skip(offset) {
+                        if !add(
+                            path,
+                            "retain copied item in a sibling recovery journal".into(),
+                        ) {
+                            break 'records;
+                        }
+                    }
+                }
+                UndoableOperation::FilesDeleted { paths } => {
+                    for path in paths.iter().skip(offset) {
+                        if !add(path, "OS trash recovery required".into()) {
+                            break 'records;
+                        }
+                    }
+                }
+                UndoableOperation::FileRenamed { path, old_path, .. } => {
+                    if !add(path, format!("rename back to {}", old_path.display())) {
+                        break 'records;
+                    }
+                }
+                UndoableOperation::FileCreated { path }
+                | UndoableOperation::DirectoryCreated { path } => {
+                    if !add(path, "remove created item if unchanged and empty".into()) {
+                        break 'records;
+                    }
+                }
+            }
+            offset = 0;
+        }
+        self.selected_warning = 0;
+        if self.undo_review_warnings.is_empty() {
+            self.operation_message = Some((true, "No retained undo paths require review".into()));
+        } else {
+            self.view = View::Errors;
+            self.operation_message = Some((
+                false,
+                format!(
+                    "Undo review page {page}/{pages} ({total} original paths); :undo-review <page>. Outcomes unverified; replay disabled"
+                ),
+            ));
+        }
+    }
+
+    fn show_undo_errors(&mut self, page: usize) {
+        const PAGE_SIZE: usize = 1000;
+        let total = self
+            .undo_log
+            .iter()
+            .filter(|entry| entry.review_required)
+            .filter_map(|entry| entry.last_attempt.as_ref())
+            .fold(0usize, |sum, attempt| {
+                sum.saturating_add(attempt.errors.len())
+            });
+        let pages = total.div_ceil(PAGE_SIZE).max(1);
+        if page == 0 || page > pages {
+            self.error = Some(format!(
+                "Undo error review page must be between 1 and {pages}"
+            ));
+            return;
+        }
+        let Some(mut offset) = (page - 1).checked_mul(PAGE_SIZE) else {
+            self.error = Some("Undo error review page is too large".into());
+            return;
+        };
+        self.undo_review_warnings.clear();
+        for entry in self.undo_log.iter().filter(|entry| entry.review_required) {
+            let Some(attempt) = &entry.last_attempt else {
+                continue;
+            };
+            if offset >= attempt.errors.len() {
+                offset -= attempt.errors.len();
+                continue;
+            }
+            for error in attempt
+                .errors
+                .iter()
+                .skip(offset)
+                .take(PAGE_SIZE - self.undo_review_warnings.len())
+            {
+                self.undo_review_warnings
+                    .push(gravityfile_core::ScanWarning::new(
+                        error.path.clone(),
+                        gravityfile_core::WarningKind::ReadError,
+                        format!("Undo #{} reported error: {}", entry.id, error.message),
+                    ));
+            }
+            if self.undo_review_warnings.len() == PAGE_SIZE {
+                break;
+            }
+            offset = 0;
+        }
+        self.selected_warning = 0;
+        if total == 0 {
+            self.operation_message = Some((true,
+                "No retained error diagnostics; use :undo-review for original records and completion status".into()));
+        } else {
+            self.view = View::Errors;
+            self.operation_message = Some((
+                false,
+                format!(
+                    "Undo errors page {page}/{pages} ({total} diagnostics); :undo-review errors <page>. Errors may describe partial changes"
+                ),
+            ));
+        }
+    }
+
+    fn export_undo_review(&mut self, path: &str) {
+        if self.undo_export_rx.is_some() {
+            self.error = Some("Undo review export is already in progress".into());
+            return;
+        }
+        let snapshot = self.undo_log.review_snapshot();
+        if snapshot.is_empty() {
+            self.error = Some("No retained undo records require review".into());
+            return;
+        }
+        let destination = self.view_root.join(path);
+        let (sender, receiver) = oneshot::channel();
+        self.undo_export_rx = Some(receiver);
+        self.operation_message = Some((true, "Exporting undo review…".into()));
+        tokio::spawn(async move {
+            let output_path = destination.clone();
+            let result =
+                tokio::task::spawn_blocking(move || snapshot.export_review_json(&destination))
+                    .await
+                    .map_err(|error| format!("Export worker failed: {error}"))
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = sender.send((output_path, result));
+        });
+    }
+
+    fn finish_undo_export(&mut self, exported: Option<(PathBuf, Result<(), String>)>) {
+        self.undo_export_rx = None;
+        match exported {
+            Some((path, Ok(()))) => {
+                self.operation_message = Some((
+                    true,
+                    format!(
+                        "Undo review exported to {} (inspection only; outcomes unverified)",
+                        path.display()
+                    ),
+                ))
+            }
+            Some((path, Err(error))) => {
+                self.operation_message = None;
+                self.error = Some(format!(
+                    "Cannot export undo review to {}: {error}",
+                    path.display()
+                ));
+            }
+            None => {
+                self.operation_message = None;
+                self.error = Some(
+                    "Undo review export ended without a result; inspect the destination".into(),
+                );
+            }
+        }
+    }
+
     /// Execute undo of the last operation.
     fn execute_undo(&mut self) {
+        if self.mode == AppMode::Undoing {
+            return;
+        }
         if let Some(entry) = self.undo_log.pop() {
+            self.pending_undo = Some(entry.clone());
             let msg = format!("Undoing: {}", entry.description);
             self.operation_message = Some((true, msg));
 
-            // Cancel any active scan
-            self.scan_token.cancel();
-            self.scan_token = CancellationToken::new();
+            self.prepare_operation();
 
-            let rx = gravityfile_ops::execute_undo(entry);
+            let rx =
+                gravityfile_ops::execute_undo_with_cancellation(entry, self.scan_token.clone());
 
             // Adapt the generic OperationResult to ScanResult
             let (tx, adapted_rx) = tokio::sync::mpsc::channel(100);
             let token = self.scan_token.clone();
             tokio::spawn(async move {
                 let mut rx = rx;
-                while let Some(result) = rx.recv().await {
-                    if token.is_cancelled() {
-                        break;
-                    }
+                loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = tx.closed() => { token.cancel(); break; }
+                        result = rx.recv() => match result {
+                            Some(result) => result,
+                            None => break,
+                        },
+                    };
+                    // Keep the receiver alive through cancellation so the worker
+                    // can finish active calls and deliver its partial completion.
                     let scan_result = match result {
                         gravityfile_ops::OperationResult::Progress(p) => {
                             ScanResult::OperationProgress(p)
@@ -2201,24 +2865,37 @@ impl App {
                         }
                         gravityfile_ops::OperationResult::Complete(c) => {
                             ScanResult::OperationComplete {
+                                cancelled: c.cancelled,
                                 operation_type: c.operation_type,
                                 succeeded: c.succeeded,
                                 failed: c.failed,
+                                skipped: c.skipped,
                                 bytes_processed: c.bytes_processed,
+                                errors: c.errors,
                                 undo_info: None, // Don't record undos of undos in this simple impl
                             }
                         }
                     };
                     if tx.send(scan_result).await.is_err() {
+                        token.cancel();
                         break;
                     }
                 }
             });
 
             self.scan_rx = Some(adapted_rx);
-            self.mode = AppMode::Normal;
+            self.mode = AppMode::Undoing;
         } else {
-            self.operation_message = Some((false, "Nothing to undo".to_string()));
+            let message = if self
+                .undo_log
+                .peek()
+                .is_some_and(|entry| entry.review_required)
+            {
+                "Previous undo is incomplete; use :undo-review to inspect original paths"
+            } else {
+                "Nothing to undo"
+            };
+            self.operation_message = Some((false, message.to_owned()));
         }
     }
 
@@ -2236,6 +2913,7 @@ impl App {
                 InputResult::Submit(value) => {
                     let context_path = input.context_path.clone();
                     self.input_state = None;
+                    self.mode = AppMode::Normal;
 
                     match current_mode {
                         AppMode::Renaming => {
@@ -2263,8 +2941,6 @@ impl App {
                         }
                         _ => {}
                     }
-
-                    self.mode = AppMode::Normal;
                 }
             }
         } else {
@@ -2283,12 +2959,13 @@ impl App {
             return;
         }
 
+        self.prepare_operation();
         let rx = start_rename(source.clone(), new_name.clone());
 
         // Adapt the rename result receiver
         let adapted_rx = Self::adapt_rename_rx(source, new_name.clone(), rx);
         self.scan_rx = Some(adapted_rx);
-        self.mode = AppMode::Normal;
+        self.mode = AppMode::UpdatingEntry;
 
         // Show pending message
         self.operation_message = Some((true, format!("Renaming to {}...", new_name)));
@@ -2303,13 +2980,17 @@ impl App {
         let (tx, adapted_rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => None,
+                result = rx.recv() => result,
+            } {
                 let scan_result = match result {
                     gravityfile_ops::RenameResult::Progress(progress) => {
                         ScanResult::OperationProgress(progress)
                     }
                     gravityfile_ops::RenameResult::Complete(complete) => {
-                        let undo_info = if complete.is_success() {
+                        let undo_info = if complete.succeeded > 0 && complete.is_success() {
                             let parent = source_path.parent().unwrap_or(std::path::Path::new(""));
                             let new_path = parent.join(&new_name);
                             Some(gravityfile_ops::UndoableOperation::FileRenamed {
@@ -2322,10 +3003,13 @@ impl App {
                         };
 
                         ScanResult::OperationComplete {
+                            cancelled: complete.cancelled,
                             operation_type: complete.operation_type,
                             succeeded: complete.succeeded,
                             failed: complete.failed,
+                            skipped: complete.skipped,
                             bytes_processed: complete.bytes_processed,
+                            errors: complete.errors,
                             undo_info,
                         }
                     }
@@ -2350,12 +3034,14 @@ impl App {
         }
 
         let path = parent.join(&name);
+        self.prepare_operation();
         let rx = start_create_file(path.clone());
 
         let adapted_rx = Self::adapt_create_rx(path, rx);
         self.scan_rx = Some(adapted_rx);
 
         self.operation_message = Some((true, format!("Creating file {}...", name)));
+        self.mode = AppMode::UpdatingEntry;
     }
 
     /// Execute create directory operation.
@@ -2369,57 +3055,72 @@ impl App {
         }
 
         let path = parent.join(&name);
+        self.prepare_operation();
         let rx = start_create_directory(path.clone());
 
         let adapted_rx = Self::adapt_create_rx(path, rx);
         self.scan_rx = Some(adapted_rx);
 
         self.operation_message = Some((true, format!("Creating directory {}...", name)));
+        self.mode = AppMode::UpdatingEntry;
     }
 
     /// Execute take operation (create directory and navigate into it).
     fn execute_take(&mut self, parent: std::path::PathBuf, name: String) {
-        // Validate name
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            self.operation_message = Some((false, "Invalid directory name".to_string()));
+        if self.take_rx.is_some() {
+            self.operation_message = Some((false, "Create-and-enter is still in progress".into()));
             return;
         }
-
-        let path = parent.join(&name);
-
-        // Check if already exists
-        if path.exists() {
-            if path.is_dir() {
-                // Directory exists - just navigate into it
-                self.operation_message = Some((
-                    true,
-                    format!("Directory {} already exists, navigating...", name),
-                ));
-            } else {
-                // File exists with same name
-                self.operation_message =
-                    Some((false, format!("A file named {} already exists", name)));
-                return;
-            }
-        } else {
-            // Create the directory synchronously (it's a simple operation)
-            if let Err(e) = std::fs::create_dir(&path) {
-                self.operation_message =
-                    Some((false, format!("Failed to create directory: {}", e)));
-                return;
-            }
-            self.operation_message = Some((true, format!("Created and entered {}", name)));
+        if name.contains('/') || name.contains('\\') {
+            self.operation_message = Some((false, "Invalid directory name".into()));
+            return;
         }
+        if let Err(error) = gravityfile_ops::validate_filename(&name) {
+            self.operation_message = Some((false, error));
+            return;
+        }
+        let path = parent.join(&name);
+        self.prepare_operation();
+        self.take_rx = Some(scanning::start_take(path));
+        self.operation_message = Some((true, format!("Creating or opening {name}...")));
+    }
 
-        // Navigate into the new directory
-        // Save current state to history
-        let saved_expanded = self.tree_state.expanded.clone();
-        let saved_selected = match self.layout_mode {
+    /// Start a new history branch using the cursor of the active layout.
+    fn record_navigation_origin(&mut self) {
+        let selected = match self.layout_mode {
             LayoutMode::Tree => self.tree_state.selected,
             LayoutMode::Miller => self.miller_state.selected,
         };
-        self.view_history
-            .push((self.view_root.clone(), saved_selected, saved_expanded));
+        self.view_history.push((
+            self.view_root.clone(),
+            selected,
+            self.tree_state.expanded.clone(),
+        ));
+        self.forward_history.clear();
+    }
+
+    fn finish_take(&mut self, path: PathBuf, result: Result<bool, String>) {
+        self.take_rx = None;
+        let created = match result {
+            Ok(created) => created,
+            Err(error) => {
+                self.operation_message =
+                    Some((false, format!("Cannot create or enter directory: {error}")));
+                return;
+            }
+        };
+        if created {
+            self.undo_log.record_create_directory(path.clone());
+        }
+        if path.parent() != Some(self.view_root.as_path()) || self.mode != AppMode::Normal {
+            self.operation_message = Some((true, format!("Directory ready: {}", path.display())));
+            return;
+        }
+        self.operation_message = Some((true, format!("Entered {}", path.display())));
+
+        // Navigate into the new directory
+        // Save current state to history
+        self.record_navigation_origin();
 
         // Update view root to the new directory
         self.view_root = path;
@@ -2450,13 +3151,17 @@ impl App {
         let (tx, adapted_rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => None,
+                result = rx.recv() => result,
+            } {
                 let scan_result = match result {
                     gravityfile_ops::CreateResult::Progress(progress) => {
                         ScanResult::OperationProgress(progress)
                     }
                     gravityfile_ops::CreateResult::Complete(complete) => {
-                        let undo_info = if complete.is_success() {
+                        let undo_info = if complete.succeeded > 0 && complete.is_success() {
                             match complete.operation_type {
                                 gravityfile_ops::OperationType::CreateFile => {
                                     Some(gravityfile_ops::UndoableOperation::FileCreated {
@@ -2475,10 +3180,13 @@ impl App {
                         };
 
                         ScanResult::OperationComplete {
+                            cancelled: complete.cancelled,
                             operation_type: complete.operation_type,
                             succeeded: complete.succeeded,
                             failed: complete.failed,
+                            skipped: complete.skipped,
                             bytes_processed: complete.bytes_processed,
+                            errors: complete.errors,
                             undo_info,
                         }
                     }
@@ -2562,7 +3270,7 @@ impl App {
                 }
             }
             View::Errors => {
-                let max = self.warnings.len().saturating_sub(1);
+                let max = self.warning_count().saturating_sub(1);
                 self.selected_warning = (self.selected_warning + 1).min(max);
             }
             View::Treemap => {
@@ -2629,7 +3337,7 @@ impl App {
                 }
             }
             View::Errors => {
-                let max = self.warnings.len().saturating_sub(1);
+                let max = self.warning_count().saturating_sub(1);
                 self.selected_warning = (self.selected_warning + PAGE_SIZE).min(max);
             }
             View::Treemap => {
@@ -2679,7 +3387,7 @@ impl App {
                 }
             }
             View::Errors => {
-                self.selected_warning = self.warnings.len().saturating_sub(1);
+                self.selected_warning = self.warning_count().saturating_sub(1);
             }
             View::Treemap => {
                 // Jump to last item in treemap
@@ -2753,93 +3461,45 @@ impl App {
     }
 
     fn get_selected_info(&self) -> Option<SelectedInfo> {
+        let path = self.get_selected_path()?;
         let tree = self.tree.as_ref()?;
-        let (view_node, view_path) = self.get_view_root_node()?;
-
-        match self.layout_mode {
-            LayoutMode::Tree => {
-                let items = TreeView::new(
-                    view_node,
-                    &view_path,
-                    &self.theme,
-                    &self.marked,
-                    &self.clipboard,
-                )
-                .flatten(&self.tree_state);
-                let item = items.get(self.tree_state.selected)?;
-                let node = Self::find_node_at_path(&tree.root, &item.path, &tree.root_path)?;
-
-                Some(SelectedInfo {
-                    name: item.node.name.clone(),
-                    path: item.path.clone(),
-                    size: node.size,
-                    file_count: node.file_count(),
-                    dir_count: node.dir_count(),
-                    modified: node.timestamps.modified,
-                    is_dir: node.is_dir(),
-                })
-            }
-            LayoutMode::Miller => {
-                let child = view_node.children.get(self.miller_state.selected)?;
-                let path = self.view_root.join(&*child.name);
-
-                Some(SelectedInfo {
-                    name: child.name.to_string(),
-                    path,
-                    size: child.size,
-                    file_count: child.file_count(),
-                    dir_count: child.dir_count(),
-                    modified: child.timestamps.modified,
-                    is_dir: child.is_dir(),
-                })
-            }
-        }
+        let node = Self::find_node_at_path(&tree.root, &path, &tree.root_path)?;
+        Some(SelectedInfo {
+            name: node.display_name().into_owned(),
+            path,
+            size: node.size,
+            file_count: node.file_count(),
+            dir_count: node.dir_count(),
+            modified: node.timestamps.modified,
+            is_dir: node.is_dir(),
+        })
     }
 
-    /// Check if the currently selected item is a file (not a directory).
+    /// Check the active view's selection, never an inactive explorer cursor.
     fn is_selected_file(&self) -> bool {
-        if self.view == View::Treemap {
-            return self
-                .get_selected_treemap_child()
-                .map(|(child, _)| !child.is_dir())
-                .unwrap_or(false);
-        }
-
-        match self.layout_mode {
-            LayoutMode::Tree => {
-                if let Some((view_node, view_path)) = self.get_view_root_node() {
-                    let items = TreeView::new(
-                        view_node,
-                        &view_path,
-                        &self.theme,
-                        &self.marked,
-                        &self.clipboard,
-                    )
-                    .flatten(&self.tree_state);
-                    if let Some(item) = items.get(self.tree_state.selected) {
-                        return !matches!(
-                            item.node.kind,
-                            crate::ui::VisibleNodeKind::Directory { .. }
-                        );
-                    }
-                }
-                false
-            }
-            LayoutMode::Miller => {
-                if let Some((view_node, _)) = self.get_view_root_node()
-                    && let Some(child) = view_node.children.get(self.miller_state.selected)
-                {
-                    return !child.is_dir();
-                }
-                false
-            }
-        }
+        self.get_selected_info().is_some_and(|info| !info.is_dir)
     }
 
     /// Get the path of the currently selected item.
     fn get_selected_path(&self) -> Option<PathBuf> {
-        if self.view == View::Treemap {
-            return self.get_selected_treemap_child().map(|(_, path)| path);
+        match self.view {
+            View::Explorer => {}
+            View::Treemap => return self.get_selected_treemap_child().map(|(_, path)| path),
+            View::Errors => {
+                return self
+                    .displayed_warning(self.selected_warning)
+                    .map(|warning| warning.path.clone());
+            }
+            View::Duplicates => {
+                let (groups, _) = self.get_filtered_duplicates()?;
+                return self.duplicates_state.selected_file_path(&groups).cloned();
+            }
+            View::Age => {
+                let directories = self.get_filtered_stale_dirs()?;
+                return directories
+                    .get(self.selected_stale_dir)
+                    .map(|directory| directory.path.clone());
+            }
         }
 
         match self.layout_mode {
@@ -2863,7 +3523,7 @@ impl App {
                 if let Some((view_node, _)) = self.get_view_root_node()
                     && let Some(child) = view_node.children.get(self.miller_state.selected)
                 {
-                    return Some(self.view_root.join(&*child.name));
+                    return Some(self.view_root.join(child.file_name()));
                 }
                 None
             }
@@ -3003,7 +3663,7 @@ impl App {
             return;
         }
 
-        let target_path = self.view_root.join(&*selected_child.name);
+        let target_path = self.view_root.join(selected_child.file_name());
 
         // Lazy loading: if directory has no children (from quick_list), load them now
         if selected_child.children.is_empty() {
@@ -3051,6 +3711,12 @@ impl App {
     /// Lazy load a directory's children using quick_list.
     /// This updates the tree in-place with the new children.
     fn lazy_load_directory(&mut self, path: &Path) {
+        // Captured up front: the mutable borrow taken by `Arc::make_mut` below
+        // rules out reading the tree's own root path at the same time.
+        let Some(root_path) = self.tree.as_ref().map(|tree| tree.root_path.clone()) else {
+            return;
+        };
+
         // First check if we have cached scan data for this directory
         if let Some(cached_tree) = self
             .scanned_cache
@@ -3060,22 +3726,35 @@ impl App {
         {
             // Use cached scan data - it has full size/structure information
             if let Some(tree) = &mut self.tree
-                && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
+                && let Some(node) =
+                    Self::find_node_mut(&mut Arc::make_mut(tree).root, path, &root_path)
             {
                 // Replace with the cached node (preserves all scan data)
-                *node = cached_tree.root;
+                *node = cached_tree.root.clone();
             }
             return;
         }
 
         // Quick load directory contents for immediate display
         // When the full scan completes, it will replace this with accurate data
-        if let Ok(quick_tree) = quick_list_with_settings(path, &self.user_settings) {
+        if let Some(mut quick_tree) = self.load_directory_listing(path) {
             // Find the node in our tree and update its children
             if let Some(tree) = &mut self.tree
-                && let Some(node) = Self::find_node_mut(&mut tree.root, path, &tree.root_path)
+                && let Some(node) =
+                    Self::find_node_mut(&mut Arc::make_mut(tree).root, path, &root_path)
             {
-                node.children = quick_tree.root.children;
+                node.children = std::mem::take(&mut quick_tree.root.children);
+            }
+        }
+    }
+
+    fn load_directory_listing(&mut self, path: &Path) -> Option<gravityfile_core::FileTree> {
+        match quick_list_with_settings(path, &self.user_settings) {
+            Ok(tree) => Some(tree),
+            Err(error) => {
+                self.error = Some(format!("Cannot list {}: {error}", path.display()));
+                self.needs_redraw = true;
+                None
             }
         }
     }
@@ -3086,20 +3765,18 @@ impl App {
         target: &Path,
         current_path: &Path,
     ) -> Option<&'a mut gravityfile_core::FileNode> {
-        if current_path == target {
-            return Some(node);
+        let relative = target.strip_prefix(current_path).ok()?;
+        let mut found = node;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            found = found
+                .children
+                .iter_mut()
+                .find(|child| child.file_name() == name)?;
         }
-
-        for child in &mut node.children {
-            let child_path = current_path.join(&*child.name);
-            if target.starts_with(&child_path)
-                && let Some(found) = Self::find_node_mut(child, target, &child_path)
-            {
-                return Some(found);
-            }
-        }
-
-        None
+        Some(found)
     }
 
     /// Navigate back up to the previous view root.
@@ -3117,8 +3794,28 @@ impl App {
         );
 
         // First, try to use view history if available
-        if let Some((prev_root, saved_selected, saved_expanded)) = self.view_history.pop() {
-            // Navigation will succeed - save current state to forward history
+        if let Some((prev_root, saved_selected, saved_expanded)) = self.view_history.last().cloned()
+        {
+            let loaded = self.tree.as_ref().is_some_and(|tree| {
+                Self::find_node_at_path(&tree.root, &prev_root, &tree.root_path)
+                    .is_some_and(|node| node.is_dir())
+            });
+            let prev_root = if loaded {
+                prev_root
+            } else {
+                let Some(tree) = self.load_directory_listing(&prev_root) else {
+                    return;
+                };
+                self.prepare_operation();
+                self.path = tree.root_path.clone();
+                self.tree = Some(Arc::new(tree));
+                self.duplicates = None;
+                self.age_report = None;
+                self.has_full_scan = false;
+                self.path.clone()
+            };
+            self.view_history.pop();
+            // Destination is usable; only now commit both history stacks.
             self.forward_history.push(current_state);
             self.view_root = prev_root;
             self.tree_state.expanded = saved_expanded;
@@ -3148,9 +3845,6 @@ impl App {
         let parent = parent.to_path_buf();
         let dir_we_came_from = self.view_root.clone();
 
-        // Navigation will succeed - save current state to forward history
-        self.forward_history.push(current_state);
-
         // Check if parent is within our current tree
         let parent_in_tree = parent.starts_with(&self.path) || parent == self.path;
 
@@ -3161,9 +3855,12 @@ impl App {
             self.tree_state.expand(&self.view_root);
         } else {
             // Navigate beyond scan root - need to extend our tree
-            self.navigate_to_parent_beyond_scan_root(&parent, &dir_we_came_from);
+            if self.navigate_to_parent_beyond_scan_root(&parent, &dir_we_came_from) {
+                self.forward_history.push(current_state);
+            }
             return;
         }
+        self.forward_history.push(current_state);
 
         // Select the directory we just came from
         self.select_child_by_name(&dir_we_came_from);
@@ -3172,27 +3869,34 @@ impl App {
 
     /// Navigate to a parent directory that's outside the current scan root.
     /// This extends the tree by lazy-loading the parent.
-    fn navigate_to_parent_beyond_scan_root(&mut self, parent: &Path, dir_we_came_from: &Path) {
+    fn navigate_to_parent_beyond_scan_root(
+        &mut self,
+        parent: &Path,
+        dir_we_came_from: &Path,
+    ) -> bool {
         // Cache current tree before navigating away (if we have scan data)
         if let Some(tree) = &self.tree
             && self.has_full_scan
             && let Some(cache) = &mut self.scanned_cache
         {
-            cache.insert(tree.root_path.clone(), tree.clone());
+            cache.insert(tree.root_path.clone(), Arc::clone(tree));
         }
 
         // Load the parent directory contents
-        let Ok(mut parent_tree) = quick_list_with_settings(parent, &self.user_settings) else {
-            return; // Can't access parent directory
+        let Some(mut parent_tree) = self.load_directory_listing(parent) else {
+            return false; // Preserve the current tree and histories on failure.
         };
 
         // Merge any cached scans into the parent tree's children
         self.merge_cached_scans_into_tree(&mut parent_tree.root, parent);
 
-        // Create a new tree rooted at the parent
-        self.path = parent.to_path_buf();
-        self.tree = Some(parent_tree);
-        self.view_root = parent.to_path_buf();
+        // Create a new tree rooted at the resolved parent.
+        self.prepare_operation();
+        self.path = parent_tree.root_path.clone();
+        self.tree = Some(Arc::new(parent_tree));
+        self.view_root = self.path.clone();
+        self.duplicates = None;
+        self.age_report = None;
         self.view_history.clear();
         // Note: don't clear forward_history here - we want to allow navigating back
 
@@ -3200,7 +3904,7 @@ impl App {
         self.has_full_scan = false;
 
         // Reset tree state for the new root
-        self.tree_state = TreeState::new(parent.to_path_buf());
+        self.tree_state = TreeState::new(self.path.clone());
 
         // Update cached parent for Miller columns display
         self.update_cached_parent();
@@ -3208,6 +3912,7 @@ impl App {
         // Select the directory we came from
         self.select_child_by_name(dir_we_came_from);
         self.sync_to_active_tab();
+        true
     }
 
     /// Merge cached scan data into a tree node's children.
@@ -3220,7 +3925,7 @@ impl App {
     ) {
         for child in &mut node.children {
             if child.is_dir() {
-                let child_path = node_path.join(&*child.name);
+                let child_path = node_path.join(child.file_name());
                 if let Some(cached_tree) =
                     self.scanned_cache.as_ref().and_then(|c| c.get(&child_path))
                 {
@@ -3233,10 +3938,7 @@ impl App {
 
     /// Select a child entry by matching its name.
     fn select_child_by_name(&mut self, target_path: &Path) {
-        let dir_name = target_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let dir_name = target_path.file_name().unwrap_or_default();
 
         match self.layout_mode {
             LayoutMode::Tree => {
@@ -3245,9 +3947,10 @@ impl App {
                     let items =
                         TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
                             .flatten(&self.tree_state);
-                    if let Some(idx) = items.iter().position(|item| {
-                        item.path.file_name().and_then(|n| n.to_str()) == Some(dir_name)
-                    }) {
+                    if let Some(idx) = items
+                        .iter()
+                        .position(|item| item.path.file_name() == Some(dir_name))
+                    {
                         self.tree_state.selected = idx;
                     } else {
                         self.tree_state.selected = 0;
@@ -3264,7 +3967,7 @@ impl App {
                     let idx = node
                         .children
                         .iter()
-                        .position(|c| c.name.as_str() == dir_name)
+                        .position(|c| c.file_name() == dir_name)
                         .unwrap_or(0);
                     self.miller_state.selected = idx;
                 } else {
@@ -3279,19 +3982,40 @@ impl App {
     /// Find a node by path in the tree.
     fn find_node_at_path<'a>(
         node: &'a gravityfile_core::FileNode,
-        target_path: &PathBuf,
-        current_path: &PathBuf,
+        target_path: &Path,
+        current_path: &Path,
     ) -> Option<&'a gravityfile_core::FileNode> {
-        if current_path == target_path {
-            return Some(node);
+        Self::find_node_at_path_while(node, target_path, current_path, || true)
+    }
+
+    fn find_node_at_path_while<'a>(
+        node: &'a gravityfile_core::FileNode,
+        target_path: &Path,
+        current_path: &Path,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Option<&'a gravityfile_core::FileNode> {
+        if !keep_going() {
+            return None;
         }
-        for child in &node.children {
-            let child_path = current_path.join(&*child.name);
-            if let Some(found) = Self::find_node_at_path(child, target_path, &child_path) {
-                return Some(found);
+        let relative = target_path.strip_prefix(current_path).ok()?;
+        let mut found = node;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            let mut matched = None;
+            for child in &found.children {
+                if !keep_going() {
+                    return None;
+                }
+                if child.file_name() == name {
+                    matched = Some(child);
+                    break;
+                }
             }
+            found = matched?;
         }
-        None
+        Some(found)
     }
 
     /// Get the current view root node.
@@ -3324,6 +4048,8 @@ impl App {
     /// Update the cached parent tree for Miller columns display.
     /// Called when navigating to ensure the parent column can be shown.
     fn update_cached_parent(&mut self) {
+        // Never retain a previous location's parent when refresh fails.
+        self.cached_parent_tree = None;
         let Some(tree) = &self.tree else { return };
 
         // Only need to cache parent if we're at or near the tree root
@@ -3372,8 +4098,22 @@ impl App {
     fn execute_command(&mut self, cmd: &str) {
         match parse_command(cmd) {
             CommandAction::None => {}
+            CommandAction::Invalid(message) => {
+                self.error = Some(message.to_string());
+            }
             CommandAction::Quit => {
-                self.mode = AppMode::Quit;
+                if self.cancel_archive_operation() {
+                    return;
+                }
+                if self.archive_rx.is_some()
+                    || self.take_rx.is_some()
+                    || self.undo_export_rx.is_some()
+                {
+                    self.error =
+                        Some("Filesystem operation in progress; wait for it to finish".to_string());
+                } else {
+                    self.mode = AppMode::Quit;
+                }
             }
             CommandAction::Refresh => {
                 self.marked.clear();
@@ -3502,6 +4242,9 @@ impl App {
             CommandAction::Undo => {
                 self.execute_undo();
             }
+            CommandAction::UndoReview(page) => self.show_undo_review(page),
+            CommandAction::UndoReviewErrors(page) => self.show_undo_errors(page),
+            CommandAction::UndoExport(path) => self.export_undo_review(&path),
             CommandAction::ShowBookmarks => {
                 self.bookmark_list_state =
                     Some(BookmarkListState::new(&self.user_settings.bookmarks));
@@ -3523,7 +4266,9 @@ impl App {
             }
             CommandAction::DeleteBookmark(key) => {
                 self.user_settings.bookmarks.remove(key);
-                let _ = self.user_settings.save();
+                if let Err(error) = self.user_settings.save() {
+                    self.error = Some(format!("Failed to save bookmarks: {error}"));
+                }
             }
             CommandAction::BulkRename => {
                 self.start_bulk_rename();
@@ -3568,163 +4313,6 @@ impl App {
         Ok(path)
     }
 
-    /// Sanitize archive error messages to prevent path disclosure.
-    fn sanitize_archive_error(err: &gravityfile_ops::ArchiveError) -> String {
-        use gravityfile_ops::ArchiveError;
-        match err {
-            ArchiveError::Io(e) => {
-                // Extract just the error kind, not the full message which may contain paths
-                let kind = e.kind();
-                match kind {
-                    std::io::ErrorKind::NotFound => "File not found".to_string(),
-                    std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
-                    std::io::ErrorKind::AlreadyExists => "File already exists".to_string(),
-                    std::io::ErrorKind::InvalidData => "Invalid or corrupted archive".to_string(),
-                    _ => format!("I/O error: {}", kind),
-                }
-            }
-            ArchiveError::Zip(_) => "Invalid or corrupted ZIP archive".to_string(),
-            ArchiveError::UnsupportedFormat(fmt) => format!("Unsupported format: {}", fmt),
-            ArchiveError::NotFound(_) => "Archive file not found".to_string(),
-            ArchiveError::DestinationExists(_) => "Destination already exists".to_string(),
-            ArchiveError::DecompressionBomb(_) => {
-                "Archive rejected: potential decompression bomb detected".to_string()
-            }
-        }
-    }
-
-    /// Extract an archive file to a destination directory.
-    fn extract_archive(&mut self, destination: Option<String>) {
-        // Get the archive path from current selection
-        let Some(archive_path) = self.get_selected_path() else {
-            self.error = Some("No file selected for extraction".to_string());
-            return;
-        };
-
-        // Check if it's actually an archive
-        if gravityfile_ops::ArchiveFormat::from_path(&archive_path).is_none() {
-            self.error = Some("Selected file is not a supported archive format".to_string());
-            return;
-        }
-
-        // Determine destination directory
-        let dest_dir = if let Some(dest) = destination {
-            // Validate user-provided path
-            let dest_path = match Self::validate_user_path(&dest) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.error = Some(format!("Invalid destination: {}", e));
-                    return;
-                }
-            };
-
-            if dest_path.is_absolute() {
-                dest_path
-            } else {
-                // Relative to view root
-                self.view_root.join(&dest_path)
-            }
-        } else {
-            // Extract to current directory by default
-            self.view_root.clone()
-        };
-
-        // Extract the archive
-        match gravityfile_ops::extract_archive(&archive_path, &dest_dir) {
-            Ok(extracted_files) => {
-                self.error = Some(format!(
-                    "Extracted {} files from {} to {}",
-                    extracted_files.len(),
-                    archive_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    dest_dir.display()
-                ));
-                // Trigger a rescan to show the extracted files
-                self.start_scan();
-            }
-            Err(e) => {
-                self.error = Some(format!(
-                    "Failed to extract: {}",
-                    Self::sanitize_archive_error(&e)
-                ));
-            }
-        }
-    }
-
-    /// Compress marked files into an archive.
-    fn compress_files(&mut self, archive_name: &str) {
-        // Get files to compress from marked items, or current selection
-        let files: Vec<PathBuf> = if self.marked.is_empty() {
-            if let Some(path) = self.get_selected_path() {
-                vec![path]
-            } else {
-                self.error = Some("No files selected for compression".to_string());
-                return;
-            }
-        } else {
-            self.marked.iter().cloned().collect()
-        };
-
-        if files.is_empty() {
-            self.error = Some("No files to compress".to_string());
-            return;
-        }
-
-        // Validate archive name
-        let validated_name = match Self::validate_user_path(archive_name) {
-            Ok(p) => p,
-            Err(e) => {
-                self.error = Some(format!("Invalid archive name: {}", e));
-                return;
-            }
-        };
-
-        // Determine archive path - relative to view root
-        let archive_path = self.view_root.join(&validated_name);
-
-        // Determine format from name
-        let format = match gravityfile_ops::ArchiveFormat::from_path(&archive_path) {
-            Some(f) => f,
-            None => {
-                // Default to zip if no recognized extension
-                gravityfile_ops::ArchiveFormat::Zip
-            }
-        };
-
-        // Adjust path if needed (add extension if missing)
-        let archive_path = if gravityfile_ops::ArchiveFormat::from_path(&archive_path).is_none() {
-            PathBuf::from(format!("{}{}", archive_path.display(), format.extension()))
-        } else {
-            archive_path
-        };
-
-        // Create the archive
-        match gravityfile_ops::create_archive(&files, &archive_path, format) {
-            Ok(()) => {
-                self.error = Some(format!(
-                    "Created archive {} with {} files",
-                    archive_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    files.len()
-                ));
-                // Clear marks after successful compression
-                self.marked.clear();
-                // Trigger a rescan to show the new archive
-                self.start_scan();
-            }
-            Err(e) => {
-                self.error = Some(format!(
-                    "Failed to create archive: {}",
-                    Self::sanitize_archive_error(&e)
-                ));
-            }
-        }
-    }
-
     /// Start bulk rename by opening editor with marked file names.
     fn start_bulk_rename(&mut self) {
         // Collect paths to rename
@@ -3743,51 +4331,23 @@ impl App {
             return;
         }
 
-        // Create temp file with file names
-        let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(format!("gravityfile-rename-{}.txt", std::process::id()));
+        let edit = match bulk_edit::BulkRenameEdit::new(paths) {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.error = Some(format!("Cannot prepare bulk rename: {error}"));
+                return;
+            }
+        };
 
-        let content: String = paths
-            .iter()
-            .filter_map(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let cmd = match crate::opener::editor_command(edit.path(), &self.user_settings.editor) {
+            Ok(command) => command,
+            Err(error) => {
+                self.error = Some(format!("Cannot configure bulk rename editor: {error}"));
+                return;
+            }
+        };
 
-        if std::fs::write(&temp_file, &content).is_err() {
-            self.error = Some("Failed to create temp file for bulk rename".to_string());
-            return;
-        }
-
-        // Determine editor
-        let editor = std::env::var("EDITOR")
-            .or_else(|_| std::env::var("VISUAL"))
-            .unwrap_or_else(|_| "vi".to_string());
-
-        // Create the command to suspend terminal and run editor
-        let mut cmd = std::process::Command::new(&editor);
-        cmd.arg(&temp_file);
-
-        // Store paths and temp file for later processing
-        self.bulk_rename_state = Some(state::BulkRenameState {
-            entries: paths
-                .iter()
-                .filter_map(|p| {
-                    Some(state::RenameEntry {
-                        original: p.clone(),
-                        new_name: p.file_name()?.to_string_lossy().to_string(),
-                    })
-                })
-                .collect(),
-            selected: 0,
-            offset: 0,
-            error: None,
-        });
-
-        // Store temp file path in error field temporarily (we'll read it after editor closes)
-        if let Some(ref mut bulk_state) = self.bulk_rename_state {
-            bulk_state.error = Some(temp_file.to_string_lossy().to_string());
-        }
+        self.bulk_rename_edit = Some(edit);
 
         // Set pending command to suspend terminal
         self.pending_suspend_command = Some(cmd);
@@ -3795,46 +4355,17 @@ impl App {
 
     /// Process bulk rename after editor closes.
     fn process_bulk_rename_from_editor(&mut self) {
-        let Some(ref bulk_state) = self.bulk_rename_state else {
+        let Some(edit) = self.bulk_rename_edit.take() else {
             return;
         };
-
-        // Get temp file path from error field
-        let Some(temp_file_str) = bulk_state.error.as_ref() else {
-            return;
-        };
-        let temp_file = PathBuf::from(temp_file_str);
-
-        // Read the edited file
-        let new_names: Vec<String> = match std::fs::read_to_string(&temp_file) {
-            Ok(content) => content.lines().map(|s| s.to_string()).collect(),
-            Err(_) => {
-                self.error = Some("Failed to read edited file".to_string());
-                self.bulk_rename_state = None;
-                let _ = std::fs::remove_file(&temp_file);
+        let new_names = match edit.read_names() {
+            Ok(names) => names,
+            Err(error) => {
+                self.error = Some(format!("Cannot read edited rename list: {error}"));
                 return;
             }
         };
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&temp_file);
-
-        // Validate and create new state
-        let original_paths: Vec<PathBuf> = bulk_state
-            .entries
-            .iter()
-            .map(|e| e.original.clone())
-            .collect();
-
-        if new_names.len() != original_paths.len() {
-            self.error = Some(format!(
-                "Line count mismatch: expected {}, got {}",
-                original_paths.len(),
-                new_names.len()
-            ));
-            self.bulk_rename_state = None;
-            return;
-        }
+        let original_paths = edit.paths.clone();
 
         // Create proper state with changes only
         let mut new_state = state::BulkRenameState::new(original_paths, new_names);
@@ -3858,56 +4389,27 @@ impl App {
             return;
         };
 
-        let mut success_count = 0;
-        let mut error_messages: Vec<String> = Vec::new();
-
-        for entry in &bulk_state.entries {
-            let new_path = entry.original.parent().map(|p| p.join(&entry.new_name));
-            if let Some(new_path) = new_path {
-                match std::fs::rename(&entry.original, &new_path) {
-                    Ok(_) => {
-                        success_count += 1;
-                        // Update marks if this path was marked
-                        if self.marked.remove(&entry.original) {
-                            self.marked.insert(new_path);
-                        }
-                    }
-                    Err(e) => {
-                        error_messages.push(format!(
-                            "{}: {}",
-                            entry
-                                .original
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            e
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Show result message
-        if error_messages.is_empty() {
-            self.operation_message = Some((true, format!("Renamed {} items", success_count)));
-        } else {
-            self.operation_message = Some((
-                false,
-                format!(
-                    "Renamed {} items, {} failed: {}",
-                    success_count,
-                    error_messages.len(),
-                    error_messages.first().unwrap_or(&String::new())
-                ),
-            ));
-        }
-
-        // Clear marks after successful bulk rename
-        self.marked.clear();
-
-        // Refresh the view
-        self.mode = AppMode::Normal;
-        self.start_scan();
+        let renames: Vec<_> = bulk_state
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .original
+                    .parent()
+                    .map(|parent| (entry.original.clone(), parent.join(&entry.new_name)))
+            })
+            .collect();
+        self.prepare_operation();
+        self.scan_rx = Some(scanning::start_bulk_rename(
+            renames,
+            self.scan_token.clone(),
+        ));
+        self.mode = AppMode::BulkRenaming;
+        self.operation_message = Some((
+            true,
+            "Bulk rename in progress; waiting for completion".into(),
+        ));
+        self.needs_redraw = true;
     }
 
     /// Go to the scan root.
@@ -3922,7 +4424,7 @@ impl App {
         self.sync_to_active_tab();
     }
 
-    /// Change directory to a path.
+    /// Change directory within the loaded scan tree. Leading `/` is scan-root relative.
     fn cd_to_path(&mut self, target: &str) {
         if target == "/" || target == "~" {
             self.go_to_root();
@@ -3932,33 +4434,56 @@ impl App {
             self.navigate_back();
             return;
         }
-
         let Some(tree) = &self.tree else {
+            self.error = Some("Cannot change directory: no directory tree is loaded".into());
             return;
         };
-
-        let target_path = if target.starts_with('/') {
-            let relative = target.trim_start_matches('/');
-            self.path.join(relative)
+        let mut target_path = if target.starts_with('/') {
+            self.path.clone()
         } else {
-            self.view_root.join(target)
+            self.view_root.clone()
         };
-
-        if let Some(node) = Self::find_node_at_path(&tree.root, &target_path, &tree.root_path)
-            && node.is_dir()
-        {
-            let saved_expanded = self.tree_state.expanded.clone();
-            let saved_selected = self.tree_state.selected;
-            self.view_history
-                .push((self.view_root.clone(), saved_selected, saved_expanded));
-
-            self.view_root = target_path;
-            self.tree_state.selected = 0;
-            self.tree_state.offset = 0;
-            self.tree_state.expand(&self.view_root);
-            self.update_cached_tree_len();
-            self.sync_to_active_tab();
+        for component in Path::new(target.trim_start_matches('/')).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(name) => target_path.push(name),
+                std::path::Component::ParentDir => {
+                    if target_path == self.path || !target_path.starts_with(&self.path) {
+                        self.error =
+                            Some("Cannot change directory: path leaves the scan root".into());
+                        return;
+                    }
+                    target_path.pop();
+                }
+                _ => {
+                    self.error = Some("Cannot change directory: unsupported path prefix".into());
+                    return;
+                }
+            }
         }
+        let Some(node) = Self::find_node_at_path(&tree.root, &target_path, &tree.root_path) else {
+            self.error = Some(format!(
+                "Directory is not in the loaded tree: {}",
+                target_path.display()
+            ));
+            return;
+        };
+        if !node.is_dir() {
+            self.error = Some(format!("Not a directory: {}", target_path.display()));
+            return;
+        }
+        if target_path == self.view_root {
+            return;
+        }
+        self.record_navigation_origin();
+        self.view_root = target_path;
+        self.tree_state.selected = 0;
+        self.tree_state.offset = 0;
+        self.tree_state.expand(&self.view_root);
+        self.miller_state.reset();
+        self.update_cached_tree_len();
+        self.update_cached_miller_len();
+        self.sync_to_active_tab();
     }
 
     /// Check if a path is marked for deletion.
@@ -3998,50 +4523,69 @@ impl App {
         self.user_settings
             .bookmarks
             .set(key, self.view_root.clone());
-        let _ = self.user_settings.save();
+        if let Err(error) = self.user_settings.save() {
+            self.error = Some(format!("Failed to save bookmarks: {error}"));
+        }
     }
 
-    /// Jump to a bookmark.
+    /// Resolve and prepare a bookmark destination before changing navigation.
     fn jump_to_bookmark(&mut self, key: char) {
-        if let Some(path) = self.user_settings.bookmarks.get(key).cloned()
-            && path.is_dir()
-        {
-            // Save current state to history
-            let saved_expanded = self.tree_state.expanded.clone();
-            let saved_selected = self.tree_state.selected;
-            self.view_history
-                .push((self.view_root.clone(), saved_selected, saved_expanded));
-
-            // Check if we need to rescan (jumping outside current tree)
-            let needs_rescan = !path.starts_with(&self.path);
-
-            self.view_root = path.clone();
-            self.forward_history.clear();
-            self.tree_state.selected = 0;
-            self.tree_state.offset = 0;
-            self.miller_state.reset();
-
-            if needs_rescan {
-                // We're jumping outside the scanned tree, need to rescan
-                self.path = path;
-                self.tree = quick_list_with_settings(&self.path, &self.user_settings).ok();
-                self.tree_state = TreeState::new(self.path.clone());
-                self.tree_state.expand(&self.path);
-                self.duplicates = None;
-                self.age_report = None;
-                self.has_full_scan = false;
-                // Start a background scan of the new location
-                if self.scan_on_startup {
-                    self.start_scan();
-                }
-            } else {
-                self.tree_state.expand(&self.view_root);
+        let Some(saved_path) = self.user_settings.bookmarks.get(key).cloned() else {
+            self.error = Some(format!("Bookmark '{key}' is not set"));
+            return;
+        };
+        let path = match saved_path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                self.error = Some(format!("Cannot open bookmark '{key}': {error}"));
+                return;
             }
-
-            self.update_cached_tree_len();
-            self.update_cached_miller_len();
-            self.sync_to_active_tab();
+        };
+        if !path.is_dir() {
+            self.error = Some(format!("Bookmark '{key}' is not a directory"));
+            return;
         }
+        let loaded = self.tree.as_ref().is_some_and(|tree| {
+            Self::find_node_at_path(&tree.root, &path, &tree.root_path)
+                .is_some_and(|node| node.is_dir())
+        });
+        // A descendant can be absent from a quick/partial tree even when its
+        // path is under the scan root. Prepare a usable listing in that case.
+        let replacement = if loaded {
+            None
+        } else {
+            let Some(tree) = self.load_directory_listing(&path) else {
+                return;
+            };
+            Some(tree)
+        };
+        let destination = replacement
+            .as_ref()
+            .map_or_else(|| path.clone(), |tree| tree.root_path.clone());
+        if loaded && destination == self.view_root {
+            return;
+        }
+        self.record_navigation_origin();
+        self.view_root = destination;
+        self.tree_state.selected = 0;
+        self.tree_state.offset = 0;
+        self.miller_state.reset();
+        if let Some(tree) = replacement {
+            self.prepare_operation();
+            self.path = tree.root_path.clone();
+            self.tree = Some(Arc::new(tree));
+            self.tree_state = TreeState::new(self.path.clone());
+            self.duplicates = None;
+            self.age_report = None;
+            self.has_full_scan = false;
+            if self.scan_on_startup {
+                self.start_scan();
+            }
+        }
+        self.tree_state.expand(&self.view_root);
+        self.update_cached_tree_len();
+        self.update_cached_miller_len();
+        self.sync_to_active_tab();
     }
 
     /// Handle input in the bookmark list modal.
@@ -4083,7 +4627,9 @@ impl App {
                     if let Some((key, _)) = entries.get(state.selected) {
                         let key = *key;
                         self.user_settings.bookmarks.remove(key);
-                        let _ = self.user_settings.save();
+                        if let Err(error) = self.user_settings.save() {
+                            self.error = Some(format!("Failed to save bookmarks: {error}"));
+                        }
                     }
                 }
                 // Update state after deletion
@@ -4315,7 +4861,7 @@ impl App {
                         .filter_map(|i| {
                             node.children
                                 .get(i)
-                                .map(|child| view_root.join(&*child.name))
+                                .map(|child| view_root.join(child.file_name()))
                         })
                         .collect()
                 } else {
@@ -4411,7 +4957,7 @@ impl App {
                         }
                     }
                     View::Errors => {
-                        let max = self.warnings.len().saturating_sub(1);
+                        let max = self.warning_count().saturating_sub(1);
                         for _ in 0..3 {
                             if self.selected_warning < max {
                                 self.selected_warning += 1;
@@ -4571,51 +5117,61 @@ impl App {
     /// Start fuzzy search mode.
     fn start_search(&mut self) {
         // Populate search paths from the current tree
-        self.update_search_paths();
         self.search_state.activate();
+        self.update_search_paths();
         self.mode = AppMode::Search;
     }
 
-    /// Update search paths from the file tree.
+    /// Update search paths from the selected subtree, preserving preorder ranking.
     fn update_search_paths(&mut self) {
-        let mut paths = Vec::new();
-
-        if let Some(tree) = &self.tree {
-            Self::collect_paths_recursive(&tree.root, &tree.root_path, &self.view_root, &mut paths);
-        }
-
-        self.search_state.update_paths(paths);
+        let tree = self.tree.clone();
+        let view_root = self.view_root.clone();
+        self.search_state.build_paths(move |cancelled| {
+            tree.as_ref().map_or_else(Vec::new, |tree| {
+                Self::collect_search_paths(tree, &view_root, cancelled)
+            })
+        });
     }
 
-    /// Recursively collect paths from the file tree.
-    fn collect_paths_recursive(
-        node: &gravityfile_core::FileNode,
-        current_path: &PathBuf,
-        view_root: &PathBuf,
-        paths: &mut Vec<(PathBuf, String, bool)>,
-    ) {
-        // Only include paths under view_root
-        if !current_path.starts_with(view_root) && current_path != view_root {
-            return;
-        }
-
-        // Compute relative display path from view_root
-        let display = if current_path == view_root {
-            ".".to_string()
-        } else {
-            current_path
-                .strip_prefix(view_root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| node.name.to_string())
+    fn collect_search_paths(
+        tree: &gravityfile_core::FileTree,
+        view_root: &std::path::Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Vec<(PathBuf, String, bool)> {
+        let Some(root) =
+            Self::find_node_at_path_while(&tree.root, view_root, &tree.root_path, || {
+                !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            })
+        else {
+            return Vec::new();
         };
-
-        paths.push((current_path.clone(), display, node.is_dir()));
-
-        // Recurse into children
-        for child in &node.children {
-            let child_path = current_path.join(&*child.name);
-            Self::collect_paths_recursive(child, &child_path, view_root, paths);
+        let mut paths = Vec::new();
+        let mut current_path = view_root.to_path_buf();
+        paths.push((current_path.clone(), ".".into(), root.is_dir()));
+        // One iterator per depth avoids recursive calls and a width-sized stack
+        // of allocated paths for directories with millions of children.
+        let mut stack = vec![root.children.iter()];
+        while let Some(children) = stack.last_mut() {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Vec::new();
+            }
+            if let Some(child) = children.next() {
+                current_path.push(child.file_name());
+                let display = gravityfile_core::escape_filename(
+                    current_path
+                        .strip_prefix(view_root)
+                        .expect("search traversal stays inside its selected subtree")
+                        .as_os_str(),
+                )
+                .into_owned();
+                paths.push((current_path.clone(), display, child.is_dir()));
+                stack.push(child.children.iter());
+            } else {
+                stack.pop();
+                current_path.pop();
+            }
         }
+        paths
     }
 
     /// Handle key input during search mode.
@@ -4630,6 +5186,9 @@ impl App {
             }
             // Execute search (navigate to selected)
             (KeyCode::Enter, _) => {
+                if self.search_state.is_searching() {
+                    return;
+                }
                 if let Some(result) = self.search_state.selected_result() {
                     let target_path = result.path.clone();
                     self.navigate_to_search_result(&target_path);
@@ -4686,13 +5245,7 @@ impl App {
         // If it's a file, navigate to its parent and select it
         if target.is_dir() {
             // Save current state
-            let saved_expanded = self.tree_state.expanded.clone();
-            let saved_selected = match self.layout_mode {
-                LayoutMode::Tree => self.tree_state.selected,
-                LayoutMode::Miller => self.miller_state.selected,
-            };
-            self.view_history
-                .push((self.view_root.clone(), saved_selected, saved_expanded));
+            self.record_navigation_origin();
 
             // Navigate to directory
             self.view_root = target.to_path_buf();
@@ -4710,23 +5263,14 @@ impl App {
             // It's a file - navigate to parent and select it
             if let Some(parent) = target.parent() {
                 // Save current state
-                let saved_expanded = self.tree_state.expanded.clone();
-                let saved_selected = match self.layout_mode {
-                    LayoutMode::Tree => self.tree_state.selected,
-                    LayoutMode::Miller => self.miller_state.selected,
-                };
-                self.view_history
-                    .push((self.view_root.clone(), saved_selected, saved_expanded));
+                self.record_navigation_origin();
 
                 // Navigate to parent
                 self.view_root = parent.to_path_buf();
                 self.tree_state.expand(&self.view_root);
 
                 // Get file name before borrowing for position search
-                let file_name = target
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string());
+                let file_name = target.file_name().map(|s| s.to_os_string());
                 match self.layout_mode {
                     LayoutMode::Tree => {
                         // For tree view, we need to find the index in flattened list
@@ -4756,7 +5300,7 @@ impl App {
                             let idx = node
                                 .children
                                 .iter()
-                                .position(|c| c.name.as_str() == file_name)
+                                .position(|c| c.file_name() == file_name)
                                 .unwrap_or(0);
                             self.miller_state.selected = idx;
                         }
@@ -4792,31 +5336,33 @@ impl App {
                     state.toggle_selected();
                 }
             }
-            KeyAction::Sort => {
-                // 's' saves settings
-                if let Some(ref state) = self.settings_state
-                    && state.dirty
-                {
-                    // Save settings to disk
-                    self.user_settings = state.settings.clone();
-                    if let Err(e) = self.user_settings.save() {
-                        self.error = Some(format!("Failed to save settings: {}", e));
-                    } else {
-                        // Apply settings immediately where applicable
-                        self.scan_on_startup = self.user_settings.scan_on_startup;
-                    }
-                }
-                self.settings_state = None;
-                self.mode = AppMode::Normal;
-            }
+            KeyAction::Sort => self.save_settings_with(UserSettings::save),
             _ => {}
         }
+    }
+
+    /// Commit edited settings only after persistence succeeds; retain edits for retry.
+    fn save_settings_with(&mut self, persist: impl FnOnce(&UserSettings) -> std::io::Result<()>) {
+        if let Some(state) = &self.settings_state
+            && state.dirty
+        {
+            if let Err(error) = persist(&state.settings) {
+                self.error = Some(format!("Failed to save settings: {error}"));
+                self.needs_redraw = true;
+                return;
+            }
+            self.user_settings = state.settings.clone();
+            self.scan_on_startup = self.user_settings.scan_on_startup;
+        }
+        self.settings_state = None;
+        self.mode = AppMode::Normal;
+        self.needs_redraw = true;
     }
 
     /// Apply the current sort mode to the file tree.
     fn apply_sort(&mut self) {
         if let Some(ref mut tree) = self.tree {
-            Self::sort_node_recursive(&mut tree.root, self.sort_mode);
+            Self::sort_node_tree(&mut Arc::make_mut(tree).root, self.sort_mode);
             // Update cached lengths after sorting
             match self.layout_mode {
                 LayoutMode::Tree => self.update_cached_tree_len(),
@@ -4828,66 +5374,66 @@ impl App {
         }
     }
 
-    /// Recursively sort a node and all its children.
-    fn sort_node_recursive(node: &mut gravityfile_core::FileNode, mode: SortMode) {
-        // Sort children based on mode
-        node.children.sort_by(|a, b| match mode {
-            SortMode::SizeDescending => b.size.cmp(&a.size),
-            SortMode::SizeAscending => a.size.cmp(&b.size),
-            SortMode::NameAscending => a.name.cmp(&b.name),
-            SortMode::NameDescending => b.name.cmp(&a.name),
-            SortMode::ModifiedDescending => b.timestamps.modified.cmp(&a.timestamps.modified),
-            SortMode::ModifiedAscending => a.timestamps.modified.cmp(&b.timestamps.modified),
-            SortMode::CountDescending => {
-                let a_count = a.children.len();
-                let b_count = b.children.len();
-                b_count.cmp(&a_count)
-            }
-            SortMode::CountAscending => {
-                let a_count = a.children.len();
-                let b_count = b.children.len();
-                a_count.cmp(&b_count)
-            }
-        });
-
-        // Recursively sort children
-        for child in &mut node.children {
-            Self::sort_node_recursive(child, mode);
+    /// Sort a tree using one child iterator per depth instead of recursive calls.
+    fn sort_node_tree(node: &mut gravityfile_core::FileNode, mode: SortMode) {
+        let compare = |a: &gravityfile_core::FileNode, b: &gravityfile_core::FileNode| {
+            (match mode {
+                SortMode::SizeDescending => b.size.cmp(&a.size),
+                SortMode::SizeAscending => a.size.cmp(&b.size),
+                SortMode::NameAscending => a.compare_name(b),
+                SortMode::NameDescending => b.compare_name(a),
+                SortMode::ModifiedDescending => b.timestamps.modified.cmp(&a.timestamps.modified),
+                SortMode::ModifiedAscending => a.timestamps.modified.cmp(&b.timestamps.modified),
+                SortMode::CountDescending => {
+                    let a_count = a.children.len();
+                    let b_count = b.children.len();
+                    b_count.cmp(&a_count)
+                }
+                SortMode::CountAscending => {
+                    let a_count = a.children.len();
+                    let b_count = b.children.len();
+                    a_count.cmp(&b_count)
+                }
+            })
+            .then_with(|| a.compare_name(b))
+        };
+        node.children.sort_by(compare);
+        let mut stack = vec![node.children.iter_mut()];
+        while let Some(children) = stack.last_mut() {
+            let Some(child) = children.next() else {
+                stack.pop();
+                continue;
+            };
+            child.children.sort_by(compare);
+            stack.push(child.children.iter_mut());
         }
     }
 
     /// Get duplicate groups filtered to current view_root.
     fn get_filtered_duplicates(&self) -> Option<(Vec<&gravityfile_analyze::DuplicateGroup>, u64)> {
-        let dups = self.duplicates.as_ref()?;
+        let report = self.duplicates.as_ref()?;
+        let cached = self
+            .duplicate_filter
+            .get(report, &self.view_root, &self.path);
+        Some((
+            cached
+                .groups
+                .iter()
+                .map(|(index, _)| &report.groups[*index])
+                .collect(),
+            cached.wasted,
+        ))
+    }
 
-        if self.view_root == self.path {
-            let total: u64 = dups.groups.iter().map(|g| g.wasted_bytes).sum();
-            return Some((dups.groups.iter().collect(), total));
-        }
-
-        let filtered: Vec<&gravityfile_analyze::DuplicateGroup> = dups
+    fn filtered_duplicate_path_count(&self, index: usize) -> usize {
+        let Some(report) = &self.duplicates else {
+            return 0;
+        };
+        self.duplicate_filter
+            .get(report, &self.view_root, &self.path)
             .groups
-            .iter()
-            .filter(|g| g.paths.iter().any(|p| p.starts_with(&self.view_root)))
-            .collect();
-
-        let total_wasted: u64 = filtered
-            .iter()
-            .map(|g| {
-                let paths_in_view = g
-                    .paths
-                    .iter()
-                    .filter(|p| p.starts_with(&self.view_root))
-                    .count();
-                if paths_in_view > 1 {
-                    g.size * (paths_in_view as u64 - 1)
-                } else {
-                    0
-                }
-            })
-            .sum();
-
-        Some((filtered, total_wasted))
+            .get(index)
+            .map_or(0, |(_, count)| *count)
     }
 
     /// Get stale directories filtered to current view_root.
@@ -4905,5 +5451,3885 @@ impl App {
             .collect();
 
         Some(filtered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::sample_dir_on_disk;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    #[test]
+    fn all_explorer_sort_modes_handle_deep_trees() {
+        use gravityfile_core::{FileNode, NodeId, Timestamps};
+        let depth = 20_000u64;
+        let mut root = FileNode::new_directory(
+            NodeId::new(depth),
+            "d",
+            Timestamps::with_modified(std::time::UNIX_EPOCH),
+        );
+        for id in (0..depth).rev() {
+            let mut parent = FileNode::new_directory(
+                NodeId::new(id),
+                "d",
+                Timestamps::with_modified(std::time::UNIX_EPOCH),
+            );
+            parent
+                .children
+                .push(crate::test_support::file(depth + id + 1, "z", 10));
+            let mut file = crate::test_support::file(depth + id + 1, "z", 10);
+            file.timestamps.modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+            parent.children.push(file);
+            parent.children.push(root);
+            root = parent;
+        }
+        let mut all_sorted = true;
+        for mode in [
+            SortMode::SizeDescending,
+            SortMode::SizeAscending,
+            SortMode::NameAscending,
+            SortMode::NameDescending,
+            SortMode::ModifiedDescending,
+            SortMode::ModifiedAscending,
+            SortMode::CountDescending,
+            SortMode::CountAscending,
+        ] {
+            App::sort_node_tree(&mut root, mode);
+            let mut current = &root;
+            while current.children.len() == 2 {
+                let directory = current.children.iter().find(|node| node.is_dir()).unwrap();
+                let file_first = match mode {
+                    SortMode::SizeDescending
+                    | SortMode::NameDescending
+                    | SortMode::ModifiedDescending => true,
+                    SortMode::CountAscending => !directory.children.is_empty(),
+                    _ => false,
+                };
+                all_sorted &= current.children[0].is_file() == file_first;
+                current = directory;
+            }
+        }
+        let mut pending = std::mem::take(&mut root.children);
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+        }
+        assert!(all_sorted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_ties_sort_consistently_across_explorer_modes() {
+        use std::os::unix::ffi::OsStringExt;
+        let low = std::ffi::OsString::from_vec(b"same-\xfe".to_vec());
+        let high = std::ffi::OsString::from_vec(b"same-\xff".to_vec());
+        let mut a = crate::test_support::file(1, "", 10);
+        a.set_file_name(&low);
+        let mut b = a.clone();
+        b.id = gravityfile_core::NodeId::new(2);
+        b.set_file_name(&high);
+        assert_eq!(a.name, b.name);
+        for mode in [
+            SortMode::SizeDescending,
+            SortMode::SizeAscending,
+            SortMode::NameAscending,
+            SortMode::NameDescending,
+            SortMode::ModifiedDescending,
+            SortMode::ModifiedAscending,
+            SortMode::CountDescending,
+            SortMode::CountAscending,
+        ] {
+            for children in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+                let mut root = crate::test_support::directory(0, "root", children);
+                App::sort_node_tree(&mut root, mode);
+                let expected = if matches!(mode, SortMode::NameDescending) {
+                    &high
+                } else {
+                    &low
+                };
+                assert_eq!(root.children[0].file_name(), expected);
+                root.sort_children_by_size();
+                assert_eq!(root.children[0].file_name(), &low);
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let mut app = App::with_loaded_settings(
+            fixture.path().into(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let tree = Arc::make_mut(app.tree.as_mut().unwrap());
+        tree.root = crate::test_support::directory(0, "root", vec![b, a]);
+        let rects = crate::ui::TreemapView::new(
+            &tree.root,
+            &tree.root_path,
+            &app.theme,
+            &app.marked,
+            &app.clipboard,
+        )
+        .calculate_rects(Rect::new(0, 0, 80, 24));
+        assert_eq!(rects.len(), 2);
+        for (index, expected) in [low, high].iter().enumerate() {
+            app.treemap_state.selected = index;
+            let (_, selected) = app.get_selected_treemap_child().unwrap();
+            assert_eq!(selected, app.view_root.join(expected));
+            assert_eq!(rects[index].path, selected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_name_collisions_keep_selection_lookup_and_search_paths_distinct() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let mut app = App::with_loaded_settings(
+            fixture.path().into(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let names = [
+            std::ffi::OsString::from_vec(b"bad-\xff".to_vec()),
+            std::ffi::OsString::from_vec(b"bad-\xfe".to_vec()),
+        ];
+        let tree = Arc::make_mut(app.tree.as_mut().unwrap());
+        for (index, name) in names.iter().enumerate() {
+            let mut child = crate::test_support::file(index as u64 + 1, "", 1);
+            child.set_file_name(name);
+            tree.root.children.push(child);
+        }
+        assert_eq!(tree.root.children[0].name, tree.root.children[1].name);
+        assert_ne!(
+            tree.root.children[0].display_name(),
+            tree.root.children[1].display_name()
+        );
+        let search = App::collect_search_paths(
+            tree,
+            &tree.root_path,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        for name in &names {
+            assert!(
+                search
+                    .iter()
+                    .any(|(path, _, _)| path == &tree.root_path.join(name))
+            );
+        }
+        app.layout_mode = LayoutMode::Miller;
+        for (index, name) in names.iter().enumerate() {
+            app.miller_state.selected = index;
+            let path = app.view_root.join(name);
+            assert_eq!(app.get_selected_path(), Some(path.clone()));
+            let tree = app.tree.as_ref().unwrap();
+            assert_eq!(
+                App::find_node_at_path(&tree.root, &path, &tree.root_path)
+                    .unwrap()
+                    .file_name(),
+                name
+            );
+            app.select_child_by_name(&path);
+            assert_eq!(app.miller_state.selected, index);
+        }
+        let displayed = text(&render(&app, Rect::new(0, 0, 200, 30)));
+        assert!(displayed.contains(r"bad-\xff"), "{displayed}");
+        assert!(displayed.contains(r"bad-\xfe"), "{displayed}");
+    }
+
+    #[tokio::test]
+    async fn saved_entry_budget_reaches_startup_navigation_and_rescans() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("nested")).unwrap();
+        std::fs::write(fixture.path().join("nested/one"), b"one").unwrap();
+        std::fs::write(fixture.path().join("nested/two"), b"two").unwrap();
+        let settings = UserSettings {
+            max_scan_entries: Some(1),
+            ..UserSettings::default()
+        };
+        let mut app = App::with_loaded_settings(
+            fixture.path().into(),
+            crate::TuiConfig::default(),
+            Ok(settings),
+        );
+        assert_eq!(app.tree.as_ref().unwrap().config.max_entries, Some(1));
+        assert!(matches!(
+            quick_list_with_settings(&fixture.path().join("nested"), &app.user_settings),
+            Err(gravityfile_scan::ScanError::EntryLimitExceeded { limit: 1 })
+        ));
+        for _ in 0..2 {
+            app.start_scan();
+            let mut receiver = app.scan_rx.take().unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let ScanResult::ScanComplete(result) = receiver
+                        .recv()
+                        .await
+                        .expect("scan worker closed without a final result")
+                    {
+                        break result;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                result,
+                Err(gravityfile_scan::ScanError::EntryLimitExceeded { limit: 1 })
+            ));
+            app.handle_scan_result(ScanResult::ScanComplete(result));
+            assert!(
+                app.error
+                    .as_ref()
+                    .unwrap()
+                    .contains("Scan entry limit exceeded")
+            );
+            assert!(app.scan_progress.is_none());
+            assert!(!app.analyzing);
+            assert_eq!(app.tree.as_ref().unwrap().config.max_depth, Some(1));
+        }
+        let over_budget = App::with_loaded_settings(
+            fixture.path().join("nested"),
+            crate::TuiConfig::default(),
+            Ok(app.user_settings.clone()),
+        );
+        assert!(over_budget.tree.is_none());
+        assert!(
+            over_budget
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Scan entry limit exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_requests_coalesce_and_forced_reload_rejects_old_completion() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("latest.txt");
+        std::fs::write(&path, b"fresh").unwrap();
+        let mut app = App::with_loaded_settings(
+            fixture.path().into(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let (sender, receiver) = oneshot::channel();
+        app.preview_rx = Some(receiver); // Hold an active load deterministically.
+        for index in 0..1000 {
+            app.schedule_preview(fixture.path().join(format!("obsolete-{index}")), true);
+        }
+        app.schedule_preview(path.clone(), true);
+        assert_eq!(app.pending_preview.as_ref().unwrap().path, path);
+        assert!(!sender.is_closed()); // No schedule replaced the active receiver.
+        sender
+            .send(PreviewLoad {
+                path: path.clone(),
+                mode: app.preview_state.mode,
+                result: Ok(PreviewContent::Error("stale".into())),
+            })
+            .unwrap_or_else(|_| panic!("receiver lost"));
+        let old = app.preview_rx.take().unwrap().await.unwrap();
+        app.finish_preview(Some(old));
+        assert!(matches!(app.preview_state.content, PreviewContent::Loading));
+        assert!(app.pending_preview.is_none());
+        let latest = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.preview_rx.take().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.path, path);
+        app.finish_preview(Some(latest));
+        let PreviewContent::Text { lines, .. } = &app.preview_state.content else {
+            panic!("latest preview not installed")
+        };
+        assert_eq!(lines[0].to_string(), "fresh");
+        assert!(!app.preview_state.loading);
+    }
+
+    #[tokio::test]
+    async fn clearing_preview_retains_active_slot_and_recovers_from_worker_loss() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("latest.txt");
+        std::fs::write(&path, b"fresh").unwrap();
+        let mut app = App::with_loaded_settings(
+            fixture.path().into(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let (sender, receiver) = oneshot::channel();
+        app.preview_rx = Some(receiver);
+        app.schedule_preview(path.clone(), false);
+        app.clear_preview();
+        assert!(app.preview_rx.is_some());
+        assert!(app.pending_preview.is_none());
+        assert!(matches!(app.preview_state.content, PreviewContent::Empty));
+        app.schedule_preview(path, false);
+        assert!(!sender.is_closed());
+        drop(sender);
+        assert!(app.preview_rx.take().unwrap().await.is_err());
+        app.finish_preview(None);
+        let latest = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.preview_rx.take().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        app.finish_preview(Some(latest));
+        assert!(matches!(
+            app.preview_state.content,
+            PreviewContent::Text { .. }
+        ));
+        app.preview_state.loading = true;
+        app.finish_preview(None);
+        assert!(matches!(
+            app.preview_state.content,
+            PreviewContent::Error(_)
+        ));
+        assert!(!app.preview_state.loading);
+    }
+
+    #[test]
+    #[ignore = "manual optimized background search measurement"]
+    fn background_search_scale_benchmark() {
+        use crate::test_support::{directory, file};
+        use std::time::Instant;
+        let mut measurements = Vec::new();
+        for count in [100_000, 1_000_000] {
+            let fixture_started = Instant::now();
+            let root = sample_dir_on_disk();
+            let mut app = App::with_config(
+                root.path().canonicalize().unwrap(),
+                crate::TuiConfig::default(),
+            );
+            Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
+                0,
+                "root",
+                (1..=count)
+                    .map(|index| file(index, &format!("report-{index:07}.rs"), 1))
+                    .collect(),
+            );
+            app.search_state.enable_background();
+            let fixture_ms = fixture_started.elapsed().as_secs_f64() * 1000.0;
+            for sample in 0..3 {
+                let started = Instant::now();
+                app.start_search();
+                let activation_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let submit_started = Instant::now();
+                app.search_state.set_query("rpt".into());
+                let submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+                let mut poll_max_ms = 0.0_f64;
+                let mut polls = 0;
+                while app.search_state.has_background_work() {
+                    let poll_started = Instant::now();
+                    app.search_state.poll_background();
+                    poll_max_ms = poll_max_ms.max(poll_started.elapsed().as_secs_f64() * 1000.0);
+                    polls += 1;
+                    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let completion_ms = started.elapsed().as_secs_f64() * 1000.0;
+                assert!(app.search_state.error.is_none());
+                assert_eq!(app.search_state.results.len(), 1000);
+                assert!(
+                    app.search_state
+                        .results
+                        .iter()
+                        .all(|result| result.display.starts_with("report-"))
+                );
+                measurements.push(serde_json::json!({"paths": count, "sample": sample,
+                    "fixture_ms": fixture_ms, "activation_ms": activation_ms,
+                    "query_submission_ms": submit_ms, "max_poll_ms": poll_max_ms,
+                    "completion_ms": completion_ms, "polls": polls}));
+            }
+        }
+        println!(
+            "BACKGROUND_SEARCH_JSON={}",
+            serde_json::json!({"schema_version": 1,
+            "measurements": measurements, "limits": ["Synthetic flat FileNode tree; actual app index collector",
+            "1 ms test polling, not the interactive event loop", "No terminal rendering or filesystem scan",
+            "Fixture construction excluded from completion time", "Three samples; uncontrolled host load"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_completion_requires_exact_original_item_accounting() {
+        for succeeded in [0, 1, 2, 3] {
+            let (_fixture, mut app) = scanned_app();
+            app.pending_undo = Some(gravityfile_ops::UndoEntry::new(
+                17,
+                gravityfile_ops::UndoableOperation::FilesCopied {
+                    created: vec![app.path.join("first"), app.path.join("second")],
+                },
+                "copied two items",
+            ));
+            app.mode = AppMode::Undoing;
+            app.handle_scan_result(ScanResult::OperationComplete {
+                operation_type: gravityfile_ops::OperationType::Delete,
+                cancelled: false,
+                succeeded,
+                failed: 0,
+                skipped: 0,
+                bytes_processed: 0,
+                errors: Vec::new(),
+                undo_info: None,
+            });
+            assert!(app.pending_undo.is_none());
+            assert_eq!(app.operation_message.as_ref().unwrap().0, succeeded == 2);
+            assert!(
+                app.operation_message
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .contains("recovery journals")
+            );
+            assert!(
+                !app.operation_message
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .starts_with("Deleted")
+            );
+            if succeeded == 2 {
+                assert!(app.undo_log.is_empty());
+            } else {
+                let entry = app.undo_log.peek().unwrap();
+                assert_eq!(entry.operation.item_count(), 2);
+                assert!(entry.review_required);
+                assert_eq!(entry.last_attempt.as_ref().unwrap().succeeded, succeeded);
+                assert!(app.error.as_ref().unwrap().contains("Undo incomplete"));
+                assert!(
+                    app.operation_message
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .contains("requires review")
+                );
+                assert!(app.undo_log.pop().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_undo_errors_are_paged_separately_from_original_paths() {
+        let fixture = sample_dir_on_disk();
+        let mut app = App::with_loaded_settings(
+            fixture.path().to_path_buf(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let mut entry = gravityfile_ops::UndoEntry::new(
+            11,
+            gravityfile_ops::UndoableOperation::FileCreated {
+                path: "original".into(),
+            },
+            "created",
+        );
+        entry.last_attempt = Some(gravityfile_ops::UndoAttempt {
+            observed_at: std::time::UNIX_EPOCH,
+            cancelled: true,
+            succeeded: 1,
+            failed: 1002,
+            skipped: 0,
+            bytes_processed: 0,
+            errors: (0..1002)
+                .map(|index| {
+                    gravityfile_ops::OperationError::new(
+                        PathBuf::from(format!("error-{index}")),
+                        format!("detail-{index} 日本"),
+                    )
+                })
+                .collect(),
+        });
+        app.undo_log.retain_for_review(entry);
+        app.set_operation_errors(
+            gravityfile_ops::OperationType::Copy,
+            vec![gravityfile_ops::OperationError::new(
+                "live".into(),
+                "fresh failure",
+            )],
+        );
+        app.execute_command("undo-review errors");
+        assert_eq!(app.undo_review_warnings.len(), 1000);
+        assert_eq!(
+            app.displayed_warning(0).unwrap().path,
+            PathBuf::from("error-0")
+        );
+        assert!(
+            app.displayed_warning(1000)
+                .unwrap()
+                .message
+                .contains("fresh failure")
+        );
+        app.execute_command("undo-review errors 2");
+        assert_eq!(app.undo_review_warnings.len(), 2);
+        assert_eq!(
+            app.displayed_warning(0).unwrap().path,
+            PathBuf::from("error-1000")
+        );
+        assert_eq!(
+            app.displayed_warning(1).unwrap().message,
+            "Undo #11 reported error: detail-1001 日本"
+        );
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("page 2/2")
+        );
+        for command in [
+            "undo-review errors 0",
+            "undo-review errors 3",
+            "undo-review errors x",
+            "undo-review errors 2 extra",
+        ] {
+            app.execute_command(command);
+            assert!(app.error.is_some());
+            assert_eq!(app.undo_review_warnings.len(), 2);
+        }
+        app.execute_command("undo-review");
+        assert_eq!(app.undo_review_warnings.len(), 1);
+        assert_eq!(
+            app.displayed_warning(0).unwrap().path,
+            PathBuf::from("original")
+        );
+        assert_eq!(app.undo_log.len(), 1);
+        app.undo_log.clear();
+        app.execute_command("undo-review errors");
+        assert!(app.undo_review_warnings.is_empty());
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("completion status")
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_export_runs_independently_and_preserves_existing_destinations() {
+        let fixture = sample_dir_on_disk();
+        let mut app = App::with_loaded_settings(
+            fixture.path().to_path_buf(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        app.undo_log
+            .retain_for_review(gravityfile_ops::UndoEntry::new(
+                7,
+                gravityfile_ops::UndoableOperation::FileCreated {
+                    path: app.path.join("original"),
+                },
+                "retained",
+            ));
+        let destination = app.path.join("review  日本.json");
+        app.execute_command("undo-export review  日本.json");
+        assert!(app.undo_export_rx.is_some());
+        app.execute_command("undo-export second.json");
+        assert!(app.error.as_ref().unwrap().contains("already in progress"));
+        app.handle_action(KeyAction::Quit);
+        assert_ne!(app.mode, AppMode::Quit);
+        app.execute_command("quit");
+        assert_ne!(app.mode, AppMode::Quit);
+        app.undo_log.clear();
+        let receiver = app.undo_export_rx.take().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        app.finish_undo_export(Some(result));
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("exported")
+        );
+        let bytes = std::fs::read(&destination).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["entries"][0]["id"], 7);
+        assert!(!app.path.join("second.json").exists());
+        app.undo_log
+            .retain_for_review(gravityfile_ops::UndoEntry::new(
+                8,
+                gravityfile_ops::UndoableOperation::FileCreated {
+                    path: "later".into(),
+                },
+                "later",
+            ));
+        app.execute_command("undo-export review  日本.json");
+        let receiver = app.undo_export_rx.take().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        app.finish_undo_export(Some(result));
+        assert!(app.error.as_ref().unwrap().contains("already exists"));
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
+        assert_eq!(app.undo_log.len(), 1);
+        app.execute_command("undo-export");
+        assert!(app.error.as_ref().unwrap().contains("Usage"));
+    }
+
+    #[test]
+    fn undo_review_shows_original_paths_without_mutation_or_diagnostic_loss() {
+        use gravityfile_ops::{UndoEntry, UndoableOperation};
+        let fixture = sample_dir_on_disk();
+        let mut app = App::with_loaded_settings(
+            fixture.path().to_path_buf(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let current = app.path.join("review-current");
+        let original = app.path.join("original 日本");
+        std::fs::write(&current, "preserve me").unwrap();
+        app.operation_warnings
+            .push(gravityfile_core::ScanWarning::new(
+                current.clone(),
+                gravityfile_core::WarningKind::ReadError,
+                "original diagnostic",
+            ));
+        app.undo_log.retain_for_review(UndoEntry::new(
+            1,
+            UndoableOperation::FilesMoved {
+                moves: vec![(original.clone(), current.clone())],
+            },
+            "moved",
+        ));
+        app.undo_log.retain_for_review(UndoEntry::new(
+            2,
+            UndoableOperation::FileRenamed {
+                path: current.clone(),
+                old_path: original.clone(),
+                new_name: "review-current".into(),
+            },
+            "renamed",
+        ));
+        app.execute_command("undo-review");
+        assert_eq!(app.view, View::Errors);
+        assert_eq!(app.undo_review_warnings.len(), 2);
+        assert_eq!(app.displayed_warning(0).unwrap().path, current);
+        assert!(
+            app.displayed_warning(0)
+                .unwrap()
+                .message
+                .contains(&original.display().to_string())
+        );
+        assert!(
+            app.displayed_warning(1)
+                .unwrap()
+                .message
+                .contains("rename back")
+        );
+        assert!(
+            app.displayed_warning(1)
+                .unwrap()
+                .message
+                .contains("outcome unverified")
+        );
+        assert_eq!(
+            app.displayed_warning(2).unwrap().message,
+            "original diagnostic"
+        );
+        assert_eq!(app.undo_log.len(), 2);
+        app.undo_log.retain_for_review(UndoEntry::new(
+            3,
+            UndoableOperation::FilesCopied {
+                created: (0..1001)
+                    .map(|index| app.path.join(format!("copy-{index}")))
+                    .collect(),
+            },
+            "copied",
+        ));
+        app.execute_command("undo-review");
+        assert_eq!(app.undo_review_warnings.len(), 1000);
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("page 1/2")
+        );
+        assert_eq!(
+            app.displayed_warning(1000).unwrap().message,
+            "original diagnostic"
+        );
+        assert_eq!(std::fs::read(&current).unwrap(), b"preserve me");
+        assert!(!original.exists());
+        app.execute_command("undo-review 2");
+        assert_eq!(app.undo_review_warnings.len(), 3);
+        assert_eq!(app.undo_review_warnings[0].path, app.path.join("copy-998"));
+        assert_eq!(app.undo_review_warnings[2].path, app.path.join("copy-1000"));
+        assert_eq!(
+            app.displayed_warning(3).unwrap().message,
+            "original diagnostic"
+        );
+        for command in [
+            "undo-review 0",
+            "undo-review extra",
+            "undo-review -1",
+            "undo-review 1 extra",
+            "undo-review 18446744073709551615",
+        ] {
+            app.execute_command(command);
+            assert!(app.error.is_some());
+            assert_eq!(app.undo_review_warnings.len(), 3);
+        }
+        app.set_operation_errors(
+            gravityfile_ops::OperationType::Copy,
+            vec![gravityfile_ops::OperationError::new(
+                current,
+                "fresh failure",
+            )],
+        );
+        assert!(app.undo_review_warnings.is_empty());
+        assert!(
+            app.displayed_warning(0)
+                .unwrap()
+                .message
+                .contains("fresh failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_undo_retains_original_record_without_replaying_completed_items() {
+        let (_fixture, mut app) = scanned_app();
+        let created = app.path.join("undo-created");
+        let missing = app.path.join("undo-missing");
+        std::fs::write(&created, "copied").unwrap();
+        let id = app
+            .undo_log
+            .record_copy(vec![created.clone(), missing.clone()]);
+        app.execute_undo();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pump_until_complete(&mut app),
+        )
+        .await
+        .unwrap();
+        assert!(!created.exists());
+        let retained = app.undo_log.peek().unwrap();
+        assert_eq!(retained.id, id);
+        assert!(retained.review_required);
+        let gravityfile_ops::UndoableOperation::FilesCopied { created: paths } =
+            &retained.operation
+        else {
+            panic!("copy record expected");
+        };
+        assert_eq!(paths, &vec![created.clone(), missing.clone()]);
+        let attempt = retained.last_attempt.as_ref().unwrap();
+        assert_eq!(
+            (attempt.succeeded, attempt.failed, attempt.skipped),
+            (1, 1, 0)
+        );
+        assert!(!attempt.cancelled);
+        assert_eq!(attempt.errors.len(), 1);
+        assert_eq!(attempt.errors[0].path, missing);
+        app.set_operation_errors(gravityfile_ops::OperationType::Copy, Vec::new());
+        assert_eq!(
+            app.undo_log
+                .peek()
+                .unwrap()
+                .last_attempt
+                .as_ref()
+                .unwrap()
+                .errors[0]
+                .path,
+            missing
+        );
+        let mut exported = Vec::new();
+        app.undo_log.write_review_json(&mut exported).unwrap();
+        let exported: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+        assert_eq!(exported["entries"][0]["last_attempt"]["succeeded"], 1);
+        assert_eq!(exported["entries"][0]["last_attempt"]["failed"], 1);
+        assert!(app.pending_undo.is_none());
+        std::fs::write(&created, "new data").unwrap();
+        app.execute_undo();
+        assert!(app.operation_message.as_ref().unwrap().1.contains("review"));
+        assert_eq!(std::fs::read(&created).unwrap(), b"new data");
+        assert_eq!(app.undo_log.len(), 1);
+
+        let entry = gravityfile_ops::UndoEntry::new(
+            99,
+            gravityfile_ops::UndoableOperation::FileCreated { path: created },
+            "interrupted",
+        );
+        app.pending_undo = Some(entry);
+        app.mode = AppMode::Undoing;
+        app.handle_background_channel_closed();
+        assert!(app.pending_undo.is_none());
+        assert_eq!(app.undo_log.peek().unwrap().id, 99);
+        assert!(app.undo_log.peek().unwrap().review_required);
+        assert!(app.undo_log.peek().unwrap().last_attempt.is_none());
+    }
+
+    #[test]
+    fn back_reloads_replaced_tree_and_retains_unavailable_history() {
+        for layout in [LayoutMode::Tree, LayoutMode::Miller] {
+            let fixture = tempfile::tempdir().unwrap();
+            let origin = fixture.path().join("origin");
+            let destination = fixture.path().join("destination");
+            std::fs::create_dir(&origin).unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(origin.join("original-file"), "contents").unwrap();
+            let mut app = App::with_loaded_settings(
+                origin.clone(),
+                crate::TuiConfig::default(),
+                Ok(UserSettings::default()),
+            );
+            app.layout_mode = layout;
+            app.scan_on_startup = false;
+            let origin = app.path.clone();
+            app.user_settings.bookmarks.set('d', destination);
+            app.jump_to_bookmark('d');
+            let current = app.view_root.clone();
+            let token = app.scan_token.clone();
+            app.navigate_back();
+            assert!(token.is_cancelled());
+            assert_eq!(app.view_root, origin);
+            assert_eq!(app.tree.as_ref().unwrap().root_path, origin);
+            assert!(
+                app.get_view_root_node()
+                    .unwrap()
+                    .0
+                    .children
+                    .iter()
+                    .any(|node| &*node.name == "original-file")
+            );
+            assert!(app.view_history.is_empty());
+            assert_eq!(app.forward_history.last().unwrap().0, current);
+            app.jump_to_bookmark('d');
+            let before = Arc::clone(app.tree.as_ref().unwrap());
+            let history = app.view_history.clone();
+            let forward = app.forward_history.clone();
+            std::fs::rename(&origin, fixture.path().join("moved-origin")).unwrap();
+            app.navigate_back();
+            assert_eq!(app.view_root, current);
+            assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &before));
+            assert_eq!(app.view_history, history);
+            assert_eq!(app.forward_history, forward);
+            assert!(app.error.as_ref().unwrap().contains("Cannot list"));
+        }
+    }
+
+    #[test]
+    fn bookmark_failures_preserve_view_and_unloaded_destinations_get_a_tree() {
+        let fixture = sample_dir_on_disk();
+        let mut app = App::with_loaded_settings(
+            fixture.path().to_path_buf(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        app.scan_on_startup = false;
+        let original = Arc::clone(app.tree.as_ref().unwrap());
+        let root = app.view_root.clone();
+        let file = root.join("bookmark-file");
+        std::fs::write(&file, "file").unwrap();
+        app.user_settings.bookmarks.set('f', file);
+        app.user_settings.bookmarks.set('m', root.join("missing"));
+        for key in ['z', 'f', 'm'] {
+            app.jump_to_bookmark(key);
+            assert!(app.error.is_some());
+            assert_eq!(app.view_root, root);
+            assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &original));
+            assert!(app.view_history.is_empty());
+        }
+        let destination = root.join("new/nested");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("needle"), "contents").unwrap();
+        app.user_settings
+            .bookmarks
+            .set('n', root.join("new/./nested"));
+        let old_token = app.scan_token.clone();
+        app.jump_to_bookmark('n');
+        assert!(old_token.is_cancelled());
+        assert_eq!(app.view_root, destination);
+        assert_eq!(app.path, destination);
+        assert_eq!(app.tree.as_ref().unwrap().root_path, destination);
+        assert!(
+            app.get_view_root_node()
+                .unwrap()
+                .0
+                .children
+                .iter()
+                .any(|child| &*child.name == "needle")
+        );
+        assert_eq!(app.view_history.len(), 1);
+        app.jump_to_bookmark('n');
+        assert_eq!(app.view_history.len(), 1);
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&destination, &alias).unwrap();
+            app.user_settings.bookmarks.set('a', alias);
+            app.jump_to_bookmark('a');
+            assert_eq!(app.view_root, destination);
+            assert_eq!(app.view_history.len(), 1);
+        }
+    }
+
+    #[test]
+    fn cd_normalizes_components_and_reports_failures_without_navigation() {
+        use crate::test_support::{directory, file};
+        let fixture = sample_dir_on_disk();
+        let mut app = App::with_loaded_settings(
+            fixture.path().to_path_buf(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        let root = app.path.clone();
+        Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
+            0,
+            "root",
+            vec![
+                directory(1, "first", vec![]),
+                directory(2, "two  日本", vec![]),
+                file(3, "file.txt", 1),
+            ],
+        );
+        app.cd_to_path("./first");
+        assert_eq!(app.view_root, root.join("first"));
+        app.cd_to_path("../two  日本/.");
+        assert_eq!(app.view_root, root.join("two  日本"));
+        let history_len = app.view_history.len();
+        app.cd_to_path(".");
+        assert_eq!(app.view_history.len(), history_len);
+        for (target, message) in [
+            ("/missing", "not in the loaded tree"),
+            ("/file.txt", "Not a directory"),
+            ("../../escape", "leaves the scan root"),
+        ] {
+            app.cd_to_path(target);
+            assert!(app.error.as_ref().unwrap().contains(message));
+            assert_eq!(app.view_root, root.join("two  日本"));
+            assert_eq!(app.view_history.len(), history_len);
+        }
+        app.cd_to_path("/first/../two  日本");
+        assert_eq!(app.view_root, root.join("two  日本"));
+        assert_eq!(app.view_history.len(), history_len);
+        app.tree = None;
+        app.cd_to_path("first");
+        assert!(app.error.as_ref().unwrap().contains("no directory tree"));
+        assert_eq!(app.view_history.len(), history_len);
+    }
+
+    #[test]
+    fn constructor_uses_listing_root_for_relative_and_aliased_paths() {
+        const WORKER: &str = "GRAVITYFILE_TEST_RELATIVE_ROOT_WORKER";
+        if std::env::var_os(WORKER).is_none() {
+            // Relative paths need a writable working directory, but the checkout
+            // may be read-only. Isolate cwd in a child instead of changing the
+            // process-wide directory beneath concurrently running tests.
+            let workspace = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::constructor_uses_listing_root_for_relative_and_aliased_paths",
+                    "--nocapture",
+                ])
+                .env(WORKER, "1")
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let fixture = tempfile::tempdir_in(".").unwrap();
+        let real = fixture.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("needle.txt"), "contents").unwrap();
+        let canonical = real.canonicalize().unwrap();
+        let mut inputs = vec![real.clone(), real.join("."), real.join("../real")];
+        #[cfg(unix)]
+        {
+            let alias = fixture.path().join("alias");
+            std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+            inputs.push(alias);
+        }
+        // Keep the collection mutable on platforms without symlink fixtures.
+        inputs.push(canonical.clone());
+        for input in inputs {
+            let mut app = App::with_loaded_settings(
+                input,
+                crate::TuiConfig::default(),
+                Ok(UserSettings::default()),
+            );
+            assert_eq!(app.path, canonical);
+            assert_eq!(app.view_root, canonical);
+            assert_eq!(app.tree.as_ref().unwrap().root_path, canonical);
+            assert_eq!(app.tab_manager.active_tab().unwrap().view_root, canonical);
+            assert!(app.get_view_root_node().is_some());
+            app.search_state.enable_background();
+            app.start_search();
+            app.search_state.set_query("needle".into());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.search_state.has_background_work() {
+                app.search_state.poll_background();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(app.search_state.error.is_none());
+            assert_eq!(app.search_state.results.len(), 1);
+            assert_eq!(
+                app.search_state.results[0].path,
+                canonical.join("needle.txt")
+            );
+        }
+    }
+
+    #[test]
+    fn scope_lookup_cancellation_stops_within_wide_directory() {
+        use crate::test_support::{directory, file};
+        let root = directory(
+            0,
+            "root",
+            (1..=1000)
+                .map(|index| file(index, &format!("file-{index:04}"), 1))
+                .collect(),
+        );
+        let root_path = Path::new("root");
+        let target = root_path.join("file-1000");
+        let mut checks = 0;
+        let result = App::find_node_at_path_while(&root, &target, root_path, || {
+            checks += 1;
+            checks <= 10
+        });
+        assert!(result.is_none());
+        assert_eq!(checks, 11);
+        assert_eq!(
+            &*App::find_node_at_path(&root, &target, root_path)
+                .unwrap()
+                .name,
+            "file-1000"
+        );
+        assert!(App::find_node_at_path_while(&root, root_path, root_path, || false).is_none());
+    }
+
+    #[test]
+    fn search_index_scopes_nested_directories_and_preserves_preorder() {
+        use crate::test_support::{directory, file};
+        let root = sample_dir_on_disk();
+        let mut app = App::with_config(root.path().to_path_buf(), crate::TuiConfig::default());
+        let scan_root = app.tree.as_ref().unwrap().root_path.clone();
+        Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
+            0,
+            "root",
+            vec![
+                directory(
+                    1,
+                    "src",
+                    vec![
+                        file(2, "日本.rs", 1),
+                        directory(3, "nested", vec![file(4, "deep.rs", 1)]),
+                    ],
+                ),
+                directory(5, "src-other", vec![file(6, "outside.rs", 1)]),
+            ],
+        );
+        let tree = app.tree.as_ref().unwrap();
+        for (scope, expected) in [
+            (
+                scan_root.clone(),
+                vec![
+                    ".",
+                    "src",
+                    "src/nested",
+                    "src/nested/deep.rs",
+                    "src/日本.rs",
+                    "src-other",
+                    "src-other/outside.rs",
+                ],
+            ),
+            (
+                scan_root.join("src"),
+                vec![".", "nested", "nested/deep.rs", "日本.rs"],
+            ),
+            (scan_root.join("src/nested"), vec![".", "deep.rs"]),
+            (scan_root.join("missing"), vec![]),
+            (scan_root.parent().unwrap().to_path_buf(), vec![]),
+        ] {
+            let paths =
+                App::collect_search_paths(tree, &scope, &std::sync::atomic::AtomicBool::new(false));
+            let expected: Vec<_> = expected.iter().map(PathBuf::from).collect();
+            assert_eq!(
+                paths
+                    .iter()
+                    .map(|(_, display, _)| PathBuf::from(display))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for (path, display, _) in paths {
+                assert!(path.starts_with(&scope));
+                assert_eq!(
+                    path,
+                    if display == "." {
+                        scope.clone()
+                    } else {
+                        scope.join(display)
+                    }
+                );
+            }
+        }
+        app.view_root = scan_root.join("src/nested");
+        app.search_state.enable_background();
+        app.start_search();
+        app.search_state.set_query("deep".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.search_state.has_background_work() {
+            app.search_state.poll_background();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.search_state.results.len(), 1);
+        assert_eq!(
+            app.search_state.results[0].path,
+            scan_root.join("src/nested/deep.rs")
+        );
+    }
+
+    #[test]
+    fn pending_search_renders_feedback_and_enter_waits_for_current_results() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = sample_dir_on_disk();
+        let mut app = App::with_config(root.path().to_path_buf(), crate::TuiConfig::default());
+        app.mode = AppMode::Search;
+        app.search_state.activate();
+        app.search_state.enable_background();
+        app.search_state.set_query("file".into());
+        app.handle_search_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, AppMode::Search);
+        assert!(app.search_state.active);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+        app.render(area, &mut buffer);
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Searching…"));
+        assert!(!rendered.contains("No matches found"));
+        app.handle_search_input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.search_state.is_searching());
+    }
+
+    #[test]
+    fn failed_initial_listing_is_reported_as_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let app = App::with_config(missing, crate::TuiConfig::default());
+        assert!(app.tree.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("Cannot list"))
+        );
+    }
+
+    #[test]
+    fn lazy_listing_failure_preserves_tree_and_invalidates_stale_parent_cache() {
+        let root = sample_dir_on_disk();
+        let path = root.path().canonicalize().unwrap();
+        let mut app = App::with_config(path.clone(), crate::TuiConfig::default());
+        let original = Arc::clone(app.tree.as_ref().unwrap());
+        app.lazy_load_directory(&path.join("missing"));
+        assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &original));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains("Cannot list"))
+        );
+        app.cached_parent_tree = Some((*original).clone());
+        app.tree = None;
+        app.update_cached_parent();
+        assert!(app.cached_parent_tree.is_none());
+    }
+
+    /// Terminal sizes chosen to bracket every layout threshold: below the
+    /// minimum width for a details panel, below the width of a right-anchored
+    /// size bar, and tall-and-narrow (a short terminal exits the row loop
+    /// before the interesting arithmetic ever runs).
+    const SIZES: &[(u16, u16)] = &[
+        (1, 1),
+        (2, 2),
+        (3, 20),
+        (4, 3),
+        (5, 24),
+        (6, 30),
+        (7, 12),
+        (8, 5),
+        (8, 30),
+        (9, 40),
+        (10, 6),
+        (10, 30),
+        (11, 24),
+        (12, 8),
+        (12, 40),
+        (14, 30),
+        (16, 10),
+        (18, 24),
+        (20, 12),
+        (24, 10),
+        (24, 30),
+        (30, 14),
+        (36, 24),
+        (40, 16),
+        (44, 30),
+        (50, 20),
+        (60, 24),
+        (79, 24),
+        (80, 24),
+        (81, 24),
+        (100, 30),
+        (120, 40),
+        (200, 60),
+    ];
+
+    const VIEWS: &[View] = &[
+        View::Explorer,
+        View::Duplicates,
+        View::Age,
+        View::Errors,
+        View::Treemap,
+    ];
+
+    const MODES: &[AppMode] = &[
+        AppMode::Normal,
+        AppMode::Help,
+        AppMode::Search,
+        AppMode::ConfirmDelete,
+        AppMode::Deleting,
+        AppMode::Copying,
+        AppMode::Moving,
+        AppMode::Undoing,
+        AppMode::UpdatingEntry,
+        AppMode::Renaming,
+        AppMode::CreatingFile,
+        AppMode::CreatingDirectory,
+        AppMode::Taking,
+        AppMode::GoingTo,
+        AppMode::Command,
+        AppMode::Settings,
+        AppMode::SettingBookmark,
+        AppMode::JumpingToBookmark,
+        AppMode::BookmarkList,
+        AppMode::ConfirmBulkRename,
+        AppMode::BulkRenaming,
+        AppMode::Visual,
+    ];
+
+    #[test]
+    fn settings_failure_disables_automatic_scans_but_honors_explicit_override() {
+        let directory = tempfile::tempdir().unwrap();
+        for override_value in [None, Some(false), Some(true)] {
+            let config = crate::TuiConfig {
+                scan_on_startup: override_value,
+                ..Default::default()
+            };
+            let app = App::with_loaded_settings(
+                directory.path().into(),
+                config,
+                Err(std::io::Error::other("unreadable settings")),
+            );
+            assert_eq!(app.scan_on_startup, override_value.unwrap_or(false));
+            assert!(!app.user_settings.scan_on_startup);
+            assert!(
+                app.error
+                    .as_ref()
+                    .unwrap()
+                    .contains("automatic scanning disabled")
+            );
+            assert!(app.tree.is_some()); // Quick browsing remains available.
+        }
+        let app = App::with_loaded_settings(
+            directory.path().into(),
+            crate::TuiConfig::default(),
+            Ok(UserSettings::default()),
+        );
+        assert!(app.scan_on_startup);
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn startup_reports_settings_and_listing_failures_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::with_loaded_settings(
+            directory.path().join("missing"),
+            crate::TuiConfig::default(),
+            Err(std::io::Error::other("invalid settings fixture")),
+        );
+        let error = app.error.as_ref().unwrap();
+        assert!(error.contains("invalid settings fixture"));
+        assert!(error.contains("Cannot list"));
+        assert!(!app.user_settings.scan_on_startup);
+        assert!(app.image_previews_enabled());
+    }
+
+    #[test]
+    fn settings_save_failure_retains_edits_and_successful_retry_applies_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        let original_startup = app.user_settings.scan_on_startup;
+        let original_runtime_startup = app.scan_on_startup;
+        let mut edited = SettingsState::new(app.user_settings.clone());
+        edited.settings.scan_on_startup = !original_startup;
+        edited.dirty = true;
+        app.settings_state = Some(edited);
+        app.mode = AppMode::Settings;
+        app.needs_redraw = false;
+
+        app.save_settings_with(|_| Err(std::io::Error::other("injected storage failure")));
+        assert_eq!(app.user_settings.scan_on_startup, original_startup);
+        assert_eq!(app.scan_on_startup, original_runtime_startup);
+        assert_eq!(app.mode, AppMode::Settings);
+        assert!(app.settings_state.as_ref().unwrap().dirty);
+        assert!(
+            app.error
+                .as_ref()
+                .unwrap()
+                .contains("injected storage failure")
+        );
+        assert!(app.needs_redraw);
+
+        app.save_settings_with(|settings| {
+            assert_eq!(settings.scan_on_startup, !original_startup);
+            Ok(())
+        });
+        assert_eq!(app.user_settings.scan_on_startup, !original_startup);
+        assert_eq!(app.scan_on_startup, !original_startup);
+        assert!(app.settings_state.is_none());
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn unchanged_settings_close_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        app.settings_state = Some(SettingsState::new(app.user_settings.clone()));
+        app.mode = AppMode::Settings;
+        app.save_settings_with(|_| panic!("unchanged settings must not write"));
+        assert!(app.settings_state.is_none());
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    /// An app with a completed scan over a real directory.
+    ///
+    /// The `TempDir` is returned alongside because dropping it would delete the
+    /// tree out from under the app.
+    fn scanned_app() -> (tempfile::TempDir, App) {
+        let dir = sample_dir_on_disk();
+        // The scanner stores a canonical root, and on macOS a `TempDir` lives
+        // under a `/var` symlink — without this the view root never matches a
+        // node and the explorer silently renders nothing.
+        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+
+        let mut app = App::with_config(root.clone(), crate::TuiConfig::default());
+
+        let config = gravityfile_core::ScanConfig::new(&root);
+        let tree = gravityfile_scan::JwalkScanner::new()
+            .scan(&config, CancellationToken::new())
+            .expect("scan the fixture");
+        app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+        // `ScanComplete` schedules a background scan-complete hook; the tests
+        // never poll for it, and the app state is already final here.
+        app.scan_rx = None;
+
+        (dir, app)
+    }
+
+    /// The scanned app with every optional piece of state populated, so each
+    /// modal and overlay has real content to draw.
+    fn populated_app() -> (tempfile::TempDir, App) {
+        let (dir, mut app) = scanned_app();
+        let root = app.path.clone();
+        let tree = Arc::clone(app.tree.as_ref().expect("scan produced a tree"));
+
+        let duplicates = gravityfile_analyze::DuplicateFinder::with_config(
+            gravityfile_analyze::DuplicateConfig::builder()
+                .min_size(1u64)
+                .build()
+                .expect("duplicate config uses only defaulted fields"),
+        )
+        .unwrap()
+        .find_duplicates(&tree, CancellationToken::new());
+        assert!(
+            !duplicates.groups.is_empty(),
+            "the fixture must contain a duplicate pair"
+        );
+        app.duplicates = Some(Arc::new(duplicates));
+        app.age_report = Some(
+            gravityfile_analyze::AgeAnalyzer::with_config(Default::default())
+                .unwrap()
+                .analyze(&tree, CancellationToken::new()),
+        );
+
+        app.warnings = vec![
+            gravityfile_core::ScanWarning::new(
+                root.join("denied"),
+                gravityfile_core::WarningKind::PermissionDenied,
+                "permission denied",
+            ),
+            gravityfile_core::ScanWarning::new(
+                root.join("dangling"),
+                gravityfile_core::WarningKind::BrokenSymlink,
+                "broken symlink",
+            ),
+        ];
+
+        app.marked.insert(root.join("empty"));
+        app.clipboard.yank([root.join("copy-a.bin")], root.clone());
+
+        app.error = Some("something went wrong".to_string());
+        app.operation_message = Some((true, "Copied 3 items, 1 skipped".to_string()));
+        app.deletion_message = Some((false, "Deleted 1 item, 1 failed".to_string()));
+
+        app.operation_progress = Some(gravityfile_ops::OperationProgress::new(
+            gravityfile_ops::OperationType::Copy,
+            10,
+            4096,
+        ));
+        app.deletion_progress = Some(state::DeletionProgress::new(3));
+        app.scan_progress = Some(gravityfile_scan::ScanProgress::new());
+
+        app.input_state = Some(InputState::with_initial("some-name.txt"));
+        app.settings_state = Some(SettingsState::new(app.user_settings.clone()));
+        app.bookmark_list_state = Some(BookmarkListState::new(&app.user_settings.bookmarks));
+        app.bulk_rename_state = Some(state::BulkRenameState::new(
+            vec![root.join("copy-a.bin"), root.join("copy-b.bin")],
+            vec!["one.bin".to_string(), "two.bin".to_string()],
+        ));
+        app.visual_state = Some(state::VisualState::new(1));
+        app.tab_manager.new_tab(root.join("src"));
+
+        (dir, app)
+    }
+
+    fn render(app: &App, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        Widget::render(app, area, &mut buf);
+        buf
+    }
+
+    fn text(buf: &Buffer) -> String {
+        buf.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    /// Index of a named row in the tree view's flattened list.
+    fn tree_row(app: &App, name: &str) -> usize {
+        let (node, path) = app.get_view_root_node().expect("a view root node");
+        TreeView::new(node, &path, &app.theme, &app.marked, &app.clipboard)
+            .flatten(&app.tree_state)
+            .iter()
+            .position(|item| item.node.name == name)
+            .unwrap_or_else(|| panic!("{name} is not visible"))
+    }
+
+    #[tokio::test]
+    async fn completion_errors_override_zero_failure_count_in_ui_summary() {
+        let (_dir, mut app) = scanned_app();
+        let path = app.path.join("copy-a.bin");
+        app.handle_scan_result(ScanResult::OperationComplete {
+            operation_type: gravityfile_ops::OperationType::Copy,
+            cancelled: false,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0,
+            bytes_processed: 0,
+            errors: vec![gravityfile_ops::OperationError::new(
+                path.clone(),
+                "late diagnostic",
+            )],
+            undo_info: Some(gravityfile_ops::UndoableOperation::FilesCopied {
+                created: vec![path],
+            }),
+        });
+        let (success, message) = app.operation_message.as_ref().unwrap();
+        assert!(!success);
+        assert!(message.contains("1 errors"));
+        assert_eq!(app.operation_warnings.len(), 1);
+        assert_eq!(app.undo_log.len(), 1, "retain undo for the completed item");
+        assert_eq!(app.view, View::Errors);
+        app.scan_token.cancel();
+        app.scan_rx = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn archive_default_extension_preserves_native_parent_path() {
+        use std::os::unix::ffi::OsStringExt;
+        for name in ["bundle", "bundle.zip"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let parent = temporary
+                .path()
+                .join(std::ffi::OsString::from_vec(b"native-\xff".to_vec()));
+            let decoy = temporary.path().join("native-\u{fffd}");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::create_dir(&decoy).unwrap();
+            let source = parent.join("source.txt");
+            std::fs::write(&source, b"native directory contents").unwrap();
+            let mut app = App::with_config(parent.clone(), crate::TuiConfig::default());
+            app.marked.insert(source);
+            app.compress_files(name);
+            let completion = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.archive_rx.take().expect("archive task started"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let ArchiveCompletion::Compress {
+                archive_path,
+                result,
+                ..
+            } = completion
+            else {
+                panic!("expected compression completion");
+            };
+            result.unwrap();
+            assert_eq!(archive_path, parent.join("bundle.zip"));
+            assert!(archive_path.is_file());
+            assert!(!decoy.join("bundle.zip").exists());
+            let extracted = parent.join("extracted");
+            gravityfile_ops::extract_archive(&archive_path, &extracted).unwrap();
+            assert_eq!(
+                std::fs::read(extracted.join("source.txt")).unwrap(),
+                b"native directory contents"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_app_cancels_archive_work_without_misreporting_publication() {
+        let (_directory, mut app) = scanned_app();
+        let destination = app.view_root.join("drop.zip");
+        app.marked.insert(app.view_root.join("copy-a.bin"));
+        app.compress_files("drop.zip");
+        let cancel = app.archive_cancel.as_ref().unwrap().0.clone();
+        let receiver = app.archive_rx.take().unwrap();
+        drop(app);
+        assert!(cancel.is_cancelled());
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        let ArchiveCompletion::Compress { result, .. } = completion else {
+            panic!("expected creation")
+        };
+        match result {
+            Ok(()) => assert!(
+                destination.is_file(),
+                "publication won the cancellation race"
+            ),
+            Err(gravityfile_ops::ArchiveError::Cancelled) => assert!(!destination.exists()),
+            other => panic!("unexpected archive result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_archive_extraction_quit_cancels_and_waits_for_completion() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, started) = std::sync::mpsc::channel();
+        let blocker = executor.spawn_blocking(move || {
+            ready.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        executor.block_on(async {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            std::fs::write(&source, b"contents").unwrap();
+            let root = temporary.path().join("view");
+            std::fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let archive = root.join("archive.zip");
+            gravityfile_ops::create_archive(
+                &[source],
+                &archive,
+                gravityfile_ops::ArchiveFormat::Zip,
+            )
+            .unwrap();
+            let mut app = App::with_config(root.clone(), crate::TuiConfig::default());
+            let tree = gravityfile_scan::JwalkScanner::new()
+                .scan(
+                    &gravityfile_core::ScanConfig::new(&root),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+            app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+            app.scan_rx = None;
+            app.layout_mode = LayoutMode::Miller;
+            app.select_child_by_name(&archive);
+            assert_eq!(app.get_selected_path(), Some(archive.clone()));
+            app.marked.insert(archive.clone());
+            app.extract_archive(Some("extracted".into()));
+            app.handle_action(KeyAction::Quit);
+            assert_ne!(app.mode, AppMode::Quit);
+            assert!(app.archive_cancel.as_ref().unwrap().0.is_cancelled());
+            assert!(app.archive_rx.is_some());
+            drop(release);
+            blocker.await.unwrap();
+            let completion = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.archive_rx.as_mut().unwrap(),
+            )
+            .await
+            .unwrap()
+            .ok();
+            app.finish_archive_task(completion);
+            assert!(app.archive_cancel.is_none());
+            assert!(app.archive_rx.is_none());
+            assert!(!root.join("extracted").exists());
+            assert!(app.marked.contains(&archive));
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("extraction cancelled before publication")
+            );
+        });
+    }
+
+    #[test]
+    fn queued_archive_creation_can_be_cancelled_without_publication() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, started) = std::sync::mpsc::channel();
+        let blocker = executor.spawn_blocking(move || {
+            ready.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        executor.block_on(async {
+            let (_directory, mut app) = scanned_app();
+            let source = app.view_root.join("copy-a.bin");
+            app.marked.insert(source.clone());
+            app.compress_files("cancelled.zip");
+            app.handle_action(KeyAction::Cancel);
+            assert!(app.archive_cancel.as_ref().unwrap().0.is_cancelled());
+            assert!(
+                app.archive_rx.is_some(),
+                "retain admission until the worker completes"
+            );
+            drop(release);
+            blocker.await.unwrap();
+            let completion = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.archive_rx.as_mut().unwrap(),
+            )
+            .await
+            .unwrap()
+            .ok();
+            app.finish_archive_task(completion);
+            assert!(app.archive_cancel.is_none());
+            assert!(app.archive_rx.is_none());
+            assert!(!app.view_root.join("cancelled.zip").exists());
+            assert!(app.marked.contains(&source));
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("cancelled before publication")
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn lost_archive_worker_refreshes_uncertain_output_and_releases_admission() {
+        for active_creation in [false, true] {
+            let (_directory, mut app) = scanned_app();
+            let root = app.view_root.clone();
+            let source = root.join("copy-a.bin");
+            app.marked.insert(source.clone());
+            app.operation_message = Some((true, "Creating archive…".into()));
+            // The worker may have changed the filesystem before losing its reply.
+            std::fs::write(
+                root.join("uncertain-output"),
+                b"completed before reply loss",
+            )
+            .unwrap();
+            if active_creation {
+                app.execute_create_file(root.clone(), "created".into());
+            }
+            let token = app.scan_token.clone();
+            let message = app.operation_message.clone();
+            let (sender, receiver) = oneshot::channel();
+            app.archive_rx = Some(receiver);
+            drop(sender);
+            let completion = app.archive_rx.as_mut().unwrap().await.ok();
+            app.finish_archive_task(completion);
+            assert!(app.archive_rx.is_none());
+            assert!(
+                app.scan_rx.is_some(),
+                "unknown outcome must refresh the filesystem view"
+            );
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("inspect the destination before retrying")
+            );
+            if active_creation {
+                assert!(!token.is_cancelled());
+                assert_eq!(app.operation_message, message);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(receiver) = app.scan_rx.as_mut() {
+                    let Some(result) = receiver.recv().await else {
+                        break;
+                    };
+                    app.handle_scan_result(result);
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                app.tree
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .children
+                    .iter()
+                    .any(|node| node.name == "uncertain-output")
+            );
+            assert!(app.marked.contains(&source));
+            assert!(!app.pending_archive_refresh);
+            assert!(
+                !app.operation_message
+                    .as_ref()
+                    .is_some_and(|(_, message)| message == "Creating archive…")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_archive_warning_refreshes_without_clearing_selection() {
+        for active_creation in [false, true] {
+            let (_directory, mut app) = scanned_app();
+            let root = app.view_root.clone();
+            let source = root.join("copy-a.bin");
+            let archive = root.join("result.zip");
+            gravityfile_ops::create_archive(
+                std::slice::from_ref(&source),
+                &archive,
+                gravityfile_ops::ArchiveFormat::Zip,
+            )
+            .unwrap();
+            app.marked.insert(source.clone());
+            if active_creation {
+                app.execute_create_file(root.clone(), "created".into());
+            }
+            let token = app.scan_token.clone();
+            app.handle_archive_completion(ArchiveCompletion::Compress {
+                archive_path: archive.clone(),
+                sources: vec![source.clone()],
+                result: Err(gravityfile_ops::ArchiveError::PublishedDurability {
+                    destination: archive,
+                    source: std::io::Error::other("private/path must not appear"),
+                }),
+            });
+            let message = app.error.as_deref().unwrap();
+            assert!(
+                message.starts_with("Archive created, but persistence is uncertain"),
+                "{message}"
+            );
+            assert!(!message.contains("private/path"));
+            assert!(app.marked.contains(&source));
+            assert!(app.scan_rx.is_some());
+            if active_creation {
+                assert!(!token.is_cancelled());
+                assert!(app.pending_archive_refresh);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                // Unlike the operation-only helper, allow its follow-up
+                // scan to finish so the assertion observes the actual tree.
+                while let Some(receiver) = app.scan_rx.as_mut() {
+                    let Some(result) = receiver.recv().await else {
+                        break;
+                    };
+                    app.handle_scan_result(result);
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                app.tree
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .children
+                    .iter()
+                    .any(|node| node.name == "result.zip")
+            );
+            assert!(app.marked.contains(&source));
+            assert!(!app.pending_archive_refresh);
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("persistence is uncertain")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_extraction_rollback_refreshes_without_clearing_selection() {
+        for active_creation in [false, true] {
+            let (_directory, mut app) = scanned_app();
+            let root = app.view_root.clone();
+            let source = root.join("copy-a.bin");
+            let archive = root.join("result.zip");
+            std::fs::write(&archive, b"leftover extraction output").unwrap();
+            app.marked.insert(source.clone());
+            if active_creation {
+                app.execute_create_file(root.clone(), "created".into());
+            }
+            let token = app.scan_token.clone();
+            app.handle_archive_completion(ArchiveCompletion::Extract {
+                archive_path: root.join("input.zip"),
+                destination: root.clone(),
+                result: Err(gravityfile_ops::ArchiveError::ExtractionRollback {
+                    destination: root.clone(),
+                    source: Box::new(
+                        std::io::Error::other("private/path publication failure").into(),
+                    ),
+                    cleanup_errors: vec![(
+                        archive.clone(),
+                        std::io::Error::other("private/path removal failure"),
+                    )],
+                }),
+            });
+            let message = app.error.as_deref().unwrap();
+            assert!(
+                message.starts_with("Archive extraction failed and rollback was incomplete"),
+                "{message}"
+            );
+            assert!(!message.contains("private/path"));
+            assert!(app.marked.contains(&source));
+            assert!(app.scan_rx.is_some());
+            if active_creation {
+                assert!(!token.is_cancelled());
+                assert!(app.pending_archive_refresh);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                // Unlike the operation-only helper, allow its follow-up
+                // scan to finish so the assertion observes the actual tree.
+                while let Some(receiver) = app.scan_rx.as_mut() {
+                    let Some(result) = receiver.recv().await else {
+                        break;
+                    };
+                    app.handle_scan_result(result);
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                app.tree
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .children
+                    .iter()
+                    .any(|node| node.name == "result.zip")
+            );
+            assert!(app.marked.contains(&source));
+            assert!(!app.pending_archive_refresh);
+            assert!(
+                app.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("rollback was incomplete")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_completion_defers_refresh_until_active_creation_finishes() {
+        for compress in [false, true] {
+            let (_directory, mut app) = scanned_app();
+            let root = app.view_root.clone();
+            let archived_source = root.join("copy-a.bin");
+            let unrelated_mark = root.join("copy-b.bin");
+            app.marked.insert(archived_source.clone());
+            app.marked.insert(unrelated_mark.clone());
+            app.execute_create_file(root.clone(), "created".into());
+            let token = app.scan_token.clone();
+            let message = app.operation_message.clone();
+            let completion = if compress {
+                ArchiveCompletion::Compress {
+                    archive_path: root.join("result.zip"),
+                    sources: vec![archived_source.clone(), root.join("unmarked-source")],
+                    result: Ok(()),
+                }
+            } else {
+                ArchiveCompletion::Extract {
+                    archive_path: root.join("source.zip"),
+                    destination: root.clone(),
+                    result: Ok(vec![root.join("extracted")]),
+                }
+            };
+            app.handle_archive_completion(completion);
+            assert_eq!(app.marked.contains(&archived_source), !compress);
+            assert!(app.marked.contains(&unrelated_mark));
+            assert_eq!(app.mode, AppMode::UpdatingEntry);
+            assert!(app.scan_rx.is_some());
+            assert!(!token.is_cancelled());
+            assert_eq!(app.operation_message, message);
+            assert!(app.pending_archive_refresh);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                pump_until_complete(&mut app),
+            )
+            .await
+            .unwrap();
+            assert!(root.join("created").is_file());
+            assert_eq!(app.undo_log.len(), 1);
+            assert!(!app.pending_archive_refresh);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_selection_totals_remain_renderable_and_saturate() {
+        let (_directory, mut app) = scanned_app();
+        Arc::make_mut(app.tree.as_mut().unwrap()).root.size = u64::MAX;
+        app.marked.insert(app.path.clone());
+        app.marked.insert(app.path.join("copy-a.bin"));
+        let expected = crate::ui::format_size(u64::MAX);
+        for mode in [AppMode::Normal, AppMode::ConfirmDelete] {
+            app.mode = mode;
+            let rendered = text(&render(&app, Rect::new(0, 0, 120, 40)));
+            assert!(rendered.contains(&expected));
+        }
+        let (_directory, mut app) = populated_app();
+        let root = app.path.clone();
+        let report = app.age_report.as_mut().unwrap();
+        report.stale_directories = [root.clone(), root.join("src")]
+            .into_iter()
+            .map(|path| gravityfile_analyze::StaleDirectory {
+                path,
+                size: u64::MAX,
+                newest_file_age: std::time::Duration::from_secs(86400),
+                file_count: 1,
+            })
+            .collect();
+        report.stale_directory_status = gravityfile_analyze::StaleDirectoryStatus::Evaluated;
+        assert_eq!(report.total_stale_size(), u64::MAX);
+        app.view = View::Age;
+        app.mode = AppMode::Normal;
+        let rendered = text(&render(&app, Rect::new(0, 0, 120, 40)));
+        assert!(rendered.contains(&expected));
+    }
+
+    #[tokio::test]
+    async fn commands_use_exact_internal_spacing_for_navigation_and_creation() {
+        let (_directory, mut app) = scanned_app();
+        let root = app.path.clone();
+        let destination = root.join("two  spaces");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::create_dir(root.join("two spaces")).unwrap();
+        app.start_scan();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = app.scan_rx.as_mut().unwrap().recv().await.unwrap();
+                let complete = matches!(result, ScanResult::ScanComplete(_));
+                app.handle_scan_result(result);
+                if complete {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        app.execute_command("cd two  spaces");
+        assert_eq!(app.view_root, destination);
+        app.execute_command("touch note  日本.txt");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_until_complete(&mut app),
+        )
+        .await
+        .unwrap();
+        assert!(destination.join("note  日本.txt").is_file());
+        assert!(!destination.join("note 日本.txt").exists());
+        assert_eq!(app.undo_log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_palette_commands_preserve_sort_bookmarks_and_navigation() {
+        let (_directory, mut app) = scanned_app();
+        let root = app.view_root.clone();
+        app.user_settings.bookmarks.set('a', root.clone());
+        let sort = app.sort_mode;
+        for command in ["sort typo", "delmark ab", "go a extra", "unknown"] {
+            app.error = None;
+            app.execute_command(command);
+            assert!(app.error.is_some());
+            assert_eq!(app.sort_mode, sort);
+            assert_eq!(app.view_root, root);
+            assert_eq!(app.user_settings.bookmarks.get('a'), Some(&root));
+            assert!(app.scan_rx.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_operations_render_before_the_first_progress_update() {
+        let (_dir, mut app) = scanned_app();
+        for mode in [
+            AppMode::Copying,
+            AppMode::Moving,
+            AppMode::Undoing,
+            AppMode::UpdatingEntry,
+        ] {
+            app.mode = mode;
+            app.operation_progress = None;
+            for message in [None, Some((false, "Waiting for filesystem work".into()))] {
+                app.operation_message = message;
+                for &(width, height) in SIZES {
+                    let _ = render(&app, Rect::new(3, 2, width, height));
+                }
+                let rendered = text(&render(&app, Rect::new(0, 0, 80, 24)));
+                assert!(rendered.contains("Operation in progress"));
+                let expected = if app.operation_message.is_some() {
+                    "Waiting for filesystem work"
+                } else {
+                    "Waiting for worker progress..."
+                };
+                assert!(rendered.contains(expected));
+                app.operation_progress = Some(OperationProgress::new(
+                    gravityfile_ops::OperationType::Rename,
+                    1,
+                    0,
+                ));
+                let rendered = text(&render(&app, Rect::new(0, 0, 80, 24)));
+                assert!(rendered.contains("Renaming..."));
+                assert!(!rendered.contains("Operation in progress"));
+                app.operation_progress = None;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn renders_every_view_and_mode_at_every_terminal_size() {
+        // A terminal can be resized to anything, including one column wide, and
+        // a panic in a widget aborts the whole app. This sweep is the backstop
+        // for the right-edge and viewport arithmetic across all the widgets.
+        let (_dir, mut app) = populated_app();
+
+        for &layout in &[LayoutMode::Tree, LayoutMode::Miller] {
+            for &view in VIEWS {
+                for &mode in MODES {
+                    for &(width, height) in SIZES {
+                        app.layout_mode = layout;
+                        app.view = view;
+                        app.mode = mode;
+                        let _ = render(&app, Rect::new(0, 0, width, height));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn renders_at_every_size_before_a_scan_has_produced_a_tree() {
+        // Startup and scan failure both leave the app with no tree at all.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(dir.path().to_path_buf(), crate::TuiConfig::default());
+        app.tree = None;
+        app.error = Some("scan failed".to_string());
+
+        for &layout in &[LayoutMode::Tree, LayoutMode::Miller] {
+            for &view in VIEWS {
+                for &(width, height) in SIZES {
+                    app.layout_mode = layout;
+                    app.view = view;
+                    let _ = render(&app, Rect::new(0, 0, width, height));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_explorer_renders_the_scanned_entries() {
+        // Guards the sweep above: a render that draws nothing would also never
+        // panic, so at least one size has to prove real content reaches the
+        // buffer.
+        let (_dir, app) = scanned_app();
+        let rendered = text(&render(&app, Rect::new(0, 0, 120, 30)));
+        assert!(rendered.contains("src"), "explorer is blank: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn both_layouts_render_the_selected_directory() {
+        let (_dir, mut app) = scanned_app();
+
+        app.layout_mode = LayoutMode::Tree;
+        assert!(text(&render(&app, Rect::new(0, 0, 120, 30))).contains("src"));
+
+        app.layout_mode = LayoutMode::Miller;
+        let rendered = text(&render(&app, Rect::new(0, 0, 120, 30)));
+        assert!(rendered.contains("Current"), "miller columns missing");
+        assert!(rendered.contains("src"), "miller is blank: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn tree_navigation_is_clamped_to_the_visible_item_count() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Tree;
+        let last = app.cached_tree_len - 1;
+        assert!(last > 0, "the fixture should expand to several rows");
+
+        app.jump_to_bottom();
+        assert_eq!(app.tree_state.selected, last);
+        app.move_down();
+        app.page_down();
+        assert_eq!(app.tree_state.selected, last);
+
+        app.jump_to_top();
+        assert_eq!(app.tree_state.selected, 0);
+        app.move_up();
+        app.page_up();
+        assert_eq!(app.tree_state.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn expanding_a_directory_grows_the_visible_item_count() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Tree;
+        let collapsed_len = app.cached_tree_len;
+
+        app.tree_state.selected = tree_row(&app, "src");
+        app.expand_selected();
+        assert!(
+            app.cached_tree_len > collapsed_len,
+            "expanding src revealed nothing"
+        );
+
+        app.collapse_selected();
+        assert_eq!(app.cached_tree_len, collapsed_len);
+    }
+
+    #[tokio::test]
+    async fn drilling_into_a_directory_and_back_restores_the_previous_root() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Tree;
+        let original_root = app.view_root.clone();
+
+        let src_index = tree_row(&app, "src");
+        app.tree_state.selected = src_index;
+        app.drill_into_selected();
+        assert_eq!(app.view_root, original_root.join("src"));
+
+        app.navigate_back();
+        assert_eq!(app.view_root, original_root);
+        assert_eq!(
+            app.tree_state.selected, src_index,
+            "returning restores the row the user drilled from"
+        );
+    }
+
+    #[tokio::test]
+    async fn drilling_in_miller_mode_and_back_restores_the_previous_root() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Miller;
+        let original_root = app.view_root.clone();
+
+        let (node, _) = app.get_view_root_node().unwrap();
+        let src_index = node
+            .children
+            .iter()
+            .position(|child| child.name.as_str() == "src")
+            .expect("src is a child");
+        app.miller_state.selected = src_index;
+
+        app.drill_into_miller_selected();
+        assert_eq!(app.view_root, original_root.join("src"));
+
+        app.navigate_back();
+        assert_eq!(app.view_root, original_root);
+        assert_eq!(app.miller_state.selected, src_index);
+    }
+
+    #[tokio::test]
+    async fn drilling_into_a_file_does_nothing() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Tree;
+        let root = app.view_root.clone();
+
+        app.tree_state.selected = tree_row(&app, "empty");
+        app.drill_into_selected();
+        assert_eq!(app.view_root, root, "a file is not a directory to enter");
+        assert!(app.view_history.is_empty(), "no history entry was recorded");
+    }
+
+    #[tokio::test]
+    async fn navigating_back_from_the_scan_root_walks_up_the_filesystem() {
+        let (_dir, mut app) = scanned_app();
+        let root = app.view_root.clone();
+        let parent = root
+            .parent()
+            .expect("the temp dir has a parent")
+            .to_path_buf();
+
+        app.navigate_back();
+        assert_eq!(app.view_root, parent);
+    }
+
+    #[tokio::test]
+    async fn the_treemap_selection_is_bounded_by_the_rectangle_count() {
+        let (_dir, mut app) = scanned_app();
+        app.view = View::Treemap;
+        app.update_cached_treemap_len();
+        let last = app.cached_treemap_len - 1;
+
+        app.jump_to_bottom();
+        assert_eq!(app.treemap_state.selected, last);
+        app.move_down();
+        app.page_down();
+        assert_eq!(app.treemap_state.selected, last);
+
+        app.jump_to_top();
+        assert_eq!(app.treemap_state.selected, 0);
+        app.move_up();
+        app.page_up();
+        assert_eq!(app.treemap_state.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_failures_reach_the_errors_view_and_success_clears_old_details() {
+        let (_directory, mut app) = scanned_app();
+        let missing = app.path.join("missing-delete-target");
+        let removed = app.path.join("temporary-delete-target");
+        std::fs::write(&removed, b"temporary").unwrap();
+        app.operation_message = Some((true, "Old copy summary".into()));
+        let mut rx = deletion::start_deletion_with_mode(
+            vec![(missing.clone(), 0), (removed.clone(), 9)],
+            deletion::DeletionMode::Permanent,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = rx.recv().await.expect("deletion completion");
+                let complete = matches!(result, ScanResult::DeletionComplete { .. });
+                app.handle_scan_result(result);
+                if complete {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!removed.exists());
+        assert_eq!(app.view, View::Errors);
+        assert!(app.operation_message.is_none());
+        assert!(!app.deletion_message.as_ref().unwrap().0);
+        assert!(
+            app.deletion_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("Permanently deleted")
+        );
+        assert_eq!(app.operation_warnings.len(), 1);
+        assert_eq!(app.operation_warnings[0].path, missing);
+        assert!(
+            app.operation_warnings[0]
+                .message
+                .contains("Cannot access path")
+        );
+        let rendered = text(&render(&app, Rect::new(0, 0, 120, 40)));
+        assert!(rendered.contains("missing-delete-target"), "{rendered}");
+        assert!(rendered.contains("Cannot access path"), "{rendered}");
+        assert!(!rendered.contains("Old copy summary"));
+        app.handle_scan_result(ScanResult::DeletionComplete {
+            mode: deletion::DeletionMode::Trash,
+            deleted: 1,
+            failed: 0,
+            bytes_freed: 9,
+            errors: Vec::new(),
+        });
+        assert!(app.operation_warnings.is_empty());
+        assert!(app.deletion_message.as_ref().unwrap().0);
+    }
+
+    #[tokio::test]
+    async fn undo_failure_details_survive_refresh_and_render_in_errors_view() {
+        let (_directory, mut app) = scanned_app();
+        let path = app.path.join("work-in-progress.txt");
+        std::fs::write(&path, b"user content").unwrap();
+        app.undo_log.record_create_file(path.clone());
+        app.execute_undo();
+        let mut rx = app.scan_rx.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = rx.recv().await.expect("undo completion");
+                let complete = matches!(result, ScanResult::OperationComplete { .. });
+                app.handle_scan_result(result);
+                if complete {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.view, View::Errors);
+        assert_eq!(app.operation_warnings.len(), 1);
+        assert_eq!(app.operation_warnings[0].path, path);
+        assert!(
+            app.operation_warnings[0]
+                .message
+                .contains("now contains data")
+        );
+        assert!(
+            app.warnings.is_empty(),
+            "automatic refresh clears scan warnings only"
+        );
+        let rendered = text(&render(&app, Rect::new(0, 0, 120, 40)));
+        assert!(rendered.contains("work-in-progress.txt"), "{rendered}");
+        assert!(rendered.contains("now contains data"), "{rendered}");
+        app.warnings.push(gravityfile_core::ScanWarning::new(
+            app.path.join("scan-warning"),
+            gravityfile_core::WarningKind::ReadError,
+            "scan issue",
+        ));
+        app.jump_to_bottom();
+        assert_eq!(app.selected_warning, 1);
+        assert_eq!(app.displayed_warning(1).unwrap().message, "scan issue");
+        app.jump_to_top();
+        assert_eq!(app.displayed_warning(0).unwrap().path, path);
+        assert_eq!(std::fs::read(path).unwrap(), b"user content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_does_not_prefill_lossy_filename_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let (_directory, mut app) = scanned_app();
+        let path = app
+            .path
+            .join(std::ffi::OsString::from_vec(b"name-\xff".to_vec()));
+        app.operation_warnings
+            .push(gravityfile_core::ScanWarning::new(
+                &path,
+                gravityfile_core::WarningKind::ReadError,
+                "diagnostic",
+            ));
+        app.view = View::Errors;
+        app.start_rename();
+        let input = app.input_state.as_ref().unwrap();
+        assert_eq!(input.context_path, Some(path));
+        assert_eq!(input.buffer(), "");
+        assert!(input.original().is_none());
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("not UTF-8")
+        );
+        // Empty submission is rejected before any rename task is created.
+        app.scan_rx = None;
+        app.handle_input_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.scan_rx.is_none());
+        assert!(!app.operation_message.as_ref().unwrap().0);
+    }
+
+    #[tokio::test]
+    async fn rename_preserves_unicode_prefill_and_rejects_filesystem_root() {
+        let (_directory, mut app) = scanned_app();
+        let path = app.path.join("name-é-�");
+        app.operation_warnings
+            .push(gravityfile_core::ScanWarning::new(
+                &path,
+                gravityfile_core::WarningKind::ReadError,
+                "diagnostic",
+            ));
+        app.view = View::Errors;
+        app.start_rename();
+        assert_eq!(app.input_state.as_ref().unwrap().buffer(), "name-é-�");
+        app.input_state = None;
+        app.mode = AppMode::Normal;
+        let root = app.path.ancestors().last().unwrap().to_path_buf();
+        app.operation_warnings[0].path = root;
+        app.start_rename();
+        assert!(app.input_state.is_none());
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("root cannot be renamed")
+        );
+    }
+
+    #[tokio::test]
+    async fn node_lookup_follows_components_and_rejects_outside_paths() {
+        let (_dir, app) = scanned_app();
+        let tree = app.tree.as_ref().unwrap();
+        let deep = app.path.join("src/nested/deep.txt");
+        assert_eq!(
+            App::find_node_at_path(&tree.root, &deep, &app.path)
+                .unwrap()
+                .name,
+            "deep.txt"
+        );
+        assert!(std::ptr::eq(
+            App::find_node_at_path(&tree.root, &app.path, &app.path).unwrap(),
+            &tree.root
+        ));
+        assert!(
+            App::find_node_at_path(
+                &tree.root,
+                &app.path.join("src/missing/deep.txt"),
+                &app.path
+            )
+            .is_none()
+        );
+        assert!(
+            App::find_node_at_path(&tree.root, &app.path.join("../outside"), &app.path).is_none()
+        );
+        assert!(
+            App::find_node_at_path(&tree.root, &app.path.with_extension("outside"), &app.path)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mutable_node_lookup_handles_deep_synthetic_paths() {
+        use gravityfile_core::{FileNode, NodeId, Timestamps};
+        let depth = 20_000u64;
+        let mut node = FileNode::new_directory(
+            NodeId::new(depth),
+            "d",
+            Timestamps::with_modified(std::time::UNIX_EPOCH),
+        );
+        let mut target = PathBuf::from("root");
+        for id in (0..depth).rev() {
+            let mut parent = FileNode::new_directory(
+                NodeId::new(id),
+                "d",
+                Timestamps::with_modified(std::time::UNIX_EPOCH),
+            );
+            parent.children.push(node);
+            node = parent;
+            target.push("d");
+        }
+        let actual =
+            App::find_node_mut(&mut node, &target, Path::new("root")).map(|found| found.id);
+        let mut pending = std::mem::take(&mut node.children);
+        while let Some(mut child) = pending.pop() {
+            pending.append(&mut child.children);
+        }
+        assert_eq!(actual, Some(NodeId::new(depth)));
+    }
+
+    #[tokio::test]
+    async fn mutable_node_lookup_uses_the_same_path_scope() {
+        let (_dir, mut app) = scanned_app();
+        let tree = std::sync::Arc::make_mut(app.tree.as_mut().unwrap());
+        let deep = app.path.join("src/nested/deep.txt");
+        let found = App::find_node_mut(&mut tree.root, &deep, &app.path).unwrap();
+        found.size = 12345;
+        assert_eq!(
+            App::find_node_at_path(&tree.root, &deep, &app.path)
+                .unwrap()
+                .size,
+            12345
+        );
+        for path in [
+            app.path.join("src/missing/deep.txt"),
+            app.path.join("../outside"),
+            app.path.with_extension("outside"),
+        ] {
+            assert!(App::find_node_mut(&mut tree.root, &path, &app.path).is_none());
+        }
+        let root_id = tree.root.id;
+        assert_eq!(
+            App::find_node_mut(&mut tree.root, &app.path, &app.path)
+                .unwrap()
+                .id,
+            root_id
+        );
+    }
+
+    #[tokio::test]
+    async fn file_actions_follow_the_active_view_instead_of_the_explorer_cursor() {
+        for layout in [LayoutMode::Tree, LayoutMode::Miller] {
+            let (_dir, mut app) = populated_app();
+            app.layout_mode = layout;
+            app.marked.clear();
+            app.clipboard.clear();
+            app.view = View::Duplicates;
+            app.duplicates_state.expanded_groups.insert(0);
+            app.duplicates_state.selected_in_group.insert(0, 1);
+            let duplicate = app.duplicates.as_ref().unwrap().groups[0].paths[0].clone();
+            assert_eq!(app.get_selected_path(), Some(duplicate.clone()));
+            assert_eq!(app.get_selected_info().unwrap().path, duplicate);
+            app.yank_selection();
+            assert_eq!(app.clipboard.paths, vec![duplicate.clone()]);
+            app.start_rename();
+            assert_eq!(
+                app.input_state.as_ref().unwrap().context_path,
+                Some(duplicate)
+            );
+            app.input_state = None;
+            app.mode = AppMode::Normal;
+            // A collapsed group still remembers its child cursor, but no child
+            // is visibly selected and single-file actions must have no target.
+            app.duplicates_state.expanded_groups.clear();
+            assert!(app.get_selected_path().is_none());
+            assert!(app.get_selected_info().is_none());
+            app.start_rename();
+            assert!(app.input_state.is_none());
+
+            let diagnosed = app.path.join("copy-b.bin");
+            app.operation_warnings
+                .push(gravityfile_core::ScanWarning::new(
+                    &diagnosed,
+                    gravityfile_core::WarningKind::ReadError,
+                    "operation failed",
+                ));
+            app.view = View::Errors;
+            app.selected_warning = 0;
+            assert_eq!(app.get_selected_path(), Some(diagnosed.clone()));
+            assert_eq!(app.get_selected_info().unwrap().path, diagnosed);
+            app.cut_selection();
+            assert_eq!(app.clipboard.paths, vec![diagnosed]);
+            app.selected_warning = 1;
+            assert_eq!(app.get_selected_path(), Some(app.warnings[0].path.clone()));
+            assert!(
+                app.get_selected_info().is_none(),
+                "unknown diagnostics must not borrow another file's details"
+            );
+
+            let stale = app.path.join("src");
+            app.age_report.as_mut().unwrap().stale_directories =
+                vec![gravityfile_analyze::StaleDirectory {
+                    path: stale.clone(),
+                    size: 4096,
+                    newest_file_age: std::time::Duration::from_secs(86400),
+                    file_count: 2,
+                }];
+            app.view = View::Age;
+            app.selected_stale_dir = 0;
+            assert_eq!(app.get_selected_path(), Some(stale.clone()));
+            assert_eq!(app.get_selected_info().unwrap().path, stale);
+            assert!(!app.is_selected_file());
+            app.selected_stale_dir = 1;
+            assert!(app.get_selected_path().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_errors_view_selection_is_bounded_by_the_warning_count() {
+        let (_dir, mut app) = populated_app();
+        app.view = View::Errors;
+        let last = app.warnings.len() - 1;
+
+        app.jump_to_bottom();
+        assert_eq!(app.selected_warning, last);
+        app.move_down();
+        app.page_down();
+        assert_eq!(app.selected_warning, last);
+
+        app.jump_to_top();
+        app.move_up();
+        assert_eq!(app.selected_warning, 0);
+    }
+
+    #[tokio::test]
+    async fn navigation_on_empty_views_does_not_underflow() {
+        // Before analysis runs, the duplicates and age views have no rows at
+        // all, and a scan with no problems leaves the errors view empty.
+        let (_dir, mut app) = scanned_app();
+        app.duplicates = None;
+        app.age_report = None;
+        app.warnings.clear();
+
+        for view in VIEWS {
+            app.view = *view;
+            app.move_up();
+            app.move_down();
+            app.page_up();
+            app.page_down();
+            app.jump_to_top();
+            app.jump_to_bottom();
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_layout_keeps_the_same_item_selected() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Tree;
+        app.tree_state.selected = tree_row(&app, "src");
+        let selected_before = app.get_selected_path();
+        assert!(selected_before.is_some());
+
+        app.sync_layout_selection();
+        assert_eq!(app.layout_mode, LayoutMode::Miller);
+        assert_eq!(app.get_selected_path(), selected_before);
+
+        app.sync_layout_selection();
+        assert_eq!(app.layout_mode, LayoutMode::Tree);
+        assert_eq!(app.get_selected_path(), selected_before);
+    }
+
+    #[tokio::test]
+    async fn view_cycling_wraps_in_both_directions() {
+        let (_dir, mut app) = scanned_app();
+        let start = app.view;
+
+        let mut seen = vec![start];
+        for _ in 1..VIEWS.len() {
+            app.handle_action(KeyAction::NextView);
+            seen.push(app.view);
+        }
+        seen.sort_unstable_by_key(|view| *view as usize);
+        seen.dedup_by_key(|view| *view as usize);
+        assert_eq!(seen.len(), VIEWS.len(), "cycling must visit every view");
+
+        app.handle_action(KeyAction::NextView);
+        assert_eq!(app.view, start, "NextView must wrap");
+
+        for _ in 0..VIEWS.len() {
+            app.handle_action(KeyAction::PrevView);
+        }
+        assert_eq!(app.view, start, "PrevView must wrap");
+    }
+
+    #[tokio::test]
+    async fn escape_clears_the_clipboard_before_the_marks_and_never_quits() {
+        let (_dir, mut app) = scanned_app();
+        let root = app.view_root.clone();
+        app.marked.insert(root.join("empty"));
+        app.clipboard.yank([root.join("copy-a.bin")], root.clone());
+
+        app.handle_action(KeyAction::Cancel);
+        assert!(app.clipboard.is_empty(), "first Esc clears the clipboard");
+        assert!(!app.marked.is_empty(), "marks survive the first Esc");
+
+        app.handle_action(KeyAction::Cancel);
+        assert!(app.marked.is_empty(), "second Esc clears the marks");
+
+        app.handle_action(KeyAction::Cancel);
+        assert_eq!(app.mode, AppMode::Normal, "Esc must never quit");
+    }
+
+    #[tokio::test]
+    async fn delete_requires_confirmation_and_cancelling_drops_the_auto_mark() {
+        let (_dir, mut app) = scanned_app();
+        assert!(app.marked.is_empty());
+
+        app.handle_action(KeyAction::Delete);
+        assert_eq!(app.mode, AppMode::ConfirmDelete);
+        assert!(!app.marked.is_empty(), "delete auto-marks the selection");
+
+        app.handle_action(KeyAction::Cancel);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(
+            app.marked.is_empty(),
+            "cancelling must not leave the auto-mark behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn help_and_settings_swallow_navigation_keys() {
+        let (_dir, mut app) = scanned_app();
+        app.layout_mode = LayoutMode::Tree;
+        app.mode = AppMode::Help;
+
+        app.handle_action(KeyAction::MoveDown);
+        assert_eq!(app.tree_state.selected, 0, "help must not move the cursor");
+
+        app.handle_action(KeyAction::ToggleHelp);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn a_completed_operation_reports_skips_separately_from_failures() {
+        let (_dir, mut app) = scanned_app();
+
+        app.handle_scan_result(ScanResult::OperationComplete {
+            cancelled: false,
+            operation_type: gravityfile_ops::OperationType::Copy,
+            succeeded: 3,
+            failed: 0,
+            skipped: 2,
+            bytes_processed: 1024,
+            errors: Vec::new(),
+            undo_info: None,
+        });
+        let (success, message) = app.operation_message.clone().expect("a message is set");
+        assert!(success, "skipping is a user decision, not a failure");
+        assert!(message.contains("2 skipped"), "{message}");
+        assert!(!message.contains("failed"), "{message}");
+
+        app.handle_scan_result(ScanResult::OperationComplete {
+            cancelled: false,
+            operation_type: gravityfile_ops::OperationType::Copy,
+            succeeded: 1,
+            failed: 1,
+            skipped: 1,
+            bytes_processed: 1024,
+            errors: Vec::new(),
+            undo_info: None,
+        });
+        let (success, message) = app.operation_message.clone().expect("a message is set");
+        assert!(!success, "a failure marks the operation unsuccessful");
+        assert!(
+            message.contains("1 skipped") && message.contains("1 failed"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_marking_preserves_single_file_and_header_semantics() {
+        let (_directory, mut app) = populated_app();
+        app.marked.clear();
+        app.view = View::Duplicates;
+        let paths = app.duplicates.as_ref().unwrap().groups[0].paths.clone();
+        assert!(paths.len() >= 2);
+        app.duplicates_state.selected_group = 0;
+        app.duplicates_state.expanded_groups.insert(0);
+        app.duplicates_state
+            .selected_in_group
+            .insert(0, paths.len());
+        app.toggle_mark();
+        assert_eq!(app.marked, HashSet::from([paths.last().unwrap().clone()]));
+        app.toggle_mark();
+        assert!(app.marked.is_empty());
+        app.duplicates_state.selected_in_group.insert(0, 0);
+        app.toggle_mark();
+        assert_eq!(app.marked, paths.iter().cloned().collect());
+        app.toggle_mark();
+        assert!(app.marked.is_empty());
+        app.marked.insert(paths[0].clone());
+        app.toggle_mark();
+        assert!(app.marked.is_empty());
+        app.duplicates_state.selected_in_group.insert(0, usize::MAX);
+        app.toggle_mark();
+        assert!(app.marked.is_empty());
+        app.duplicates_state.selected_group = usize::MAX;
+        app.toggle_mark();
+        assert!(app.marked.is_empty());
+    }
+
+    /// Manual release-mode measurement; synthetic paths do not touch disk.
+    #[tokio::test]
+    #[ignore = "manual million-path render benchmark; run with --release --ignored --nocapture"]
+    async fn duplicate_render_benchmark() {
+        use gravityfile_analyze::{AnalysisStatus, DuplicateGroup, DuplicateReport};
+        let mut measurements = Vec::new();
+        for group_count in [1usize, 1_000] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+            let paths_per_group = 1_000_000 / group_count;
+            let groups = (0..group_count)
+                .map(|group| DuplicateGroup {
+                    hash: gravityfile_core::ContentHash::new([0; 32]),
+                    size: 256,
+                    paths: (0..paths_per_group)
+                        .map(|file| app.path.join(format!("group-{group:04}/file-{file:09}")))
+                        .collect(),
+                    wasted_bytes: 256 * (paths_per_group as u64 - 1),
+                })
+                .collect();
+            app.duplicates = Some(Arc::new(DuplicateReport {
+                status: AnalysisStatus::default(),
+                groups,
+                total_duplicate_size: 256_000_000,
+                total_wasted_space: 256 * (1_000_000 - group_count as u64),
+                files_analyzed: 1_000_000,
+                files_with_duplicates: 1_000_000,
+                group_count,
+                groups_omitted: 0,
+            }));
+            let start = std::time::Instant::now();
+            let report = app.duplicates.as_ref().unwrap();
+            let counts =
+                duplicate_filter::prepare_counts(report, &app.path, &CancellationToken::new())
+                    .unwrap();
+            assert!(counts.iter().all(|(_, sorted)| *sorted));
+            let preparation_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = std::time::Instant::now();
+            app.duplicate_filter.seed(report, app.path.clone(), counts);
+            let installation_ms = start.elapsed().as_secs_f64() * 1000.0;
+            app.view = View::Duplicates;
+            app.duplicates_state.expanded_groups.extend(0..group_count);
+            app.duplicates_state.selected_group = group_count - 1;
+            app.duplicates_state
+                .selected_in_group
+                .insert(group_count - 1, paths_per_group);
+            let area = Rect::new(0, 0, 120, 40);
+            let start = std::time::Instant::now();
+            std::hint::black_box(render(&app, area));
+            let cold_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let mut samples = Vec::new();
+            for _ in 0..31 {
+                let start = std::time::Instant::now();
+                std::hint::black_box(render(&app, area));
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mut sorted = samples.clone();
+            sorted.sort_by(f64::total_cmp);
+            let mut scope_samples = Vec::new();
+            for iteration in 0..31 {
+                let scope = app.path.join(if iteration % 2 == 0 {
+                    "group-0000"
+                } else {
+                    "missing"
+                });
+                let start = std::time::Instant::now();
+                let filtered = app.duplicate_filter.get(report, &scope, &app.path);
+                scope_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                let count: usize = filtered.groups.iter().map(|(_, count)| count).sum();
+                assert_eq!(
+                    count,
+                    if iteration % 2 == 0 {
+                        paths_per_group
+                    } else {
+                        0
+                    }
+                );
+            }
+            let mut sorted_scope = scope_samples.clone();
+            sorted_scope.sort_by(f64::total_cmp);
+            let expected_mark = app.duplicates.as_ref().unwrap().groups[group_count - 1]
+                .paths
+                .last()
+                .unwrap()
+                .clone();
+            // Restore and warm the displayed root after the scope-refresh series.
+            drop(app.duplicate_filter.get(
+                app.duplicates.as_ref().unwrap(),
+                &app.view_root,
+                &app.path,
+            ));
+            let mut mark_samples = Vec::new();
+            for iteration in 0..31 {
+                let start = std::time::Instant::now();
+                app.toggle_mark();
+                mark_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(app.marked.contains(&expected_mark), iteration % 2 == 0);
+                assert_eq!(app.marked.len(), usize::from(iteration % 2 == 0));
+            }
+            app.marked.clear();
+            let mut sorted_mark = mark_samples.clone();
+            sorted_mark.sort_by(f64::total_cmp);
+            measurements.push(serde_json::json!({
+                "groups": group_count, "paths": 1_000_000,
+                "all_groups_expanded": true, "selection": "last file",
+                "preparation_ms": preparation_ms, "installation_ms": installation_ms,
+                "first_frame_ms": cold_ms, "cached_frame_ms": samples,
+                "cached_median_ms": sorted[15], "cached_p95_ms": sorted[29],
+                "scope_refresh_ms": scope_samples,
+                "scope_refresh_median_ms": sorted_scope[15],
+                "scope_refresh_p95_ms": sorted_scope[29],
+                "single_mark_ms": mark_samples,
+                "single_mark_median_ms": sorted_mark[15],
+                "single_mark_p95_ms": sorted_mark[29],
+            }));
+        }
+        println!(
+            "DUPLICATE_RENDER_BENCHMARK {}",
+            serde_json::json!({
+                "schema_version": 1, "debug_assertions": cfg!(debug_assertions),
+                "width": 120, "height": 40, "measurements": measurements,
+                "scope": "full App widget to in-memory buffer; synthetic paths; excludes terminal I/O, analysis, and report construction"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn new_navigation_branches_clear_forward_history_and_save_active_cursor() {
+        for layout in [LayoutMode::Tree, LayoutMode::Miller] {
+            for action in ["take", "cd", "search-directory", "search-file", "bookmark"] {
+                let (_directory, mut app) = scanned_app();
+                let root = app.view_root.clone();
+                app.layout_mode = layout;
+                app.tree_state.selected = 1;
+                app.miller_state.selected = 2;
+                let expected_cursor = if layout == LayoutMode::Tree { 1 } else { 2 };
+                app.forward_history
+                    .push((root.join("obsolete"), 0, HashSet::new()));
+                let destination = if action == "search-file" {
+                    root.join("src/nested")
+                } else {
+                    root.join("src")
+                };
+                match action {
+                    "take" => app.finish_take(destination.clone(), Ok(false)),
+                    "cd" => app.cd_to_path("src"),
+                    "search-directory" => app.navigate_to_search_result(&destination),
+                    "search-file" => app.navigate_to_search_result(&destination.join("deep.txt")),
+                    "bookmark" => {
+                        app.user_settings.bookmarks.set('a', destination.clone());
+                        app.jump_to_bookmark('a');
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(app.view_root, destination, "{action}");
+                assert!(app.forward_history.is_empty(), "{action}");
+                let origin = app.view_history.last().unwrap();
+                assert_eq!(origin.0, root, "{action}");
+                assert_eq!(origin.1, expected_cursor, "{action}");
+                if action == "cd" && layout == LayoutMode::Miller {
+                    assert_eq!(app.miller_state.selected, 0);
+                    assert_eq!(app.cached_miller_len, 2);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_enter_waits_for_success_and_records_only_new_directories() {
+        for existing in [false, true] {
+            let (_directory, mut app) = scanned_app();
+            let root = app.view_root.clone();
+            let destination = root.join("take-target");
+            if existing {
+                std::fs::create_dir(&destination).unwrap();
+            }
+            app.execute_take(root.clone(), "take-target".into());
+            assert_eq!(app.view_root, root, "navigation must wait for completion");
+            let mut rx = app.take_rx.take().unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&result, ScanResult::TakeComplete { result: Ok(created), .. } if *created != existing)
+            );
+            app.handle_scan_result(result);
+            assert_eq!(app.view_root, destination);
+            assert!(destination.is_dir());
+            assert_eq!(app.undo_log.len(), usize::from(!existing));
+            if let Some(entry) = app.undo_log.pop() {
+                assert!(
+                    matches!(entry.operation, gravityfile_ops::UndoableOperation::DirectoryCreated { path } if path == destination)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_enter_completion_does_not_override_later_navigation() {
+        let (_directory, mut app) = scanned_app();
+        let root = app.view_root.clone();
+        app.execute_take(root.clone(), "created-later".into());
+        let mut rx = app.take_rx.take().unwrap();
+        let destination = root.join("src");
+        app.view_root = destination.clone();
+        app.start_scan();
+        let later_scan = app.scan_token.clone();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_scan_result(result);
+        assert_eq!(app.view_root, destination);
+        assert!(root.join("created-later").is_dir());
+        assert_eq!(app.undo_log.len(), 1);
+        assert!(!later_scan.is_cancelled());
+        assert!(app.scan_rx.is_some());
+    }
+
+    #[tokio::test]
+    async fn take_result_survives_another_operation_and_rejects_overlapping_take() {
+        let (_directory, mut app) = scanned_app();
+        let root = app.view_root.clone();
+        app.execute_take(root.clone(), "first".into());
+        app.handle_action(KeyAction::Quit);
+        assert_eq!(app.mode, AppMode::Normal);
+        app.execute_command("q");
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.take_rx.is_some());
+        app.execute_take(root.clone(), "second".into());
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("still in progress")
+        );
+        app.execute_create_file(root.clone(), "file".into());
+        let later_token = app.scan_token.clone();
+        let mut take = app.take_rx.take().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), take.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_scan_result(result);
+        assert_eq!(app.mode, AppMode::UpdatingEntry);
+        assert_eq!(app.view_root, root);
+        assert!(app.scan_rx.is_some());
+        assert!(!later_token.is_cancelled());
+        assert_eq!(app.undo_log.len(), 1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_until_complete(&mut app),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.undo_log.len(), 2);
+        assert!(root.join("first").is_dir());
+        assert!(root.join("file").is_file());
+        assert!(!root.join("second").exists());
+    }
+
+    #[tokio::test]
+    async fn create_and_enter_preserves_navigation_on_invalid_names_and_conflicts() {
+        let (_directory, mut app) = scanned_app();
+        let root = app.view_root.clone();
+        for name in ["..", "bad\nname", "name."] {
+            app.execute_take(root.clone(), name.into());
+            assert!(app.take_rx.is_none());
+            assert_eq!(app.view_root, root);
+            assert!(!app.operation_message.as_ref().unwrap().0);
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("src"), root.join("linked-dir")).unwrap();
+        }
+        let conflicts: &[&str] = if cfg!(unix) {
+            &["copy-a.bin", "linked-dir"]
+        } else {
+            &["copy-a.bin"]
+        };
+        for &name in conflicts {
+            app.execute_take(root.clone(), name.into());
+            let mut rx = app.take_rx.take().unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_scan_result(result);
+            assert_eq!(app.view_root, root);
+            assert!(app.undo_log.is_empty());
+            assert!(!app.operation_message.as_ref().unwrap().0);
+        }
+        assert_eq!(
+            std::fs::read(root.join("copy-a.bin")).unwrap(),
+            vec![7u8; 8192]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_rename_ui_adapters_release_idle_workers() {
+        let (create_tx, create_rx) = mpsc::channel(1);
+        drop(App::adapt_create_rx(PathBuf::from("created"), create_rx));
+        tokio::time::timeout(std::time::Duration::from_secs(5), create_tx.closed())
+            .await
+            .unwrap();
+        let (rename_tx, rename_rx) = mpsc::channel(1);
+        drop(App::adapt_rename_rx(
+            PathBuf::from("original"),
+            "renamed".into(),
+            rename_rx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), rename_tx.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_adapter_records_undo_only_for_successful_mutations() {
+        use gravityfile_ops::{CreateResult, OperationComplete, OperationType};
+        let path = PathBuf::from("created");
+        for operation_type in [OperationType::CreateFile, OperationType::CreateDirectory] {
+            for (succeeded, failed, cancelled, expected_undo) in [
+                (0, 0, false, false),
+                (1, 0, false, true),
+                (0, 1, false, false),
+                (0, 0, true, false),
+            ] {
+                let (tx, rx) = mpsc::channel(1);
+                let mut adapted = App::adapt_create_rx(path.clone(), rx);
+                tx.send(CreateResult::Complete(OperationComplete {
+                    operation_type,
+                    succeeded,
+                    failed,
+                    cancelled,
+                    skipped: 0,
+                    bytes_processed: 0,
+                    errors: Vec::new(),
+                }))
+                .await
+                .unwrap();
+                drop(tx);
+                let Some(ScanResult::OperationComplete {
+                    undo_info,
+                    succeeded: actual_succeeded,
+                    cancelled: actual_cancelled,
+                    ..
+                }) = adapted.recv().await
+                else {
+                    panic!("completion expected")
+                };
+                assert_eq!(actual_succeeded, succeeded);
+                assert_eq!(actual_cancelled, cancelled);
+                assert_eq!(undo_info.is_some(), expected_undo);
+                if let Some(undo) = undo_info {
+                    match (operation_type, undo) {
+                        (
+                            OperationType::CreateFile,
+                            gravityfile_ops::UndoableOperation::FileCreated { path: actual },
+                        )
+                        | (
+                            OperationType::CreateDirectory,
+                            gravityfile_ops::UndoableOperation::DirectoryCreated { path: actual },
+                        ) => assert_eq!(actual, path),
+                        _ => panic!("wrong undo kind"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_undo_delivers_completion_through_ui_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("created");
+        std::fs::write(&path, []).unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        app.undo_log.record_create_file(path.clone());
+        app.execute_undo();
+        app.scan_token.cancel();
+        let mut rx = app.scan_rx.take().unwrap();
+        let complete = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(result) = rx.recv().await {
+                if let ScanResult::OperationComplete {
+                    cancelled,
+                    succeeded,
+                    ..
+                } = result
+                {
+                    return Some((cancelled, succeeded));
+                }
+            }
+            None
+        })
+        .await
+        .unwrap();
+        assert_eq!(complete, Some((true, 0)));
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn filesystem_operations_cancel_previous_scan_and_clear_its_status() {
+        for operation in ["rename", "file", "directory", "take", "undo", "paste"] {
+            let (_dir, mut app) = scanned_app();
+            let tree = Arc::clone(app.tree.as_ref().unwrap());
+            let root = app.path.clone();
+            let (old_tx, old_rx) = mpsc::channel(1);
+            app.scan_rx = Some(old_rx);
+            app.scan_progress = Some(ScanProgress::new());
+            app.analyzing = true;
+            let old_token = app.scan_token.clone();
+            match operation {
+                "rename" => app.execute_rename(root.join("copy-a.bin"), "renamed".into()),
+                "file" => app.execute_create_file(root, "created".into()),
+                "directory" => app.execute_create_directory(root, "created".into()),
+                "take" => app.execute_take(root, "created".into()),
+                "undo" => {
+                    let path = root.join("created");
+                    std::fs::write(&path, []).unwrap();
+                    app.undo_log.record_create_file(path);
+                    app.execute_undo();
+                }
+                "paste" => {
+                    app.clipboard.yank([root.join("copy-a.bin")], root.clone());
+                    app.view_root = root.join("src");
+                    app.tree_state.selected = 0;
+                    app.paste_with_resolution(Some(gravityfile_ops::ConflictResolution::Skip));
+                }
+                _ => unreachable!(),
+            }
+            assert!(old_token.is_cancelled(), "{operation}");
+            assert!(old_tx.is_closed(), "{operation}");
+            assert!(!app.scan_token.is_cancelled(), "{operation}");
+            assert!(app.scan_progress.is_none());
+            assert!(!app.analyzing);
+            assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &tree));
+            let mut rx = if operation == "take" {
+                app.take_rx.take()
+            } else {
+                app.scan_rx.take()
+            }
+            .expect("operation receiver");
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut completed = false;
+                while let Some(result) = rx.recv().await {
+                    completed |= matches!(
+                        result,
+                        ScanResult::OperationComplete { .. } | ScanResult::TakeComplete { .. }
+                    );
+                }
+                assert!(completed, "{operation}");
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn submitted_create_and_rename_retain_completion_and_undo() {
+        for mode in [
+            AppMode::Renaming,
+            AppMode::CreatingFile,
+            AppMode::CreatingDirectory,
+        ] {
+            for conflict in [false, true] {
+                let (_dir, mut app) = scanned_app();
+                let root = app.path.clone();
+                let destination = root.join("result");
+                if conflict {
+                    std::fs::write(&destination, b"existing").unwrap();
+                }
+                let mut input = InputState::with_initial("result");
+                input.context_path = Some(if mode == AppMode::Renaming {
+                    root.join("copy-a.bin")
+                } else {
+                    root
+                });
+                app.input_state = Some(input);
+                app.mode = mode;
+                app.dispatch_key_event(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+                assert_eq!(app.mode, AppMode::UpdatingEntry);
+                for key in [
+                    crossterm::event::KeyCode::Char('R'),
+                    crossterm::event::KeyCode::Char('u'),
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyCode::Char('q'),
+                ] {
+                    app.dispatch_key_event(crossterm::event::KeyEvent::new(
+                        key,
+                        crossterm::event::KeyModifiers::NONE,
+                    ));
+                    assert_eq!(app.mode, AppMode::UpdatingEntry);
+                    assert!(app.scan_rx.is_some());
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    pump_until_complete(&mut app),
+                )
+                .await
+                .unwrap();
+                assert_eq!(app.mode, AppMode::Normal);
+                assert_eq!(app.undo_log.len(), usize::from(!conflict));
+                assert_eq!(app.operation_message.as_ref().unwrap().0, !conflict);
+                assert!(destination.exists());
+                if conflict {
+                    assert_eq!(std::fs::read(destination).unwrap(), b"existing");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_background_channel_releases_operation_modes_without_claiming_success() {
+        let (_dir, mut app) = scanned_app();
+        let tree = Arc::clone(app.tree.as_ref().unwrap());
+        app.undo_log.record_create_file(app.path.join("recorded"));
+        for mode in [
+            AppMode::Copying,
+            AppMode::Moving,
+            AppMode::Undoing,
+            AppMode::Deleting,
+            AppMode::BulkRenaming,
+            AppMode::ConflictResolution,
+            AppMode::Normal,
+            AppMode::Search,
+            AppMode::CreatingFile,
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            drop(tx);
+            app.scan_rx = Some(rx);
+            app.scan_token = CancellationToken::new();
+            app.scan_progress = Some(ScanProgress::new());
+            app.analyzing = true;
+            app.operation_progress = Some(OperationProgress::new(
+                gravityfile_ops::OperationType::Copy,
+                1,
+                0,
+            ));
+            app.operation_message = Some((true, "old success".into()));
+            app.deletion_message = Some((true, "old deletion".into()));
+            app.mode = mode;
+            assert!(app.scan_rx.as_mut().unwrap().recv().await.is_none());
+            app.handle_background_channel_closed();
+            let expected = match mode {
+                AppMode::Search | AppMode::CreatingFile => mode,
+                _ => AppMode::Normal,
+            };
+            assert_eq!(app.mode, expected);
+            assert!(app.scan_token.is_cancelled());
+            assert!(app.scan_rx.is_none());
+            assert!(app.scan_progress.is_none());
+            assert!(!app.analyzing);
+            assert!(app.operation_progress.is_none());
+            assert!(app.operation_message.is_none());
+            assert!(app.deletion_message.is_none());
+            assert!(app.error.as_ref().unwrap().contains("outcome unknown"));
+            assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &tree));
+            assert_eq!(app.undo_log.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_retains_exclusive_ui_ownership_until_cancelled_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("created");
+        std::fs::write(&path, []).unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        app.undo_log
+            .record_create_file(directory.path().join("older"));
+        app.undo_log.record_create_file(path.clone());
+        app.execute_undo();
+        assert_eq!(app.mode, AppMode::Undoing);
+        let token = app.scan_token.clone();
+        app.execute_undo();
+        app.handle_action(KeyAction::Undo);
+        app.dispatch_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('R'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.undo_log.len(), 1);
+        assert!(!token.is_cancelled());
+        assert_eq!(app.mode, AppMode::Undoing);
+        for action in [KeyAction::Cancel, KeyAction::Quit, KeyAction::ForceQuit] {
+            app.handle_action(action);
+            assert!(token.is_cancelled());
+            assert!(app.scan_rx.is_some());
+            assert_eq!(app.mode, AppMode::Undoing);
+        }
+        let mut rx = app.scan_rx.take().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = rx.recv().await.expect("undo completion");
+                if matches!(result, ScanResult::OperationComplete { .. }) {
+                    break result;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            &result,
+            ScanResult::OperationComplete {
+                cancelled: true,
+                succeeded: 0,
+                ..
+            }
+        ));
+        app.handle_scan_result(result);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.undo_log.len(), 2);
+        assert!(app.undo_log.peek().unwrap().review_required);
+        assert!(app.undo_log.pop().is_none());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn warning_merge_preserves_distinct_details_and_stable_order() {
+        use gravityfile_core::{ScanWarning, WarningKind};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        let path = directory.path().join("file");
+        let first = ScanWarning::new(&path, WarningKind::ReadError, "first failure");
+        let different_kind = ScanWarning::new(&path, WarningKind::MetadataError, "first failure");
+        let different_message = ScanWarning::new(&path, WarningKind::ReadError, "second failure");
+        app.warnings.push(first.clone());
+        app.merge_scan_warnings(&[
+            first.clone(),
+            different_kind.clone(),
+            different_message.clone(),
+            different_kind.clone(),
+        ]);
+        assert_eq!(app.warnings, vec![first, different_kind, different_message]);
+    }
+
+    #[test]
+    fn warning_rows_render_in_the_same_order_as_action_selection() {
+        use gravityfile_core::{ScanWarning, WarningKind};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        app.view = View::Errors;
+        app.undo_review_warnings = vec![ScanWarning::new(
+            "review-entry",
+            WarningKind::ReadError,
+            "review detail",
+        )];
+        app.operation_warnings = vec![ScanWarning::new(
+            "operation-entry",
+            WarningKind::ReadError,
+            "operation detail",
+        )];
+        app.warnings = vec![ScanWarning::new(
+            "scan-entry",
+            WarningKind::BrokenSymlink,
+            "scan detail",
+        )];
+        for selected in 0..3 {
+            app.selected_warning = selected;
+            let area = Rect::new(0, 0, 120, 30);
+            let mut buffer = Buffer::empty(area);
+            app.render(area, &mut buffer);
+            let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            let review = rendered.find("review-entry").expect("review row visible");
+            let operation = rendered
+                .find("operation-entry")
+                .expect("operation row visible");
+            let scan = rendered.find("scan-entry").expect("scan row visible");
+            assert!(review < operation && operation < scan);
+            assert!(rendered.contains("Undo Review"));
+            assert_eq!(rendered.contains("[d to delete]"), selected == 2);
+            let expected = ["review-entry", "operation-entry", "scan-entry"][selected];
+            assert_eq!(
+                app.displayed_warning(selected).unwrap().path,
+                PathBuf::from(expected)
+            );
+            app.mode = AppMode::Normal;
+            app.marked.clear();
+            app.handle_action(KeyAction::Delete);
+            if selected == 2 {
+                assert_eq!(app.mode, AppMode::ConfirmDelete);
+                assert_eq!(app.marked.len(), 1);
+                assert!(app.marked.contains(&PathBuf::from("scan-entry")));
+            } else {
+                assert_eq!(app.mode, AppMode::Normal);
+                assert!(app.marked.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn warning_merge_handles_large_repeated_final_batches() {
+        use gravityfile_core::{ScanWarning, WarningKind};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        let warnings: Vec<_> = (0..10_000)
+            .map(|index| {
+                ScanWarning::new(
+                    directory.path().join(index.to_string()),
+                    WarningKind::PermissionDenied,
+                    "denied",
+                )
+            })
+            .collect();
+        app.warnings.extend_from_slice(&warnings[..5_000]);
+        app.merge_scan_warnings(&warnings);
+        app.merge_scan_warnings(&warnings);
+        assert_eq!(app.warnings, warnings);
+    }
+
+    #[tokio::test]
+    async fn scan_completion_preserves_open_dialog_and_unrelated_error() {
+        let (_directory, mut app) = scanned_app();
+        let tree = app.tree.as_ref().unwrap().as_ref().clone();
+        app.mode = AppMode::Settings;
+        let mut edited = SettingsState::new(app.user_settings.clone());
+        edited.dirty = true;
+        edited.settings.scan_on_startup = !edited.settings.scan_on_startup;
+        app.settings_state = Some(edited);
+        app.error = Some("Cannot load settings; using defaults".into());
+        app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+        assert_eq!(app.mode, AppMode::Settings);
+        assert!(app.settings_state.as_ref().unwrap().dirty);
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Cannot load settings; using defaults")
+        );
+        app.handle_scan_result(ScanResult::ScanComplete(Err(
+            gravityfile_scan::ScanError::Other {
+                message: "scan failed".into(),
+            },
+        )));
+        assert_eq!(app.mode, AppMode::Settings);
+        assert!(app.settings_state.as_ref().unwrap().dirty);
+        assert!(app.error.as_ref().unwrap().contains("scan failed"));
+    }
+
+    #[test]
+    fn escape_acknowledges_error_before_changing_selection_or_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        let marked = directory.path().join("marked");
+        app.marked.insert(marked.clone());
+        app.error = Some("visible error".into());
+        app.scan_progress = Some(ScanProgress::new());
+        app.handle_action(KeyAction::Cancel);
+        assert!(app.error.is_none());
+        assert!(app.marked.contains(&marked));
+        assert!(app.scan_progress.is_some());
+        assert!(!app.scan_token.is_cancelled());
+        app.handle_action(KeyAction::Cancel);
+        assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn editor_handoff_preserves_source_mapping_and_rejects_invalid_edits() {
+        for valid in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let first = directory.path().join("a");
+            let second = directory.path().join("z");
+            std::fs::write(&first, b"first").unwrap();
+            std::fs::write(&second, b"second").unwrap();
+            let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+            app.marked.extend([second.clone(), first.clone()]);
+            app.start_bulk_rename();
+            let edit_path = app.bulk_rename_edit.as_ref().unwrap().path().to_owned();
+            assert_eq!(std::fs::read_to_string(&edit_path).unwrap(), "a\nz\n");
+            app.pending_suspend_command = None; // No external editor is launched by this test.
+            std::fs::write(&edit_path, if valid { "b\ny\n" } else { "b\n\n" }).unwrap();
+            app.process_bulk_rename_from_editor();
+            assert!(!edit_path.exists());
+            if valid {
+                let state = app.bulk_rename_state.as_ref().unwrap();
+                assert_eq!(state.entries[0].original, first);
+                assert_eq!(state.entries[0].new_name, "b");
+                assert_eq!(state.entries[1].original, second);
+                assert_eq!(state.entries[1].new_name, "y");
+                assert_eq!(app.mode, AppMode::ConfirmBulkRename);
+            } else {
+                assert!(app.bulk_rename_state.is_none());
+                assert!(app.error.as_ref().unwrap().contains("edited rename list"));
+            }
+            assert_eq!(app.marked.len(), 2);
+            assert_eq!(std::fs::read(first).unwrap(), b"first");
+            assert_eq!(std::fs::read(second).unwrap(), b"second");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_bulk_rename_waits_for_worker_result_and_preserves_marks() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::write(&source, b"payload").unwrap();
+        let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+        app.marked.insert(source.clone());
+        app.bulk_rename_state = Some(state::BulkRenameState::new(
+            vec![source.clone()],
+            vec!["target".into()],
+        ));
+        app.execute_bulk_rename();
+        app.handle_action(KeyAction::Cancel);
+        assert!(app.scan_token.is_cancelled());
+        assert_eq!(app.mode, AppMode::BulkRenaming);
+        assert!(app.scan_rx.is_some());
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.scan_rx.as_mut().unwrap().recv())
+                .await
+                .unwrap()
+                .unwrap();
+        app.handle_scan_result(result);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.operation_message.as_ref().unwrap().0);
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("cancelled")
+        );
+        assert!(app.marked.contains(&source));
+        assert_eq!(std::fs::read(source).unwrap(), b"payload");
+        assert!(!directory.path().join("target").exists());
+    }
+
+    #[tokio::test]
+    async fn bulk_rename_runs_in_background_and_reports_success_or_failure() {
+        for fail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let target = directory.path().join("target");
+            std::fs::write(&source, b"payload").unwrap();
+            if fail {
+                std::fs::write(&target, b"existing").unwrap();
+            }
+            let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
+            app.marked.insert(source.clone());
+            app.bulk_rename_state = Some(state::BulkRenameState::new(
+                vec![source.clone()],
+                vec!["target".into()],
+            ));
+            app.execute_bulk_rename();
+            assert_eq!(app.mode, AppMode::BulkRenaming);
+            app.handle_action(KeyAction::MoveDown);
+            assert_eq!(app.mode, AppMode::BulkRenaming);
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), app.scan_rx.as_mut().unwrap().recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(result, ScanResult::BulkRenameComplete(_)));
+            app.handle_scan_result(result);
+            assert_eq!(app.mode, AppMode::Normal);
+            assert_eq!(app.operation_message.as_ref().unwrap().0, !fail);
+            if fail {
+                assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+                assert_eq!(std::fs::read(&target).unwrap(), b"existing");
+                assert!(app.marked.contains(&source));
+            } else {
+                assert!(!source.exists());
+                assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+                assert!(app.marked.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_tui_operation_adapters_closes_idle_upstream_channels() {
+        let (copy_tx, copy_rx) = mpsc::channel(1);
+        drop(App::adapt_copy_rx(copy_rx));
+        tokio::time::timeout(Duration::from_secs(5), copy_tx.closed())
+            .await
+            .expect("idle copy adapter must release its upstream receiver");
+        let (move_tx, move_rx) = mpsc::channel(1);
+        drop(App::adapt_move_rx(move_rx));
+        tokio::time::timeout(Duration::from_secs(5), move_tx.closed())
+            .await
+            .expect("idle move adapter must release its upstream receiver");
+    }
+
+    #[tokio::test]
+    async fn cancelled_completion_is_visible_and_keeps_partial_undo() {
+        let (_dir, mut app) = scanned_app();
+        app.handle_scan_result(ScanResult::OperationComplete {
+            cancelled: true,
+            operation_type: gravityfile_ops::OperationType::Copy,
+            succeeded: 1,
+            failed: 0,
+            skipped: 0,
+            bytes_processed: 10,
+            errors: Vec::new(),
+            undo_info: Some(gravityfile_ops::UndoableOperation::FilesCopied {
+                created: vec![app.path.join("copied")],
+            }),
+        });
+        let (success, message) = app.operation_message.as_ref().unwrap();
+        assert!(!success);
+        assert!(message.contains("cancelled"));
+        assert!(message.contains("1 items"));
+        assert!(app.undo_log.pop().is_some());
+    }
+
+    /// Set up a paste whose destination already holds a file of the same name.
+    ///
+    /// Returns the destination path that will collide.
+    fn stage_conflicting_paste(app: &mut App) -> PathBuf {
+        let root = app.view_root.clone();
+        let source = root.join("src").join("copy-a.bin");
+        std::fs::write(&source, b"replacement contents").expect("write the source");
+
+        app.clipboard.yank([source], root.join("src"));
+
+        // Row 0 of the tree is the view root itself, which is a directory, so
+        // the paste destination is the scan root — where `copy-a.bin` already
+        // exists.
+        app.layout_mode = LayoutMode::Tree;
+        app.tree_state.selected = 0;
+
+        root.join("copy-a.bin")
+    }
+
+    /// Drive the operation channel until it reports a conflict.
+    async fn pump_until_conflict(app: &mut App) {
+        for _ in 0..64 {
+            let Some(rx) = app.scan_rx.as_mut() else {
+                panic!("the operation channel closed before reporting a conflict");
+            };
+            let result = rx.recv().await.expect("the operation ended unexpectedly");
+            app.handle_scan_result(result);
+            if app.pending_conflict.is_some() {
+                return;
+            }
+        }
+        panic!("no conflict was reported");
+    }
+
+    /// Drive the operation channel until it reports completion.
+    async fn pump_until_complete(app: &mut App) {
+        for _ in 0..64 {
+            let Some(rx) = app.scan_rx.as_mut() else {
+                return;
+            };
+            let Some(result) = rx.recv().await else {
+                return;
+            };
+            let done = matches!(result, ScanResult::OperationComplete { .. });
+            app.handle_scan_result(result);
+            if done {
+                // `OperationComplete` kicks off a refresh scan the test does
+                // not need; drop it so nothing is left running.
+                app.scan_token.cancel();
+                app.scan_rx = None;
+                return;
+            }
+        }
+        panic!("the operation never completed");
+    }
+
+    #[tokio::test]
+    async fn a_paste_conflict_pauses_until_the_user_answers_and_skip_preserves_the_file() {
+        let (_dir, mut app) = scanned_app();
+        let destination = stage_conflicting_paste(&mut app);
+        let before = std::fs::read(&destination).expect("read the destination");
+
+        app.paste_clipboard();
+        assert_eq!(app.mode, AppMode::Copying);
+
+        pump_until_conflict(&mut app).await;
+        assert_eq!(app.mode, AppMode::ConflictResolution);
+
+        // The operation is paused, not cancelled: the file is still untouched.
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            before,
+            "the operation wrote before the user answered"
+        );
+
+        // 's' skips this one item.
+        app.dispatch_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.pending_conflict.is_none(), "the request was answered");
+        assert_eq!(app.mode, AppMode::Copying, "the operation is still running");
+
+        pump_until_complete(&mut app).await;
+
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            before,
+            "skip must leave the existing file alone"
+        );
+        let (_, message) = app
+            .operation_message
+            .clone()
+            .expect("a summary is reported");
+        assert!(message.contains("1 skipped"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn answering_a_paste_conflict_with_overwrite_replaces_the_file() {
+        let (_dir, mut app) = scanned_app();
+        let destination = stage_conflicting_paste(&mut app);
+        let before = std::fs::read(&destination).expect("read the destination");
+
+        app.paste_clipboard();
+        pump_until_conflict(&mut app).await;
+
+        // 'o' overwrites this one item.
+        app.dispatch_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        pump_until_complete(&mut app).await;
+
+        let after = std::fs::read(&destination).unwrap();
+        assert_ne!(after, before, "overwrite left the old contents in place");
+        assert_eq!(after, b"replacement contents");
+    }
+
+    #[tokio::test]
+    async fn paste_cancellation_retains_results_until_completion() {
+        for mode in [ClipboardMode::Copy, ClipboardMode::Cut] {
+            for at_conflict in [false, true] {
+                let (_dir, mut app) = scanned_app();
+                let destination = stage_conflicting_paste(&mut app);
+                let source = app.clipboard.paths[0].clone();
+                app.clipboard.mode = mode;
+                let before = std::fs::read(&destination).unwrap();
+                app.paste_clipboard();
+                let expected = if mode == ClipboardMode::Cut {
+                    AppMode::Moving
+                } else {
+                    AppMode::Copying
+                };
+                if at_conflict {
+                    pump_until_conflict(&mut app).await;
+                }
+                app.dispatch_key_event(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+                assert_eq!(app.mode, expected);
+                assert!(app.scan_token.is_cancelled());
+                assert!(app.scan_rx.is_some());
+                app.handle_action(KeyAction::Undo);
+                assert_eq!(app.mode, expected);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    pump_until_complete(&mut app),
+                )
+                .await
+                .unwrap();
+                assert_eq!(app.mode, AppMode::Normal);
+                assert!(
+                    app.operation_message
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .contains("cancelled")
+                );
+                assert_eq!(std::fs::read(&destination).unwrap(), before);
+                assert_eq!(std::fs::read(&source).unwrap(), b"replacement contents");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_move_conflict_resumes_move_mode_after_clipboard_clears() {
+        let (_dir, mut app) = scanned_app();
+        stage_conflicting_paste(&mut app);
+        app.clipboard.mode = ClipboardMode::Cut;
+        app.paste_clipboard();
+        assert!(app.clipboard.is_empty());
+        pump_until_conflict(&mut app).await;
+        app.dispatch_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.mode, AppMode::Moving);
+        pump_until_complete(&mut app).await;
+        assert!(
+            app.operation_message
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("1 skipped")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_conflict_modal_renders_at_every_size() {
+        let (_dir, mut app) = scanned_app();
+        stage_conflicting_paste(&mut app);
+        app.paste_clipboard();
+        pump_until_conflict(&mut app).await;
+
+        for &(width, height) in SIZES {
+            let _ = render(&app, Rect::new(0, 0, width, height));
+        }
+
+        app.scan_token.cancel();
+        app.scan_rx = None;
     }
 }

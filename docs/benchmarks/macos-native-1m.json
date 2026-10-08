@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-09-21T02:45:00Z",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "logical_cpus": 16,
+  "binary": "/Users/nickpaterno/work/gravityfile/target/release/grav",
+  "binary_version": "grav 0.3.1",
+  "binary_sha256": "300323c192c348d4ff8c00f3c6df8ba3b0f5850ce74226e8f174738623d62fe2",
+  "cache_state": "warm; fixture created immediately before measurement; caches not cleared",
+  "fixture": {
+    "files": 1000000,
+    "file_bytes": 256,
+    "files_per_directory": 1000,
+    "distinct_contents": 256
+  },
+  "runs_per_command": 1,
+  "measurements": {
+    "scan": {
+      "arguments": [
+        "scan",
+        "<fixture>",
+        "--top",
+        "0",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 11.29965004202677,
+          "peak_rss_bytes": 501301248,
+          "user_seconds": 0.9799399999999999,
+          "system_seconds": 15.667095
+        }
+      ],
+      "median_seconds": 11.29965004202677
+    },
+    "duplicates": {
+      "arguments": [
+        "duplicates",
+        "<fixture>",
+        "--min-size",
+        "0",
+        "--top",
+        "1",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 80.88805041601881,
+          "peak_rss_bytes": 876478464,
+          "user_seconds": 3.239496,
+          "system_seconds": 48.514716
+        }
+      ],
+      "median_seconds": 80.88805041601881
+    },
+    "age": {
+      "arguments": [
+        "age",
+        "<fixture>",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 12.205883375019766,
+          "peak_rss_bytes": 490815488,
+          "user_seconds": 1.214461,
+          "system_seconds": 15.141479
+        }
+      ],
+      "median_seconds": 12.205883375019766
+    }
+  },
+  "fixture_parent": "/private/tmp",
+  "filesystem": {
+    "block_size": 1048576,
+    "fragment_size": 4096
+  },
+  "fixture_creation_seconds": 59.063364707981236
+}

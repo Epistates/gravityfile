@@ -19,8 +19,7 @@ use crate::types::{PluginError, PluginResult, Value};
 /// Shared by the main engine and isolated contexts so both apply the same
 /// guarantees: the read is denied unless the sandbox allows the path, the file
 /// is rejected if it exceeds `max_read_size`, the canonicalized path is opened
-/// (so a symlink swapped in after the policy check can't redirect the read —
-/// TOCTOU mitigation), and the read itself is capped at `max_read_size`.
+/// after policy validation, and the read itself is capped at `max_read_size`.
 /// Returns `Dynamic::UNIT` (Rhai's nil) on any denial or error.
 fn sandboxed_read(sb: &SandboxConfig, path: &str) -> Dynamic {
     use std::io::Read as _;
@@ -30,9 +29,23 @@ fn sandboxed_read(sb: &SandboxConfig, path: &str) -> Dynamic {
         return Dynamic::UNIT;
     }
 
-    if let Ok(meta) = std::fs::metadata(p)
-        && meta.len() > sb.max_read_size as u64
-    {
+    let Ok(real) = std::fs::canonicalize(p) else {
+        return Dynamic::UNIT;
+    };
+    if !sb.can_read(&real) {
+        return Dynamic::UNIT;
+    }
+    let Ok(file) = std::fs::File::open(&real) else {
+        return Dynamic::UNIT;
+    };
+    let Ok(meta) = file.metadata() else {
+        return Dynamic::UNIT;
+    };
+    if !meta.is_file() {
+        tracing::warn!(target: "plugin", "Read denied: path is not a regular file");
+        return Dynamic::UNIT;
+    }
+    if meta.len() > sb.max_read_size as u64 {
         tracing::warn!(
             target: "plugin",
             "Read denied: file too large ({} bytes > {} limit)",
@@ -41,13 +54,6 @@ fn sandboxed_read(sb: &SandboxConfig, path: &str) -> Dynamic {
         );
         return Dynamic::UNIT;
     }
-
-    let Ok(real) = std::fs::canonicalize(p) else {
-        return Dynamic::UNIT;
-    };
-    let Ok(file) = std::fs::File::open(&real) else {
-        return Dynamic::UNIT;
-    };
 
     let mut content = String::new();
     if file
@@ -343,7 +349,7 @@ impl PluginRuntime for RhaiRuntime {
         // read roots is what makes the filesystem API usable (and scoped).
         self.sandbox = Arc::new(SandboxConfig {
             timeout_ms: config.default_timeout_ms,
-            max_memory: config.max_memory_mb * 1024 * 1024,
+            max_memory: config.max_memory_mb.saturating_mul(1024 * 1024),
             allow_network: config.allow_network,
             allowed_read_paths: config.fs_read_roots.clone(),
             ..SandboxConfig::default()
@@ -358,7 +364,7 @@ impl PluginRuntime for RhaiRuntime {
 
     fn load_plugin(&mut self, id: &str, source: &Path) -> PluginResult<PluginHandle> {
         // Read and compile the plugin
-        let code = std::fs::read_to_string(source)?;
+        let code = crate::runtime::read_plugin_source(source)?;
 
         let ast = self
             .engine
@@ -551,6 +557,7 @@ struct RhaiIsolatedContext {
     /// The compiled AST populated by the first `execute` call.
     /// `call_function` uses this AST via `Engine::call_fn` — no string interpolation.
     ast: Mutex<Option<AST>>,
+    scope: Mutex<Scope<'static>>,
 }
 
 impl RhaiIsolatedContext {
@@ -639,14 +646,16 @@ impl RhaiIsolatedContext {
             timeout_ms,
             watchdog,
             ast: Mutex::new(None),
+            scope: Mutex::new(Scope::new()),
         })
     }
 
     /// Arm the watchdog for one execution and return the deadline (if any).
     /// Pairs with [`disarm_watchdog`](Self::disarm_watchdog).
     fn arm_watchdog(&self, cancel: &CancellationToken) -> Option<Instant> {
-        let deadline =
-            (self.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
+        let deadline = (self.timeout_ms > 0)
+            .then(|| Instant::now().checked_add(Duration::from_millis(self.timeout_ms)))
+            .flatten();
         let mut guard = self.watchdog.lock().unwrap_or_else(|e| e.into_inner());
         guard.deadline = deadline;
         guard.cancel = Some(cancel.clone());
@@ -716,10 +725,11 @@ impl IsolatedContext for RhaiIsolatedContext {
 
             // Arm the wall-clock/cancel watchdog for this evaluation.
             let deadline = self.arm_watchdog(&cancel);
-            let mut scope = Scope::new();
+            let mut scope = self.scope.lock().unwrap_or_else(|e| e.into_inner());
             let eval = self
                 .engine
                 .eval_ast_with_scope::<Dynamic>(&mut scope, &compiled);
+            drop(scope);
             self.disarm_watchdog();
 
             let result = eval.map_err(|e| self.classify_eval_error(*e, &cancel, deadline))?;
@@ -766,7 +776,7 @@ impl IsolatedContext for RhaiIsolatedContext {
 
             // Arm the wall-clock/cancel watchdog for this call.
             let deadline = self.arm_watchdog(&cancel);
-            let mut scope = Scope::new();
+            let mut scope = self.scope.lock().unwrap_or_else(|e| e.into_inner());
             let call = self
                 .engine
                 .call_fn::<Dynamic>(&mut scope, ast, name, rhai_args);
@@ -778,14 +788,22 @@ impl IsolatedContext for RhaiIsolatedContext {
         })
     }
 
-    fn set_global(&mut self, _name: &str, _value: Value) -> PluginResult<()> {
-        // Rhai doesn't support persistent globals without scope
-        // This would need to be handled differently
+    fn set_global(&mut self, name: &str, value: Value) -> PluginResult<()> {
+        self.scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_or_push(name, RhaiRuntime::value_to_dynamic(&value));
         Ok(())
     }
 
-    fn get_global(&self, _name: &str) -> PluginResult<Value> {
-        Ok(Value::Null)
+    fn get_global(&self, name: &str) -> PluginResult<Value> {
+        Ok(self
+            .scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_value::<Dynamic>(name)
+            .map(|value| RhaiRuntime::dynamic_to_value(&value))
+            .unwrap_or(Value::Null))
     }
 }
 
@@ -851,5 +869,17 @@ mod tests {
             Value::String(s) => assert_eq!(s, "hi there"),
             other => panic!("expected file contents, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandboxed_read_rejects_files_larger_than_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, "larger than four bytes").unwrap();
+
+        let mut sandbox = SandboxConfig::minimal().allow_read(dir.path());
+        sandbox.max_read_size = 4;
+
+        assert!(sandboxed_read(&sandbox, &file.to_string_lossy()).is_unit());
     }
 }

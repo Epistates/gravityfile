@@ -130,7 +130,7 @@ impl<'a> TreemapView<'a> {
 
         // Prepare items sorted by size (descending)
         let mut items: Vec<(&FileNode, u64)> = children.iter().map(|n| (*n, n.size)).collect();
-        items.sort_by_key(|item| std::cmp::Reverse(item.1));
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.compare_name(b.0)));
 
         // Apply squarified algorithm
         self.squarify(&items, area, self.root.size, 0, &mut rects);
@@ -155,8 +155,8 @@ impl<'a> TreemapView<'a> {
         if items.len() == 1 {
             let (node, size) = items[0];
             rects.push(TreemapRect {
-                path: self.root_path.join(&*node.name),
-                name: node.name.to_string(),
+                path: self.root_path.join(node.file_name()),
+                name: node.display_name().into_owned(),
                 size,
                 is_dir: node.is_dir(),
                 rect: area,
@@ -265,8 +265,8 @@ impl<'a> TreemapView<'a> {
 
             if item_rect.width > 0 && item_rect.height > 0 {
                 rects.push(TreemapRect {
-                    path: self.root_path.join(&*node.name),
-                    name: node.name.to_string(),
+                    path: self.root_path.join(node.file_name()),
+                    name: node.display_name().into_owned(),
                     size,
                     is_dir: node.is_dir(),
                     rect: item_rect,
@@ -412,7 +412,8 @@ impl Widget for TreemapView<'_> {
                 }
             }
 
-            // Draw size if there's room
+            // Draw size if there's room. The label is drawn on row 1, so the
+            // size needs a third row.
             if rect.width >= 6 && rect.height >= 3 {
                 let size_str = crate::ui::format_size(treemap_rect.size);
                 let size_y = rect.y + 2;
@@ -429,5 +430,226 @@ impl Widget for TreemapView<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{sample_node_tree, sample_root_path};
+    use ratatui::buffer::Buffer;
+
+    fn view_over<'a>(
+        root: &'a FileNode,
+        root_path: &'a PathBuf,
+        theme: &'a Theme,
+        marked: &'a HashSet<PathBuf>,
+        clipboard: &'a ClipboardState,
+    ) -> TreemapView<'a> {
+        TreemapView::new(root, root_path, theme, marked, clipboard)
+    }
+
+    fn rects_for(area: Rect) -> Vec<TreemapRect> {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        view_over(&root, &root_path, &theme, &marked, &clipboard).calculate_rects(area)
+    }
+
+    #[test]
+    fn navigation_stays_within_bounds() {
+        let mut state = TreemapState::new();
+        state.move_prev();
+        assert_eq!(state.selected, 0);
+        state.move_next(4);
+        state.move_next(4);
+        state.move_next(4);
+        state.move_next(4);
+        state.move_next(4);
+        assert_eq!(state.selected, 3, "clamped to the last rectangle");
+
+        // An empty treemap must not underflow.
+        let mut state = TreemapState::new();
+        state.move_next(0);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn reset_clears_selection_and_hover() {
+        let mut state = TreemapState {
+            selected: 5,
+            hover: Some(2),
+        };
+        state.reset();
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.hover, None);
+    }
+
+    #[test]
+    fn degenerate_inputs_produce_no_rectangles() {
+        assert!(rects_for(Rect::new(0, 0, 0, 10)).is_empty());
+        assert!(rects_for(Rect::new(0, 0, 10, 0)).is_empty());
+
+        // A zero-size root has no proportions to lay out.
+        let empty = FileNode::new_directory(
+            gravityfile_core::NodeId::new(0),
+            "root",
+            crate::test_support::timestamps(),
+        );
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        assert!(
+            view_over(&empty, &root_path, &theme, &marked, &clipboard)
+                .calculate_rects(Rect::new(0, 0, 80, 24))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn every_rectangle_stays_inside_the_area() {
+        // A rectangle escaping the area would corrupt neighbouring widgets, or
+        // panic when the buffer is indexed.
+        for (x, y, width, height) in [
+            (0u16, 0u16, 1u16, 1u16),
+            (0, 0, 10, 4),
+            (3, 2, 40, 12),
+            (0, 0, 80, 24),
+            (7, 5, 200, 60),
+        ] {
+            let area = Rect::new(x, y, width, height);
+            for rect in rects_for(area) {
+                assert!(
+                    rect.rect.x >= area.x
+                        && rect.rect.y >= area.y
+                        && rect.rect.right() <= area.right()
+                        && rect.rect.bottom() <= area.bottom(),
+                    "{:?} escapes {area:?}",
+                    rect.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rectangles_within_a_row_do_not_overlap() {
+        // Sibling rectangles are stacked by accumulating an offset; an
+        // off-by-one there would paint one item on top of another.
+        let area = Rect::new(0, 0, 80, 24);
+        let rects = rects_for(area);
+        for (i, a) in rects.iter().enumerate() {
+            for b in rects.iter().skip(i + 1) {
+                let disjoint = a.rect.right() <= b.rect.x
+                    || b.rect.right() <= a.rect.x
+                    || a.rect.bottom() <= b.rect.y
+                    || b.rect.bottom() <= a.rect.y;
+                assert!(disjoint, "{:?} overlaps {:?}", a.rect, b.rect);
+            }
+        }
+    }
+
+    #[test]
+    fn rectangle_order_follows_size_descending() {
+        let rects = rects_for(Rect::new(0, 0, 80, 24));
+        let sizes: Vec<u64> = rects.iter().map(|r| r.size).collect();
+        let mut sorted = sizes.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(sizes, sorted, "layout must match the navigation order");
+    }
+
+    #[test]
+    fn paths_are_built_under_the_root() {
+        let root_path = sample_root_path();
+        for rect in rects_for(Rect::new(0, 0, 80, 24)) {
+            assert_eq!(rect.path.parent(), Some(root_path.as_path()));
+            assert_eq!(rect.path.file_name().unwrap().to_string_lossy(), rect.name);
+        }
+    }
+
+    #[test]
+    fn children_whose_sizes_exceed_the_parent_do_not_hang_the_layout() {
+        // Quick-scan trees report a parent size that can be smaller than the
+        // sum of its children. The remaining-size subtraction must saturate
+        // rather than wrap into an enormous denominator.
+        let mut root = FileNode::new_directory(
+            gravityfile_core::NodeId::new(0),
+            "root",
+            crate::test_support::timestamps(),
+        );
+        root.children = vec![
+            crate::test_support::file(1, "a", 1_000),
+            crate::test_support::file(2, "b", 1_000),
+            crate::test_support::file(3, "c", 1_000),
+        ];
+        root.size = 10; // deliberately inconsistent with the children
+
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let rects = view_over(&root, &root_path, &theme, &marked, &clipboard)
+            .calculate_rects(Rect::new(0, 0, 80, 24));
+        assert!(!rects.is_empty());
+    }
+
+    #[test]
+    fn renders_at_every_size_without_panicking() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+
+        for width in 1u16..=100 {
+            for height in [1u16, 2, 3, 5, 24] {
+                let area = Rect::new(0, 0, width, height);
+                let mut buf = Buffer::empty(area);
+                let view = view_over(&root, &root_path, &theme, &marked, &clipboard).selected(0);
+                Widget::render(view, area, &mut buf);
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_treemap_says_so() {
+        let empty = FileNode::new_directory(
+            gravityfile_core::NodeId::new(0),
+            "root",
+            crate::test_support::timestamps(),
+        );
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        Widget::render(
+            view_over(&empty, &root_path, &theme, &marked, &clipboard),
+            area,
+            &mut buf,
+        );
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("(empty)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_large_area_labels_its_rectangles() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        Widget::render(
+            view_over(&root, &root_path, &theme, &marked, &clipboard).selected(0),
+            area,
+            &mut buf,
+        );
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("src"), "no labels drawn: {rendered}");
     }
 }

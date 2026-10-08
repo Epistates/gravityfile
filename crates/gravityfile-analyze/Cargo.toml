@@ -2,6 +2,7 @@
 name = "gravityfile-analyze"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Analysis algorithms for gravityfile (duplicates, age, trends)"
@@ -10,12 +11,14 @@ description = "Analysis algorithms for gravityfile (duplicates, age, trends)"
 gravityfile-core.workspace = true
 blake3.workspace = true
 rayon.workspace = true
-thiserror.workspace = true
 derive_builder.workspace = true
 serde.workspace = true
 globset.workspace = true
-tracing.workspace = true
 tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+gravityfile-scan.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

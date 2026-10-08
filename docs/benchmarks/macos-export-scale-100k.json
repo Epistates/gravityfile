@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-09-23T18:42:48Z",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "logical_cpus": 16,
+  "binary": "/Users/nickpaterno/work/gravityfile/target/release/grav",
+  "binary_version": "grav 0.3.1",
+  "binary_sha256": "6cef936aefcf147979895f8d30735564af501d569c13000b19ef794da6f6d314",
+  "cache_state": "warm; fixture created immediately before measurement; caches not cleared",
+  "fixture": {
+    "files": 100000,
+    "file_bytes": 256,
+    "files_per_directory": 1000,
+    "distinct_contents": 256
+  },
+  "runs_per_command": 3,
+  "include_export": true,
+  "correctness_checks": "file/directory counts, duplicate totals and group membership counts, age bucket accounting",
+  "measurements": {
+    "scan": {
+      "arguments": [
+        "scan",
+        "<fixture>",
+        "--top",
+        "0",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 0.35052683399408124,
+          "peak_rss_bytes": 71008256,
+          "user_seconds": 0.095078,
+          "system_seconds": 1.391863
+        },
+        {
+          "seconds": 0.382927667000331,
+          "peak_rss_bytes": 62849024,
+          "user_seconds": 0.093346,
+          "system_seconds": 1.485547
+        },
+        {
+          "seconds": 0.3720619169980637,
+          "peak_rss_bytes": 62341120,
+          "user_seconds": 0.092573,
+          "system_seconds": 1.505739
+        }
+      ],
+      "median_seconds": 0.3720619169980637
+    },
+    "duplicates": {
+      "arguments": [
+        "duplicates",
+        "<fixture>",
+        "--min-size",
+        "0",
+        "--top",
+        "1",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 2.843891167001857,
+          "peak_rss_bytes": 116637696,
+          "user_seconds": 0.27774299999999996,
+          "system_seconds": 3.571271
+        },
+        {
+          "seconds": 3.0487582919959095,
+          "peak_rss_bytes": 113262592,
+          "user_seconds": 0.283776,
+          "system_seconds": 3.765656
+        },
+        {
+          "seconds": 3.1334449580026558,
+          "peak_rss_bytes": 116604928,
+          "user_seconds": 0.28897,
+          "system_seconds": 4.013524
+        }
+      ],
+      "median_seconds": 3.0487582919959095
+    },
+    "age": {
+      "arguments": [
+        "age",
+        "<fixture>",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 0.372674708996783,
+          "peak_rss_bytes": 62668800,
+          "user_seconds": 0.10681399999999999,
+          "system_seconds": 1.416324
+        },
+        {
+          "seconds": 0.3731407079976634,
+          "peak_rss_bytes": 56983552,
+          "user_seconds": 0.102708,
+          "system_seconds": 1.318035
+        },
+        {
+          "seconds": 0.3707451250011218,
+          "peak_rss_bytes": 63094784,
+          "user_seconds": 0.104599,
+          "system_seconds": 1.355221
+        }
+      ],
+      "median_seconds": 0.372674708996783
+    },
+    "export": {
+      "arguments": [
+        "export",
+        "<fixture>",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 0.4358885839974391,
+          "peak_rss_bytes": 68829184,
+          "user_seconds": 0.133546,
+          "system_seconds": 1.169845
+        },
+        {
+          "seconds": 0.4427806670064456,
+          "peak_rss_bytes": 62259200,
+          "user_seconds": 0.136525,
+          "system_seconds": 1.2475829999999999
+        },
+        {
+          "seconds": 0.46291020899661817,
+          "peak_rss_bytes": 62504960,
+          "user_seconds": 0.140406,
+          "system_seconds": 1.504043
+        }
+      ],
+      "median_seconds": 0.4427806670064456
+    }
+  },
+  "fixture_parent": "/var/folders/nj/j0466v5s17x8skjnpb1pl1m00000gn/T",
+  "filesystem": {
+    "block_size": 1048576,
+    "fragment_size": 4096
+  },
+  "fixture_creation_seconds": 7.145242458005669
+}

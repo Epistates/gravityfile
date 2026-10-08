@@ -19,10 +19,11 @@ This crate provides the scanning engine that traverses directories and builds th
 
 ```rust
 use gravityfile_scan::{JwalkScanner, ScanConfig};
+use tokio_util::sync::CancellationToken;
 
 let config = ScanConfig::new("/path/to/scan");
 let scanner = JwalkScanner::new();
-let tree = scanner.scan(&config)?;
+let tree = scanner.scan(&config, CancellationToken::new())?;
 
 println!("Total size: {} bytes", tree.total_size());
 println!("Total files: {}", tree.total_files());
@@ -33,6 +34,7 @@ println!("Total directories: {}", tree.total_dirs());
 
 ```rust
 use gravityfile_scan::{JwalkScanner, ScanConfig, ScanProgress};
+use tokio_util::sync::CancellationToken;
 
 let scanner = JwalkScanner::new();
 let mut progress_rx = scanner.subscribe();
@@ -50,17 +52,19 @@ tokio::spawn(async move {
 });
 
 let config = ScanConfig::new("/path/to/scan");
-let tree = scanner.scan(&config)?;
+let tree = scanner.scan(&config, CancellationToken::new())?;
 ```
 
 ### Custom Configuration
 
 ```rust
 use gravityfile_scan::{JwalkScanner, ScanConfig};
+use tokio_util::sync::CancellationToken;
 
 let config = ScanConfig::builder()
     .root("/path/to/scan")
     .max_depth(Some(5))           // Limit depth
+    .max_entries(Some(100_000))    // Fail if the scope exceeds this budget
     .include_hidden(false)         // Skip hidden files
     .follow_symlinks(false)        // Don't follow symlinks
     .cross_filesystems(false)      // Stay on same filesystem
@@ -74,8 +78,16 @@ let config = ScanConfig::builder()
     .build()?;
 
 let scanner = JwalkScanner::new();
-let tree = scanner.scan(&config)?;
+let tree = scanner.scan(&config, CancellationToken::new())?;
 ```
+
+`max_entries` applies to descendant entries yielded after name/depth filtering;
+the root is excluded. Metadata failures and unsupported file types still consume
+the budget. `None` (the default) is unlimited; zero permits an empty scope.
+Both recursive scans and `quick_list` fail with `ScanError::EntryLimitExceeded`
+on the first excess entry, without returning a partial tree. The CLI report commands expose this as `--max-entries`; the TUI uses the saved
+`max_scan_entries` setting. It does not cap walker prefetching,
+Git status work, total memory, or filesystem-call duration.
 
 ## Output Structure
 
@@ -93,9 +105,10 @@ Children are automatically sorted by size (largest first) for efficient display.
 ## Performance
 
 - Uses rayon thread pool via jwalk for parallel directory traversal
-- Hardlink tracking uses DashMap for lock-free concurrent access
-- Progress updates are batched (every 1000 files) to reduce overhead
-- Memory-efficient: only stores aggregated tree, not individual paths
+- Physical-size accounting retains hard-linked identities for the scan lifetime;
+  following symlinks also tracks single-link identities to suppress path aliases
+- Progress updates are batched every 1000 accepted entries
+- Collection retains entry paths before building the in-memory tree; large scans require proportional memory
 
 ## Re-exports
 

@@ -14,6 +14,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, StatefulWidget, Widget};
 use gravityfile_core::{FileNode, GitStatus, NodeKind};
 
 use crate::app::state::{ClipboardMode, ClipboardState};
+use ratatui_image::Image as RatatuiImage;
+
 use crate::preview::PreviewContent;
 use crate::theme::Theme;
 use crate::ui::{CompactSizeBar, fit_to_width, format_size};
@@ -74,6 +76,7 @@ impl MillerState {
 #[derive(Debug, Clone)]
 pub struct ColumnEntry {
     pub name: String,
+    pub native_name: std::ffi::OsString,
     pub size: u64,
     pub is_dir: bool,
     pub is_executable: bool,
@@ -92,7 +95,8 @@ impl ColumnEntry {
         };
 
         Self {
-            name: node.name.to_string(),
+            name: node.display_name().into_owned(),
+            native_name: node.file_name().to_os_string(),
             size: node.size,
             is_dir: node.is_dir(),
             is_executable,
@@ -184,7 +188,7 @@ impl<'a> MillerColumns<'a> {
         buf: &mut Buffer,
         entries: &[ColumnEntry],
         selected: Option<usize>,
-        highlight_name: Option<&str>,
+        highlight_name: Option<&std::ffi::OsStr>,
         offset: usize,
         title: Option<&str>,
         base_path: Option<&Path>,
@@ -210,8 +214,10 @@ impl<'a> MillerColumns<'a> {
             return;
         }
 
-        // Size bar configuration
-        let size_bar_width: u16 = 8;
+        // Size bar configuration. A column narrower than the bar cannot show
+        // it, and in that case the row text gets the space back instead of
+        // being squeezed into nothing.
+        let size_bar_width: u16 = if inner.width >= 8 { 8 } else { 0 };
 
         let viewport_height = inner.height as usize;
         let end = (offset + viewport_height).min(entries.len());
@@ -221,10 +227,10 @@ impl<'a> MillerColumns<'a> {
             let y = inner.y + row_idx as u16;
 
             let is_selected = selected == Some(entry_idx);
-            let is_highlighted = highlight_name.is_some_and(|name| name == entry.name);
+            let is_highlighted = highlight_name.is_some_and(|name| name == entry.native_name);
 
             // Check if this entry is marked
-            let entry_path = base_path.map(|bp| bp.join(&entry.name));
+            let entry_path = base_path.map(|bp| bp.join(&entry.native_name));
             let is_marked = entry_path
                 .as_ref()
                 .map(|p| self.marked.contains(p))
@@ -348,23 +354,28 @@ impl<'a> MillerColumns<'a> {
             let line_area = Rect::new(
                 inner.x,
                 y,
-                inner.width.saturating_sub(size_bar_width + 1),
+                inner
+                    .width
+                    .saturating_sub(size_bar_width)
+                    .saturating_sub(u16::from(size_bar_width > 0)),
                 1,
             );
             Widget::render(line, line_area, buf);
 
-            // Render size bar
-            let ratio = if total_size > 0 {
-                entry.size as f64 / total_size as f64
-            } else {
-                0.0
-            };
+            // Render the size bar hugging the right edge, when there is one.
+            if size_bar_width > 0 {
+                let ratio = if total_size > 0 {
+                    entry.size as f64 / total_size as f64
+                } else {
+                    0.0
+                };
 
-            let bar_area = Rect::new(inner.x + inner.width - size_bar_width, y, size_bar_width, 1);
+                let bar_area =
+                    Rect::new(inner.x + inner.width - size_bar_width, y, size_bar_width, 1);
 
-            let bar = CompactSizeBar::new(ratio).style(self.theme.size_bar_style(ratio));
-
-            Widget::render(bar, bar_area, buf);
+                let bar = CompactSizeBar::new(ratio).style(self.theme.size_bar_style(ratio));
+                Widget::render(bar, bar_area, buf);
+            }
         }
 
         // Show empty message if no entries
@@ -395,7 +406,10 @@ impl<'a> MillerColumns<'a> {
                 } => {
                     // Add header with file name and highlighting indicator
                     let header = Line::from(vec![
-                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(" "),
                         Span::styled(
                             if *highlighted {
@@ -417,7 +431,10 @@ impl<'a> MillerColumns<'a> {
                 }
                 PreviewContent::Hex { lines, total_bytes } => {
                     let header = Line::from(vec![
-                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(" "),
                         Span::styled(
                             format!("[binary: {} bytes]", total_bytes),
@@ -433,12 +450,22 @@ impl<'a> MillerColumns<'a> {
 
                     Paragraph::new(display_lines).render(inner, buf);
                 }
-                PreviewContent::Directory { entries } => {
+                PreviewContent::Directory {
+                    entries,
+                    total_entries,
+                } => {
                     let header = Line::from(vec![
-                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(" "),
                         Span::styled(
-                            format!("[{} items]", entries.len()),
+                            format!(
+                                "[{} items; {} shown]",
+                                total_entries,
+                                entries.len().min(inner.height.saturating_sub(2) as usize)
+                            ),
                             Style::default().fg(self.theme.muted),
                         ),
                     ]);
@@ -452,7 +479,10 @@ impl<'a> MillerColumns<'a> {
                         } else {
                             self.theme.file
                         };
-                        display_lines.push(Line::styled(format!("{}{}", icon, name), style));
+                        display_lines.push(Line::styled(
+                            format!("{}{}", icon, gravityfile_core::escape_terminal_text(name)),
+                            style,
+                        ));
                     }
 
                     Paragraph::new(display_lines).render(inner, buf);
@@ -466,7 +496,10 @@ impl<'a> MillerColumns<'a> {
                     permissions,
                 } => {
                     let mut lines = vec![
-                        Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Line::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
                         Line::raw(""),
                         Line::from(vec![
                             Span::styled("Type: ", self.theme.help_desc),
@@ -528,7 +561,10 @@ impl<'a> MillerColumns<'a> {
                     entries,
                 } => {
                     let header = Line::from(vec![
-                        Span::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(" "),
                         Span::styled(
                             format!("[{} archive]", format),
@@ -574,7 +610,7 @@ impl<'a> MillerColumns<'a> {
                         let target_str = archive_entry
                             .link_target
                             .as_ref()
-                            .map(|t| format!(" -> {}", t))
+                            .map(|t| format!(" -> {}", gravityfile_core::escape_terminal_text(t)))
                             .unwrap_or_default();
 
                         let style = if archive_entry.is_symlink {
@@ -586,7 +622,14 @@ impl<'a> MillerColumns<'a> {
                         };
 
                         display_lines.push(Line::from(vec![
-                            Span::styled(format!("{}{}", icon, archive_entry.path), style),
+                            Span::styled(
+                                format!(
+                                    "{}{}",
+                                    icon,
+                                    gravityfile_core::escape_terminal_text(&archive_entry.path)
+                                ),
+                                style,
+                            ),
                             Span::styled(target_str, self.theme.symlink),
                             Span::styled(size_str, Style::default().fg(self.theme.muted)),
                             Span::styled(ratio_str, Style::default().fg(self.theme.success)),
@@ -602,13 +645,59 @@ impl<'a> MillerColumns<'a> {
 
                     Paragraph::new(display_lines).render(inner, buf);
                 }
+                PreviewContent::Image {
+                    protocol,
+                    width,
+                    height,
+                    format,
+                } => {
+                    // One header line, then the image fills the remainder. The
+                    // protocol was already encoded off-thread, so rendering is
+                    // just a blit.
+                    let header = Line::from(vec![
+                        Span::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{format} {width}×{height}"),
+                            Style::default().fg(self.theme.muted),
+                        ),
+                    ]);
+                    let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
+                    Widget::render(Paragraph::new(header), header_area, buf);
+
+                    if inner.height > 1 {
+                        let image_area = Rect::new(
+                            inner.x,
+                            inner.y + 1,
+                            inner.width,
+                            inner.height.saturating_sub(1),
+                        );
+                        RatatuiImage::new(&protocol.0).render(image_area, buf);
+                    }
+                }
                 PreviewContent::Error(msg) => {
                     let lines = vec![
-                        Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+                        Line::styled(
+                            gravityfile_core::escape_terminal_text(&entry.name),
+                            self.theme.title.add_modifier(Modifier::BOLD),
+                        ),
                         Line::raw(""),
-                        Line::styled(msg.clone(), Style::default().fg(self.theme.error)),
+                        Line::styled(
+                            gravityfile_core::escape_terminal_text(msg),
+                            Style::default().fg(self.theme.error),
+                        ),
                     ];
                     Paragraph::new(lines).render(inner, buf);
+                }
+                PreviewContent::Loading => {
+                    Paragraph::new(Line::styled(
+                        "Loading preview…",
+                        Style::default().fg(self.theme.muted),
+                    ))
+                    .render(inner, buf);
                 }
                 PreviewContent::Empty => {
                     self.render_basic_info(inner, buf, entry);
@@ -632,7 +721,10 @@ impl<'a> MillerColumns<'a> {
         block.render(area, buf);
 
         let lines = vec![
-            Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+            Line::styled(
+                gravityfile_core::escape_terminal_text(&entry.name),
+                self.theme.title.add_modifier(Modifier::BOLD),
+            ),
             Line::raw(""),
             Line::from(vec![
                 Span::styled("Type: ", self.theme.help_desc),
@@ -658,7 +750,10 @@ impl<'a> MillerColumns<'a> {
         };
 
         let lines = vec![
-            Line::styled(&entry.name, self.theme.title.add_modifier(Modifier::BOLD)),
+            Line::styled(
+                gravityfile_core::escape_terminal_text(&entry.name),
+                self.theme.title.add_modifier(Modifier::BOLD),
+            ),
             Line::raw(""),
             Line::from(vec![
                 Span::styled("Size: ", self.theme.help_desc),
@@ -733,7 +828,11 @@ impl StatefulWidget for MillerColumns<'_> {
             buf,
             &parent_entries,
             None,
-            Some(self.current_name),
+            Some(
+                self.view_root
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new(self.current_name)),
+            ),
             0,
             Some("Parent"),
             parent_base_path.as_deref(),
@@ -761,10 +860,10 @@ impl StatefulWidget for MillerColumns<'_> {
                     .current
                     .children
                     .iter()
-                    .find(|c| c.name.as_str() == selected_entry.name)
+                    .find(|c| c.file_name() == selected_entry.native_name)
                 {
                     let preview_entries = Self::get_entries(child_node);
-                    let preview_base_path = self.view_root.join(&selected_entry.name);
+                    let preview_base_path = self.view_root.join(&selected_entry.native_name);
                     let preview_total_size = child_node.size;
                     self.render_column(
                         preview_area,
@@ -810,4 +909,312 @@ fn format_timestamp(secs: u64) -> String {
 #[allow(dead_code)]
 pub fn get_selected_entry<'a>(state: &MillerState, node: &'a FileNode) -> Option<&'a FileNode> {
     node.children.get(state.selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preview::PreviewContent;
+    use crate::test_support::{sample_node_tree, sample_root_path};
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn preview_names_targets_and_errors_escape_directional_controls() {
+        use crate::preview::ArchiveEntry;
+        let name = "a\u{202e}b";
+        let previews = [
+            PreviewContent::Directory {
+                total_entries: 1,
+                entries: vec![(name.into(), false)],
+            },
+            PreviewContent::Error(name.into()),
+            PreviewContent::Archive {
+                format: "TAR".into(),
+                entry_count: 1,
+                total_size: 0,
+                entries: vec![ArchiveEntry {
+                    path: name.into(),
+                    size: 0,
+                    is_dir: false,
+                    is_symlink: true,
+                    link_target: Some("c\u{2067}d".into()),
+                    compression_ratio: None,
+                }],
+            },
+        ];
+        for preview in &previews {
+            let root = sample_node_tree();
+            let mut state = MillerState {
+                selected: root
+                    .children
+                    .iter()
+                    .position(|child| !child.is_dir())
+                    .unwrap(),
+                ..MillerState::default()
+            };
+            let buffer = render_at(Rect::new(0, 0, 240, 20), &mut state, Some(preview));
+            let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(rendered.contains("a\\u{202e}b"));
+            assert!(!rendered.contains('\u{202e}'));
+            assert!(!rendered.contains('\u{2067}'));
+            if matches!(preview, PreviewContent::Archive { .. }) {
+                assert!(rendered.contains("c\\u{2067}d"));
+            }
+        }
+    }
+
+    #[test]
+    fn renders_filename_controls_visibly_without_changing_entry_identity() {
+        use crate::test_support::{directory, file};
+        let name = "a\u{202e}txt";
+        let root = directory(0, "root", vec![file(1, name, 1)]);
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let area = Rect::new(0, 0, 160, 20);
+        let mut buffer = Buffer::empty(area);
+        let mut state = MillerState::new();
+        StatefulWidget::render(
+            MillerColumns::new(&root, None, name, &root_path, &marked, &clipboard, &theme),
+            area,
+            &mut buffer,
+            &mut state,
+        );
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("a\\u{202e}txt"));
+        assert!(!rendered.contains('\u{202e}'));
+        assert_eq!(ColumnEntry::from_node(&root.children[0]).native_name, name);
+        assert_eq!(
+            ColumnEntry::from_node(&root.children[0]).name,
+            r"a\u{202e}txt"
+        );
+    }
+
+    /// Render the widget over `area` into an 120x40 buffer, so a rect that
+    /// escapes its area is caught by the buffer bounds rather than silently
+    /// clipped.
+    fn render_at(area: Rect, state: &mut MillerState, preview: Option<&PreviewContent>) -> Buffer {
+        let root = sample_node_tree();
+        let parent = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+
+        let canvas = Rect::new(0, 0, area.right().max(120), area.bottom().max(40));
+        let mut buf = Buffer::empty(canvas);
+
+        let mut miller = MillerColumns::new(
+            &root,
+            Some(&parent),
+            "src",
+            &root_path,
+            &marked,
+            &clipboard,
+            &theme,
+        );
+        if let Some(preview) = preview {
+            miller = miller.file_preview(preview);
+        }
+        StatefulWidget::render(miller, area, &mut buf, state);
+        buf
+    }
+
+    #[test]
+    fn navigation_stays_within_bounds() {
+        let mut state = MillerState::new();
+        state.move_up(10);
+        assert_eq!(state.selected, 0);
+        state.move_down(100, 7);
+        assert_eq!(state.selected, 6);
+        state.jump_to_top();
+        assert_eq!((state.selected, state.offset), (0, 0));
+        state.jump_to_bottom(7);
+        assert_eq!(state.selected, 6);
+
+        // An empty directory must not underflow.
+        state.jump_to_bottom(0);
+        assert_eq!(state.selected, 0);
+        state.move_down(5, 0);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn ensure_visible_scrolls_the_minimum_distance() {
+        let mut state = MillerState::new();
+        state.selected = 20;
+        state.ensure_visible(8);
+        assert_eq!(state.offset, 13);
+
+        state.selected = 13;
+        state.ensure_visible(8);
+        assert_eq!(state.offset, 13);
+
+        state.selected = 2;
+        state.ensure_visible(8);
+        assert_eq!(state.offset, 2);
+    }
+
+    #[test]
+    fn reset_clears_scroll_as_well_as_selection() {
+        let mut state = MillerState {
+            selected: 9,
+            offset: 4,
+        };
+        state.reset();
+        assert_eq!((state.selected, state.offset), (0, 0));
+    }
+
+    #[test]
+    fn column_entries_carry_display_metadata_from_the_node() {
+        let root = sample_node_tree();
+        let entries: Vec<ColumnEntry> = root.children.iter().map(ColumnEntry::from_node).collect();
+
+        let run = entries.iter().find(|e| e.name == "run.sh").unwrap();
+        assert!(run.is_executable && !run.is_dir && !run.is_symlink);
+
+        let link = entries.iter().find(|e| e.name == "link").unwrap();
+        assert!(link.is_symlink && !link.is_broken_symlink);
+
+        let dangling = entries.iter().find(|e| e.name == "dangling").unwrap();
+        assert!(dangling.is_symlink && dangling.is_broken_symlink);
+
+        let src = entries.iter().find(|e| e.name == "src").unwrap();
+        assert!(src.is_dir && !src.is_executable);
+    }
+
+    #[test]
+    fn renders_at_every_size_without_panicking() {
+        // The three columns are percentage splits, so a narrow terminal can
+        // produce a column narrower than the right-anchored size bar. That used
+        // to compute an out-of-bounds rect and abort the app.
+        for width in 1u16..=120 {
+            for height in [1u16, 2, 3, 10, 40] {
+                let mut state = MillerState::new();
+                let _ = render_at(Rect::new(0, 0, width, height), &mut state, None);
+            }
+        }
+    }
+
+    #[test]
+    fn renders_every_preview_kind_without_panicking() {
+        use crate::preview::{ArchiveEntry, PreviewContent};
+        use ratatui::text::Line;
+
+        let previews = vec![
+            PreviewContent::Empty,
+            PreviewContent::Loading,
+            PreviewContent::Error("boom".into()),
+            PreviewContent::Text {
+                lines: vec![Line::raw("hello"); 200],
+                highlighted: true,
+                total_lines: 200,
+            },
+            PreviewContent::Hex {
+                lines: vec![Line::raw("00000000  ff"); 200],
+                total_bytes: 4096,
+            },
+            PreviewContent::Directory {
+                total_entries: 200,
+                entries: vec![("child".to_string(), true); 200],
+            },
+            PreviewContent::Metadata {
+                size: 1234,
+                modified: Some(std::time::SystemTime::UNIX_EPOCH),
+                created: Some(std::time::SystemTime::UNIX_EPOCH),
+                accessed: Some(std::time::SystemTime::UNIX_EPOCH),
+                file_type: "File".into(),
+                permissions: Some("rw-r--r--".into()),
+            },
+            PreviewContent::Archive {
+                format: "ZIP".into(),
+                entry_count: 300,
+                total_size: 9999,
+                entries: vec![
+                    ArchiveEntry {
+                        path: "inner/file".into(),
+                        size: 10,
+                        is_dir: false,
+                        is_symlink: false,
+                        link_target: None,
+                        compression_ratio: Some(0.5),
+                    };
+                    300
+                ],
+            },
+        ];
+
+        for preview in &previews {
+            for (width, height) in [(1u16, 1u16), (12, 4), (40, 6), (80, 24), (200, 60)] {
+                // Select a file, so the third column renders the preview
+                // rather than a directory listing.
+                let root = sample_node_tree();
+                let file_index = root
+                    .children
+                    .iter()
+                    .position(|child| !child.is_dir())
+                    .expect("fixture has a file");
+                let mut state = MillerState {
+                    selected: file_index,
+                    offset: 0,
+                };
+                let _ = render_at(Rect::new(0, 0, width, height), &mut state, Some(preview));
+            }
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_selection_is_clamped_during_render() {
+        let mut state = MillerState {
+            selected: 999,
+            offset: 0,
+        };
+        let _ = render_at(Rect::new(0, 0, 100, 20), &mut state, None);
+        assert_eq!(state.selected, sample_node_tree().children.len() - 1);
+    }
+
+    #[test]
+    fn a_wide_layout_renders_all_three_column_titles() {
+        let mut state = MillerState::new();
+        let buf = render_at(Rect::new(0, 0, 120, 20), &mut state, None);
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        for title in ["Parent", "Current", "Preview"] {
+            assert!(
+                rendered.contains(title),
+                "missing {title} column: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_directory_says_so() {
+        let empty = FileNode::new_directory(
+            gravityfile_core::NodeId::new(0),
+            "empty",
+            crate::test_support::timestamps(),
+        );
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+        let mut state = MillerState::new();
+
+        let miller = MillerColumns::new(
+            &empty, None, "empty", &root_path, &marked, &clipboard, &theme,
+        );
+        StatefulWidget::render(miller, area, &mut buf, &mut state);
+
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("(empty)"), "{rendered}");
+    }
+
+    #[test]
+    fn timestamps_outside_the_representable_range_render_a_placeholder() {
+        // A corrupt or absurd mtime must not panic the preview pane.
+        assert_eq!(format_timestamp(i64::MAX as u64), "—");
+        assert_ne!(format_timestamp(0), "—");
+    }
 }

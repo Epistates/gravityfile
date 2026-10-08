@@ -592,3 +592,256 @@ pub fn get_key_bindings() -> Vec<KeyBinding> {
         .flat_map(|s| s.bindings)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn action(code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
+        KeyAction::from_key_event(key(code, modifiers))
+    }
+
+    fn plain(c: char) -> KeyAction {
+        action(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn shifted(c: char) -> KeyAction {
+        action(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    fn ctrl(c: char) -> KeyAction {
+        action(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn vim_navigation_keys_map_to_movement() {
+        assert_eq!(plain('j'), KeyAction::MoveDown);
+        assert_eq!(plain('k'), KeyAction::MoveUp);
+        assert_eq!(plain('h'), KeyAction::MoveLeft);
+        assert_eq!(plain('l'), KeyAction::MoveRight);
+    }
+
+    #[test]
+    fn arrow_keys_mirror_the_vim_bindings() {
+        assert_eq!(
+            action(KeyCode::Down, KeyModifiers::NONE),
+            KeyAction::MoveDown
+        );
+        assert_eq!(action(KeyCode::Up, KeyModifiers::NONE), KeyAction::MoveUp);
+        assert_eq!(
+            action(KeyCode::Left, KeyModifiers::NONE),
+            KeyAction::MoveLeft
+        );
+        assert_eq!(
+            action(KeyCode::Right, KeyModifiers::NONE),
+            KeyAction::MoveRight
+        );
+    }
+
+    #[test]
+    fn destructive_actions_require_their_exact_binding() {
+        // Delete must not be reachable by accident from a modified 'd'.
+        assert_eq!(plain('d'), KeyAction::Delete);
+        assert_eq!(shifted('D'), KeyAction::Delete);
+        assert_eq!(
+            action(KeyCode::Delete, KeyModifiers::NONE),
+            KeyAction::Delete
+        );
+
+        // Ctrl-d is paging, not deleting.
+        assert_eq!(ctrl('d'), KeyAction::PageDown);
+        assert_eq!(ctrl('u'), KeyAction::PageUp);
+    }
+
+    #[test]
+    fn quit_is_reachable_only_from_its_own_bindings() {
+        assert_eq!(plain('q'), KeyAction::Quit);
+        assert_eq!(ctrl('c'), KeyAction::ForceQuit);
+
+        // Esc clears state rather than quitting, at every modifier level.
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(action(KeyCode::Esc, modifiers), KeyAction::Cancel);
+        }
+
+        // A modified 'q' is not a quit.
+        assert_eq!(ctrl('q'), KeyAction::None);
+        assert_eq!(
+            action(KeyCode::Char('q'), KeyModifiers::ALT),
+            KeyAction::None
+        );
+    }
+
+    #[test]
+    fn clipboard_bindings_are_vim_style() {
+        assert_eq!(plain('y'), KeyAction::Yank);
+        assert_eq!(plain('x'), KeyAction::Cut);
+        assert_eq!(plain('p'), KeyAction::Paste);
+        assert_eq!(ctrl('z'), KeyAction::Undo);
+    }
+
+    #[test]
+    fn shifted_letters_use_the_shift_modifier() {
+        // Crossterm reports uppercase letters with SHIFT set, so every
+        // uppercase binding is declared that way. Without the modifier they
+        // fall through to `None` — this pins the contract so a future edit
+        // cannot silently drop the modifier from one arm and not another.
+        for (c, expected) in [
+            ('G', KeyAction::JumpToBottom),
+            ('V', KeyAction::EnterVisual),
+            ('D', KeyAction::Delete),
+            ('A', KeyAction::CreateDirectory),
+            ('T', KeyAction::Take),
+            ('P', KeyAction::CyclePreviewMode),
+            ('R', KeyAction::Refresh),
+            ('S', KeyAction::ReverseSort),
+            ('B', KeyAction::ShowBookmarkList),
+        ] {
+            assert_eq!(shifted(c), expected, "Shift-{c}");
+            assert_eq!(
+                action(KeyCode::Char(c), KeyModifiers::NONE),
+                KeyAction::None,
+                "unmodified {c} should not be bound"
+            );
+        }
+    }
+
+    #[test]
+    fn the_command_palette_accepts_colon_with_or_without_shift() {
+        // ':' is a shifted key on most layouts, and terminals disagree about
+        // whether they report the modifier.
+        assert_eq!(plain(':'), KeyAction::CommandMode);
+        assert_eq!(shifted(':'), KeyAction::CommandMode);
+    }
+
+    #[test]
+    fn digit_keys_select_directory_tabs() {
+        for n in 1u8..=9 {
+            let c = char::from_digit(u32::from(n), 10).unwrap();
+            assert_eq!(plain(c), KeyAction::DirTab(n));
+        }
+        // Zero is not a tab.
+        assert_eq!(plain('0'), KeyAction::None);
+    }
+
+    #[test]
+    fn unbound_keys_produce_no_action() {
+        for code in [
+            KeyCode::Char('~'),
+            KeyCode::Char('Z'),
+            KeyCode::F(5),
+            KeyCode::Insert,
+        ] {
+            assert_eq!(
+                action(code, KeyModifiers::NONE),
+                KeyAction::None,
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_events_map_to_actions() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let at = |kind| MouseEvent {
+            kind,
+            column: 4,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Down(MouseButton::Left))),
+            MouseAction::Click { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Down(MouseButton::Right))),
+            MouseAction::RightClick { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::ScrollUp)),
+            MouseAction::ScrollUp { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::ScrollDown)),
+            MouseAction::ScrollDown { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Drag(MouseButton::Left))),
+            MouseAction::DragTo { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Up(MouseButton::Left))),
+            MouseAction::DragEnd
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Moved)),
+            MouseAction::None
+        );
+    }
+
+    #[test]
+    fn help_sections_are_well_formed() {
+        let sections = get_help_sections();
+        assert!(!sections.is_empty());
+
+        let mut titles: Vec<&str> = sections.iter().map(|section| section.title).collect();
+        let count = titles.len();
+        titles.sort_unstable();
+        titles.dedup();
+        assert_eq!(titles.len(), count, "duplicate help section titles");
+
+        for section in &sections {
+            assert!(
+                !section.bindings.is_empty(),
+                "empty help section: {}",
+                section.title
+            );
+            for binding in &section.bindings {
+                assert!(
+                    !binding.keys.is_empty(),
+                    "{} has a blank key",
+                    section.title
+                );
+                assert!(
+                    !binding.description.is_empty(),
+                    "{} / {} has no description",
+                    section.title,
+                    binding.keys
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_help_lists_each_command_once() {
+        let commands = get_command_help();
+        assert!(!commands.is_empty());
+
+        let mut names: Vec<&str> = commands.iter().map(|(name, _)| *name).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate entries in the command help");
+
+        for (name, description) in &commands {
+            assert!(name.starts_with(':'), "{name} is not a command");
+            assert!(!description.is_empty(), "{name} has no description");
+        }
+    }
+}

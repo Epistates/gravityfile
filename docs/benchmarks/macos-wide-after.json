@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-09-21T03:06:56Z",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "logical_cpus": 16,
+  "binary": "/Users/nickpaterno/work/gravityfile/target/release/grav",
+  "binary_version": "grav 0.3.1",
+  "binary_sha256": "d93513dad23d5004535cef606ba2273bd7433e42760a7d9eb38f1e33de145f0b",
+  "cache_state": "warm; fixture created immediately before measurement; caches not cleared",
+  "fixture": {
+    "files": 100000,
+    "file_bytes": 256,
+    "files_per_directory": 100000,
+    "distinct_contents": 256
+  },
+  "runs_per_command": 3,
+  "correctness_checks": "file/directory counts, duplicate totals and group membership counts, age bucket accounting",
+  "measurements": {
+    "scan": {
+      "arguments": [
+        "scan",
+        "<fixture>",
+        "--top",
+        "0",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 0.2644070840324275,
+          "peak_rss_bytes": 80560128,
+          "user_seconds": 0.15148899999999998,
+          "system_seconds": 0.24809799999999999
+        },
+        {
+          "seconds": 0.28349349997006357,
+          "peak_rss_bytes": 80527360,
+          "user_seconds": 0.176982,
+          "system_seconds": 0.290418
+        },
+        {
+          "seconds": 0.2882463749847375,
+          "peak_rss_bytes": 80592896,
+          "user_seconds": 0.174654,
+          "system_seconds": 0.29706099999999996
+        }
+      ],
+      "median_seconds": 0.28349349997006357
+    },
+    "duplicates": {
+      "arguments": [
+        "duplicates",
+        "<fixture>",
+        "--min-size",
+        "0",
+        "--top",
+        "1",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 2.2481579579762183,
+          "peak_rss_bytes": 119734272,
+          "user_seconds": 0.349866,
+          "system_seconds": 2.075354
+        },
+        {
+          "seconds": 2.4087116669979878,
+          "peak_rss_bytes": 119668736,
+          "user_seconds": 0.356479,
+          "system_seconds": 2.235761
+        },
+        {
+          "seconds": 2.451025624992326,
+          "peak_rss_bytes": 118013952,
+          "user_seconds": 0.35672,
+          "system_seconds": 2.274846
+        }
+      ],
+      "median_seconds": 2.4087116669979878
+    },
+    "age": {
+      "arguments": [
+        "age",
+        "<fixture>",
+        "--envelope",
+        "--strict"
+      ],
+      "samples": [
+        {
+          "seconds": 0.33664183400105685,
+          "peak_rss_bytes": 80805888,
+          "user_seconds": 0.22716999999999998,
+          "system_seconds": 0.311015
+        },
+        {
+          "seconds": 0.3283327089739032,
+          "peak_rss_bytes": 80773120,
+          "user_seconds": 0.21453,
+          "system_seconds": 0.295589
+        },
+        {
+          "seconds": 0.3305603750050068,
+          "peak_rss_bytes": 80805888,
+          "user_seconds": 0.218488,
+          "system_seconds": 0.29537599999999997
+        }
+      ],
+      "median_seconds": 0.3305603750050068
+    }
+  },
+  "fixture_parent": "/var/folders/nj/j0466v5s17x8skjnpb1pl1m00000gn/T",
+  "filesystem": {
+    "block_size": 1048576,
+    "fragment_size": 4096
+  },
+  "fixture_creation_seconds": 7.363679750007577
+}

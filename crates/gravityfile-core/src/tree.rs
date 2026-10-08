@@ -23,10 +23,13 @@ pub struct TreeStats {
     /// Maximum depth reached.
     pub max_depth: u32,
     /// Largest file (path, size).
+    #[serde(default, with = "crate::path_serde::optional_pair")]
     pub largest_file: Option<(PathBuf, u64)>,
     /// Oldest file (path, time).
+    #[serde(default, with = "crate::path_serde::optional_pair")]
     pub oldest_file: Option<(PathBuf, SystemTime)>,
     /// Newest file (path, time).
+    #[serde(default, with = "crate::path_serde::optional_pair")]
     pub newest_file: Option<(PathBuf, SystemTime)>,
 }
 
@@ -37,6 +40,7 @@ impl TreeStats {
     }
 
     /// Update stats with a file entry. Only clones the path when updating a tracked field.
+    /// Equal sizes/times choose the smallest native path, independent of arrival order.
     ///
     /// `modified` is `None` when the file's modification time could not be read;
     /// such files are excluded from oldest/newest tracking rather than being
@@ -53,16 +57,24 @@ impl TreeStats {
         self.max_depth = self.max_depth.max(depth);
 
         // Track largest file
-        if self.largest_file.as_ref().is_none_or(|(_, s)| size > *s) {
+        if self
+            .largest_file
+            .as_ref()
+            .is_none_or(|(previous, s)| size > *s || (size == *s && path < previous.as_path()))
+        {
             self.largest_file = Some((path.to_path_buf(), size));
         }
 
         // Track oldest/newest only for files with a real modification time.
         if let Some(modified) = modified {
-            if self.oldest_file.as_ref().is_none_or(|(_, t)| modified < *t) {
+            if self.oldest_file.as_ref().is_none_or(|(previous, t)| {
+                modified < *t || (modified == *t && path < previous.as_path())
+            }) {
                 self.oldest_file = Some((path.to_path_buf(), modified));
             }
-            if self.newest_file.as_ref().is_none_or(|(_, t)| modified > *t) {
+            if self.newest_file.as_ref().is_none_or(|(previous, t)| {
+                modified > *t || (modified == *t && path < previous.as_path())
+            }) {
                 self.newest_file = Some((path.to_path_buf(), modified));
             }
         }
@@ -89,6 +101,7 @@ pub struct FileTree {
     pub root: FileNode,
 
     /// Root path that was scanned.
+    #[serde(with = "crate::path_serde")]
     pub root_path: PathBuf,
 
     /// When this scan was performed.
@@ -108,7 +121,11 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    /// Create a new file tree. `scanned_at` should be captured by the caller at scan start time.
+    /// Create a new file tree.
+    ///
+    /// `scanned_at` is stamped at construction time, which is when the scan
+    /// finished. `scan_duration` is supplied by the caller, so the scan's start
+    /// time is `scanned_at - scan_duration`.
     pub fn new(
         root: FileNode,
         root_path: PathBuf,
@@ -151,11 +168,52 @@ impl FileTree {
     pub fn has_warnings(&self) -> bool {
         !self.warnings.is_empty()
     }
+
+    /// Observed warning count, including explicitly omitted details.
+    pub fn warning_count(&self) -> u64 {
+        self.warnings.iter().fold(0u64, |count, warning| {
+            count.saturating_add(warning.represented_count())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tied_extremes_are_independent_of_arrival_order() {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for order in [["c", "b", "a"], ["a", "c", "b"], ["b", "a", "c"]] {
+            let mut stats = TreeStats::new();
+            for path in order {
+                stats.record_file(Path::new(path), 42, Some(time), 1);
+            }
+            assert_eq!(stats.largest_file, Some((PathBuf::from("a"), 42)));
+            assert_eq!(stats.oldest_file, Some((PathBuf::from("a"), time)));
+            assert_eq!(stats.newest_file, Some((PathBuf::from("a"), time)));
+            assert_eq!(stats.total_files, 3);
+            assert_eq!(stats.total_size, 126);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tied_extremes_compare_native_paths_not_lossy_labels() {
+        use std::os::unix::ffi::OsStrExt;
+        let paths = [b"/file-\xfe".as_slice(), b"/file-\xff".as_slice()]
+            .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+        assert_eq!(paths[0].to_string_lossy(), paths[1].to_string_lossy());
+        for order in [[0, 1], [1, 0]] {
+            let mut stats = TreeStats::new();
+            for index in order {
+                stats.record_file(&paths[index], 10, Some(SystemTime::UNIX_EPOCH), 1);
+            }
+            assert_eq!(stats.largest_file.unwrap().0, paths[0]);
+            assert_eq!(stats.oldest_file.unwrap().0, paths[0]);
+            assert_eq!(stats.newest_file.unwrap().0, paths[0]);
+        }
+    }
 
     #[test]
     fn test_tree_stats_default() {

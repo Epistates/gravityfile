@@ -6,14 +6,16 @@
 
 function grav
     set -l tmp (mktemp -t "gravityfile-cwd.XXXXXX")
+    or return $status
     command gravityfile --cwd-file="$tmp" $argv
     set -l exit_code $status
-    if test -f "$tmp"
-        set -l cwd (cat "$tmp")
+    if test $exit_code -eq 0; and test -f "$tmp"
+        set -l cwd
+        read --null cwd < "$tmp"
         if test -d "$cwd"; and test "$cwd" != "$PWD"
             cd "$cwd"
         end
-        rm -f "$tmp"
     end
+    rm -f -- "$tmp"
     return $exit_code
 end

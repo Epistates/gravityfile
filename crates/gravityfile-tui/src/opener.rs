@@ -112,6 +112,11 @@ pub fn open_file(
     openers: &FileOpeners,
     editor_config: &opensesame::EditorConfig,
 ) -> OpenResult {
+    let path = match std::path::absolute(path) {
+        Ok(path) => path,
+        Err(error) => return OpenResult::Error(format!("Cannot resolve file path: {error}")),
+    };
+    let path = path.as_path();
     let extension = path
         .extension()
         .and_then(OsStr::to_str)
@@ -119,10 +124,18 @@ pub fn open_file(
 
     match extension.as_deref() {
         // Markdown files
-        Some("md" | "markdown") => open_markdown(path, openers),
+        Some("md" | "markdown") => open_markdown(path, openers, editor_config),
 
         // Text/code files - use editor
-        Some(ext) if is_text_extension(ext) => open_with_editor(path, editor_config),
+        Some(ext) if is_text_extension(ext) => {
+            if openers.text == "editor" {
+                open_with_editor(path, editor_config)
+            } else {
+                let mut cmd = Command::new(&openers.text);
+                cmd.arg(path);
+                OpenResult::NeedsSuspend(cmd)
+            }
+        }
 
         // Other files - use system default
         _ => open_with_system(path, openers),
@@ -135,7 +148,11 @@ fn is_text_extension(ext: &str) -> bool {
 }
 
 /// Open a markdown file.
-fn open_markdown(path: &Path, openers: &FileOpeners) -> OpenResult {
+fn open_markdown(
+    path: &Path,
+    openers: &FileOpeners,
+    config: &opensesame::EditorConfig,
+) -> OpenResult {
     let opener = &openers.md;
 
     // External treemd or other opener
@@ -153,7 +170,7 @@ fn open_markdown(path: &Path, openers: &FileOpeners) -> OpenResult {
 
     // Custom opener
     if opener == "editor" {
-        return open_with_editor(path, &opensesame::EditorConfig::default());
+        return open_with_editor(path, config);
     }
 
     if opener == "open" || opener == "system" {
@@ -169,29 +186,63 @@ fn open_markdown(path: &Path, openers: &FileOpeners) -> OpenResult {
 /// Open a file with the configured editor.
 ///
 /// Resolution order:
-/// 1. User config editor (from settings)
+/// 1. User config executable or editor kind (from settings)
 /// 2. $VISUAL environment variable
 /// 3. $EDITOR environment variable
 /// 4. Fallback to vim
 fn open_with_editor(path: &Path, config: &opensesame::EditorConfig) -> OpenResult {
-    // Determine which editor to use
-    let editor = config
+    match editor_command(path, config) {
+        Ok(command) => OpenResult::NeedsSuspend(command),
+        Err(error) => OpenResult::Error(format!("Cannot configure editor: {error}")),
+    }
+}
+
+pub(crate) fn editor_command(
+    path: &Path,
+    config: &opensesame::EditorConfig,
+) -> std::io::Result<Command> {
+    build_editor_command(
+        path,
+        config,
+        std::env::var_os("VISUAL"),
+        std::env::var_os("EDITOR"),
+    )
+}
+
+fn build_editor_command(
+    path: &Path,
+    config: &opensesame::EditorConfig,
+    visual: Option<std::ffi::OsString>,
+    editor: Option<std::ffi::OsString>,
+) -> std::io::Result<Command> {
+    let program = config
         .editor
-        .clone()
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| "vim".to_string());
-
-    // Build command
-    let mut cmd = Command::new(&editor);
-    cmd.arg(path);
-
-    // Inherit stdio for terminal editors
-    cmd.stdin(std::process::Stdio::inherit())
+        .as_ref()
+        .map(std::ffi::OsString::from)
+        .or_else(|| {
+            config
+                .editor_kind
+                .as_ref()
+                .map(|kind| kind.0.default_binary().into())
+        })
+        .or_else(|| visual.filter(|value| !value.is_empty()))
+        .or_else(|| editor.filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| "vim".into());
+    if program.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configured editor is empty",
+        ));
+    }
+    // Treat the program as an executable name/path, never as shell code. An
+    // absolute file operand cannot be mistaken for an option starting with '-'.
+    let mut command = Command::new(program);
+    command.args(&config.args).arg(std::path::absolute(path)?);
+    command
+        .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
-
-    OpenResult::NeedsSuspend(cmd)
+    Ok(command)
 }
 
 /// Open a file with the system default application.
@@ -215,4 +266,76 @@ fn open_with_system(path: &Path, openers: &FileOpeners) -> OpenResult {
 /// Check if a command exists in PATH using the `which` crate (no subprocess).
 fn which_exists(cmd: &str) -> bool {
     which::which(cmd).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn editor_settings_and_arguments_take_precedence_without_shell_parsing() {
+        let config = opensesame::EditorConfig {
+            editor: Some("/editor with spaces".into()),
+            args: vec!["--wait".into(), "literal $(touch marker)".into()],
+            ..Default::default()
+        };
+        let command = build_editor_command(
+            Path::new("-option.txt"),
+            &config,
+            Some("visual".into()),
+            Some("editor".into()),
+        )
+        .unwrap();
+        assert_eq!(command.get_program(), "/editor with spaces");
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(arguments[0], "--wait");
+        assert_eq!(arguments[1], "literal $(touch marker)");
+        assert_eq!(arguments[2], std::path::absolute("-option.txt").unwrap());
+    }
+
+    #[test]
+    fn editor_environment_order_and_empty_values_are_consistent() {
+        let config = opensesame::EditorConfig::default();
+        for (visual, editor, expected) in [
+            (Some("visual"), Some("editor"), "visual"),
+            (Some(""), Some("editor"), "editor"),
+            (None, Some(""), "vim"),
+        ] {
+            let command = build_editor_command(
+                Path::new("file"),
+                &config,
+                visual.map(OsString::from),
+                editor.map(OsString::from),
+            )
+            .unwrap();
+            assert_eq!(command.get_program(), expected);
+        }
+        let config = opensesame::EditorConfig {
+            editor: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(build_editor_command(Path::new("file"), &config, None, None).is_err());
+    }
+
+    #[test]
+    fn markdown_honors_editor_config_and_text_honors_custom_opener() {
+        let openers = FileOpeners {
+            md: "editor".into(),
+            text: "custom-text".into(),
+            ..Default::default()
+        };
+        let config = opensesame::EditorConfig::with_editor("configured");
+        for (file, expected) in [("note.md", "configured"), ("code.rs", "custom-text")] {
+            let OpenResult::NeedsSuspend(command) = open_file(Path::new(file), &openers, &config)
+            else {
+                panic!("expected editor command")
+            };
+            assert_eq!(command.get_program(), expected);
+            assert_eq!(
+                command.get_args().last().unwrap(),
+                std::path::absolute(file).unwrap()
+            );
+        }
+    }
 }

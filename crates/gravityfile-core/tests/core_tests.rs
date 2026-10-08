@@ -459,6 +459,7 @@ fn test_update_counts_includes_symlinks_and_other() {
     let symlink = FileNode {
         id: NodeId::new(3),
         name: "link".into(),
+        native_name: None,
         kind: NodeKind::Symlink {
             target: "target".into(),
             broken: false,
@@ -474,6 +475,7 @@ fn test_update_counts_includes_symlinks_and_other() {
     let other = FileNode {
         id: NodeId::new(4),
         name: "sock".into(),
+        native_name: None,
         kind: NodeKind::Other,
         size: 0,
         blocks: 0,
@@ -686,6 +688,7 @@ fn test_symlink_node() {
     let node = FileNode {
         id: NodeId::new(1),
         name: "symlink".into(),
+        native_name: None,
         kind: NodeKind::Symlink {
             target: "/path/to/target".into(),
             broken: false,
@@ -711,6 +714,7 @@ fn test_symlink_node() {
     let broken_node = FileNode {
         id: NodeId::new(2),
         name: "broken_symlink".into(),
+        native_name: None,
         kind: NodeKind::Symlink {
             target: "/nonexistent".into(),
             broken: true,
@@ -752,9 +756,9 @@ fn test_scan_config_builder() {
     assert!(!config.follow_symlinks);
     assert!(config.cross_filesystems);
 
-    assert!(config.should_ignore("file.tmp"));
-    assert!(config.should_ignore(".DS_Store"));
-    assert!(!config.should_ignore("normal.txt"));
+    assert!(config.should_ignore("file.tmp").unwrap());
+    assert!(config.should_ignore(".DS_Store").unwrap());
+    assert!(!config.should_ignore("normal.txt").unwrap());
 
     let default_config = ScanConfig::new("/default");
     assert_eq!(default_config.root.to_str().unwrap(), "/default");
@@ -775,9 +779,9 @@ fn test_scan_config_builder_ignore_works_without_compile() {
         .unwrap();
 
     // No compile_patterns() called — fallback path must handle this correctly.
-    assert!(config.should_ignore("app.log"));
-    assert!(config.should_ignore("node_modules"));
-    assert!(!config.should_ignore("main.rs"));
+    assert!(config.should_ignore("app.log").unwrap());
+    assert!(config.should_ignore("node_modules").unwrap());
+    assert!(!config.should_ignore("main.rs").unwrap());
 }
 
 #[test]
@@ -785,10 +789,10 @@ fn test_scan_config_new_ignore_works_immediately() {
     // ScanConfig::new calls compile_patterns internally.
     let mut config = ScanConfig::new("/test");
     config.ignore_patterns = vec!["*.bak".to_string()];
-    config.compile_patterns();
+    config.compile_patterns().unwrap();
 
-    assert!(config.should_ignore("file.bak"));
-    assert!(!config.should_ignore("file.rs"));
+    assert!(config.should_ignore("file.bak").unwrap());
+    assert!(!config.should_ignore("file.rs").unwrap());
 }
 
 #[test]
@@ -802,13 +806,13 @@ fn test_scan_config_compile_patterns_glob_wildcards() {
         ])
         .build()
         .unwrap();
-    config.compile_patterns();
+    config.compile_patterns().unwrap();
 
-    assert!(config.should_ignore("node_modules"));
-    assert!(config.should_ignore("test.log"));
-    assert!(config.should_ignore("cache.tmp"));
-    assert!(!config.should_ignore("src"));
-    assert!(!config.should_ignore("test.txt"));
+    assert!(config.should_ignore("node_modules").unwrap());
+    assert!(config.should_ignore("test.log").unwrap());
+    assert!(config.should_ignore("cache.tmp").unwrap());
+    assert!(!config.should_ignore("src").unwrap());
+    assert!(!config.should_ignore("test.txt").unwrap());
 }
 
 #[test]
@@ -818,20 +822,20 @@ fn test_scan_config_compile_patterns_prefix_glob() {
         .ignore_patterns(vec!["build*".to_string()])
         .build()
         .unwrap();
-    config.compile_patterns();
+    config.compile_patterns().unwrap();
 
-    assert!(config.should_ignore("build"));
-    assert!(config.should_ignore("build-output"));
-    assert!(!config.should_ignore("rebuild"));
+    assert!(config.should_ignore("build").unwrap());
+    assert!(config.should_ignore("build-output").unwrap());
+    assert!(!config.should_ignore("rebuild").unwrap());
 }
 
 #[test]
 fn test_scan_config_compile_patterns_empty() {
     let mut config = ScanConfig::new("/test");
     config.ignore_patterns = vec![];
-    config.compile_patterns();
+    config.compile_patterns().unwrap();
 
-    assert!(!config.should_ignore("anything"));
+    assert!(!config.should_ignore("anything").unwrap());
 }
 
 #[test]

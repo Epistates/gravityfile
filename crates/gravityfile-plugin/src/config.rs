@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::PluginKind;
 
 /// Global plugin system configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Directory where plugins are stored.
     pub plugin_dir: PathBuf,

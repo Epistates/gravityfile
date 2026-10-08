@@ -1,0 +1,52 @@
+{
+  "groups": [
+    {
+      "hash": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "size": 9007199254740993,
+      "paths": [
+        "data/a",
+        "data/b"
+      ],
+      "wasted_bytes": 9007199254740993
+    }
+  ],
+  "total_duplicate_size": 18014398509481986,
+  "total_wasted_space": 9007199254740993,
+  "files_analyzed": 2,
+  "files_with_duplicates": 2,
+  "group_count": 1,
+  "groups_omitted": 0
+}

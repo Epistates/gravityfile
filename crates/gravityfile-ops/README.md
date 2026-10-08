@@ -196,12 +196,34 @@ pub enum UndoableOperation {
 
 ## Architecture
 
+Bulk rename prepares native-path intents, object identities and a coordinated
+batch plan before moving sources. `restore_rename_batch` locks all participants,
+validates identities and restores an uncommitted batch with resumable no-replace
+moves. `RenameIntentRecord` adds `last_recorded_phase: Option<RenamePhase>` and
+`object_identity: Option<ObjectIdentity>`; callers constructing records must
+initialize these fields. The non-exhaustive phase enum describes historical
+progress; recovery validates current paths separately.
+See [recovery semantics](../../docs/RECOVERY.md#bulk-rename-intent-records).
+
+Archive extraction journals its prepared entries before publication. Discovery
+adds `RecoveryDiscovery::archive_records`; callers constructing discovery results
+must initialize this field. `retain_archive_extraction` preserves owned output in
+the journal, including same-object edits, while leaving unrelated data in place.
+Journal errors retain staging and report `ArchiveError::ExtractionRecovery`.
+Path-based identity checks do not close concurrent ancestor or check-to-move races;
+native Windows execution and power-loss durability remain unqualified.
+
 The crate is organized into focused modules:
 
 - **operation.rs** - Core `FileOperation` enum and error types
 - **copy.rs** - Async copy with recursive directory support
 - **move_op.rs** - Move operations (try rename, fallback to copy+delete)
-- **rename.rs** - Single item rename
+- **rename.rs** - Single-item rename and staged bulk rename
+- **rename_journal.rs** - Immutable bulk-rename progress records and validation
+- **rename_review.rs** - Read-only bulk-rename recovery inspection
+- **rename_batch.rs** - Coordinated plans, commit markers and explicit restoration
+- **object_identity.rs** - No-follow native filesystem identity checks
+- **archive_journal.rs** - Extraction plans and data-retaining recovery
 - **create.rs** - File and directory creation
 - **conflict.rs** - Conflict detection and resolution strategies
 - **progress.rs** - Progress tracking types

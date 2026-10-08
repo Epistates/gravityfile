@@ -10,8 +10,9 @@ use thiserror::Error;
 #[derive(Debug, Error, Serialize)]
 pub enum ScanError {
     /// Permission denied for a path.
-    #[error("Permission denied: {path}: {}", serialize_io_error_display(source))]
+    #[error("Permission denied: {}: {}", crate::escape_filename(.path.as_os_str()), serialize_io_error_display(source))]
     PermissionDenied {
+        #[serde(serialize_with = "crate::path_serde::serialize")]
         path: PathBuf,
         #[source]
         #[serde(serialize_with = "serialize_io_error")]
@@ -19,8 +20,9 @@ pub enum ScanError {
     },
 
     /// Path not found.
-    #[error("Path not found: {path}: {}", serialize_io_error_display(source))]
+    #[error("Path not found: {}: {}", crate::escape_filename(.path.as_os_str()), serialize_io_error_display(source))]
     NotFound {
+        #[serde(serialize_with = "crate::path_serde::serialize")]
         path: PathBuf,
         #[source]
         #[serde(serialize_with = "serialize_io_error")]
@@ -28,8 +30,9 @@ pub enum ScanError {
     },
 
     /// Generic I/O error.
-    #[error("I/O error at {path}: {source}")]
+    #[error("I/O error at {}: {}", crate::escape_filename(.path.as_os_str()), serialize_io_error_display(source))]
     Io {
+        #[serde(serialize_with = "crate::path_serde::serialize")]
         path: PathBuf,
         #[source]
         #[serde(serialize_with = "serialize_io_error")]
@@ -44,16 +47,23 @@ pub enum ScanError {
     #[error("Too many errors ({count}), aborting")]
     TooManyErrors { count: usize },
 
+    /// The configured descendant-entry budget was exhausted.
+    #[error("Scan entry limit exceeded ({limit} descendant entries)")]
+    EntryLimitExceeded { limit: u64 },
+
     /// Invalid configuration.
-    #[error("Invalid configuration: {message}")]
+    #[error("Invalid configuration: {}", crate::escape_terminal_text(message))]
     InvalidConfig { message: String },
 
     /// Root path is not a directory.
-    #[error("Root path is not a directory: {path}")]
-    NotADirectory { path: PathBuf },
+    #[error("Root path is not a directory: {}", crate::escape_filename(.path.as_os_str()))]
+    NotADirectory {
+        #[serde(serialize_with = "crate::path_serde::serialize")]
+        path: PathBuf,
+    },
 
     /// Other error.
-    #[error("{message}")]
+    #[error("{}", crate::escape_terminal_text(message))]
     Other { message: String },
 }
 
@@ -65,7 +75,7 @@ fn serialize_io_error<S: serde::Serializer>(
 }
 
 fn serialize_io_error_display(error: &std::io::Error) -> String {
-    error.to_string()
+    crate::escape_terminal_text(&error.to_string()).into_owned()
 }
 
 impl ScanError {
@@ -81,7 +91,7 @@ impl ScanError {
 }
 
 /// Kind of scan warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WarningKind {
     /// Permission was denied.
     PermissionDenied,
@@ -93,12 +103,15 @@ pub enum WarningKind {
     MetadataError,
     /// Filesystem boundary crossed (when not allowed).
     CrossFilesystem,
+    /// Warning details omitted by a bounded scanner accumulator.
+    Omitted { count: u64 },
 }
 
 /// Non-fatal warning encountered during scan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScanWarning {
     /// Path where the warning occurred.
+    #[serde(with = "crate::path_serde")]
     pub path: PathBuf,
     /// Human-readable message.
     pub message: String,
@@ -108,11 +121,19 @@ pub struct ScanWarning {
 
 impl fmt::Display for ScanWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", crate::escape_terminal_text(&self.message))
     }
 }
 
 impl ScanWarning {
+    /// Number of observed warnings represented by this record.
+    pub fn represented_count(&self) -> u64 {
+        match self.kind {
+            WarningKind::Omitted { count } => count.max(1),
+            _ => 1,
+        }
+    }
+
     /// Create a new scan warning.
     pub fn new(path: impl Into<PathBuf>, kind: WarningKind, message: impl Into<String>) -> Self {
         Self {
@@ -126,7 +147,10 @@ impl ScanWarning {
     pub fn permission_denied(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         Self {
-            message: format!("Permission denied: {}", path.display()),
+            message: format!(
+                "Permission denied: {}",
+                crate::escape_filename(path.as_os_str())
+            ),
             path,
             kind: WarningKind::PermissionDenied,
         }
@@ -136,7 +160,11 @@ impl ScanWarning {
     pub fn broken_symlink(path: impl Into<PathBuf>, target: &str) -> Self {
         let path = path.into();
         Self {
-            message: format!("Broken symlink: {} -> {target}", path.display()),
+            message: format!(
+                "Broken symlink: {} -> {}",
+                crate::escape_filename(path.as_os_str()),
+                crate::escape_filename(std::ffi::OsStr::new(target))
+            ),
             path,
             kind: WarningKind::BrokenSymlink,
         }
@@ -156,6 +184,40 @@ impl ScanWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displayed_errors_escape_paths_and_messages_but_preserve_sources() {
+        let path = PathBuf::from("line\n\u{1b}\\n");
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = ScanError::io(&path, std::io::Error::new(kind, "bad\n\u{1b}source"));
+            let displayed = error.to_string();
+            assert!(displayed.contains(r"line\n\u{1b}\\n"));
+            assert!(displayed.contains(r"bad\n\u{1b}source"));
+            assert!(!displayed.contains(['\n', '\u{1b}']));
+            assert_eq!(
+                std::error::Error::source(&error).unwrap().to_string(),
+                "bad\n\u{1b}source"
+            );
+        }
+        for error in [
+            ScanError::NotADirectory { path },
+            ScanError::InvalidConfig {
+                message: "bad\nconfig".into(),
+            },
+            ScanError::Other {
+                message: "bad\nother".into(),
+            },
+        ] {
+            assert!(!error.to_string().contains(['\n', '\u{1b}']));
+        }
+        let warning = ScanWarning::new("root", WarningKind::ReadError, "bad\nwarning");
+        assert_eq!(warning.to_string(), r"bad\nwarning");
+        assert_eq!(warning.message, "bad\nwarning");
+    }
 
     #[test]
     fn test_scan_error_io() {

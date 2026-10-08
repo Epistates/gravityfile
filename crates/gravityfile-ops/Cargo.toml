@@ -2,20 +2,20 @@
 name = "gravityfile-ops"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "File operations engine for gravityfile"
 
 [dependencies]
-gravityfile-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
-
-# File operations
-trash = "5"
+filetime.workspace = true
+tempfile.workspace = true
 
 # Archive support
 zip.workspace = true
@@ -24,5 +24,8 @@ flate2.workspace = true
 xz2.workspace = true
 bzip2.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

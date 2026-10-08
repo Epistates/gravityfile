@@ -11,6 +11,8 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Global syntax highlighting resources (loaded once).
 static SYNTECT: OnceLock<(SyntaxSet, Theme)> = OnceLock::new();
+const MAX_HIGHLIGHT_LINE_BYTES: usize = 16 * 1024;
+const MAX_HIGHLIGHT_PREVIEW_BYTES: usize = 256 * 1024;
 
 /// Syntax highlighter for file previews.
 pub struct SyntaxHighlighter;
@@ -26,7 +28,8 @@ impl SyntaxHighlighter {
                 .themes
                 .get("base16-ocean.dark")
                 .cloned()
-                .unwrap_or_else(|| theme_set.themes.values().next().unwrap().clone());
+                .or_else(|| theme_set.themes.values().next().cloned())
+                .unwrap_or_default();
             (syntaxes, theme)
         });
         (syntaxes, theme)
@@ -60,25 +63,38 @@ impl SyntaxHighlighter {
         None
     }
 
-    /// Highlight lines of text and convert to ratatui Lines.
-    pub fn highlight_lines(
+    pub(crate) fn within_budget(lines: &[String]) -> bool {
+        let mut remaining = MAX_HIGHLIGHT_PREVIEW_BYTES;
+        for line in lines {
+            if line.len() > MAX_HIGHLIGHT_LINE_BYTES || line.len() > remaining {
+                return false;
+            }
+            remaining -= line.len();
+        }
+        true
+    }
+
+    /// Fall back as a whole so skipped lines cannot corrupt later parser state.
+    pub(crate) fn highlight_with_status(
         lines: &[String],
         syntax: &SyntaxReference,
         tab_size: u8,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<Line<'static>>, bool) {
+        if !Self::within_budget(lines) {
+            return (Self::plain_lines(lines, tab_size), false);
+        }
         let (syntaxes, theme) = Self::init();
         let mut highlighter = HighlightLines::new(syntax, theme);
         let tab_replacement = " ".repeat(tab_size as usize);
 
-        lines
-            .iter()
-            .filter_map(|line| {
-                highlighter
-                    .highlight_line(line, syntaxes)
-                    .ok()
-                    .map(|regions| Self::regions_to_line(regions, &tab_replacement))
-            })
-            .collect()
+        let mut output = Vec::with_capacity(lines.len());
+        for line in lines {
+            match highlighter.highlight_line(line, syntaxes) {
+                Ok(regions) => output.push(Self::regions_to_line(regions, &tab_replacement)),
+                Err(_) => return (Self::plain_lines(lines, tab_size), false),
+            }
+        }
+        (output, true)
     }
 
     /// Convert syntect highlight regions to a ratatui Line.
@@ -104,7 +120,7 @@ impl SyntaxHighlighter {
                 }
 
                 Span::styled(
-                    text.replace('\t', tab_replacement),
+                    Self::display_text(text, tab_replacement),
                     Style::default()
                         .fg(Self::to_ratatui_color(style.foreground))
                         .add_modifier(modifier),
@@ -145,7 +161,61 @@ impl SyntaxHighlighter {
         let tab_replacement = " ".repeat(tab_size as usize);
         lines
             .iter()
-            .map(|line| Line::from(line.replace('\t', &tab_replacement)))
+            .map(|line| Line::from(Self::display_text(line, &tab_replacement)))
             .collect()
+    }
+
+    fn display_text(text: &str, tab_replacement: &str) -> String {
+        gravityfile_core::escape_terminal_text(&text.replace('\t', tab_replacement)).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlighting_budgets_preserve_text_and_report_plain_fallback() {
+        let syntax = SyntaxHighlighter::find_syntax(Path::new("probe.rs"), None).unwrap();
+        assert!(SyntaxHighlighter::within_budget(&vec![
+                "x".repeat(MAX_HIGHLIGHT_LINE_BYTES);
+                MAX_HIGHLIGHT_PREVIEW_BYTES / MAX_HIGHLIGHT_LINE_BYTES
+            ]));
+        for input in [
+            vec![
+                "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1),
+                "日本語\t\u{202e}".into(),
+            ],
+            vec![
+                "x".repeat(MAX_HIGHLIGHT_LINE_BYTES);
+                MAX_HIGHLIGHT_PREVIEW_BYTES / MAX_HIGHLIGHT_LINE_BYTES + 1
+            ],
+        ] {
+            let (lines, highlighted) = SyntaxHighlighter::highlight_with_status(&input, syntax, 4);
+            assert!(!highlighted);
+            assert_eq!(lines, SyntaxHighlighter::plain_lines(&input, 4));
+            assert_eq!(lines.len(), input.len());
+        }
+        assert!(SyntaxHighlighter::highlight_with_status(&["fn main() {}".into()], syntax, 4).1);
+    }
+
+    #[test]
+    fn plain_and_highlighted_previews_escape_controls_and_preserve_tabs_and_unicode() {
+        let input = vec!["// 日本語\t\u{1b}]52;c;secret\u{7}\u{202e}txt".to_string()];
+        let syntax = SyntaxHighlighter::find_syntax(Path::new("probe.rs"), None).unwrap();
+        let expected = "// 日本語    \\u{1b}]52;c;secret\\u{7}\\u{202e}txt";
+        for lines in [
+            SyntaxHighlighter::plain_lines(&input, 4),
+            SyntaxHighlighter::highlight_with_status(&input, syntax, 4).0,
+        ] {
+            assert_eq!(lines.len(), 1);
+            let rendered: String = lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(rendered, expected);
+        }
+        assert!(input[0].contains('\u{1b}'));
     }
 }

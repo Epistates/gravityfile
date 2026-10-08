@@ -12,11 +12,11 @@ default:
 
 # Build the project in debug mode
 build:
-    cargo build
+    cargo build --locked
 
 # Build the project in release mode with optimizations
 release:
-    cargo build --release
+    cargo build --release --locked
 
 # Run the TUI with a path (default: current directory)
 run PATH=".":
@@ -28,19 +28,19 @@ run-release PATH=".":
 
 # Run all tests
 test:
-    cargo test --workspace
+    cargo test --workspace --all-features --locked
 
 # Run tests with output shown
 test-verbose:
-    cargo test --workspace -- --nocapture
+    cargo test --workspace --all-features --locked -- --nocapture
 
 # Check code without building
 check:
-    cargo check --workspace
+    cargo check --workspace --all-features --locked
 
 # Run clippy for linting
 lint:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # Format code with rustfmt
 fmt:
@@ -78,17 +78,21 @@ ci: fmt-check lint test release
 
 # Package all workspace crates (dry-run)
 package:
-    cargo package --workspace --allow-dirty
+    cargo package --workspace --allow-dirty --no-verify --locked --offline
+
+# Build and test the extracted package contents with local internal patches.
+verify-packages: package
+    python3 scripts/verify-packaged-workspace.py
 
 # Publish all crates to crates.io (in dependency order)
 # Requires: cargo install cargo-workspaces
 publish:
-    cargo workspaces publish --publish-as-is --no-remove-dev-deps --allow-dirty --publish-interval 30
+    cargo workspaces publish --publish-as-is --no-remove-dev-deps --publish-interval 30 --allow-branch main --locked
 
 # Dry-run publish (verify all crates without uploading)
 # Requires: cargo install cargo-workspaces
 publish-dry-run:
-    cargo workspaces publish --dry-run --publish-as-is --no-remove-dev-deps --allow-dirty
+    cargo workspaces publish --dry-run --publish-as-is --no-remove-dev-deps --allow-dirty --allow-branch main --locked
 
 # List files that would be included in each crate's package
 publish-list:
@@ -105,12 +109,33 @@ install-cargo-workspaces:
 # Release Management
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Full local release gate.
+# Requires the declared MSRV toolchain plus cargo-audit, cargo-deny, and cargo-machete.
+release-check: fmt-check
+    python3 -m unittest discover -s scripts -p "test_*.py"
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    cargo clippy -p gravityfile-scan --all-targets --no-default-features --locked -- -D warnings
+    cargo test --workspace --all-features --locked
+    cargo +1.90 check --workspace --all-targets --all-features --locked
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+    cargo audit --no-fetch --deny unsound
+    cargo deny check bans licenses sources
+    cargo machete
+    cargo package --workspace --allow-dirty --no-verify --locked --offline
+    python3 scripts/verify-packaged-workspace.py
+    cargo build --release --locked
+    python3 scripts/smoke-release.py
+    python3 scripts/qualification/terminal-smoke.py target/release/grav
+    python3 scripts/qualification/terminal-smoke.py target/release/gravityfile
+
 # Show current version
 version:
     @grep '^version' Cargo.toml | head -1 | cut -d'"' -f2
 
-# Tag and push a release (usage: just tag v0.2.0)
+# Tag and push a release (usage: just tag v0.3.1)
 tag VERSION:
+    @test "{{VERSION}}" = "v$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)" || (echo "Tag must match workspace version" >&2; exit 1)
+    @test -z "$(git status --porcelain)" || (echo "Working tree must be clean before tagging" >&2; exit 1)
     @echo "Creating tag {{VERSION}}..."
     git tag {{VERSION}}
     git push origin {{VERSION}}
@@ -118,6 +143,8 @@ tag VERSION:
 
 # Create a release commit and tag
 release-tag VERSION MESSAGE="Release":
+    @test "{{VERSION}}" = "v$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)" || (echo "Tag must match workspace version" >&2; exit 1)
+    just release-check
     git add -A
     git commit -m "{{MESSAGE}} {{VERSION}}"
     git tag {{VERSION}}

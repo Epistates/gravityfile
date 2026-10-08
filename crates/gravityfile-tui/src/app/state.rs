@@ -8,7 +8,7 @@ use strum::{Display, EnumIter, FromRepr, IntoEnumIterator};
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::FileTree;
-use gravityfile_ops::{Conflict, OperationProgress, OperationType};
+use gravityfile_ops::{ConflictRequest, OperationProgress, OperationType};
 use gravityfile_scan::ScanProgress;
 
 /// Application mode representing the current UI state.
@@ -29,6 +29,10 @@ pub enum AppMode {
     Copying,
     /// Move operation in progress.
     Moving,
+    /// Undo is running, including while cancellation is being completed.
+    Undoing,
+    /// A single-entry creation or rename is awaiting its worker result.
+    UpdatingEntry,
     /// Renaming a file or directory (text input mode).
     Renaming,
     /// Creating a new file (text input mode).
@@ -53,6 +57,8 @@ pub enum AppMode {
     BookmarkList,
     /// Confirming bulk rename changes.
     ConfirmBulkRename,
+    /// A bulk rename is running to completion or rollback.
+    BulkRenaming,
     /// Visual selection mode (vim-style range selection).
     Visual,
     Quit,
@@ -354,25 +360,41 @@ pub enum ScanResult {
     AnalysisComplete {
         duplicates: DuplicateReport,
         age_report: AgeReport,
+        /// Per-group root count and validated path ordering, prepared off-thread.
+        duplicate_scope: (PathBuf, Vec<(usize, bool)>),
     },
+    AnalysisFailed(String),
+    AnalysisCancelled,
     /// Progress update during deletion.
     DeletionProgress(DeletionProgress),
     /// Deletion completed.
     DeletionComplete {
+        mode: super::deletion::DeletionMode,
         deleted: usize,
         failed: usize,
         bytes_freed: u64,
+        errors: Vec<gravityfile_ops::OperationError>,
     },
     /// Progress update during file operations (copy/move/etc).
     OperationProgress(OperationProgress),
     /// A conflict was encountered during file operation.
-    OperationConflict(Conflict),
+    OperationConflict(ConflictRequest),
+    /// Create-and-enter completed: true means this task created the directory.
+    TakeComplete {
+        path: PathBuf,
+        result: Result<bool, String>,
+    },
+    /// Bulk rename completed or failed after rollback attempts.
+    BulkRenameComplete(Result<usize, String>),
     /// File operation completed.
     OperationComplete {
+        cancelled: bool,
         operation_type: OperationType,
         succeeded: usize,
         failed: usize,
+        skipped: usize,
         bytes_processed: u64,
+        errors: Vec<gravityfile_ops::OperationError>,
         /// OPTIONAL: Information for the undo log.
         undo_info: Option<gravityfile_ops::UndoableOperation>,
     },
@@ -388,17 +410,6 @@ pub struct SelectedInfo {
     pub dir_count: u64,
     pub modified: std::time::SystemTime,
     pub is_dir: bool,
-}
-
-/// A pending file operation waiting for conflict resolution.
-#[derive(Debug, Clone)]
-pub enum PendingOperation {
-    /// Paste operation (copy or move).
-    Paste {
-        sources: Vec<PathBuf>,
-        destination: PathBuf,
-        mode: ClipboardMode,
-    },
 }
 
 /// State for the duplicates view with expandable groups.
@@ -550,13 +561,9 @@ impl Tab {
         }
     }
 
-    /// Get a short label for display (truncated if too long).
+    /// Get a label bounded by terminal columns, without splitting UTF-8 bytes.
     pub fn short_label(&self, max_len: usize) -> String {
-        if self.label.len() <= max_len {
-            self.label.clone()
-        } else {
-            format!("{}…", &self.label[..max_len.saturating_sub(1)])
-        }
+        crate::ui::fit_to_width(&self.label, max_len)
     }
 }
 
@@ -902,21 +909,8 @@ impl BulkRenameState {
             }
             seen_names.insert(entry.new_name.clone());
 
-            // Validate the new name
-            if entry.new_name.is_empty() {
-                self.error = Some("Empty name is not allowed".to_string());
-                return false;
-            }
-            if entry.new_name.contains('/') || entry.new_name.contains('\0') {
-                self.error = Some(format!("Invalid characters in: {}", entry.new_name));
-                return false;
-            }
-            if entry.new_name == "." || entry.new_name == ".." {
-                self.error = Some(format!("Reserved name: {}", entry.new_name));
-                return false;
-            }
-            if entry.new_name.len() > 255 {
-                self.error = Some(format!("Name too long: {}", entry.new_name));
+            if let Err(error) = gravityfile_ops::validate_filename(&entry.new_name) {
+                self.error = Some(format!("{}: {error}", entry.new_name));
                 return false;
             }
         }
@@ -929,6 +923,10 @@ impl BulkRenameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserSettings {
+    /// Descendant-entry budget for quick listings and recursive scans.
+    /// None preserves unlimited traversal; zero permits an empty scope.
+    #[serde(default)]
+    pub max_scan_entries: Option<u64>,
     /// Whether to automatically start scanning on startup.
     pub scan_on_startup: bool,
     /// Show hidden files by default.
@@ -943,17 +941,31 @@ pub struct UserSettings {
     /// Directory bookmarks.
     #[serde(default = "Bookmarks::with_defaults")]
     pub bookmarks: Bookmarks,
+    /// Render image files in the preview pane using the terminal's graphics
+    /// protocol.
+    ///
+    /// Enabling this costs one capability query at startup. Terminals answer it
+    /// in microseconds, but one that never answers delays the first frame by
+    /// the query timeout, so this can be turned off.
+    #[serde(default = "default_true")]
+    pub image_previews: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
+            max_scan_entries: None,
             scan_on_startup: true, // Enabled by default
             show_hidden: false,
             default_layout: "tree".to_string(),
             openers: FileOpeners::default(),
             editor: opensesame::EditorConfig::default(),
             bookmarks: Bookmarks::with_defaults(),
+            image_previews: true,
         }
     }
 }
@@ -990,29 +1002,125 @@ impl UserSettings {
         dirs::config_dir().map(|d| d.join("gravityfile").join("settings.toml"))
     }
 
-    /// Load settings from disk, or return defaults.
-    pub fn load() -> Self {
-        Self::config_path()
-            .and_then(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|content| toml::from_str(&content).ok())
-            .unwrap_or_default()
+    const MAX_BYTES: u64 = 1024 * 1024;
+
+    /// Load settings, using defaults when no settings file exists.
+    /// Other read and parse failures are returned to the caller.
+    pub fn try_load() -> std::io::Result<Self> {
+        let Some(path) = Self::config_path() else {
+            return Ok(Self::default());
+        };
+        Self::load_from(&path).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })
     }
 
-    /// Save settings to disk.
+    /// Compatibility helper that logs errors and falls back to defaults.
+    /// Interactive callers should use `try_load` to display failures.
+    pub fn load() -> Self {
+        Self::try_load().unwrap_or_else(|error| {
+            tracing::warn!(%error, "Cannot load settings; using defaults");
+            Self::default()
+        })
+    }
+
+    fn load_from(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind, Read};
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Permit dotfile-manager symlinks, but never wait for a FIFO writer.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > Self::MAX_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "settings must be a regular UTF-8 file of at most 1 MiB",
+            ));
+        }
+        let mut content = String::new();
+        file.take(Self::MAX_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > Self::MAX_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "settings grew beyond 1 MiB",
+            ));
+        }
+        toml::from_str(&content).map_err(|error| Error::new(ErrorKind::InvalidData, error))
+    }
+
+    /// Sync a private sibling file, atomically replace settings, and on Unix sync
+    /// the containing directory. A post-replacement sync error explicitly reports
+    /// that settings were installed but durability is uncertain.
+    /// Existing file permissions are not preserved; Unix files are private (0600).
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::config_path().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "No config directory")
         })?;
+        self.save_to(&path)
+    }
 
-        // Create parent directory if needed
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.save_to_with_directory_sync(path, sync_settings_directory)
+    }
 
+    fn save_to_with_directory_sync(
+        &self,
+        path: &std::path::Path,
+        sync_directory: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if content.len() as u64 > Self::MAX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "settings exceed 1 MiB",
+            ));
+        }
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut staged = tempfile::Builder::new()
+            .prefix(".gravityfile-settings-")
+            .tempfile_in(parent)?;
+        staged.write_all(content.as_bytes())?;
+        staged.as_file().sync_all()?;
+        staged.persist(path).map_err(|error| error.error)?;
+        sync_directory(parent).map_err(|error| {
+            std::io::Error::new(error.kind(), format!(
+                "Settings installed, but directory sync failed; durability is uncertain: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+}
 
-        std::fs::write(&path, content)
+fn sync_settings_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+            .open(path)?
+            .sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -1083,7 +1191,225 @@ impl SettingsState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saved_entry_budget_roundtrips_without_changing_legacy_defaults() {
+        use super::UserSettings;
+        assert_eq!(
+            toml::from_str::<UserSettings>("").unwrap().max_scan_entries,
+            None
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for limit in [0, 1, 100_000] {
+            let settings = UserSettings {
+                max_scan_entries: Some(limit),
+                ..UserSettings::default()
+            };
+            settings.save_to(&path).unwrap();
+            assert_eq!(
+                UserSettings::load_from(&path).unwrap().max_scan_entries,
+                Some(limit)
+            );
+        }
+        assert!(toml::from_str::<UserSettings>("max_scan_entries = -1").is_err());
+    }
+    #[test]
+    fn tab_labels_fit_terminal_columns_without_unicode_panics() {
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+        for label in [
+            "",
+            "documents",
+            "éééééé",
+            "日本語資料",
+            "🗂️📁📂",
+            "👩‍💻🇺🇸1️⃣",
+            "e\u{301}e\u{301}",
+        ] {
+            let mut tab = super::Tab::new(0, std::path::PathBuf::from("directory"));
+            tab.label = label.into();
+            for width in 0..=32 {
+                for slice in [
+                    crate::ui::truncate_to_width(label, width),
+                    crate::ui::truncate_left_to_width(label, width),
+                ] {
+                    assert!(slice.width() <= width);
+                    let boundaries: Vec<_> = label
+                        .grapheme_indices(true)
+                        .map(|(index, _)| index)
+                        .chain(std::iter::once(label.len()))
+                        .collect();
+                    let start = slice.as_ptr() as usize - label.as_ptr() as usize;
+                    assert!(boundaries.contains(&start));
+                    assert!(boundaries.contains(&(start + slice.len())));
+                }
+                assert!(crate::ui::fit_left_to_width(label, width).width() <= width);
+                let shortened = tab.short_label(width);
+                assert!(shortened.width() <= width, "{label:?}, width {width}");
+                if label.width() <= width {
+                    assert_eq!(shortened, label);
+                }
+                if width == 0 {
+                    assert!(shortened.is_empty());
+                }
+            }
+        }
+    }
     use super::*;
+
+    #[test]
+    fn settings_load_missing_defaults_and_existing_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        assert!(UserSettings::load_from(&path).unwrap().scan_on_startup);
+        std::fs::write(&path, "scan_on_startup = false\nimage_previews = false\n").unwrap();
+        let settings = UserSettings::load_from(&path).unwrap();
+        assert!(!settings.scan_on_startup);
+        assert!(!settings.image_previews);
+    }
+
+    #[test]
+    fn settings_load_rejects_invalid_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for content in [b"scan_on_startup = [".as_slice(), &[0xff]] {
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(
+                UserSettings::load_from(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(UserSettings::MAX_BYTES + 1).unwrap();
+        assert_eq!(
+            UserSettings::load_from(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(UserSettings::load_from(directory.path()).is_err());
+    }
+
+    #[test]
+    fn settings_oversized_save_preserves_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, b"original").unwrap();
+        let settings = UserSettings {
+            default_layout: "x".repeat(UserSettings::MAX_BYTES as usize),
+            ..UserSettings::default()
+        };
+        assert_eq!(
+            settings.save_to(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_load_accepts_regular_symlink_and_rejects_fifo() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&target, "image_previews = false\n").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(!UserSettings::load_from(&path).unwrap().image_previews);
+        let fifo = directory.path().join("fifo");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `native` is a valid, NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            UserSettings::load_from(&fifo).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn settings_save_creates_parents_and_replaces_complete_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config/settings.toml");
+        UserSettings::default().save_to(&path).unwrap();
+        let settings = UserSettings {
+            scan_on_startup: false,
+            default_layout: "miller".into(),
+            ..UserSettings::default()
+        };
+        settings.save_to(&path).unwrap();
+        let restored: UserSettings =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!restored.scan_on_startup);
+        assert_eq!(restored.default_layout, "miller");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn settings_publication_failure_preserves_destination_and_removes_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("existing"), b"preserve me").unwrap();
+        assert!(UserSettings::default().save_to(&path).is_err());
+        assert_eq!(
+            std::fs::read(path.join("existing")).unwrap(),
+            b"preserve me"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn settings_directory_sync_failure_reports_installed_document_and_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        UserSettings::default().save_to(&path).unwrap();
+        let settings = UserSettings {
+            scan_on_startup: false,
+            ..UserSettings::default()
+        };
+        let error = settings
+            .save_to_with_directory_sync(&path, |parent| {
+                assert_eq!(parent, directory.path());
+                assert!(!UserSettings::load_from(&path).unwrap().scan_on_startup);
+                Err(std::io::Error::other("injected sync failure"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("Settings installed"));
+        assert!(error.to_string().contains("durability is uncertain"));
+        assert!(!UserSettings::load_from(&path).unwrap().scan_on_startup);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        settings.save_to(&path).unwrap();
+        assert!(!UserSettings::load_from(&path).unwrap().scan_on_startup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_directory_sync_rejects_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(sync_settings_directory(&file).is_err());
+        sync_settings_directory(directory.path()).unwrap();
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_save_replaces_leaf_symlink_with_private_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        UserSettings::default().save_to(&path).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn test_visual_state_creation() {

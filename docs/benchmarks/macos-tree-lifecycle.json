@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-09-21T12:03:50.168172+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "binary": "/Users/nickpaterno/work/gravityfile/target/release/deps/gravityfile_core-d4acb3173beb5fcd",
+  "binary_sha256": "2cdb497ed4c0bd2cc204c2020a3c1a11344a833c4024bb75c96c4a23c1a65762",
+  "fixture": "1000 files per directory, flat root, 256-byte logical file sizes, inline short names, fixed timestamps; no filesystem access",
+  "runs": [
+    {
+      "process_usage": {
+        "seconds": 1.4916051250183955,
+        "peak_rss_bytes": 4613013504,
+        "user_seconds": 1.152998,
+        "system_seconds": 0.321966
+      },
+      "measurements": [
+        {
+          "files": 100000,
+          "construction_ns": 6966334,
+          "clone_ns": 2368792,
+          "finalize_ns": 1381625,
+          "clone_drop_ns": 546042,
+          "source_drop_ns": 520958
+        },
+        {
+          "files": 1000000,
+          "construction_ns": 64859084,
+          "clone_ns": 29163500,
+          "finalize_ns": 23856833,
+          "clone_drop_ns": 6161417,
+          "source_drop_ns": 5908167
+        },
+        {
+          "files": 10000000,
+          "construction_ns": 631374667,
+          "clone_ns": 275922041,
+          "finalize_ns": 229604375,
+          "clone_drop_ns": 53319000,
+          "source_drop_ns": 94740750
+        }
+      ]
+    },
+    {
+      "process_usage": {
+        "seconds": 1.482227792032063,
+        "peak_rss_bytes": 4614848512,
+        "user_seconds": 1.145684,
+        "system_seconds": 0.316861
+      },
+      "measurements": [
+        {
+          "files": 100000,
+          "construction_ns": 6760375,
+          "clone_ns": 2507166,
+          "finalize_ns": 1633083,
+          "clone_drop_ns": 520958,
+          "source_drop_ns": 509250
+        },
+        {
+          "files": 1000000,
+          "construction_ns": 62079292,
+          "clone_ns": 26811167,
+          "finalize_ns": 23605375,
+          "clone_drop_ns": 5226041,
+          "source_drop_ns": 5198875
+        },
+        {
+          "files": 10000000,
+          "construction_ns": 624040875,
+          "clone_ns": 280594084,
+          "finalize_ns": 228393209,
+          "clone_drop_ns": 54931875,
+          "source_drop_ns": 95492417
+        }
+      ]
+    },
+    {
+      "process_usage": {
+        "seconds": 1.4688449579989538,
+        "peak_rss_bytes": 4668243968,
+        "user_seconds": 1.139768,
+        "system_seconds": 0.31631699999999996
+      },
+      "measurements": [
+        {
+          "files": 100000,
+          "construction_ns": 6300167,
+          "clone_ns": 2342709,
+          "finalize_ns": 1267584,
+          "clone_drop_ns": 529042,
+          "source_drop_ns": 520750
+        },
+        {
+          "files": 1000000,
+          "construction_ns": 61254458,
+          "clone_ns": 27456875,
+          "finalize_ns": 25202375,
+          "clone_drop_ns": 5676833,
+          "source_drop_ns": 5364584
+        },
+        {
+          "files": 10000000,
+          "construction_ns": 618569625,
+          "clone_ns": 270659917,
+          "finalize_ns": 235703625,
+          "clone_drop_ns": 53575541,
+          "source_drop_ns": 89911375
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "Peak RSS covers the complete process across all three sizes, not individual phases.",
+    "Each run holds source and cloned trees simultaneously; short inline names and no native-name allocations.",
+    "Synthetic in-memory lifecycle only; no scan, serialization, terminal or ten-million-file filesystem qualification."
+  ]
+}

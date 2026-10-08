@@ -6,6 +6,193 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 #[test]
+fn filtered_scans_do_not_certify_stale_directories() {
+    use gravityfile_analyze::StaleDirectoryStatus;
+    let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for hidden in [true, false] {
+        let root = test_dir(
+            0,
+            "data",
+            vec![test_file(1, "old", 100, SystemTime::UNIX_EPOCH)],
+        );
+        let mut tree = test_tree(std::path::Path::new("data"), root);
+        if hidden {
+            tree.config.include_hidden = false;
+        } else {
+            tree.config.ignore_patterns = vec!["recent/**".into()];
+        }
+        let analyzer = AgeAnalyzer::with_config(AgeConfig {
+            reference_time: reference,
+            min_stale_size: 0,
+            stale_threshold: Duration::from_secs(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let report = analyzer.analyze(&tree, CancellationToken::new());
+        assert!(report.status.is_complete()); // Complete for the requested filtered scope.
+        assert_eq!(report.total_files, 1);
+        assert_eq!(
+            report.stale_directory_status,
+            StaleDirectoryStatus::SuppressedFilteredScan
+        );
+        assert!(report.stale_directories.is_empty());
+        tree.config.include_hidden = true;
+        tree.config.ignore_patterns.clear();
+        let report = analyzer.analyze(&tree, CancellationToken::new());
+        assert_eq!(
+            report.stale_directory_status,
+            StaleDirectoryStatus::Evaluated
+        );
+        assert!(!report.stale_directories.is_empty());
+    }
+}
+
+#[test]
+fn average_age_preserves_subsecond_observations() {
+    let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    let root = test_dir(
+        0,
+        "data",
+        vec![
+            test_file(1, "a", 1, reference - Duration::from_millis(1900)),
+            test_file(2, "b", 1, reference - Duration::from_millis(2900)),
+        ],
+    );
+    let tree = test_tree(std::path::Path::new("data"), root);
+    let report = AgeAnalyzer::with_config(AgeConfig {
+        reference_time: reference,
+        ..Default::default()
+    })
+    .unwrap()
+    .analyze(&tree, CancellationToken::new());
+    assert_eq!(report.average_age, Duration::from_millis(2400));
+}
+
+#[test]
+fn age_configuration_rejects_ambiguous_or_incomplete_buckets() {
+    let invalid = [
+        vec![],
+        vec![AgeBucket::new("Recent", Duration::from_secs(60))],
+        vec![AgeBucket::new(" ", Duration::MAX)],
+        vec![
+            AgeBucket::new("Same", Duration::ZERO),
+            AgeBucket::new("Same", Duration::MAX),
+        ],
+        vec![
+            AgeBucket::new("One", Duration::MAX),
+            AgeBucket::new("Two", Duration::MAX),
+        ],
+    ];
+    for buckets in invalid {
+        assert!(
+            AgeConfig::builder()
+                .buckets(buckets.clone())
+                .build()
+                .is_err()
+        );
+        let config = AgeConfig {
+            buckets,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(AgeAnalyzer::with_config(config).is_err());
+    }
+}
+
+#[test]
+fn valid_age_buckets_partition_every_file_including_boundary_ages() {
+    let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let root = test_dir(
+        0,
+        "data",
+        vec![
+            test_file(1, "new", 1, reference),
+            test_file(2, "boundary", 2, reference - Duration::from_secs(60)),
+            test_file(3, "older", 3, reference - Duration::from_secs(61)),
+        ],
+    );
+    let tree = test_tree(std::path::Path::new("data"), root);
+    let config = AgeConfig::builder()
+        .reference_time(reference)
+        .buckets(vec![
+            AgeBucket::new("Older", Duration::MAX),
+            AgeBucket::new("Recent", Duration::from_secs(60)),
+        ])
+        .build()
+        .unwrap();
+    let report = AgeAnalyzer::with_config(config)
+        .unwrap()
+        .analyze(&tree, CancellationToken::new());
+    assert_eq!(report.total_files, 3);
+    assert_eq!(report.buckets[0].file_count, 2);
+    assert_eq!(report.buckets[1].file_count, 1);
+    assert_eq!(
+        report
+            .buckets
+            .iter()
+            .map(|bucket| bucket.total_size)
+            .sum::<u64>(),
+        report.total_size
+    );
+    assert_eq!(report.median_age_bucket.as_deref(), Some("Recent"));
+}
+
+#[test]
+fn shallow_scans_cannot_certify_stale_directories() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("old"), b"old").unwrap();
+    fs::create_dir(root.path().join("unvisited")).unwrap();
+    fs::write(root.path().join("unvisited/recent"), b"recent").unwrap();
+    let tree = gravityfile_scan::quick_list(root.path(), None).unwrap();
+    let analyzer = AgeAnalyzer::with_config(AgeConfig {
+        min_stale_size: 0,
+        stale_threshold: Duration::ZERO,
+        ..Default::default()
+    })
+    .unwrap();
+    let report = analyzer.analyze(&tree, CancellationToken::new());
+    assert!(report.status.is_complete()); // Complete within its explicitly shallow scope.
+    assert!(!report.has_stale_directories());
+}
+
+#[test]
+fn scan_warnings_suppress_stale_directory_recommendations() {
+    let directory = TempDir::new().unwrap();
+    fs::write(directory.path().join("data"), b"data").unwrap();
+    let mut tree = gravityfile_scan::JwalkScanner::new()
+        .scan(&ScanConfig::new(directory.path()), CancellationToken::new())
+        .unwrap();
+    let analyzer = AgeAnalyzer::with_config(AgeConfig {
+        stale_threshold: Duration::ZERO,
+        min_stale_size: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        analyzer
+            .analyze(&tree, CancellationToken::new())
+            .has_stale_directories()
+    );
+    tree.warnings
+        .push(gravityfile_core::ScanWarning::permission_denied(
+            directory.path().join("unreadable"),
+        ));
+    let report = analyzer.analyze(&tree, CancellationToken::new());
+    assert_eq!(
+        report.status.state,
+        gravityfile_analyze::AnalysisState::Partial
+    );
+    assert!(!report.has_stale_directories());
+    assert_eq!(report.total_files, 1);
+    let token = CancellationToken::new();
+    token.cancel();
+    assert_eq!(
+        analyzer.analyze(&tree, token).status.state,
+        gravityfile_analyze::AnalysisState::Cancelled
+    );
+}
+
+#[test]
 fn test_duplicate_config_builder() {
     let config = DuplicateConfig::builder()
         .min_size(2048u64)
@@ -64,6 +251,7 @@ fn test_duplicate_report_properties() {
     use std::path::PathBuf;
 
     let mut report = gravityfile_analyze::DuplicateReport {
+        status: Default::default(),
         groups: Vec::new(),
         total_duplicate_size: 0,
         total_wasted_space: 0,
@@ -127,7 +315,7 @@ fn test_find_duplicates_with_no_actual_duplicates() {
     fs::write(root.join("file3.txt"), "content three").unwrap();
 
     let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(
         root,
         &[
@@ -155,7 +343,7 @@ fn test_find_duplicates_with_exact_duplicates() {
     fs::write(root.join("file3.txt"), content).unwrap();
 
     let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(
         root,
         &[
@@ -175,6 +363,32 @@ fn test_find_duplicates_with_exact_duplicates() {
 }
 
 #[test]
+fn test_find_duplicates_uses_logical_length_not_scanned_allocation_size() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let content = b"identical logical content";
+    let first = root.join("first.bin");
+    let second = root.join("second.bin");
+    fs::write(&first, content).unwrap();
+    fs::write(&second, content).unwrap();
+
+    let mut tree = create_test_tree_with_files(root, &[first, second]);
+    // Simulate a physical-size scan where equal logical files happened to
+    // report different allocation sizes (sparse/compressed files can do this).
+    tree.root.children[0].size = 0;
+    tree.root.children[1].size = 4096;
+
+    let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
+    let report = DuplicateFinder::with_config(config)
+        .unwrap()
+        .find_duplicates(&tree, CancellationToken::new());
+
+    assert_eq!(report.group_count, 1);
+    assert_eq!(report.groups[0].size, content.len() as u64);
+    assert_eq!(report.groups[0].paths.len(), 2);
+}
+
+#[test]
 fn test_find_duplicates_with_mixed_content() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
@@ -186,7 +400,7 @@ fn test_find_duplicates_with_mixed_content() {
     fs::write(root.join("file4.txt"), "unique two").unwrap();
 
     let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(
         root,
         &[
@@ -221,7 +435,7 @@ fn test_find_duplicates_with_exclusion_patterns() {
         .build()
         .unwrap();
 
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(
         root,
         &[
@@ -253,7 +467,7 @@ fn test_find_duplicates_with_size_filtering() {
         .build()
         .unwrap();
 
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(
         root,
         &[
@@ -289,7 +503,7 @@ fn test_find_duplicates_with_max_groups_limit() {
         .build()
         .unwrap();
 
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(
         root,
         &[
@@ -324,7 +538,7 @@ fn test_find_duplicates_in_nested_structure() {
     fs::write(root.join("dir2/file.txt"), "duplicate").unwrap();
 
     let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_nested_files(
         root,
         &[
@@ -342,6 +556,52 @@ fn test_find_duplicates_in_nested_structure() {
 
 #[cfg(unix)]
 #[test]
+fn duplicate_hardlink_representative_is_independent_of_traversal_order() {
+    let temporary = TempDir::new().unwrap();
+    let first = temporary.path().join("a.bin");
+    let alias = temporary.path().join("z.bin");
+    let independent = temporary.path().join("copy.bin");
+    fs::write(&first, b"duplicate content").unwrap();
+    fs::hard_link(&first, &alias).unwrap();
+    fs::write(&independent, b"duplicate content").unwrap();
+    let finder =
+        DuplicateFinder::with_config(DuplicateConfig::builder().min_size(1u64).build().unwrap())
+            .unwrap();
+    for paths in [
+        vec![first.clone(), alias.clone(), independent.clone()],
+        vec![independent.clone(), alias.clone(), first.clone()],
+        vec![alias.clone(), first.clone(), independent.clone()],
+    ] {
+        let tree = create_test_tree_with_files(temporary.path(), &paths);
+        let report = finder.find_duplicates(&tree, CancellationToken::new());
+        assert_eq!(report.files_analyzed, 2);
+        assert_eq!(report.group_count, 1);
+        assert_eq!(report.files_with_duplicates, 2);
+        assert_eq!(
+            report.groups[0].paths,
+            vec![first.clone(), independent.clone()]
+        );
+        assert_eq!(report.total_wasted_space, b"duplicate content".len() as u64);
+    }
+    let filtered = DuplicateFinder::with_config(
+        DuplicateConfig::builder()
+            .min_size(1u64)
+            .exclude_patterns(vec!["a.bin".to_string()])
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    let tree = create_test_tree_with_files(
+        temporary.path(),
+        &[first, alias.clone(), independent.clone()],
+    );
+    let report = filtered.find_duplicates(&tree, CancellationToken::new());
+    assert_eq!(report.groups[0].paths, vec![independent, alias]);
+    assert_eq!(report.files_analyzed, 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn test_find_duplicates_ignores_hardlinked_aliases() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
@@ -352,7 +612,7 @@ fn test_find_duplicates_ignores_hardlinked_aliases() {
     fs::hard_link(&original, &alias).unwrap();
 
     let config = DuplicateConfig::builder().min_size(1u64).build().unwrap();
-    let finder = DuplicateFinder::with_config(config);
+    let finder = DuplicateFinder::with_config(config).unwrap();
     let tree = create_test_tree_with_files(root, &[original, alias]);
 
     let report = finder.find_duplicates(&tree, CancellationToken::new());
@@ -395,7 +655,9 @@ fn test_age_analyzer_reports_buckets_average_median_and_top_files() {
         .top_files_per_bucket(1usize)
         .build()
         .unwrap();
-    let report = AgeAnalyzer::with_config(config).analyze(&tree, CancellationToken::new());
+    let report = AgeAnalyzer::with_config(config)
+        .unwrap()
+        .analyze(&tree, CancellationToken::new());
 
     assert_eq!(report.total_files, 3);
     assert_eq!(report.total_size, 1_600);
@@ -463,7 +725,9 @@ fn test_age_analyzer_reports_stale_directories_sorted_and_limited() {
         .buckets(vec![AgeBucket::new("Any", Duration::MAX)])
         .build()
         .unwrap();
-    let report = AgeAnalyzer::with_config(config).analyze(&tree, CancellationToken::new());
+    let report = AgeAnalyzer::with_config(config)
+        .unwrap()
+        .analyze(&tree, CancellationToken::new());
 
     assert!(report.has_stale_directories());
     assert_eq!(report.stale_directories.len(), 1);
@@ -493,7 +757,9 @@ fn test_age_analyzer_honors_pre_cancelled_token() {
         .buckets(vec![AgeBucket::new("Any", Duration::MAX)])
         .build()
         .unwrap();
-    let report = AgeAnalyzer::with_config(config).analyze(&tree, token);
+    let report = AgeAnalyzer::with_config(config)
+        .unwrap()
+        .analyze(&tree, token);
 
     assert_eq!(report.total_files, 0);
     assert_eq!(report.total_size, 0);
@@ -722,4 +988,197 @@ fn bucket<'a>(
         .iter()
         .find(|bucket| bucket.name == name)
         .unwrap_or_else(|| panic!("missing age bucket {name}"))
+}
+
+#[test]
+fn age_analysis_handles_deep_library_trees_without_recursive_traversal() {
+    let depth = 5000;
+    let mut node = test_file(depth + 1, "leaf", 10, SystemTime::UNIX_EPOCH);
+    for id in (0..depth).rev() {
+        let mut parent = FileNode::new_directory(
+            NodeId::new(id),
+            "d",
+            Timestamps::with_modified(SystemTime::UNIX_EPOCH),
+        );
+        parent.kind = gravityfile_core::NodeKind::Directory {
+            file_count: 1,
+            dir_count: depth - id - 1,
+        };
+        parent.size = 10;
+        parent.children.push(node);
+        node = parent;
+    }
+    let mut tree = FileTree::new(
+        node,
+        "root".into(),
+        ScanConfig::new("root"),
+        gravityfile_core::TreeStats::default(),
+        Duration::ZERO,
+        Vec::new(),
+    );
+    let report = AgeAnalyzer::with_config(AgeConfig {
+        reference_time: SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        stale_threshold: Duration::from_secs(1),
+        min_stale_size: 0,
+        max_stale_dirs: 1,
+        ..Default::default()
+    })
+    .unwrap()
+    .analyze(&tree, CancellationToken::new());
+    // FileNode destruction is independently recursive; dismantle this synthetic
+    // tree before assertions so the test isolates analyzer traversal behavior.
+    let mut pending = std::mem::take(&mut tree.root.children);
+    while let Some(mut node) = pending.pop() {
+        pending.append(&mut node.children);
+    }
+    assert!(report.status.is_complete());
+    assert_eq!(report.total_files, 1);
+    assert_eq!(report.total_size, 10);
+    assert_eq!(report.average_age, Duration::from_secs(100));
+    assert_eq!(report.stale_directories.len(), 1);
+    assert_eq!(
+        report.stale_directories[0].path,
+        std::path::Path::new("root")
+    );
+}
+
+#[test]
+fn equal_size_age_files_have_stable_report_order() {
+    let modified = SystemTime::UNIX_EPOCH;
+    let expected = ["root/a", "root/b", "root/c", "root/d"];
+    for names in [
+        ["d", "b", "a", "c"],
+        ["c", "a", "b", "d"],
+        ["a", "b", "c", "d"],
+    ] {
+        let children = names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| test_file(id as u64 + 1, name, 10, modified))
+            .collect();
+        let tree = test_tree(std::path::Path::new("root"), test_dir(0, "root", children));
+        let report = AgeAnalyzer::with_config(AgeConfig {
+            reference_time: modified + Duration::from_secs(1),
+            top_files_per_bucket: 4,
+            ..Default::default()
+        })
+        .unwrap()
+        .analyze(&tree, CancellationToken::new());
+        let actual: Vec<_> = report
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.largest_files.iter().map(|file| file.0.clone()))
+            .collect();
+        assert_eq!(actual, expected.map(std::path::PathBuf::from));
+    }
+}
+
+#[test]
+fn many_age_buckets_preserve_inclusive_boundaries_and_catch_all() {
+    let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let ages = [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(500),
+        Duration::from_secs(500) + Duration::from_nanos(1),
+        Duration::from_secs(999),
+        Duration::from_secs(1000),
+        Duration::from_secs(9000),
+    ];
+    let mut buckets: Vec<_> = (0..1000)
+        .rev()
+        .map(|i| AgeBucket::new(format!("b{i}"), Duration::from_secs(i)))
+        .collect();
+    buckets.push(AgeBucket::new("rest", Duration::MAX));
+    let children = ages
+        .iter()
+        .enumerate()
+        .map(|(i, age)| test_file(i as u64 + 1, &format!("f{i}"), 10, reference - *age))
+        .collect();
+    let tree = test_tree(std::path::Path::new("root"), test_dir(0, "root", children));
+    let report = AgeAnalyzer::with_config(AgeConfig {
+        reference_time: reference,
+        buckets,
+        ..Default::default()
+    })
+    .unwrap()
+    .analyze(&tree, CancellationToken::new());
+    assert!(report.status.is_complete());
+    assert_eq!(report.total_files, 7);
+    assert_eq!(report.total_size, 70);
+    for entry in &report.buckets {
+        let expected = match entry.name.as_str() {
+            "b0" | "b1" | "b500" | "b501" | "b999" => 1,
+            "rest" => 2,
+            _ => 0,
+        };
+        assert_eq!(entry.file_count, expected, "{}", entry.name);
+        assert_eq!(entry.total_size, expected * 10);
+    }
+}
+
+/// Manual optimized measurement; excludes fixture construction and filesystem I/O.
+#[test]
+#[ignore = "manual age-analysis scale benchmark"]
+fn age_analysis_scale_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    for files in [100_000usize, 1_000_000] {
+        let children = (0..files)
+            .map(|i| {
+                test_file(
+                    i as u64 + 1,
+                    &format!("f{i:09}"),
+                    256,
+                    reference - Duration::from_secs((i % 2000) as u64),
+                )
+            })
+            .collect();
+        let tree = test_tree(std::path::Path::new("root"), test_dir(0, "root", children));
+        for custom in [false, true] {
+            let mut config = AgeConfig {
+                reference_time: reference,
+                ..Default::default()
+            };
+            if custom {
+                config.buckets = (0..1000)
+                    .map(|i| AgeBucket::new(format!("b{i}"), Duration::from_secs(i)))
+                    .collect();
+                config.buckets.push(AgeBucket::new("rest", Duration::MAX));
+            }
+            let mut expected = vec![0u64; config.buckets.len()];
+            // Independent linear reference over the 2,000 distinct fixture ages.
+            for seconds in 0..2000usize {
+                let bucket = config
+                    .buckets
+                    .iter()
+                    .position(|b| Duration::from_secs(seconds as u64) <= b.max_age)
+                    .unwrap();
+                expected[bucket] += (files / 2000 + usize::from(seconds < files % 2000)) as u64;
+            }
+            let analyzer = AgeAnalyzer::with_config(config).unwrap();
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let started = Instant::now();
+                let report = analyzer.analyze(black_box(&tree), CancellationToken::new());
+                let elapsed = started.elapsed().as_nanos();
+                assert!(report.status.is_complete());
+                assert_eq!(report.total_files, files as u64);
+                assert_eq!(report.total_size, files as u64 * 256);
+                assert!(report.stale_directories.is_empty());
+                for (bucket, expected) in report.buckets.iter().zip(&expected) {
+                    assert_eq!(bucket.file_count, *expected);
+                    assert_eq!(bucket.total_size, expected * 256);
+                    assert_eq!(bucket.largest_files.len(), (*expected).min(10) as usize);
+                }
+                black_box(&report);
+                samples.push(elapsed);
+            }
+            println!(
+                "AGE_BENCH {{\"files\":{files},\"buckets\":{},\"samples_ns\":{samples:?}}}",
+                expected.len()
+            );
+        }
+    }
 }

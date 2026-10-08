@@ -4,6 +4,31 @@ Interactive terminal user interface for gravityfile, built with ratatui.
 
 This crate provides a feature-rich TUI for exploring disk usage, finding duplicates, and analyzing file ages.
 
+## Scan entry budget
+
+Set a top-level value in `gravityfile/settings.toml` under the platform config
+directory, then restart the TUI:
+
+```toml
+max_scan_entries = 100000
+```
+
+On macOS this file is normally `~/Library/Application Support/gravityfile/settings.toml`;
+on Linux it is `${XDG_CONFIG_HOME:-~/.config}/gravityfile/settings.toml`.
+The limit applies to startup listings, navigation listings, and recursive rescans.
+It counts descendants, excluding the root. Zero permits an empty scope; removing
+the value restores unlimited traversal. An exceeded limit displays an error;
+a failed rescan preserves the prior listing and does not launch analysis.
+
+This setting is edited in the file; the settings dialog does not yet provide a
+numeric editor. CLI report commands use their own `--max-entries` option.
+Entry counts do not bound walker prefetch, Git enrichment, total RAM, or elapsed
+time. Invalid/unreadable settings currently trigger the existing visible warning
+and a fallback with automatic scanning disabled. An explicit startup scan
+request still takes precedence. Quick listings and manually requested scans
+remain available without an entry limit; this is not a mandatory administrative
+resource policy. Missing settings files retain normal first-run defaults.
+
 ## Features
 
 - **Interactive Explorer** - Navigate directory trees with vim-style keybindings

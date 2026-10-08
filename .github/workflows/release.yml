@@ -6,9 +6,73 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Verify tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Test release artifact validation
+        run: python3 -m unittest discover -s scripts -p "test_*.py"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Lint optional-feature boundaries
+        run: cargo clippy -p gravityfile-scan --all-targets --no-default-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: Verify packaged sources
+        timeout-minutes: 30
+        run: |
+          cargo fetch --locked
+          cargo package --workspace --allow-dirty --no-verify --locked --offline
+          python3 scripts/verify-packaged-workspace.py
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny,cargo-machete
+
+      - name: Advisories, licenses, sources and bans
+        run: cargo deny check
+
+      - name: Unused dependencies
+        run: cargo machete
+
   build:
     name: Build for ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -36,16 +100,26 @@ jobs:
             use_cross: false
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           shared-key: ${{ matrix.target }}
+
+      - name: Install notice generator
+        run: cargo install cargo-about --version 0.9.2 --locked --features cli
+
+      - name: Generate dependency notices
+        run: python3 scripts/generate-notices.py --target ${{ matrix.target }} --output THIRD_PARTY_NOTICES.html
 
       # Install cross for Linux ARM builds
       # Using cargo install from git since there are no recent releases
@@ -69,40 +143,67 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --locked --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }}
           fi
         shell: bash
 
-      # macOS Code Signing (optional - requires secrets to be configured)
-      - name: Import Apple Code Signing Certificate
+      - name: Smoke-test built CLI binaries
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: python3 scripts/smoke-release.py --binary-dir "target/${{ matrix.target }}/release"
+
+      - name: Smoke-test native Unix terminal behavior
+        if: ${{ !matrix.use_cross && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          python3 scripts/qualification/terminal-smoke.py "target/${{ matrix.target }}/release/grav"
+          python3 scripts/qualification/terminal-smoke.py "target/${{ matrix.target }}/release/gravityfile"
+
+      - name: Validate macOS signing configuration
         if: runner.os == 'macOS'
-        continue-on-error: true
-        uses: Apple-Actions/import-codesign-certs@v3
+        id: signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          mode="$(python3 scripts/check-signing-config.py)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Import Apple Code Signing Certificate
+        if: runner.os == 'macOS' && steps.signing.outputs.mode == 'developer-id'
+        uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
       - name: Code sign and notarize macOS binaries
         if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          CERT_IMPORTED=false
-
-          # Check if certificate was imported (if secrets exist, cert should be imported)
-          if security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
-            CERT_IMPORTED=true
-          fi
+          test "$SIGNING_MODE" = developer-id || test "$SIGNING_MODE" = adhoc
 
           # Sign both binaries
           for BINARY in gravityfile grav; do
             BINARY_PATH="target/${{ matrix.target }}/release/$BINARY"
 
-            if [ "$CERT_IMPORTED" = "true" ]; then
+            if [ "$SIGNING_MODE" = "developer-id" ]; then
               echo "Signing $BINARY with Developer ID..."
               codesign --deep --force --verify --verbose \
                 --timestamp --options runtime \
-                --sign "${{ secrets.APPLE_DEVELOPER_ID }}" \
+                --sign "$APPLE_DEVELOPER_ID" \
                 "$BINARY_PATH"
               codesign -v "$BINARY_PATH"
 
@@ -110,16 +211,16 @@ jobs:
               ditto -c -k --sequesterRsrc "$BINARY_PATH" "${BINARY}-notarize.zip"
 
               xcrun notarytool submit "${BINARY}-notarize.zip" \
-                --apple-id "${{ secrets.APPLE_ID }}" \
-                --password "${{ secrets.APPLE_ID_PASSWORD }}" \
-                --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_ID_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
                 --wait \
-                --timeout 30m
+                --timeout 30m \
+                --output-format json > "${BINARY}-notarization.json"
+              python3 scripts/verify-notarization.py "${BINARY}-notarization.json"
 
               echo "Note: Stapling is not applicable to bare CLI binaries"
-              echo "Binary is notarized server-side - users will be verified online"
-
-              echo "Verifying notarization status..."
+              echo "Gatekeeper diagnostic (not a release acceptance check)..."
               spctl -a -v "$BINARY_PATH" || true
               echo "✓ $BINARY signed and notarized"
             else
@@ -146,6 +247,7 @@ jobs:
           # Copy both binaries
           Copy-Item "target/${{ matrix.target }}/release/gravityfile.exe" "$archiveName/"
           Copy-Item "target/${{ matrix.target }}/release/grav.exe" "$archiveName/"
+          Copy-Item "LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.html" "$archiveName/"
 
           # Create zip for Windows (tar.gz not common on Windows)
           Compress-Archive -Path $archiveName -DestinationPath "artifacts/$archiveName.zip"
@@ -172,14 +274,19 @@ jobs:
           # Copy both binaries
           cp "target/${{ matrix.target }}/release/gravityfile" "$ARCHIVE_NAME/"
           cp "target/${{ matrix.target }}/release/grav" "$ARCHIVE_NAME/"
+          cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.html "$ARCHIVE_NAME/"
           chmod +x "$ARCHIVE_NAME/gravityfile" "$ARCHIVE_NAME/grav"
 
-          # Create tar to preserve permissions
-          tar -czf "artifacts/$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
+          # Preserve executable permissions without macOS AppleDouble sidecars.
+          COPYFILE_DISABLE=1 tar -czf "artifacts/$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
 
           # Generate SHA256 for the archive
           cd artifacts
-          sha256sum "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256"
+          else
+            shasum -a 256 "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256"
+          fi
 
           echo "Archive contents:"
           tar -tzf "$ARCHIVE_NAME.tar.gz"
@@ -188,7 +295,7 @@ jobs:
         shell: bash
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
           path: artifacts/*
@@ -204,51 +311,22 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release-artifacts
 
-      - name: Prepare release assets
-        run: |
-          mkdir -p final-release
-
-          # Copy archives directly (tar.gz and zip preserve permissions internally)
-          find release-artifacts -name "*.tar.gz" -type f -exec cp {} final-release/ \;
-          find release-artifacts -name "*.zip" -type f -exec cp {} final-release/ \;
-
-          # Copy individual SHA256 files
-          find release-artifacts -name "*.sha256" -type f -exec cp {} final-release/ \;
-
-          echo "Final release contents:"
-          ls -lah final-release/
-
-          echo "Verifying archive integrity:"
-          cd final-release
-          for archive in *.tar.gz; do
-            [ -f "$archive" ] || continue
-            echo "Testing $archive:"
-            tar -tzf "$archive" | head -10
-          done
-          for archive in *.zip; do
-            [ -f "$archive" ] || continue
-            echo "Testing $archive:"
-            unzip -l "$archive"
-          done
-        shell: bash
-
-      - name: Generate combined checksums
-        run: |
-          cd final-release
-          # Generate SHA256SUMS for archives (not individual binaries)
-          sha256sum *.tar.gz *.zip 2>/dev/null | grep -v "No such file" > SHA256SUMS || true
-          cat SHA256SUMS
-        shell: bash
+      - name: Verify and prepare release assets
+        run: python3 scripts/verify-release.py release-artifacts final-release
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             final-release/*.tar.gz

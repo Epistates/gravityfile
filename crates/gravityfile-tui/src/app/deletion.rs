@@ -15,7 +15,10 @@ pub enum DeletionMode {
     #[default]
     Trash,
     /// Permanently delete files (not recoverable).
-    /// Reserved for future implementation of permanent deletion option.
+    ///
+    /// Supported by [`delete_path`] but deliberately not reachable from the
+    /// UI: every user-facing delete goes through the trash. Kept so the
+    /// unlink semantics stay covered by tests.
     #[allow(dead_code)]
     Permanent,
 }
@@ -23,7 +26,9 @@ pub enum DeletionMode {
 /// Start background deletion of files/directories.
 ///
 /// Takes a list of (path, size) tuples and returns a receiver for progress updates.
-/// By default uses trash for safe, recoverable deletion.
+/// Uses system trash. Progress is best-effort; completion is reliable, including
+/// for empty batches. Dropping the receiver stops subsequent items; an active
+/// filesystem/trash call is awaited and cannot be interrupted.
 pub fn start_deletion(items: Vec<(PathBuf, u64)>) -> mpsc::Receiver<ScanResult> {
     start_deletion_with_mode(items, DeletionMode::Trash)
 }
@@ -34,73 +39,71 @@ pub fn start_deletion_with_mode(
     mode: DeletionMode,
 ) -> mpsc::Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel(SCAN_CHANNEL_SIZE);
+    tokio::spawn(delete_items(items, mode, tx));
+    rx
+}
+
+async fn delete_items(
+    items: Vec<(PathBuf, u64)>,
+    mode: DeletionMode,
+    tx: mpsc::Sender<ScanResult>,
+) {
     let total = items.len();
-
-    if total == 0 {
-        return rx;
-    }
-
-    tokio::spawn(async move {
-        let mut deleted = 0;
-        let mut failed = 0;
-        let mut bytes_freed: u64 = 0;
-
-        for (i, (path, size)) in items.iter().enumerate() {
-            // Send progress update
-            let _ = tx
-                .send(ScanResult::DeletionProgress(DeletionProgress {
-                    total,
-                    deleted,
-                    failed,
-                    bytes_freed,
-                    current: Some(path.clone()),
-                }))
-                .await;
-
-            // Perform deletion in blocking task to not block the async runtime
-            let path_clone = path.clone();
-            let result = tokio::task::spawn_blocking(move || delete_path(&path_clone, mode)).await;
-
-            match result {
-                Ok(Ok(())) => {
-                    deleted += 1;
-                    bytes_freed += size;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to delete {:?}: {}", path, e);
-                    failed += 1;
-                }
-                Err(e) => {
-                    tracing::warn!("Deletion task panicked for {:?}: {}", path, e);
-                    failed += 1;
-                }
-            }
-
-            // Send updated progress after each deletion
-            if i < total - 1 {
-                let _ = tx
-                    .send(ScanResult::DeletionProgress(DeletionProgress {
-                        total,
-                        deleted,
-                        failed,
-                        bytes_freed,
-                        current: items.get(i + 1).map(|(p, _)| p.clone()),
-                    }))
-                    .await;
-            }
-        }
-
-        // Send completion
-        let _ = tx
-            .send(ScanResult::DeletionComplete {
+    let mut deleted = 0;
+    let mut failed = 0;
+    let mut bytes_freed = 0u64;
+    let mut errors = Vec::new();
+    for (path, size) in items {
+        match tx.try_reserve() {
+            Ok(permit) => permit.send(ScanResult::DeletionProgress(DeletionProgress {
+                total,
                 deleted,
                 failed,
                 bytes_freed,
-            })
-            .await;
-    });
-
-    rx
+                current: Some(path.clone()),
+            })),
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+        }
+        let error_path = path.clone();
+        let receiver = tx.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if receiver.is_closed() {
+                return None;
+            }
+            Some(delete_path(&path, mode))
+        })
+        .await;
+        match result {
+            Ok(Some(Ok(()))) => {
+                deleted += 1;
+                bytes_freed = bytes_freed.saturating_add(size);
+            }
+            Ok(Some(Err(error))) => {
+                tracing::warn!(path = ?error_path, "Deletion failed: {error}");
+                errors.push(gravityfile_ops::OperationError::new(error_path, error));
+                failed += 1;
+            }
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(path = ?error_path, "Deletion task failed: {error}");
+                errors.push(gravityfile_ops::OperationError::new(
+                    error_path,
+                    error.to_string(),
+                ));
+                failed += 1;
+            }
+        }
+    }
+    let _ = tx
+        .send(ScanResult::DeletionComplete {
+            mode,
+            deleted,
+            failed,
+            bytes_freed,
+            errors,
+        })
+        .await;
 }
 
 /// Delete a single path with proper symlink handling.
@@ -142,19 +145,31 @@ fn delete_path(path: &PathBuf, mode: DeletionMode) -> Result<(), String> {
 }
 
 /// Format deletion result as a user-friendly message.
-pub fn format_deletion_result(deleted: usize, failed: usize, bytes_freed: u64) -> (bool, String) {
+pub fn format_deletion_result(
+    mode: DeletionMode,
+    deleted: usize,
+    failed: usize,
+    bytes_freed: u64,
+) -> (bool, String) {
     use crate::ui::format_size;
 
     let success = failed == 0;
-    let msg = if success {
+    let msg = if mode == DeletionMode::Permanent {
         format!(
-            "Moved {} items to trash, freed {}",
+            "Permanently deleted {} items ({}), {} failed",
+            deleted,
+            format_size(bytes_freed),
+            failed
+        )
+    } else if success {
+        format!(
+            "Moved {} items ({}) to trash",
             deleted,
             format_size(bytes_freed)
         )
     } else if deleted > 0 {
         format!(
-            "Moved {} to trash, {} failed (freed {})",
+            "Moved {} to trash, {} failed ({} moved)",
             deleted,
             failed,
             format_size(bytes_freed)
@@ -172,6 +187,65 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn deletion_stops_before_mutation_when_receiver_is_closed() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("keep");
+        fs::write(&path, b"keep").unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        delete_items(vec![(path.clone(), 4)], DeletionMode::Permanent, tx).await;
+        assert_eq!(fs::read(path).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn deletion_progress_backpressure_does_not_stall_and_empty_batches_complete() {
+        let temp = TempDir::new().unwrap();
+        let paths: Vec<_> = (0..4).map(|i| temp.path().join(i.to_string())).collect();
+        for path in &paths {
+            fs::write(path, []).unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        let work = tokio::spawn(delete_items(
+            paths.iter().cloned().map(|p| (p, u64::MAX)).collect(),
+            DeletionMode::Permanent,
+            tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while paths.last().unwrap().exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut completed = false;
+        while let Some(result) = rx.recv().await {
+            if let ScanResult::DeletionComplete {
+                deleted,
+                failed,
+                bytes_freed,
+                errors,
+                ..
+            } = result
+            {
+                assert_eq!((deleted, failed, bytes_freed), (4, 0, u64::MAX));
+                assert!(errors.is_empty());
+                completed = true;
+            }
+        }
+        work.await.unwrap();
+        assert!(completed);
+        let mut rx = start_deletion_with_mode(Vec::new(), DeletionMode::Permanent);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ScanResult::DeletionComplete {
+                deleted: 0,
+                failed: 0,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn test_delete_regular_file() {
@@ -379,15 +453,16 @@ mod tests {
 
     #[test]
     fn test_format_deletion_result_success() {
-        let (success, msg) = format_deletion_result(5, 0, 1024 * 1024);
+        let (success, msg) = format_deletion_result(DeletionMode::Trash, 5, 0, 1024 * 1024);
         assert!(success);
         assert!(msg.contains("5 items"));
         assert!(msg.contains("trash"));
+        assert!(!msg.contains("freed"));
     }
 
     #[test]
     fn test_format_deletion_result_partial_failure() {
-        let (success, msg) = format_deletion_result(3, 2, 512 * 1024);
+        let (success, msg) = format_deletion_result(DeletionMode::Trash, 3, 2, 512 * 1024);
         assert!(!success);
         assert!(msg.contains("3"));
         assert!(msg.contains("2 failed"));
@@ -395,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_format_deletion_result_total_failure() {
-        let (success, msg) = format_deletion_result(0, 5, 0);
+        let (success, msg) = format_deletion_result(DeletionMode::Trash, 0, 5, 0);
         assert!(!success);
         assert!(msg.contains("Failed"));
         assert!(msg.contains("5"));

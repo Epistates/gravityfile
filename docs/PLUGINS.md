@@ -2,12 +2,16 @@
 
 gravityfile features a language-agnostic plugin architecture. You can extend the explorer's functionality using **Lua** or **Rhai**.
 
+The standard CLI/TUI runs each plugin in a supervised child process. See
+[process execution and limits](PLUGIN_PROCESSES.md) for deadlines, recovery,
+embedding requirements, and the remaining security boundary.
+
 ## Architecture
 
-The plugin system is built on three core pillars:
+The plugin system is built on three core pieces:
 1. **Event Hooks**: React to file system events (scans, navigation, deletions).
-2. **Custom Actions**: Implement new file operations with progress reporting.
-3. **Isolated Runtimes**: Background tasks (like previews or heavy analysis) run in restricted sandboxes.
+2. **Action Hooks**: Observe or veto supported host actions.
+3. **Isolated Contexts**: Run standalone Lua/Rhai snippets with a separate restricted runtime.
 
 ## Supported Runtimes
 
@@ -57,11 +61,13 @@ return {
 
 ## Security & Sandboxing
 
-gravityfile employs a "Security First" approach. Plugins can be restricted using a `SandboxConfig`:
+Plugins execute in-process and can be restricted using a `SandboxConfig`:
 
 - **Read/Write Caps**: Restrict plugins to specific directory subtrees.
 - **Resource Limits**: Enforce memory (e.g., 64MB) and execution time (e.g., 5s) limits.
-- **API Permissions**: Opt-in to dangerous APIs like `Execute` or `Network`.
+- **Deny by Default**: Filesystem access must be declared and is scoped to configured roots.
+
+These runtime controls are defense in depth, not an OS-level sandbox. Only install plugins you trust.
 
 ### The `fs` API
 
@@ -71,7 +77,7 @@ The `fs` namespace provides safe, sandboxed access to the filesystem:
 - `fs.exists(path)`: Check existence.
 - `fs.metadata(path)`: Get size, timestamps, and permissions.
 
-*Note: In isolated contexts, all `fs` calls are validated against the plugin's `allowed_read_paths`.*
+All exposed `fs` reads are validated against the plugin's allowed roots and maximum read size.
 
 ---
 
@@ -92,4 +98,4 @@ The `fs` namespace provides safe, sandboxed access to the filesystem:
 
 ## Advanced: Performance Profiling
 
-Plugins are executed asynchronously where possible. For high-latency operations (like network calls or heavy computation), always use the **Isolated Context** to prevent UI hangs.
+Main hook execution is serialized because it shares runtime state. Keep hooks short; use an isolated context for standalone CPU-heavy work.

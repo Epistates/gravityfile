@@ -9,22 +9,24 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use blake3::Hasher;
 use derive_builder::Builder;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::GlobSet;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use gravityfile_core::{ContentHash, FileNode, FileTree, NodeKind};
+use crate::status::{AnalysisStatus, IssueCollector};
+use gravityfile_core::{ContentHash, FileTree};
 
 /// Configuration for duplicate detection.
-#[derive(Debug, Clone, Builder)]
-#[builder(setter(into))]
+#[derive(Debug, Clone, Builder, Serialize)]
+#[builder(setter(into), build_fn(validate = "Self::validate"))]
 pub struct DuplicateConfig {
     /// Minimum file size to consider (skip tiny files).
     #[builder(default = "1024")]
@@ -69,6 +71,18 @@ impl Default for DuplicateConfig {
     }
 }
 
+impl DuplicateConfigBuilder {
+    fn validate(&self) -> Result<(), String> {
+        if self.min_size.unwrap_or(1024) > self.max_size.unwrap_or(u64::MAX) {
+            return Err("minimum duplicate size exceeds maximum size".into());
+        }
+        gravityfile_core::ScanConfig::build_ignore_globset(
+            self.exclude_patterns.as_deref().unwrap_or_default(),
+        )?;
+        Ok(())
+    }
+}
+
 impl DuplicateConfig {
     /// Create a new config builder.
     pub fn builder() -> DuplicateConfigBuilder {
@@ -86,6 +100,7 @@ pub struct DuplicateGroup {
     pub size: u64,
 
     /// Paths to all duplicate files.
+    #[serde(with = "gravityfile_core::path_serde::list")]
     pub paths: Vec<PathBuf>,
 
     /// Wasted space: size * (count - 1).
@@ -107,6 +122,9 @@ impl DuplicateGroup {
 /// Results from duplicate analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateReport {
+    /// Completeness and bounded diagnostics. Missing legacy data is unknown.
+    #[serde(default)]
+    pub status: AnalysisStatus,
     /// Groups of duplicate files, sorted by wasted space descending.
     pub groups: Vec<DuplicateGroup>,
 
@@ -156,6 +174,21 @@ pub struct HashProgress {
     pub duplicates_found: u64,
 }
 
+/// Wall-clock phases of one duplicate analysis, excluding the preceding scan
+/// and report serialization. Parallel hashing time is elapsed wall time, not
+/// summed CPU time. Timings are diagnostic and do not describe completeness.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DuplicateTimings {
+    /// Fresh metadata collection, exclusions and hard-link representative selection.
+    pub collection: Duration,
+    /// Size filtering and grouping.
+    pub grouping: Duration,
+    /// Partial/full hashing, including identity validation and issue collection.
+    pub hashing: Duration,
+    /// Deterministic ordering, summary accounting, truncation and status assembly.
+    pub finalization: Duration,
+}
+
 /// Duplicate file finder.
 pub struct DuplicateFinder {
     config: DuplicateConfig,
@@ -173,53 +206,34 @@ impl DuplicateFinder {
     }
 
     /// Create a new duplicate finder with custom config.
-    pub fn with_config(config: DuplicateConfig) -> Self {
-        let exclude_globset = build_globset(&config.exclude_patterns);
-        Self {
+    pub fn with_config(config: DuplicateConfig) -> Result<Self, String> {
+        if config.min_size > config.max_size {
+            return Err("minimum duplicate size exceeds maximum size".into());
+        }
+        let exclude_globset =
+            gravityfile_core::ScanConfig::build_ignore_globset(&config.exclude_patterns)?;
+        Ok(Self {
             config,
             exclude_globset,
-        }
+        })
     }
 
     /// Find duplicates in a scanned file tree.
     pub fn find_duplicates(&self, tree: &FileTree, token: CancellationToken) -> DuplicateReport {
-        // Phase 1: Collect all files with their paths and sizes.
-        // Pass seen_inodes to skip hardlinked copies of the same data.
-        let mut files: Vec<FileInfo> = Vec::new();
-        let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        self.find_duplicates_with_timings(tree, token).0
+    }
 
-        // Handle root-is-file case
-        if tree.root.is_file() {
-            let path = tree.root_path.clone();
-            let should_exclude = self.is_excluded(&path);
-            if !should_exclude && tree.root.size > 0 {
-                if let Some(inode) = &tree.root.inode {
-                    if seen_inodes.insert((inode.inode, inode.device))
-                        && seen_paths.insert(path.clone())
-                    {
-                        files.push(FileInfo {
-                            path,
-                            size: tree.root.size,
-                        });
-                    }
-                } else if seen_paths.insert(path.clone()) {
-                    files.push(FileInfo {
-                        path,
-                        size: tree.root.size,
-                    });
-                }
-            }
-        } else {
-            self.collect_files(
-                &tree.root,
-                &tree.root_path,
-                &mut files,
-                &mut seen_inodes,
-                &mut seen_paths,
-                &token,
-            );
-        }
+    /// Analyze with phase timings without changing the report schema or scope.
+    pub fn find_duplicates_with_timings(
+        &self,
+        tree: &FileTree,
+        token: CancellationToken,
+    ) -> (DuplicateReport, DuplicateTimings) {
+        let started = Instant::now();
+        let issues = IssueCollector::default();
+        let mut files = self.collect_files(tree, &token, &issues);
+        let collection = started.elapsed();
+        let started = Instant::now();
 
         // Filter by size constraints
         files.retain(|f| f.size >= self.config.min_size && f.size <= self.config.max_size);
@@ -228,9 +242,12 @@ impl DuplicateFinder {
 
         // Phase 2: Group by size
         let size_groups = self.group_by_size(files);
+        let grouping = started.elapsed();
+        let started = Instant::now();
 
         // Phase 3: For groups with 2+ files, compute hashes.
-        // Only outer iterator is parallelised; inner stays sequential to avoid nested par_iter.
+        // Parallelize independent size groups. Unbounded file-level parallelism
+        // regressed the measured small-file workload; see docs/BENCHMARKS.md.
         let duplicate_groups: Vec<DuplicateGroup> = if self.config.quick_compare {
             size_groups
                 .into_par_iter()
@@ -238,7 +255,7 @@ impl DuplicateFinder {
                     if token.is_cancelled() {
                         return Vec::new();
                     }
-                    self.find_dups_in_size_group_partial(files, &token)
+                    self.find_dups_in_size_group_partial(files, &token, &issues)
                 })
                 .collect()
         } else {
@@ -248,14 +265,23 @@ impl DuplicateFinder {
                     if token.is_cancelled() {
                         return Vec::new();
                     }
-                    self.find_dups_in_size_group_full(files, &token)
+                    self.find_dups_in_size_group_full(files, &token, &issues)
                 })
                 .collect()
         };
+        let hashing = started.elapsed();
+        let started = Instant::now();
 
         // Sort by wasted space descending
         let mut groups = duplicate_groups;
-        groups.sort_by_key(|group| Reverse(group.wasted_bytes));
+        for group in &mut groups {
+            group.paths.sort();
+        }
+        groups.sort_by(|a, b| {
+            Reverse(a.wasted_bytes)
+                .cmp(&Reverse(b.wasted_bytes))
+                .then_with(|| a.paths.cmp(&b.paths))
+        });
 
         // Compute all summary stats from the full (untruncated) groups list.
         // Saturating arithmetic guards against overflow on pathological inputs
@@ -281,7 +307,8 @@ impl DuplicateFinder {
             0
         };
 
-        DuplicateReport {
+        let report = DuplicateReport {
+            status: issues.finish(tree, token.is_cancelled()),
             groups,
             total_duplicate_size,
             total_wasted_space,
@@ -289,60 +316,78 @@ impl DuplicateFinder {
             files_with_duplicates,
             group_count,
             groups_omitted,
-        }
+        };
+        let finalization = started.elapsed();
+        (
+            report,
+            DuplicateTimings {
+                collection,
+                grouping,
+                hashing,
+                finalization,
+            },
+        )
     }
 
-    /// Collect all files from the tree, deduplicating by inode and path.
+    /// Iterate without recursion and use fresh file identities for hardlinks.
     fn collect_files(
         &self,
-        node: &FileNode,
-        current_path: &Path,
-        files: &mut Vec<FileInfo>,
-        seen_inodes: &mut HashSet<(u64, u64)>,
-        seen_paths: &mut HashSet<PathBuf>,
+        tree: &FileTree,
         token: &CancellationToken,
-    ) {
-        if token.is_cancelled() {
-            return;
-        }
-        match &node.kind {
-            NodeKind::File { .. } => {
-                // current_path is already the full file path — the Directory branch
-                // pre-joins the child name before recursing.
-                let file_path = current_path.to_path_buf();
-
-                // Skip duplicate paths
-                if !seen_paths.insert(file_path.clone()) {
-                    return;
-                }
-
-                // Skip hardlinks to already-seen inodes
-                if let Some(inode) = &node.inode
-                    && !seen_inodes.insert((inode.inode, inode.device))
-                {
-                    return;
-                }
-
-                // Apply glob exclude patterns
-                if self.is_excluded(&file_path) {
-                    return;
-                }
-
-                if node.size > 0 {
-                    files.push(FileInfo {
-                        path: file_path,
-                        size: node.size,
-                    });
+        issues: &IssueCollector,
+    ) -> Vec<FileInfo> {
+        let mut files: Vec<FileInfo> = Vec::new();
+        // Retain one child iterator per directory depth rather than materializing
+        // a path for every pending sibling (potentially millions in a flat tree).
+        let mut pending = vec![(
+            std::slice::from_ref(&tree.root).iter().rev(),
+            tree.root_path.clone(),
+            true,
+        )];
+        let mut seen_paths = HashSet::new();
+        #[cfg(unix)]
+        let mut seen_inodes = HashMap::new();
+        while let Some((children, parent, is_root)) = pending.last_mut() {
+            if token.is_cancelled() {
+                break;
+            }
+            let Some(node) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            let path = if *is_root {
+                parent.clone()
+            } else {
+                parent.join(node.file_name())
+            };
+            if node.is_dir() {
+                pending.push((node.children.iter().rev(), path, false));
+            } else if node.is_file() && !self.is_excluded(&path) && seen_paths.insert(path.clone())
+            {
+                match FileInfo::read(&path) {
+                    Ok(info) => {
+                        #[cfg(unix)]
+                        match seen_inodes.entry((info.stamp.device, info.stamp.inode)) {
+                            std::collections::hash_map::Entry::Occupied(entry) => {
+                                // Choose a stable representative among eligible aliases,
+                                // rather than depending on tree/traversal arrival order.
+                                let previous: &mut FileInfo = &mut files[*entry.get()];
+                                if info.path < previous.path {
+                                    *previous = info;
+                                }
+                                continue;
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(files.len());
+                            }
+                        }
+                        files.push(info);
+                    }
+                    Err(error) => issues.record(&path, &error),
                 }
             }
-            NodeKind::Directory { .. } => {
-                for child in &node.children {
-                    let child_path = current_path.join(&*child.name);
-                    self.collect_files(child, &child_path, files, seen_inodes, seen_paths, token);
-                }
-            }
-            _ => {}
         }
+        files
     }
 
     /// Check whether a path matches any configured exclude glob patterns.
@@ -372,224 +417,151 @@ impl DuplicateFinder {
         groups
     }
 
-    /// Find duplicates in a single size group using partial hash then full hash.
+    /// Partial hashes only filter candidates; every reported match is fully hashed.
     fn find_dups_in_size_group_partial(
         &self,
         files: Vec<FileInfo>,
         token: &CancellationToken,
+        issues: &IssueCollector,
     ) -> Vec<DuplicateGroup> {
-        if files.len() < 2 {
-            return Vec::new();
+        let covered_bytes = (self.config.partial_hash_head as u64)
+            .saturating_add(self.config.partial_hash_tail as u64);
+        if files.first().is_some_and(|file| file.size <= covered_bytes) {
+            // A size group shares one length. If the partial ranges cover it,
+            // filtering would read every byte and then reopen matching files.
+            // Use the canonical full hash once, including all identity checks.
+            return self.find_dups_in_size_group_full(files, token, issues);
         }
-
-        let mut result = Vec::new();
-
-        // Compute partial hashes sequentially within the group
-        let partial_hashes: Vec<(PathBuf, u64, Option<[u8; 32]>)> = files
-            .iter()
-            .map(|f| {
-                if token.is_cancelled() {
-                    return (f.path.clone(), f.size, None);
-                }
-                let hash = self.compute_partial_hash(&f.path);
-                (f.path.clone(), f.size, hash)
-            })
-            .collect();
-
-        if token.is_cancelled() {
-            return Vec::new();
-        }
-
-        // Group by partial hash
-        let mut partial_groups: HashMap<[u8; 32], Vec<(PathBuf, u64)>> = HashMap::new();
-        for (path, size, hash) in partial_hashes {
-            if let Some(h) = hash {
-                partial_groups.entry(h).or_default().push((path, size));
-            }
-        }
-
-        // For groups with 2+ matching partial hashes, compute full hash (sequential)
-        for (_partial_hash, candidates) in partial_groups {
+        let mut partial_groups: HashMap<[u8; 32], Vec<FileInfo>> = HashMap::new();
+        let mut buffer = hash_buffer(covered_bytes.min(files.first().map_or(0, |file| file.size)));
+        for info in files {
             if token.is_cancelled() {
                 break;
             }
-            if candidates.len() < 2 {
-                continue;
-            }
-
-            let full_hashes: Vec<(PathBuf, u64, Option<ContentHash>)> = candidates
-                .iter()
-                .map(|(path, size)| {
-                    if token.is_cancelled() {
-                        return (path.clone(), *size, None);
-                    }
-                    let hash = compute_full_hash(path, token);
-                    (path.clone(), *size, hash)
-                })
-                .collect();
-
-            if token.is_cancelled() {
-                break;
-            }
-
-            // Group by full hash
-            let mut full_groups: HashMap<ContentHash, Vec<PathBuf>> = HashMap::new();
-            let mut size_for_hash: HashMap<ContentHash, u64> = HashMap::new();
-
-            for (path, size, hash) in full_hashes {
-                if let Some(h) = hash {
-                    full_groups.entry(h).or_default().push(path);
-                    size_for_hash.insert(h, size);
-                }
-            }
-
-            // Create duplicate groups
-            for (hash, paths) in full_groups {
-                if paths.len() >= 2 {
-                    let size = size_for_hash[&hash];
-                    let wasted_bytes = size.saturating_mul(paths.len() as u64 - 1);
-                    result.push(DuplicateGroup {
-                        hash,
-                        size,
-                        paths,
-                        wasted_bytes,
-                    });
-                }
+            match self.compute_partial_hash_with_buffer(&info, token, &mut buffer) {
+                Ok(hash) => partial_groups.entry(hash).or_default().push(info),
+                Err(error) if !token.is_cancelled() => issues.record(&info.path, &error),
+                Err(_) => break,
             }
         }
-
-        result
+        drop(buffer);
+        partial_groups
+            .into_values()
+            .filter(|files| files.len() > 1)
+            .flat_map(|files| self.find_dups_in_size_group_full(files, token, issues))
+            .collect()
     }
 
-    /// Find duplicates in a single size group using only full hash (sequential within group).
     fn find_dups_in_size_group_full(
         &self,
         files: Vec<FileInfo>,
         token: &CancellationToken,
+        issues: &IssueCollector,
     ) -> Vec<DuplicateGroup> {
-        if files.len() < 2 {
-            return Vec::new();
+        let mut groups: HashMap<(ContentHash, u64), Vec<PathBuf>> = HashMap::new();
+        let mut buffer = hash_buffer(files.first().map_or(0, |file| file.size));
+        for info in files {
+            if token.is_cancelled() {
+                break;
+            }
+            match compute_full_hash_with_buffer(&info, token, &mut buffer) {
+                Ok(hash) => groups.entry((hash, info.size)).or_default().push(info.path),
+                Err(error) if !token.is_cancelled() => issues.record(&info.path, &error),
+                Err(_) => break,
+            }
         }
-
-        let hashes: Vec<(PathBuf, u64, Option<ContentHash>)> = files
-            .iter()
-            .map(|f| {
-                if token.is_cancelled() {
-                    return (f.path.clone(), f.size, None);
-                }
-                let hash = compute_full_hash(&f.path, token);
-                (f.path.clone(), f.size, hash)
+        groups
+            .into_iter()
+            .filter(|(_, paths)| paths.len() > 1)
+            .map(|((hash, size), paths)| DuplicateGroup {
+                hash,
+                size,
+                wasted_bytes: size.saturating_mul(paths.len() as u64 - 1),
+                paths,
             })
-            .collect();
-
-        if token.is_cancelled() {
-            return Vec::new();
-        }
-
-        // Group by hash
-        let mut groups: HashMap<ContentHash, Vec<PathBuf>> = HashMap::new();
-        let mut size_for_hash: HashMap<ContentHash, u64> = HashMap::new();
-
-        for (path, size, hash) in hashes {
-            if let Some(h) = hash {
-                groups.entry(h).or_default().push(path);
-                size_for_hash.insert(h, size);
-            }
-        }
-
-        // Create duplicate groups
-        let mut result = Vec::new();
-        for (hash, paths) in groups {
-            if paths.len() >= 2 {
-                let size = size_for_hash[&hash];
-                let wasted_bytes = size.saturating_mul(paths.len() as u64 - 1);
-                result.push(DuplicateGroup {
-                    hash,
-                    size,
-                    paths,
-                    wasted_bytes,
-                });
-            }
-        }
-
-        result
+            .collect()
     }
 
-    /// Compute a partial hash (first + last N bytes).
-    fn compute_partial_hash(&self, path: &Path) -> Option<[u8; 32]> {
-        let mut file = File::open(path).ok()?;
-        let metadata = file.metadata().ok()?;
-        let file_size = metadata.len();
+    #[cfg(test)]
+    fn compute_partial_hash(
+        &self,
+        info: &FileInfo,
+        token: &CancellationToken,
+    ) -> io::Result<[u8; 32]> {
+        self.compute_partial_hash_with_buffer(info, token, &mut hash_buffer(info.size))
+    }
 
+    fn compute_partial_hash_with_buffer(
+        &self,
+        info: &FileInfo,
+        token: &CancellationToken,
+        buffer: &mut [u8],
+    ) -> io::Result<[u8; 32]> {
+        let mut file = info.open()?;
         let mut hasher = Hasher::new();
-
-        // Read from start
-        let head_size = (self.config.partial_hash_head as u64).min(file_size);
-        let mut head_buf = vec![0u8; head_size as usize];
-        file.read_exact(&mut head_buf).ok()?;
-        hasher.update(&head_buf);
-
-        // Read from end (if file is large enough)
-        if file_size > head_size {
-            let tail_size = (self.config.partial_hash_tail as u64).min(file_size - head_size);
-            if tail_size > 0 {
-                file.seek(SeekFrom::End(-(tail_size as i64))).ok()?;
-                let mut tail_buf = vec![0u8; tail_size as usize];
-                file.read_exact(&mut tail_buf).ok()?;
-                hasher.update(&tail_buf);
-            }
+        let head = (self.config.partial_hash_head as u64).min(info.size);
+        hash_bytes(&mut file, head, &mut hasher, token, buffer)?;
+        let tail = (self.config.partial_hash_tail as u64).min(info.size - head);
+        if tail > 0 {
+            file.seek(SeekFrom::Start(info.size - tail))?;
+            hash_bytes(&mut file, tail, &mut hasher, token, buffer)?;
         }
-
-        // Include file size in hash to differentiate files with same head/tail
-        hasher.update(&file_size.to_le_bytes());
-
-        Some(*hasher.finalize().as_bytes())
+        info.verify(&file)?;
+        hasher.update(&info.size.to_le_bytes());
+        Ok(*hasher.finalize().as_bytes())
     }
 }
 
-/// Compute full BLAKE3 hash of a file using buffered streaming I/O.
-fn compute_full_hash(path: &Path, token: &CancellationToken) -> Option<ContentHash> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut hasher = Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
+/// One scratch allocation per active group, rather than a zeroed 64 KiB stack
+/// array per file. Small-file groups need only their observed logical length.
+fn hash_buffer(length: u64) -> Vec<u8> {
+    vec![0; length.clamp(1, 64 * 1024) as usize]
+}
+
+/// Read exactly the observed length with bounded memory, even if a file grows.
+fn hash_bytes(
+    file: &mut File,
+    mut remaining: u64,
+    hasher: &mut Hasher,
+    token: &CancellationToken,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    while remaining > 0 {
         if token.is_cancelled() {
-            return None;
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "analysis cancelled",
+            ));
         }
-        let n = reader.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
+        let length = remaining.min(buffer.len() as u64) as usize;
+        let count = match file.read(&mut buffer[..length]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Err(changed_file());
         }
-        hasher.update(&buf[..n]);
+        hasher.update(&buffer[..count]);
+        remaining -= count as u64;
     }
-    Some(ContentHash::new(*hasher.finalize().as_bytes()))
+    Ok(())
 }
 
-/// Build a GlobSet from a list of glob pattern strings.
-/// Returns None if the pattern list is empty or all patterns are invalid.
-fn build_globset(patterns: &[String]) -> Option<GlobSet> {
-    if patterns.is_empty() {
-        return None;
-    }
-    let mut builder = GlobSetBuilder::new();
-    let mut any_valid = false;
-    for p in patterns {
-        match Glob::new(p) {
-            Ok(g) => {
-                builder.add(g);
-                any_valid = true;
-            }
-            Err(e) => {
-                tracing::warn!("Invalid exclude glob pattern {:?}: {}", p, e);
-            }
-        }
-    }
-    if any_valid {
-        builder.build().ok()
-    } else {
-        None
-    }
+#[cfg(test)]
+fn compute_full_hash(info: &FileInfo, token: &CancellationToken) -> io::Result<ContentHash> {
+    compute_full_hash_with_buffer(info, token, &mut hash_buffer(info.size))
+}
+
+fn compute_full_hash_with_buffer(
+    info: &FileInfo,
+    token: &CancellationToken,
+    buffer: &mut [u8],
+) -> io::Result<ContentHash> {
+    let mut file = info.open()?;
+    let mut hasher = Hasher::new();
+    hash_bytes(&mut file, info.size, &mut hasher, token, buffer)?;
+    info.verify(&file)?;
+    Ok(ContentHash::new(*hasher.finalize().as_bytes()))
 }
 
 impl Default for DuplicateFinder {
@@ -598,11 +570,86 @@ impl Default for DuplicateFinder {
     }
 }
 
-/// Internal struct for file information.
+/// Observation shared by the partial and full reads. This detects ordinary
+/// concurrent mutation; it does not turn a live filesystem into a snapshot.
 #[derive(Debug, Clone)]
 struct FileInfo {
     path: PathBuf,
     size: u64,
+    stamp: FileStamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+fn changed_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "file changed or is no longer a regular file during analysis",
+    )
+}
+
+impl FileStamp {
+    fn read(metadata: &Metadata) -> io::Result<Self> {
+        if !metadata.is_file() {
+            return Err(changed_file());
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+impl FileInfo {
+    fn read(path: &Path) -> io::Result<Self> {
+        let stamp = FileStamp::read(&std::fs::symlink_metadata(path)?)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            size: stamp.length,
+            stamp,
+        })
+    }
+
+    fn open(&self) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Refuse substituted symlinks and avoid blocking on a substituted FIFO.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&self.path)?;
+        self.verify(&file)?;
+        Ok(file)
+    }
+
+    fn verify(&self, file: &File) -> io::Result<()> {
+        if FileStamp::read(&file.metadata()?)? != self.stamp
+            || FileStamp::read(&std::fs::symlink_metadata(&self.path)?)? != self.stamp
+        {
+            return Err(changed_file());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +657,246 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn reused_hash_buffer_preserves_exact_hashes_across_read_boundaries() {
+        let temp = TempDir::new().unwrap();
+        let mut buffer = vec![0xa5; 257];
+        for length in [65_539, 1, 4097, 0, 256, 65_536, 255] {
+            let contents: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            let path = temp.path().join("file");
+            fs::write(&path, &contents).unwrap();
+            let info = FileInfo::read(&path).unwrap();
+            let actual =
+                compute_full_hash_with_buffer(&info, &CancellationToken::new(), &mut buffer)
+                    .unwrap();
+            assert_eq!(
+                actual,
+                ContentHash::new(*blake3::hash(&contents).as_bytes())
+            );
+        }
+        assert_eq!(hash_buffer(0).len(), 1);
+        assert_eq!(hash_buffer(256).len(), 256);
+        assert_eq!(hash_buffer(u64::MAX).len(), 64 * 1024);
+    }
+
+    #[test]
+    fn quick_and_full_reports_agree_across_partial_coverage_boundary() {
+        for size in [0, 4, 8, 9, 64] {
+            let root = TempDir::new().unwrap();
+            let bytes = vec![b'x'; size];
+            fs::write(root.path().join("a"), &bytes).unwrap();
+            fs::write(root.path().join("b"), &bytes).unwrap();
+            if size > 0 {
+                let mut different = bytes.clone();
+                different[size / 2] = b'y';
+                fs::write(root.path().join("different"), different).unwrap();
+            }
+            let tree = gravityfile_scan::JwalkScanner::new()
+                .scan(
+                    &gravityfile_core::ScanConfig::new(root.path()),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+            let config = DuplicateConfig {
+                min_size: 0,
+                partial_hash_head: 4,
+                partial_hash_tail: 4,
+                ..Default::default()
+            };
+            let quick = DuplicateFinder::with_config(config.clone())
+                .unwrap()
+                .find_duplicates(&tree, CancellationToken::new());
+            let full = DuplicateFinder::with_config(DuplicateConfig {
+                quick_compare: false,
+                ..config
+            })
+            .unwrap()
+            .find_duplicates(&tree, CancellationToken::new());
+            assert_eq!(quick.status.state, full.status.state);
+            assert_eq!(quick.files_analyzed, full.files_analyzed);
+            assert_eq!(quick.total_wasted_space, full.total_wasted_space);
+            assert_eq!(quick.total_duplicate_size, full.total_duplicate_size);
+            assert_eq!(quick.files_with_duplicates, full.files_with_duplicates);
+            assert_eq!(quick.group_count, full.group_count);
+            assert_eq!(quick.groups_omitted, full.groups_omitted);
+            let group_values = |report: &DuplicateReport| {
+                report
+                    .groups
+                    .iter()
+                    .map(|group| {
+                        (
+                            group.hash,
+                            group.size,
+                            group.paths.clone(),
+                            group.wasted_bytes,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(group_values(&quick), group_values(&full));
+            assert_eq!(quick.groups.len(), 1);
+            assert_eq!(quick.groups[0].paths.len(), 2);
+            assert_eq!(
+                quick.groups[0].hash,
+                ContentHash::new(*blake3::hash(&bytes).as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn fully_covered_candidates_still_reject_changed_observations() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("data");
+        fs::write(&path, b"original").unwrap();
+        let observed = FileInfo::read(&path).unwrap();
+        fs::write(&path, b"different length").unwrap();
+        let issues = IssueCollector::default();
+        let finder = DuplicateFinder::new();
+        assert!(
+            finder
+                .find_dups_in_size_group_partial(vec![observed], &CancellationToken::new(), &issues)
+                .is_empty()
+        );
+        let tree = gravityfile_scan::JwalkScanner::new()
+            .scan(
+                &gravityfile_core::ScanConfig::new(root.path()),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        let status = issues.finish(&tree, false);
+        assert_eq!(status.state, crate::AnalysisState::Partial);
+        assert_eq!(status.issue_count, 1);
+    }
+
+    #[test]
+    fn invalid_analysis_scope_is_rejected_before_any_read() {
+        assert!(
+            DuplicateConfig::builder()
+                .min_size(10u64)
+                .max_size(1u64)
+                .build()
+                .is_err()
+        );
+        assert!(
+            DuplicateConfig::builder()
+                .exclude_patterns(vec!["[".into()])
+                .build()
+                .is_err()
+        );
+        assert!(
+            DuplicateFinder::with_config(DuplicateConfig {
+                min_size: 10,
+                max_size: 1,
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            DuplicateFinder::with_config(DuplicateConfig {
+                exclude_patterns: vec!["[".into()],
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn changed_file_is_rejected_between_hash_phases() {
+        let temp = create_test_files();
+        let path = temp.path().join("file1.txt");
+        let observed = FileInfo::read(&path).unwrap();
+        let token = CancellationToken::new();
+        DuplicateFinder::new()
+            .compute_partial_hash(&observed, &token)
+            .unwrap();
+        fs::write(path, b"replacement content with another length").unwrap();
+        assert!(compute_full_hash(&observed, &token).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_symlink_is_rejected_without_hashing_target() {
+        let temp = create_test_files();
+        let path = temp.path().join("file1.txt");
+        let observed = FileInfo::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("file2.txt"), &path).unwrap();
+        assert!(compute_full_hash(&observed, &CancellationToken::new()).is_err());
+    }
+
+    #[test]
+    fn missing_candidates_produce_bounded_deterministic_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        for i in 0..110 {
+            fs::write(temp.path().join(format!("{i:03}")), b"duplicate").unwrap();
+        }
+        let tree = gravityfile_scan::JwalkScanner::new()
+            .scan(
+                &gravityfile_core::ScanConfig::new(temp.path()),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        for i in 0..110 {
+            fs::remove_file(temp.path().join(format!("{i:03}"))).unwrap();
+        }
+        let report = DuplicateFinder::new().find_duplicates(&tree, CancellationToken::new());
+        assert_eq!(report.status.state, crate::AnalysisState::Partial);
+        assert_eq!(report.status.issue_count, 110);
+        assert_eq!(report.status.issues.len(), 100);
+        assert_eq!(report.status.issues_omitted, 10);
+        assert!(
+            report
+                .status
+                .issues
+                .windows(2)
+                .all(|pair| pair[0].path < pair[1].path)
+        );
+        assert!(!report.has_duplicates());
+    }
+
+    #[test]
+    fn cancelled_report_cannot_be_mistaken_for_a_complete_empty_report() {
+        let temp = create_test_files();
+        let tree = gravityfile_scan::JwalkScanner::new()
+            .scan(
+                &gravityfile_core::ScanConfig::new(temp.path()),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let report = DuplicateFinder::new().find_duplicates(&tree, token);
+        assert_eq!(report.status.state, crate::AnalysisState::Cancelled);
+        assert!(!report.status.is_complete());
+        assert_eq!(report.files_analyzed, 0);
+    }
+
+    #[test]
+    fn display_limit_does_not_mark_a_successful_analysis_partial() {
+        let temp = create_test_files();
+        let tree = gravityfile_scan::JwalkScanner::new()
+            .scan(
+                &gravityfile_core::ScanConfig::new(temp.path()),
+                CancellationToken::new(),
+            )
+            .unwrap();
+        let report = DuplicateFinder::with_config(DuplicateConfig {
+            min_size: 0,
+            max_groups: 1,
+            ..Default::default()
+        })
+        .unwrap()
+        .find_duplicates(&tree, CancellationToken::new());
+        assert!(report.status.is_complete());
+        assert_eq!(report.groups.len(), 1);
+        assert!(
+            report.groups[0]
+                .paths
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+    }
 
     fn create_test_files() -> TempDir {
         let temp = TempDir::new().unwrap();
@@ -632,18 +919,34 @@ mod tests {
         let temp = create_test_files();
 
         let token = CancellationToken::new();
-        let hash1 = compute_full_hash(&temp.path().join("file1.txt"), &token);
-        let hash2 = compute_full_hash(&temp.path().join("file2.txt"), &token);
-        let hash3 = compute_full_hash(&temp.path().join("file3.txt"), &token);
+        let hash1 = compute_full_hash(
+            &FileInfo::read(&temp.path().join("file1.txt")).unwrap(),
+            &token,
+        );
+        let hash2 = compute_full_hash(
+            &FileInfo::read(&temp.path().join("file2.txt")).unwrap(),
+            &token,
+        );
+        let hash3 = compute_full_hash(
+            &FileInfo::read(&temp.path().join("file3.txt")).unwrap(),
+            &token,
+        );
 
-        assert!(hash1.is_some());
-        assert!(hash2.is_some());
-        assert!(hash3.is_some());
+        assert!(hash1.is_ok());
+        assert!(hash2.is_ok());
+        assert!(hash3.is_ok());
 
         // file1 and file2 should have same hash
-        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.unwrap(), hash2.unwrap());
         // file3 should be different
-        assert_ne!(hash1, hash3);
+        assert_ne!(
+            compute_full_hash(
+                &FileInfo::read(&temp.path().join("file1.txt")).unwrap(),
+                &token
+            )
+            .unwrap(),
+            hash3.unwrap()
+        );
     }
 
     #[test]
@@ -651,17 +954,24 @@ mod tests {
         let temp = create_test_files();
         let finder = DuplicateFinder::new();
 
-        let hash1 = finder.compute_partial_hash(&temp.path().join("file1.txt"));
-        let hash2 = finder.compute_partial_hash(&temp.path().join("file2.txt"));
+        let hash1 = finder.compute_partial_hash(
+            &FileInfo::read(&temp.path().join("file1.txt")).unwrap(),
+            &CancellationToken::new(),
+        );
+        let hash2 = finder.compute_partial_hash(
+            &FileInfo::read(&temp.path().join("file2.txt")).unwrap(),
+            &CancellationToken::new(),
+        );
 
-        assert!(hash1.is_some());
-        assert_eq!(hash1, hash2);
+        assert!(hash1.is_ok());
+        assert_eq!(hash1.unwrap(), hash2.unwrap());
     }
 
     #[test]
     fn test_groups_omitted_field() {
         // Build a report with max_groups limiting the output
         let report = DuplicateReport {
+            status: AnalysisStatus::default(),
             groups: Vec::new(),
             total_duplicate_size: 0,
             total_wasted_space: 0,
@@ -680,7 +990,7 @@ mod tests {
             exclude_patterns: vec!["*.log".to_string()],
             ..Default::default()
         };
-        let finder = DuplicateFinder::with_config(config);
+        let finder = DuplicateFinder::with_config(config).unwrap();
         assert!(finder.is_excluded(Path::new("/some/path/debug.log")));
         assert!(!finder.is_excluded(Path::new("/some/path/main.rs")));
     }

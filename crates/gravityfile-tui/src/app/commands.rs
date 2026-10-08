@@ -1,102 +1,47 @@
 //! Command palette handling.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use super::state::View;
 
-/// Command input state.
+/// Command input state, sharing Unicode editing with filename input.
 #[derive(Debug, Clone, Default)]
 pub struct CommandInput {
-    /// Input buffer.
-    buffer: String,
-    /// Cursor position.
-    cursor: usize,
+    input: super::input::InputState,
 }
 
 impl CommandInput {
-    /// Create a new empty command input.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Clear the input buffer.
     pub fn clear(&mut self) {
-        self.buffer.clear();
-        self.cursor = 0;
+        self.input = super::input::InputState::new();
     }
 
-    /// Get the current input buffer.
     pub fn buffer(&self) -> &str {
-        &self.buffer
+        self.input.buffer()
     }
 
-    /// Get the cursor position.
+    /// UTF-8 byte offset at a grapheme boundary.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.input.cursor()
     }
 
-    /// Handle a key event, returning whether to execute the command.
     pub fn handle_key(&mut self, key: KeyEvent) -> CommandKeyResult {
-        match (key.code, key.modifiers) {
-            // Execute command on Enter
-            (KeyCode::Enter, _) => {
-                let cmd = self.buffer.clone();
+        if key.code == KeyCode::Backspace && self.input.buffer().is_empty() {
+            return CommandKeyResult::Cancel;
+        }
+        match self.input.handle_key(key) {
+            super::input::InputResult::Submit(command) => {
                 self.clear();
-                CommandKeyResult::Execute(cmd)
+                CommandKeyResult::Execute(command)
             }
-            // Cancel on Escape
-            (KeyCode::Esc, _) => {
+            super::input::InputResult::Cancel => {
                 self.clear();
                 CommandKeyResult::Cancel
             }
-            // Delete char before cursor
-            (KeyCode::Backspace, _) => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.buffer.remove(self.cursor);
-                    CommandKeyResult::Continue
-                } else if self.buffer.is_empty() {
-                    CommandKeyResult::Cancel
-                } else {
-                    CommandKeyResult::Continue
-                }
-            }
-            // Delete char at cursor
-            (KeyCode::Delete, _) => {
-                if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
-                }
-                CommandKeyResult::Continue
-            }
-            // Move cursor
-            (KeyCode::Left, _) => {
-                self.cursor = self.cursor.saturating_sub(1);
-                CommandKeyResult::Continue
-            }
-            (KeyCode::Right, _) => {
-                self.cursor = (self.cursor + 1).min(self.buffer.len());
-                CommandKeyResult::Continue
-            }
-            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.cursor = 0;
-                CommandKeyResult::Continue
-            }
-            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                self.cursor = self.buffer.len();
-                CommandKeyResult::Continue
-            }
-            // Clear line
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.clear();
-                CommandKeyResult::Continue
-            }
-            // Type character
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                self.buffer.insert(self.cursor, c);
-                self.cursor += 1;
-                CommandKeyResult::Continue
-            }
-            _ => CommandKeyResult::Continue,
+            super::input::InputResult::Continue => CommandKeyResult::Continue,
         }
     }
 }
@@ -115,8 +60,10 @@ pub enum CommandKeyResult {
 /// Action to perform after executing a command.
 #[derive(Debug, Clone)]
 pub enum CommandAction {
-    /// No action.
+    /// No action (empty input).
     None,
+    /// Invalid input with an actionable explanation.
+    Invalid(&'static str),
     /// Quit the application.
     Quit,
     /// Refresh/rescan.
@@ -173,6 +120,12 @@ pub enum CommandAction {
     Take(Option<String>),
     /// Undo last operation.
     Undo,
+    /// Inspect retained incomplete undo records.
+    UndoReview(usize),
+    /// Inspect retained error evidence from incomplete undo attempts.
+    UndoReviewErrors(usize),
+    /// Export incomplete undo records to a new file.
+    UndoExport(String),
     /// Bulk rename marked items.
     BulkRename,
 
@@ -216,9 +169,31 @@ pub enum SortCommand {
 
 /// Parse and execute a command string.
 pub fn parse_command(cmd: &str) -> CommandAction {
+    let argument = cmd
+        .trim()
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, argument)| argument.trim_start());
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() {
         return CommandAction::None;
+    }
+
+    if matches!(
+        parts[0],
+        "bookmark" | "mark" | "bm" | "delmark" | "delbookmark" | "unbookmark" | "go" | "'"
+    ) && !argument.is_empty()
+    {
+        let mut chars = argument.chars();
+        if !chars
+            .next()
+            .is_some_and(super::state::Bookmarks::is_valid_key)
+            || chars.next().is_some()
+        {
+            return CommandAction::Invalid("Bookmark key must be one ASCII letter or digit");
+        }
+    }
+    if matches!(parts[0], "theme" | "t" | "layout" | "view" | "sort" | "s") && parts.len() > 2 {
+        return CommandAction::Invalid("This command accepts one option; use :help for syntax");
     }
 
     match parts[0] {
@@ -234,7 +209,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Change directory
         "cd" => {
             if parts.len() > 1 {
-                CommandAction::NavigateTo(parts[1..].join(" "))
+                CommandAction::NavigateTo(argument.to_owned())
             } else {
                 CommandAction::GoToRoot
             }
@@ -269,7 +244,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                     "dark" => CommandAction::SetTheme(ThemeCommand::Dark),
                     "light" => CommandAction::SetTheme(ThemeCommand::Light),
                     "toggle" => CommandAction::SetTheme(ThemeCommand::Toggle),
-                    _ => CommandAction::None,
+                    _ => CommandAction::Invalid("Unknown theme; use dark, light, or toggle"),
                 }
             } else {
                 CommandAction::SetTheme(ThemeCommand::Toggle)
@@ -285,7 +260,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                     "tree" => CommandAction::SetLayout(LayoutCommand::Tree),
                     "miller" | "columns" => CommandAction::SetLayout(LayoutCommand::Miller),
                     "toggle" => CommandAction::SetLayout(LayoutCommand::Toggle),
-                    _ => CommandAction::None,
+                    _ => CommandAction::Invalid("Unknown layout; use tree, miller, or toggle"),
                 }
             } else {
                 CommandAction::SetLayout(LayoutCommand::Toggle)
@@ -310,10 +285,10 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                 if let Some(key) = parts[1].chars().next() {
                     CommandAction::DeleteBookmark(key)
                 } else {
-                    CommandAction::None
+                    CommandAction::Invalid("Specify a bookmark key to remove")
                 }
             } else {
-                CommandAction::None
+                CommandAction::Invalid("Specify a bookmark key to remove")
             }
         }
         // Jump to a bookmark: :go h or :' h
@@ -347,7 +322,9 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                     }
                     "count+" | "ct+" | "count-asc" => CommandAction::SetSort(SortCommand::CountAsc),
                     "reverse" | "rev" => CommandAction::SetSort(SortCommand::Reverse),
-                    _ => CommandAction::SetSort(SortCommand::Cycle),
+                    _ => CommandAction::Invalid(
+                        "Unknown sort order; use size, name, date, count, or reverse",
+                    ),
                 }
             } else {
                 CommandAction::SetSort(SortCommand::Cycle)
@@ -363,7 +340,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Rename
         "rename" | "mv" => {
             if parts.len() > 1 {
-                CommandAction::Rename(Some(parts[1..].join(" ")))
+                CommandAction::Rename(Some(argument.to_owned()))
             } else {
                 CommandAction::Rename(None)
             }
@@ -372,7 +349,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Create file
         "touch" | "new" | "create" => {
             if parts.len() > 1 {
-                CommandAction::CreateFile(Some(parts[1..].join(" ")))
+                CommandAction::CreateFile(Some(argument.to_owned()))
             } else {
                 CommandAction::CreateFile(None)
             }
@@ -381,7 +358,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Create directory
         "mkdir" | "md" => {
             if parts.len() > 1 {
-                CommandAction::CreateDirectory(Some(parts[1..].join(" ")))
+                CommandAction::CreateDirectory(Some(argument.to_owned()))
             } else {
                 CommandAction::CreateDirectory(None)
             }
@@ -390,7 +367,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Take (create directory and cd into it)
         "take" => {
             if parts.len() > 1 {
-                CommandAction::Take(Some(parts[1..].join(" ")))
+                CommandAction::Take(Some(argument.to_owned()))
             } else {
                 CommandAction::Take(None)
             }
@@ -398,6 +375,21 @@ pub fn parse_command(cmd: &str) -> CommandAction {
 
         // Undo
         "undo" | "u" => CommandAction::Undo,
+        "undo-export" if !argument.is_empty() => CommandAction::UndoExport(argument.to_owned()),
+        "undo-export" => CommandAction::Invalid("Usage: undo-export <new-file.json>"),
+        "undo-review" => match parts.as_slice() {
+            [_] => CommandAction::UndoReview(1),
+            [_, "errors"] => CommandAction::UndoReviewErrors(1),
+            [_, "errors", page] => match page.parse::<usize>() {
+                Ok(page) if page > 0 => CommandAction::UndoReviewErrors(page),
+                _ => CommandAction::Invalid("undo-review page must be a positive integer"),
+            },
+            [_, page] => match page.parse::<usize>() {
+                Ok(page) if page > 0 => CommandAction::UndoReview(page),
+                _ => CommandAction::Invalid("undo-review page must be a positive integer"),
+            },
+            _ => CommandAction::Invalid("Usage: undo-review [errors] [page]"),
+        },
 
         // Bulk rename
         "rename-bulk" | "bulk-rename" | "bulkrename" | "brn" => CommandAction::BulkRename,
@@ -406,7 +398,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "extract" | "unzip" | "untar" | "decompress" => {
             if parts.len() > 1 {
                 // :extract <destination> - extract to specified location
-                CommandAction::Extract(Some(parts[1..].join(" ")))
+                CommandAction::Extract(Some(argument.to_owned()))
             } else {
                 // :extract - extract to current directory
                 CommandAction::Extract(None)
@@ -415,18 +407,143 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "compress" | "zip" | "archive" => {
             if parts.len() > 1 {
                 // :compress <archive_name> - create archive with name
-                CommandAction::Compress(parts[1..].join(" "))
+                CommandAction::Compress(argument.to_owned())
             } else {
-                CommandAction::None // Name is required
+                CommandAction::Invalid("Specify an archive name, for example :compress backup.zip")
             }
         }
 
-        _ => CommandAction::None,
+        _ => CommandAction::Invalid("Unknown command; use :help to see available commands"),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_commands_report_errors_instead_of_fallback_actions() {
+        use super::*;
+        for command in [
+            "unknown",
+            "theme blue",
+            "layout sideways",
+            "sort typo",
+            "sort name extra",
+            "compress",
+            "zip",
+            "delmark",
+            "bookmark ab",
+            "go a b",
+            "unbookmark é",
+            "bm !",
+        ] {
+            assert!(
+                matches!(parse_command(command), CommandAction::Invalid(message) if !message.is_empty()),
+                "{command}"
+            );
+        }
+        assert!(matches!(parse_command(" \t "), CommandAction::None));
+        assert!(matches!(
+            parse_command("sort"),
+            CommandAction::SetSort(SortCommand::Cycle)
+        ));
+        assert!(matches!(
+            parse_command("bookmark"),
+            CommandAction::ShowBookmarks
+        ));
+        assert!(matches!(
+            parse_command("go"),
+            CommandAction::JumpToBookmark(None)
+        ));
+        assert!(matches!(
+            parse_command("delmark a"),
+            CommandAction::DeleteBookmark('a')
+        ));
+    }
+
+    #[test]
+    fn path_arguments_preserve_internal_whitespace() {
+        use super::*;
+        for command in [
+            "cd",
+            "rename",
+            "mv",
+            "touch",
+            "new",
+            "create",
+            "mkdir",
+            "md",
+            "take",
+            "extract",
+            "unzip",
+            "untar",
+            "decompress",
+            "compress",
+            "zip",
+            "archive",
+        ] {
+            for argument in [
+                "two  spaces",
+                "café\u{2003}日本",
+                "path\twith\tspacing",
+                "literal 'quotes'",
+            ] {
+                let result = parse_command(&format!("  {command}\t  {argument}  "));
+                let actual = match result {
+                    CommandAction::NavigateTo(path) | CommandAction::Compress(path) => path,
+                    CommandAction::Rename(Some(path))
+                    | CommandAction::CreateFile(Some(path))
+                    | CommandAction::CreateDirectory(Some(path))
+                    | CommandAction::Take(Some(path))
+                    | CommandAction::Extract(Some(path)) => path,
+                    _ => panic!("unexpected command result"),
+                };
+                assert_eq!(actual, argument, "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_commands_edit_render_and_submit_without_byte_splitting() {
+        use super::*;
+        use crossterm::event::KeyModifiers;
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        use unicode_width::UnicodeWidthStr;
+        let mut input = CommandInput::new();
+        let command = "cd café/日本/👩‍💻";
+        for character in command.chars() {
+            input.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(input.buffer(), command);
+        input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(&input.buffer()[input.cursor()..], "👩‍💻");
+        for cursor in 0..=command.len() + 1 {
+            for width in 0..=20 {
+                let (before, current, after) =
+                    crate::ui::visible_input_parts(command, cursor, width);
+                assert!(before.width() + current.width() + after.width() <= width);
+                let area = Rect::new(0, 0, width as u16, 1);
+                let mut buffer = Buffer::empty(area);
+                crate::ui::modals::CommandPalette::new(
+                    &crate::theme::Theme::default(),
+                    command,
+                    cursor,
+                )
+                .render(area, &mut buffer);
+            }
+        }
+        input.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(input.buffer(), "cd café/日本/");
+        assert!(
+            matches!(input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            CommandKeyResult::Execute(command) if command == "cd café/日本/")
+        );
+        assert!(input.buffer().is_empty());
+        assert_eq!(input.cursor(), 0);
+        assert!(matches!(
+            input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            CommandKeyResult::Cancel
+        ));
+    }
     use super::*;
 
     #[test]

@@ -55,7 +55,7 @@ let config = DuplicateConfig::builder()
     .max_groups(100usize)           // Limit results
     .build()?;
 
-let finder = DuplicateFinder::with_config(config);
+let finder = DuplicateFinder::with_config(config)?;
 let report = finder.find_duplicates(&tree);
 ```
 
@@ -118,7 +118,7 @@ let config = AgeConfig::builder()
     ])
     .build()?;
 
-let analyzer = AgeAnalyzer::with_config(config);
+let analyzer = AgeAnalyzer::with_config(config)?;
 let report = analyzer.analyze(&tree);
 ```
 

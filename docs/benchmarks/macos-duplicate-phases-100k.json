@@ -1,0 +1,44 @@
+{
+  "distinct_contents": 256,
+  "file_bytes": 256,
+  "files": 100000,
+  "files_per_directory": 1000,
+  "fixture_removed": true,
+  "method": "one scan followed by three analyses; warm-cache possible; fixture setup, report serialization and cleanup excluded; no RSS measurement",
+  "samples": [
+    {
+      "collection_seconds": 0.405248458,
+      "elapsed_seconds": 3.022871791,
+      "finalization_seconds": 0.009094791,
+      "grouping_seconds": 0.0017185,
+      "hashing_seconds": 2.606808417,
+      "run": 0
+    },
+    {
+      "collection_seconds": 0.266252167,
+      "elapsed_seconds": 2.8706771250000003,
+      "finalization_seconds": 0.006892,
+      "grouping_seconds": 0.001552584,
+      "hashing_seconds": 2.59597925,
+      "run": 1
+    },
+    {
+      "collection_seconds": 0.250469125,
+      "elapsed_seconds": 2.540404583,
+      "finalization_seconds": 0.00557975,
+      "grouping_seconds": 0.001422875,
+      "hashing_seconds": 2.282931458,
+      "run": 2
+    }
+  ],
+  "scan_seconds": 0.452840667,
+  "test_binary_sha256": "6ab937e06943baac4d3f2dc5bb661e9c68447af538e230a272adfcc7c497fa8f",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8",
+  "platform": "Darwin Nicks-MacBook-Pro.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6041 arm64",
+  "sources": {
+    "src/duplicate_bench.rs": "ae6abbe8fa7e911e228206576adb1379eb638361e3903a1ac29351a561be0a0b",
+    "src/lib.rs": "bdd0e73ba9d2f2c467fcfa0b186fc1fb288b77b490de9c5329e79eff15fec27c",
+    "crates/gravityfile-analyze/src/duplicates.rs": "53f0aa64d7f2b8441a50f1201744d54e92a6c80117d7dc5d7100726919c02c3f",
+    "crates/gravityfile-analyze/src/lib.rs": "fd6b42ce9cea7b2f1b68e9ac2023eddf48d58427c44341c19d50b7628da66c58"
+  }
+}

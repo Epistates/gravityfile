@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Widget};
 use strum::IntoEnumIterator;
 use unicode_width::UnicodeWidthStr;
 
@@ -26,6 +26,7 @@ use super::state::{AppMode, ClipboardMode, LayoutMode, View};
 enum DuplicateListItem<'a> {
     GroupHeader {
         group: &'a gravityfile_analyze::DuplicateGroup,
+        files_in_view: usize,
         is_expanded: bool,
         is_selected: bool,
     },
@@ -35,6 +36,39 @@ enum DuplicateListItem<'a> {
         is_selected: bool,
         is_marked: bool,
     },
+}
+
+/// Map a flattened grouped list to visible (group, item) coordinates without
+/// allocating or visiting every file row. Item zero is the group header.
+fn duplicate_viewport(
+    groups: impl Iterator<Item = (usize, Option<usize>)> + Clone,
+    height: usize,
+) -> (Vec<(usize, usize)>, usize, usize) {
+    let mut total = 0usize;
+    let mut selected = None;
+    for (count, selection) in groups.clone() {
+        if let Some(index) = selection.filter(|index| *index < count) {
+            selected = Some(total + index);
+        }
+        total += count;
+    }
+    if height == 0 {
+        return (Vec::new(), 0, total);
+    }
+    let offset = selected.unwrap_or(0).saturating_sub(height - 1);
+    let end = offset.saturating_add(height).min(total);
+    let mut visible = Vec::with_capacity(end - offset);
+    let mut base = 0usize;
+    for (group, (count, _)) in groups.enumerate() {
+        if base >= end {
+            break;
+        }
+        let start = offset.saturating_sub(base).min(count);
+        let stop = end.saturating_sub(base).min(count);
+        visible.extend((start..stop).map(|item| (group, item)));
+        base += count;
+    }
+    (visible, offset, total)
 }
 
 impl Widget for &App {
@@ -179,7 +213,7 @@ impl App {
                 .marked
                 .iter()
                 .filter_map(|p| self.get_path_size(p))
-                .sum();
+                .fold(0u64, u64::saturating_add);
             Span::styled(
                 format!(
                     " {} selected ({}) ",
@@ -367,14 +401,41 @@ impl App {
                         .render(area, buf);
                 }
             }
-            AppMode::Copying | AppMode::Moving => {
+            AppMode::Copying | AppMode::Moving | AppMode::Undoing | AppMode::UpdatingEntry => {
                 if let Some(progress) = &self.operation_progress {
                     OperationProgressModal::new(&self.theme, progress).render(area, buf);
+                } else {
+                    let width = 55.min(area.width.saturating_sub(4));
+                    let height = 7.min(area.height.saturating_sub(4));
+                    let popup = Rect::new(
+                        area.x + area.width.saturating_sub(width) / 2,
+                        area.y + area.height.saturating_sub(height) / 2,
+                        width,
+                        height,
+                    );
+                    Clear.render(popup, buf);
+                    let block = Block::default()
+                        .title(" Operation in progress ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(self.theme.info));
+                    let inner = block.inner(popup);
+                    block.render(popup, buf);
+                    let message = self
+                        .operation_message
+                        .as_ref()
+                        .map(|(_, message)| message.as_str())
+                        .unwrap_or("Waiting for worker progress...");
+                    Paragraph::new(vec![
+                        Line::raw(""),
+                        Line::raw(fit_left_to_width(message, inner.width as usize)),
+                    ])
+                    .style(Style::default().fg(self.theme.info))
+                    .render(inner, buf);
                 }
             }
             AppMode::ConflictResolution => {
                 if let Some(conflict) = &self.pending_conflict {
-                    ConflictModal::new(&self.theme, conflict).render(area, buf);
+                    ConflictModal::new(&self.theme, conflict.conflict()).render(area, buf);
                 }
             }
             AppMode::Search => {
@@ -442,12 +503,22 @@ impl App {
 
     fn render_tabs(&self, area: Rect, buf: &mut Buffer) {
         let is_scanning = self.scan_progress.is_some();
-        let error_count = self.warnings.len().max(
-            self.scan_progress
-                .as_ref()
-                .map(|p| p.errors_count as usize)
-                .unwrap_or(0),
-        );
+        let error_count = self
+            .warnings
+            .iter()
+            .fold(0usize, |count, warning| {
+                count.saturating_add(
+                    usize::try_from(warning.represented_count()).unwrap_or(usize::MAX),
+                )
+            })
+            .max(
+                self.scan_progress
+                    .as_ref()
+                    .map(|p| usize::try_from(p.errors_count).unwrap_or(usize::MAX))
+                    .unwrap_or(0),
+            )
+            .saturating_add(self.operation_warnings.len())
+            .saturating_add(self.undo_review_warnings.len());
 
         let titles: Vec<String> = View::iter()
             .map(|v| {
@@ -511,6 +582,16 @@ impl App {
                     );
                 }
                 LayoutMode::Miller => {
+                    // Record the preview column's inner size so the next image
+                    // preview is encoded at the size it will actually occupy.
+                    // Mirrors the 40% third column in `MillerColumns`, less the
+                    // block border and the one-line image header.
+                    let preview_width = layout.main.width * 40 / 100;
+                    self.preview_area.set(ratatui::layout::Size::new(
+                        preview_width.saturating_sub(2).max(1),
+                        layout.main.height.saturating_sub(3).max(1),
+                    ));
+
                     let parent_node = self.get_parent_node();
                     let current_name = self.get_current_dir_name().unwrap_or_default();
 
@@ -581,6 +662,14 @@ impl App {
             " Duplicates ".to_string()
         };
 
+        let title = if let Some(report) = &self.duplicates
+            && !report.status.is_complete()
+        {
+            format!("{title}[{}] ", report.status.state)
+        } else {
+            title
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border)
@@ -592,7 +681,13 @@ impl App {
 
         if let Some((filtered_groups, total_wasted)) = self.get_filtered_duplicates() {
             if filtered_groups.is_empty() {
-                let message = if self.has_full_scan {
+                let message = if self
+                    .duplicates
+                    .as_ref()
+                    .is_some_and(|report| !report.status.is_complete())
+                {
+                    "Analysis incomplete. No matches in the files successfully checked."
+                } else if self.has_full_scan {
                     "No duplicate files found in this directory."
                 } else {
                     "No duplicate data yet.\n\nPress R to run a full scan."
@@ -630,67 +725,57 @@ impl App {
             );
             let visible_height = list_area.height as usize;
 
-            let mut items: Vec<DuplicateListItem> = Vec::new();
-            for (group_idx, group) in filtered_groups.iter().enumerate() {
-                let is_expanded = self.duplicates_state.is_expanded(group_idx);
-                let selected_in_group = self.duplicates_state.selected_item(group_idx);
-                let is_group_selected = group_idx == self.duplicates_state.selected_group;
-
-                items.push(DuplicateListItem::GroupHeader {
-                    group,
-                    is_expanded,
-                    is_selected: is_group_selected && selected_in_group == 0,
-                });
-
-                if is_expanded {
-                    for (file_idx, path) in group.paths.iter().enumerate() {
-                        let is_marked = self.marked.contains(path);
-                        items.push(DuplicateListItem::File {
-                            file_idx,
-                            path,
-                            is_selected: is_group_selected && selected_in_group == file_idx + 1,
-                            is_marked,
-                        });
+            let layout = filtered_groups.iter().enumerate().map(|(index, group)| {
+                let count = 1 + if self.duplicates_state.is_expanded(index) {
+                    group.paths.len()
+                } else {
+                    0
+                };
+                let selected = (index == self.duplicates_state.selected_group)
+                    .then(|| self.duplicates_state.selected_item(index));
+                (count, selected)
+            });
+            let (rows, scroll_offset, total_rows) = duplicate_viewport(layout, visible_height);
+            let max_wasted = filtered_groups
+                .iter()
+                .map(|group| group.wasted_bytes)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            for (render_idx, (group_idx, item_idx)) in rows.into_iter().enumerate() {
+                let group = filtered_groups[group_idx];
+                let is_selected = group_idx == self.duplicates_state.selected_group
+                    && item_idx == self.duplicates_state.selected_item(group_idx);
+                let item = if item_idx == 0 {
+                    DuplicateListItem::GroupHeader {
+                        group,
+                        files_in_view: self.filtered_duplicate_path_count(group_idx),
+                        is_expanded: self.duplicates_state.is_expanded(group_idx),
+                        is_selected,
                     }
-                }
-            }
-
-            let selected_item_idx = items
-                .iter()
-                .position(|item| match item {
-                    DuplicateListItem::GroupHeader { is_selected, .. } => *is_selected,
-                    DuplicateListItem::File { is_selected, .. } => *is_selected,
-                })
-                .unwrap_or(0);
-
-            let scroll_offset = if selected_item_idx >= visible_height {
-                selected_item_idx - visible_height + 1
-            } else {
-                0
-            };
-
-            for (render_idx, item) in items
-                .iter()
-                .enumerate()
-                .skip(scroll_offset)
-                .take(visible_height)
-            {
-                let y = list_area.y + (render_idx - scroll_offset) as u16;
+                } else {
+                    let path = &group.paths[item_idx - 1];
+                    DuplicateListItem::File {
+                        file_idx: item_idx - 1,
+                        path,
+                        is_selected,
+                        is_marked: self.marked.contains(path),
+                    }
+                };
+                let item = &item;
+                let y = list_area.y + render_idx as u16;
                 let line_area = Rect::new(list_area.x, y, list_area.width, 1);
 
                 match item {
                     DuplicateListItem::GroupHeader {
                         group,
+                        files_in_view,
                         is_expanded,
                         is_selected,
                         ..
                     } => {
                         let expand_icon = if *is_expanded { "▼" } else { "▶" };
-                        let files_in_view = group
-                            .paths
-                            .iter()
-                            .filter(|p| p.starts_with(&self.view_root))
-                            .count();
+                        let files_in_view = *files_in_view;
                         let total_files = group.count();
 
                         let file_info = if files_in_view < total_files {
@@ -699,11 +784,6 @@ impl App {
                             format!("{}", total_files)
                         };
 
-                        let max_wasted = filtered_groups
-                            .iter()
-                            .map(|g| g.wasted_bytes)
-                            .max()
-                            .unwrap_or(1);
                         let heat_ratio = group.wasted_bytes as f64 / max_wasted as f64;
 
                         let bar_width = 8;
@@ -770,8 +850,8 @@ impl App {
                 }
             }
 
-            if items.len() > visible_height {
-                let total = items.len();
+            if total_rows > visible_height && visible_height > 0 {
+                let total = total_rows;
                 let hint = format!(" ({}/{})", scroll_offset + 1, total);
                 let hint_x = list_area.x + list_area.width.saturating_sub(hint.len() as u16 + 1);
                 if hint_x > list_area.x {
@@ -854,6 +934,14 @@ impl App {
             " Age Analysis ".to_string()
         };
 
+        let title = if let Some(report) = &self.age_report
+            && !report.status.is_complete()
+        {
+            format!("{title}[{}] ", report.status.state)
+        } else {
+            title
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.theme.border)
@@ -904,8 +992,15 @@ impl App {
             if let Some(stale_dirs) = self.get_filtered_stale_dirs() {
                 let stale_y = bucket_start_y + chart_height as u16 + 1;
                 if stale_y < inner.y + inner.height {
-                    let total_stale_size: u64 = stale_dirs.iter().map(|d| d.size).sum();
-                    let stale_header = if stale_dirs.is_empty() {
+                    let total_stale_size: u64 = stale_dirs
+                        .iter()
+                        .map(|d| d.size)
+                        .fold(0u64, u64::saturating_add);
+                    let stale_header = if age.stale_directory_status
+                        != gravityfile_analyze::StaleDirectoryStatus::Evaluated
+                    {
+                        format!(" Stale directories {}", age.stale_directory_status)
+                    } else if stale_dirs.is_empty() {
                         " No stale directories found.".to_string()
                     } else {
                         format!(
@@ -1006,11 +1101,20 @@ impl App {
                 .as_ref()
                 .map(|p| p.errors_count)
                 .unwrap_or(0);
-            format!(" Errors & Warnings ({}) ", count)
-        } else if !self.warnings.is_empty() {
-            format!(" Scan Errors & Warnings ({}) ", self.warnings.len())
+            format!(
+                " Errors & Warnings ({}) ",
+                usize::try_from(count)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(self.operation_warnings.len())
+                    .saturating_add(self.undo_review_warnings.len())
+            )
+        } else if self.warning_count() > 0 {
+            format!(
+                " Errors & Warnings ({} retained records) ",
+                self.warning_count()
+            )
         } else {
-            " Scan Errors & Warnings ".to_string()
+            " Errors & Warnings ".to_string()
         };
 
         let block = Block::default()
@@ -1022,7 +1126,7 @@ impl App {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        if self.warnings.is_empty() {
+        if self.warning_count() == 0 {
             let lines = if is_scanning {
                 let error_count = self
                     .scan_progress
@@ -1068,8 +1172,10 @@ impl App {
         };
 
         for (i, warning) in self
-            .warnings
+            .undo_review_warnings
             .iter()
+            .chain(self.operation_warnings.iter())
+            .chain(self.warnings.iter())
             .enumerate()
             .skip(scroll_offset)
             .take(visible_items)
@@ -1077,22 +1183,30 @@ impl App {
             let base_y = inner.y + ((i - scroll_offset) * lines_per_item) as u16;
             let is_selected = i == self.selected_warning;
 
-            let (icon, kind_label, can_delete) = match warning.kind {
-                gravityfile_core::WarningKind::PermissionDenied => {
-                    ("\u{1F512}", "Permission Denied", false)
-                }
-                gravityfile_core::WarningKind::BrokenSymlink => {
-                    ("\u{1F517}", "Broken Symlink", true)
-                }
-                gravityfile_core::WarningKind::ReadError => ("\u{26A0}", "Read Error", false),
-                gravityfile_core::WarningKind::MetadataError => {
-                    ("\u{1F4CB}", "Metadata Error", false)
-                }
-                gravityfile_core::WarningKind::CrossFilesystem => {
-                    ("\u{1F4BE}", "Cross Filesystem", false)
+            let (icon, kind_label, can_delete) = if i < self.undo_review_warnings.len() {
+                ("!", "Undo Review", false)
+            } else if i < self.undo_review_warnings.len() + self.operation_warnings.len() {
+                ("!", "Operation", false)
+            } else {
+                match warning.kind {
+                    gravityfile_core::WarningKind::PermissionDenied => {
+                        ("\u{1F512}", "Permission Denied", false)
+                    }
+                    gravityfile_core::WarningKind::BrokenSymlink => {
+                        ("\u{1F517}", "Broken Symlink", true)
+                    }
+                    gravityfile_core::WarningKind::ReadError => ("\u{26A0}", "Read Error", false),
+                    gravityfile_core::WarningKind::MetadataError => {
+                        ("\u{1F4CB}", "Metadata Error", false)
+                    }
+                    gravityfile_core::WarningKind::CrossFilesystem => {
+                        ("\u{1F4BE}", "Cross Filesystem", false)
+                    }
+                    gravityfile_core::WarningKind::Omitted { .. } => {
+                        ("!", "Omitted Warnings", false)
+                    }
                 }
             };
-
             let is_marked = self.marked.contains(&warning.path);
             let path_str = warning.path.display().to_string();
             let mark_indicator = if is_marked { "[x] " } else { "    " };
@@ -1405,7 +1519,7 @@ impl App {
         ]));
 
         let query = &self.search_state.query;
-        let cursor = self.search_state.cursor;
+        let cursor = self.search_state.cursor_byte_offset();
         let mut spans = vec![Span::styled("/", self.theme.help_key)];
 
         if query.is_empty() {
@@ -1414,15 +1528,11 @@ impl App {
                 Style::default().add_modifier(Modifier::SLOW_BLINK),
             ));
         } else {
-            // `cursor` is a char index; build the segments char-by-char so
-            // multi-byte queries never slice on a non-char boundary.
-            let before_cursor: String = query.chars().take(cursor).collect();
-            let at_cursor = query
-                .chars()
-                .nth(cursor)
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| " ".to_string());
-            let after_cursor: String = query.chars().skip(cursor + 1).collect();
+            let (before_cursor, at_cursor, after_cursor) = crate::ui::visible_input_parts(
+                query,
+                cursor,
+                input_area.width.saturating_sub(1) as usize,
+            );
             spans.push(Span::raw(before_cursor));
             spans.push(Span::styled(
                 at_cursor,
@@ -1449,7 +1559,16 @@ impl App {
         let results = &self.search_state.results;
         let selected = self.search_state.selected;
 
-        if results.is_empty() {
+        if let Some(error) = &self.search_state.error {
+            Paragraph::new(error.as_str())
+                .style(Style::default().fg(self.theme.error))
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .render(results_area, buf);
+        } else if self.search_state.is_searching() {
+            Paragraph::new("Searching…")
+                .style(Style::default().fg(self.theme.muted))
+                .render(results_area, buf);
+        } else if results.is_empty() {
             if !query.is_empty() {
                 Paragraph::new("No matches found")
                     .style(Style::default().fg(self.theme.muted))
@@ -1512,5 +1631,58 @@ impl App {
                     );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_viewport_tests {
+    use super::duplicate_viewport;
+
+    #[test]
+    fn viewport_matches_flattened_reference_at_group_boundaries() {
+        for selected_group in 0..3 {
+            for selected_item in 0..4 {
+                for height in 0..10 {
+                    let counts = [3, 1, 4];
+                    let groups: Vec<_> = counts
+                        .iter()
+                        .enumerate()
+                        .map(|(group, count)| {
+                            (*count, (group == selected_group).then_some(selected_item))
+                        })
+                        .collect();
+                    let flat: Vec<_> = counts
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(group, count)| (0..*count).map(move |item| (group, item)))
+                        .collect();
+                    let selection = flat
+                        .iter()
+                        .position(|row| *row == (selected_group, selected_item))
+                        .unwrap_or(0);
+                    let offset = if height == 0 {
+                        0
+                    } else {
+                        selection.saturating_sub(height - 1)
+                    };
+                    let expected: Vec<_> = flat.iter().skip(offset).take(height).copied().collect();
+                    let (rows, actual_offset, total) =
+                        duplicate_viewport(groups.iter().copied(), height);
+                    assert_eq!(rows, expected);
+                    assert_eq!(actual_offset, offset);
+                    assert_eq!(total, flat.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn million_row_group_only_materializes_the_viewport() {
+        let groups = [(1_000_001, Some(1_000_000))];
+        let (rows, offset, total) = duplicate_viewport(groups.into_iter(), 24);
+        assert_eq!(rows.len(), 24);
+        assert_eq!(offset, 999_977);
+        assert_eq!(total, 1_000_001);
+        assert_eq!(rows.last(), Some(&(0, 1_000_000)));
     }
 }

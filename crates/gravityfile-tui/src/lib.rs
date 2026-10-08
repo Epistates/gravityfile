@@ -37,9 +37,15 @@
 
 pub mod app;
 mod event;
+mod event_source;
+mod graphics_query;
 mod opener;
 mod preview;
 mod search;
+mod shell_integration;
+mod terminal_session;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod ui;
 
@@ -50,6 +56,9 @@ pub use theme::Theme;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TuiConfig {
+    /// Host executable supporting the private plugin worker protocol. If absent,
+    /// embedded TUI hosts do not load plugins into their own process implicitly.
+    pub plugin_worker_executable: Option<std::path::PathBuf>,
     /// Whether to automatically start scanning on startup.
     /// `None` means defer to the user's saved settings.
     /// `Some(true)` forces scanning on, `Some(false)` forces it off.
@@ -62,6 +71,11 @@ pub struct TuiConfig {
 }
 
 impl TuiConfig {
+    /// Enable supervised plugins using a worker-capable host executable.
+    pub fn with_plugin_worker_executable(mut self, path: std::path::PathBuf) -> Self {
+        self.plugin_worker_executable = Some(path);
+        self
+    }
     /// Create a new config with default values.
     pub fn new() -> Self {
         Self::default()
@@ -100,7 +114,7 @@ pub fn run(path: std::path::PathBuf) -> AppResult<()> {
 
 /// Run the TUI application with custom configuration.
 pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult<()> {
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::event::EnableMouseCapture;
     use crossterm::execute;
 
     // Create tokio runtime for async operations - setup services BEFORE terminal
@@ -112,12 +126,36 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
 
     // Initialize terminal with Ratatui's high-level API
     // This automatically installs a panic hook that restores the terminal.
+    let mut session = terminal_session::TerminalSession::new();
     let terminal = ratatui::try_init()?;
 
-    // Enable mouse capture
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // The guard also restores partially initialized state on this error path.
+    execute!(std::io::stdout(), EnableMouseCapture)?;
 
+    // Detect the terminal's graphics protocol and font size.
+    //
+    // This writes control sequences and reads the reply, so it has to happen
+    // after raw mode is enabled and before the event loop takes ownership of
+    // stdin. Unix probing reads synchronously with a 250 ms deadline and an
+    // 8 KiB reply budget; no reader survives a timeout. Other platforms use
+    // half-block previews without a stdio query. `image_previews` opts out.
+    //
+    // Failed detection is not an error: image files simply fall back to the
+    // ordinary binary preview.
     let app = App::with_config(path, config);
+    let image_picker = if app.image_previews_enabled() {
+        match graphics_query::query_picker() {
+            Ok(picker) => Some(picker),
+            Err(error) => {
+                tracing::debug!("Terminal graphics detection failed: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let app = app.with_image_picker(image_picker);
     let result = rt.block_on(async { app.run_and_return_exit_data(terminal).await });
 
     // Discard all pending terminal output sitting in the kernel's PTY buffer.
@@ -132,22 +170,23 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
     }
 
     // Now these commands go to the front of an empty buffer — instant.
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    ratatui::try_restore()?;
+    let terminal_restore = session.restore();
     rt.shutdown_background();
 
-    // Handle exit data for shell integration
-    if let Ok(exit_data) = &result {
-        // Write cwd to file if requested
-        if let Some(cwd_path) = cwd_file {
-            let _ = std::fs::write(&cwd_path, exit_data.last_cwd.to_string_lossy().as_bytes());
-        }
+    // Prefer the application error, but never skip the cleanup attempts above.
+    let exit_data = result?;
+    terminal_restore?;
 
-        // Print cwd if requested
-        if print_cwd {
-            println!("{}", exit_data.last_cwd.display());
-        }
+    // Handle exit data for shell integration
+    // Write cwd to file if requested.
+    if let Some(cwd_path) = cwd_file {
+        shell_integration::write_cwd_file(&cwd_path, &exit_data.last_cwd)?;
     }
 
-    result.map(|_| ())
+    // Print cwd if requested.
+    if print_cwd {
+        shell_integration::print_cwd(&exit_data.last_cwd, &mut std::io::stdout().lock())?;
+    }
+
+    Ok(())
 }

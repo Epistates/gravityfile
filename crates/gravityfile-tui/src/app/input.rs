@@ -1,13 +1,14 @@
 //! Input state for text input modes (rename, create).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// State for text input operations.
 #[derive(Debug, Clone, Default)]
 pub struct InputState {
     /// The current input buffer.
     buffer: String,
-    /// Cursor position within the buffer.
+    /// UTF-8 byte offset at a grapheme boundary within the buffer.
     cursor: usize,
     /// Original value (for rename operations to show what's being renamed).
     original: Option<String>,
@@ -91,8 +92,10 @@ impl InputState {
             // Backspace - delete character before cursor
             (KeyCode::Backspace, _) => {
                 if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.buffer.remove(self.cursor);
+                    let start = self.previous_boundary();
+                    self.buffer.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                    self.snap_cursor_forward();
                 }
                 InputResult::Continue
             }
@@ -100,20 +103,22 @@ impl InputState {
             // Delete - delete character at cursor
             (KeyCode::Delete, _) => {
                 if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
+                    let end = self.next_boundary();
+                    self.buffer.replace_range(self.cursor..end, "");
+                    self.snap_cursor_forward();
                 }
                 InputResult::Continue
             }
 
             // Left arrow - move cursor left
             (KeyCode::Left, _) => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = self.previous_boundary();
                 InputResult::Continue
             }
 
             // Right arrow - move cursor right
             (KeyCode::Right, _) => {
-                self.cursor = (self.cursor + 1).min(self.buffer.len());
+                self.cursor = self.next_boundary();
                 InputResult::Continue
             }
 
@@ -145,14 +150,20 @@ impl InputState {
             // Ctrl-W - delete word before cursor
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                 if self.cursor > 0 {
-                    // Find the start of the word
-                    let before = &self.buffer[..self.cursor];
-                    let word_start = before
-                        .rfind(|c: char| c.is_whitespace())
-                        .map(|i| i + 1)
-                        .unwrap_or(0);
-                    self.buffer.replace_range(word_start..self.cursor, "");
-                    self.cursor = word_start;
+                    let mut start = self.cursor;
+                    let mut found_word = false;
+                    for (index, grapheme) in self.buffer[..self.cursor].grapheme_indices(true).rev()
+                    {
+                        let whitespace = grapheme.chars().all(char::is_whitespace);
+                        if found_word && whitespace {
+                            break;
+                        }
+                        found_word |= !whitespace;
+                        start = index;
+                    }
+                    self.buffer.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                    self.snap_cursor_forward();
                 }
                 InputResult::Continue
             }
@@ -160,7 +171,8 @@ impl InputState {
             // Regular character input
             (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.buffer.insert(self.cursor, c);
-                self.cursor += 1;
+                self.cursor += c.len_utf8();
+                self.snap_cursor_forward();
                 InputResult::Continue
             }
 
@@ -173,41 +185,33 @@ impl InputState {
     ///
     /// Returns Ok(()) if valid, Err with message if invalid.
     pub fn validate_filename(&self) -> Result<(), String> {
-        let name = &self.buffer;
+        gravityfile_ops::validate_filename(&self.buffer)
+    }
 
-        if name.is_empty() {
-            return Err("Name cannot be empty".into());
-        }
+    fn previous_boundary(&self) -> usize {
+        self.buffer
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .take_while(|&index| index < self.cursor)
+            .last()
+            .unwrap_or(0)
+    }
 
-        if name.len() > 255 {
-            return Err("Name is too long (max 255 characters)".into());
-        }
+    fn next_boundary(&self) -> usize {
+        self.buffer
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .find(|&index| index > self.cursor)
+            .unwrap_or(self.buffer.len())
+    }
 
-        // Check for invalid characters (Unix)
-        if name.contains('/') {
-            return Err("Name cannot contain '/'".into());
-        }
-
-        if name.contains('\0') {
-            return Err("Name cannot contain null character".into());
-        }
-
-        // Check for . and .. which are reserved
-        if name == "." || name == ".." {
-            return Err("'.' and '..' are reserved names".into());
-        }
-
-        // Check for leading/trailing spaces (problematic)
-        if name.starts_with(' ') || name.ends_with(' ') {
-            return Err("Name cannot start or end with spaces".into());
-        }
-
-        // Check for trailing dots (problematic on Windows)
-        if name.ends_with('.') && name != "." {
-            return Err("Name cannot end with a dot".into());
-        }
-
-        Ok(())
+    fn snap_cursor_forward(&mut self) {
+        self.cursor = self
+            .buffer
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .find(|&index| index >= self.cursor)
+            .unwrap_or(self.buffer.len());
     }
 
     /// Check if the buffer has changed from the original value.
@@ -239,6 +243,80 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn unicode_editing_preserves_grapheme_boundaries() {
+        use ratatui::{buffer::Buffer, layout::Rect, style::Modifier, widgets::Widget};
+        for value in ["é日", "e\u{301}x", "👩‍💻🇺🇸1️⃣", "a\u{2003}word  "] {
+            let mut input = InputState::new();
+            for character in value.chars() {
+                input.handle_key(key_event(KeyCode::Char(character), KeyModifiers::NONE));
+                assert!(input.buffer.is_char_boundary(input.cursor));
+                for width in [0, 1, 6, 20, 80] {
+                    let area = Rect::new(0, 0, width, 24);
+                    let mut buffer = Buffer::empty(area);
+                    crate::ui::modals::InputModal::new(
+                        &crate::theme::Theme::default(),
+                        &input,
+                        "Rename",
+                        "Name",
+                    )
+                    .render(area, &mut buffer);
+                }
+            }
+            assert_eq!(input.buffer(), value);
+            let boundaries: Vec<_> = value
+                .grapheme_indices(true)
+                .map(|(index, _)| index)
+                .chain(std::iter::once(value.len()))
+                .collect();
+            for &boundary in boundaries.iter().rev().skip(1) {
+                input.handle_key(key_event(KeyCode::Left, KeyModifiers::NONE));
+                assert_eq!(input.cursor(), boundary);
+            }
+            for &boundary in boundaries.iter().skip(1) {
+                input.handle_key(key_event(KeyCode::Right, KeyModifiers::NONE));
+                assert_eq!(input.cursor(), boundary);
+            }
+            for remaining in (0..value.graphemes(true).count()).rev() {
+                input.handle_key(key_event(KeyCode::Backspace, KeyModifiers::NONE));
+                assert_eq!(input.buffer.graphemes(true).count(), remaining);
+            }
+            let mut input = InputState::with_initial(value);
+            input.handle_key(key_event(KeyCode::Home, KeyModifiers::NONE));
+            for remaining in (0..value.graphemes(true).count()).rev() {
+                input.handle_key(key_event(KeyCode::Delete, KeyModifiers::NONE));
+                assert_eq!(input.buffer.graphemes(true).count(), remaining);
+            }
+        }
+        let mut input = InputState::with_initial("é\u{2003}word  ");
+        input.handle_key(key_event(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(input.buffer(), "é\u{2003}");
+        input.handle_key(key_event(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(input.buffer().is_empty());
+        let mut input = InputState::with_initial("🇺x🇸");
+        input.handle_key(key_event(KeyCode::Left, KeyModifiers::NONE));
+        input.handle_key(key_event(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(input.buffer(), "🇺🇸");
+        assert_eq!(input.cursor(), input.buffer().len());
+        let mut input = InputState::with_initial("é日");
+        input.handle_key(key_event(KeyCode::Left, KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        crate::ui::modals::InputModal::new(
+            &crate::theme::Theme::default(),
+            &input,
+            "Rename",
+            "Name",
+        )
+        .render(area, &mut buffer);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "日" && cell.modifier.contains(Modifier::REVERSED))
+        );
     }
 
     #[test]

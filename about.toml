@@ -1,0 +1,260 @@
+# Notice generation uses bundled license texts; cargo-deny remains the policy gate.
+ignore-dev-dependencies = true
+accepted = ["MIT", "0BSD", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSL-1.0", "CC0-1.0", "MPL-2.0", "Unicode-3.0", "Unlicense", "Zlib", "bzip2-1.0.6"]
+
+[zstd-safe]
+accepted = ["BSD-3-Clause"]
+
+[zstd-sys]
+accepted = ["BSD-3-Clause"]
+
+[blake3.clarify]
+license = "Apache-2.0"
+
+[[blake3.clarify.files]]
+path = "LICENSE_A2"
+checksum = "00fcc7a934ddbc9ece2a7cc063ac788e284b703b1d705ccbba72d462aa97921e"
+
+[constant_time_eq.clarify]
+license = "Apache-2.0"
+
+[[constant_time_eq.clarify.files]]
+path = "LICENSE-APACHE"
+checksum = "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+
+[ryu.clarify]
+license = "Apache-2.0"
+
+[[ryu.clarify.files]]
+path = "LICENSE-APACHE"
+checksum = "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+
+[sync_wrapper.clarify]
+license = "Apache-2.0"
+
+[[sync_wrapper.clarify.files]]
+path = "LICENSE"
+checksum = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+
+[gravityfile-analyze.clarify]
+license = "MIT"
+
+[[gravityfile-analyze.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "d2fb587595a98e66310d2d3152994e6f1078b82f9e8bceab42d053e18d212f73"
+
+[gravityfile-core.clarify]
+license = "MIT"
+
+[[gravityfile-core.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "d2fb587595a98e66310d2d3152994e6f1078b82f9e8bceab42d053e18d212f73"
+
+[gravityfile-ops.clarify]
+license = "MIT"
+
+[[gravityfile-ops.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "d2fb587595a98e66310d2d3152994e6f1078b82f9e8bceab42d053e18d212f73"
+
+[gravityfile-plugin.clarify]
+license = "MIT"
+
+[[gravityfile-plugin.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "d2fb587595a98e66310d2d3152994e6f1078b82f9e8bceab42d053e18d212f73"
+
+[gravityfile-scan.clarify]
+license = "MIT"
+
+[[gravityfile-scan.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "d2fb587595a98e66310d2d3152994e6f1078b82f9e8bceab42d053e18d212f73"
+
+[gravityfile-tui.clarify]
+license = "MIT"
+
+[[gravityfile-tui.clarify.files]]
+path = "../../LICENSE-MIT"
+checksum = "d2fb587595a98e66310d2d3152994e6f1078b82f9e8bceab42d053e18d212f73"
+
+[base64-simd.clarify]
+license = "MIT"
+override-git-commit = "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+
+[[base64-simd.clarify.git]]
+path = "LICENSE"
+checksum = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+
+[chrono.clarify]
+license = "MIT"
+
+[[chrono.clarify.files]]
+path = "LICENSE.txt"
+checksum = "946c9835d8034d24404f8cfec5f4654cee5dad17e944afc3d06d742cf2882831"
+
+[icy_sixel.clarify]
+license = "MIT"
+override-git-commit = "7baecc1bbb18ddf0ff0de83d296b4509a1b64b0f"
+
+[[icy_sixel.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "7110f70a51841ce71ec9a2a156db30561aba84d3ad2323ef88ede17c9aa34ba0"
+
+[libm.clarify]
+license = "MIT"
+
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+[lua-src.clarify]
+license = "MIT"
+
+[[lua-src.clarify.files]]
+path = "LICENSE"
+checksum = "bb53bb4136a0ac250ba54c3baf6fb0ee22f33879a696848dc0d0aa64dfa9412d"
+
+[mlua-sys.clarify]
+license = "MIT"
+override-git-commit = "4fd87af2157b0a7ecd22ba299848e4ca3d462efe"
+
+[[mlua-sys.clarify.git]]
+path = "LICENSE"
+checksum = "63b61a30d3e3abcfcb1bda4b99f4eea9fdb7d6ab05fbc513461fef6cf89baf29"
+
+[palette_math.clarify]
+license = "MIT"
+
+[[palette_math.clarify.files]]
+path = "LICENSE_MIT"
+checksum = "be1313a4b07ab509c80083966cdd209a7d81d75cd57fcea24441fc9041ccf184"
+
+[quantette.clarify]
+license = "MIT"
+override-git-commit = "066855ad3efb4143c3b901c812f80b9b17f8f303"
+
+[[quantette.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "8f2b430687de9562bfac3b9c2e58d5989d2f0b95772928e94c23a942878c919a"
+
+[rhai_codegen.clarify]
+license = "MIT"
+override-git-commit = "b247dd730de3f2c97fa1e46f138a17f9d844de67"
+
+[[rhai_codegen.clarify.git]]
+path = "LICENSE-MIT.txt"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
+[vsimd.clarify]
+license = "MIT"
+override-git-commit = "d74c030d9dc4f3cae02146d1f497ff62726ef09a"
+
+[[vsimd.clarify.git]]
+path = "LICENSE"
+checksum = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+
+[windows.clarify]
+license = "MIT"
+
+[[windows.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-collections.clarify]
+license = "MIT"
+
+[[windows-collections.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-core.clarify]
+license = "MIT"
+
+[[windows-core.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-future.clarify]
+license = "MIT"
+
+[[windows-future.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-implement.clarify]
+license = "MIT"
+
+[[windows-implement.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-interface.clarify]
+license = "MIT"
+
+[[windows-interface.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-link.clarify]
+license = "MIT"
+
+[[windows-link.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-numerics.clarify]
+license = "MIT"
+
+[[windows-numerics.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-result.clarify]
+license = "MIT"
+
+[[windows-result.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-strings.clarify]
+license = "MIT"
+
+[[windows-strings.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-sys.clarify]
+license = "MIT"
+
+[[windows-sys.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-targets.clarify]
+license = "MIT"
+
+[[windows-targets.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows-threading.clarify]
+license = "MIT"
+
+[[windows-threading.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows_x86_64_gnu.clarify]
+license = "MIT"
+
+[[windows_x86_64_gnu.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+
+[windows_x86_64_msvc.clarify]
+license = "MIT"
+
+[[windows_x86_64_msvc.clarify.git]]
+path = "license-mit"
+checksum = "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"

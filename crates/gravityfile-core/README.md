@@ -114,3 +114,42 @@ use gravityfile_core::{ScanError, ScanWarning, WarningKind};
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+
+
+### Native filename components
+
+`FileNode.name` is a Unicode display label. Use `FileNode::file_name()` for
+filesystem path construction, and `set_file_name(&OsStr)` when creating nodes
+from filesystem entries. Non-Unicode components are retained in the optional
+`native_name` field. Its serialized representation is platform-specific; legacy
+nodes without it continue to use `name`. Direct Rust struct literals must include
+the new field. Display labels may collide even when native components differ.
+Scan and analysis report paths use `path_serde` adapters to retain Unicode
+strings and encode non-Unicode paths as tagged native values; see
+[report formats](../../docs/REPORTS.md).
+
+
+Use `FileNode::display_name()` for terminal-facing labels. It preserves ordinary
+Unicode and escapes invalid platform-encoded bytes, controls, and backslashes
+distinctly. `name` remains the compatibility label; `file_name()` remains the
+exact filesystem component. The display string must never be parsed back into
+a path.
+
+### Deep tree lifecycle and field ownership
+
+`FileNode` uses iterative traversal for cloning, count updates, child sorting,
+and destruction. The destructor drains descendants through heap-backed iterator
+frames; memory for those frames grows with depth. Recursive Serde remains a
+separate depth limit.
+
+`FileNode` debug formatting prints local metadata and `child_count`, omitting
+descendant contents in both compact and pretty modes. Logging a node therefore
+does not traverse the tree or consume stack proportional to tree depth. This
+changes diagnostic text, not serialization. Local metadata such as names and
+symlink targets can still be large; there is no fixed byte limit on a debug line.
+
+`FileNode` now implements `Drop`, which changes Rust source-level field moves.
+Borrow fields when possible. To transfer owned children without cloning, use
+`let children = std::mem::take(&mut node.children);` with a mutable node. Use
+`Option::take` or `std::mem::replace` as appropriate for other owned fields.
+The serialized field layout is unchanged by the destructor.
