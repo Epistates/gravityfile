@@ -93,6 +93,7 @@ fn quick_list_with_settings(
 /// ended without reporting.
 enum Background {
     Scan(Option<ScanResult>),
+    Operation(Option<ScanResult>),
     Take(Option<ScanResult>),
     Preview(Option<PreviewLoad>),
     Archive(Option<ArchiveCompletion>),
@@ -189,11 +190,16 @@ pub struct App {
     deletion_progress: Option<DeletionProgress>,
     /// Current scan progress (for display during scanning).
     scan_progress: Option<ScanProgress>,
-    /// Channel for receiving scan results.
+    /// Results of the running scan or analysis.
     scan_rx: Option<mpsc::Receiver<ScanResult>>,
     take_rx: Option<mpsc::Receiver<ScanResult>>,
-    /// Token for cancelling active scan.
+    /// Cancels the running scan or analysis.
     scan_token: CancellationToken,
+    /// Results of the running filesystem operation, which runs alongside a
+    /// scan rather than replacing it.
+    op_rx: Option<mpsc::Receiver<ScanResult>>,
+    /// Cancels the running filesystem operation.
+    op_token: CancellationToken,
     /// Scan warnings/errors (populated in real-time during scan).
     warnings: Vec<gravityfile_core::ScanWarning>,
     /// Latest operation diagnostics survive the automatic scan refresh.
@@ -375,6 +381,8 @@ impl App {
             scan_rx: None,
             take_rx: None,
             scan_token: CancellationToken::new(),
+            op_rx: None,
+            op_token: CancellationToken::new(),
             warnings: Vec::new(),
             operation_warnings: Vec::new(),
             selected_warning: 0,
@@ -643,6 +651,7 @@ impl App {
             .await;
 
         self.scan_token.cancel();
+        self.op_token.cancel();
         self.cancel_archive_operation();
 
         // Take heavy structures — they'll be dropped when the runtime shuts down
@@ -681,6 +690,7 @@ impl App {
     /// Whether any background task can still report back.
     fn has_background(&self) -> bool {
         self.scan_rx.is_some()
+            || self.op_rx.is_some()
             || self.take_rx.is_some()
             || self.preview_rx.is_some()
             || self.archive_rx.is_some()
@@ -694,6 +704,9 @@ impl App {
             result = async {
                 self.scan_rx.as_mut().expect("guarded scan receiver").recv().await
             }, if self.scan_rx.is_some() => Background::Scan(result),
+            result = async {
+                self.op_rx.as_mut().expect("guarded operation receiver").recv().await
+            }, if self.op_rx.is_some() => Background::Operation(result),
             take = async {
                 self.take_rx.as_mut().expect("guarded take receiver").recv().await
             }, if self.take_rx.is_some() => Background::Take(take),
@@ -712,8 +725,11 @@ impl App {
 
     fn handle_background(&mut self, background: Background) {
         match background {
-            Background::Scan(Some(result)) => self.handle_scan_result(result),
-            Background::Scan(None) => self.handle_background_channel_closed(),
+            Background::Scan(Some(result)) | Background::Operation(Some(result)) => {
+                self.handle_scan_result(result)
+            }
+            Background::Scan(None) => self.handle_scan_channel_closed(),
+            Background::Operation(None) => self.handle_operation_channel_closed(),
             Background::Take(take) => {
                 self.take_rx = None;
                 if let Some(ScanResult::TakeComplete { path, result }) = take {
@@ -745,7 +761,7 @@ impl App {
         // Wait for a running refresh, and for an operation or scan in
         // progress: one could still be changing these paths, and a full scan
         // would cancel it.
-        if self.refresh_rx.is_some() || self.scan_rx.is_some() {
+        if self.refresh_rx.is_some() || self.scan_rx.is_some() || self.op_rx.is_some() {
             return;
         }
         let Some(tree) = &self.tree else {
@@ -895,8 +911,17 @@ impl App {
         ));
     }
 
-    /// Transfer the background result slot to a filesystem operation.
+    /// Get ready to start a filesystem operation. A running scan carries on;
+    /// analysis, whose results the operation would make stale, is cancelled.
     fn prepare_operation(&mut self) {
+        if self.analyzing {
+            self.cancel_scan();
+        }
+        self.op_token = CancellationToken::new();
+    }
+
+    /// Stop the running scan or analysis, whose tree is being replaced.
+    fn cancel_scan(&mut self) {
         self.scan_token.cancel();
         self.scan_token = CancellationToken::new();
         self.scan_rx = None;
@@ -906,15 +931,9 @@ impl App {
 
     /// Cancel the active scan or post-scan analysis without leaving the explorer.
     fn cancel_background_work(&mut self) {
-        self.scan_token.cancel();
-        self.scan_token = CancellationToken::new();
-        self.scan_rx = None;
-
         let was_scanning = self.scan_progress.is_some();
         let was_analyzing = self.analyzing;
-
-        self.scan_progress = None;
-        self.analyzing = false;
+        self.cancel_scan();
 
         if was_scanning {
             self.operation_message =
@@ -964,14 +983,24 @@ impl App {
         self.warnings.extend(additional);
     }
 
+    /// A scan or analysis worker ended without a result.
+    fn handle_scan_channel_closed(&mut self) {
+        let analyzing = self.analyzing;
+        self.cancel_scan();
+        self.error = Some(if analyzing {
+            "Analysis ended without a result".to_string()
+        } else {
+            "Scan ended without a result; showing the previous listing".to_string()
+        });
+        self.needs_redraw = true;
+    }
+
     /// Release dead worker state without interpreting missing completion as success.
-    fn handle_background_channel_closed(&mut self) {
-        self.scan_token.cancel();
-        self.scan_rx = None;
-        self.scan_progress = None;
+    fn handle_operation_channel_closed(&mut self) {
+        self.op_token.cancel();
+        self.op_rx = None;
         self.deletion_progress = None;
         self.operation_progress = None;
-        self.analyzing = false;
         self.pending_conflict = None;
         self.operation_message = None;
         self.deletion_message = None;
@@ -992,6 +1021,8 @@ impl App {
             "Background operation ended without completion; outcome unknown. Inspect affected paths before retrying."
                 .to_string(),
         );
+        // Whatever it changed, show what is there now.
+        self.refresh_paths(vec![self.view_root.clone()]);
         self.needs_redraw = true;
     }
 
@@ -999,7 +1030,7 @@ impl App {
     fn handle_scan_result(&mut self, result: ScanResult) {
         match result {
             ScanResult::BulkRenameComplete(result) => {
-                self.scan_rx = None;
+                self.op_rx = None;
                 // After a failure, rollback may have left any of the viewed
                 // directory's entries renamed.
                 let mut touched = vec![self.view_root.clone()];
@@ -1150,7 +1181,7 @@ impl App {
                 self.set_operation_errors(gravityfile_ops::OperationType::Delete, errors);
                 self.operation_message = None;
                 self.deletion_progress = None;
-                self.scan_rx = None;
+                self.op_rx = None;
 
                 let (success, msg) =
                     deletion::format_deletion_result(mode, deleted.len(), failed, bytes_freed);
@@ -1167,7 +1198,7 @@ impl App {
                 self.operation_progress = Some(progress);
             }
             ScanResult::OperationConflict(conflict) => {
-                if self.scan_token.is_cancelled() {
+                if self.op_token.is_cancelled() {
                     conflict.resolve(gravityfile_ops::ConflictResolution::Abort);
                     return;
                 }
@@ -1187,7 +1218,7 @@ impl App {
                 touched,
             } => {
                 self.operation_progress = None;
-                self.scan_rx = None;
+                self.op_rx = None;
                 let error_count = errors.iter().fold(0usize, |total, error| {
                     total.saturating_add(error.represented_count())
                 });
@@ -1741,7 +1772,7 @@ impl App {
                     action,
                     KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
                 ) {
-                    self.scan_token.cancel();
+                    self.op_token.cancel();
                     self.operation_message =
                         Some((false, "Cancelling bulk rename; waiting for rollback".into()));
                     self.needs_redraw = true;
@@ -1803,7 +1834,7 @@ impl App {
                     action,
                     KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
                 ) {
-                    self.scan_token.cancel();
+                    self.op_token.cancel();
                     self.operation_message =
                         Some((false, "Cancelling undo; waiting for completion".into()));
                     self.needs_redraw = true;
@@ -1828,7 +1859,7 @@ impl App {
                     action,
                     KeyAction::Cancel | KeyAction::Quit | KeyAction::ForceQuit
                 ) {
-                    self.scan_token.cancel();
+                    self.op_token.cancel();
                     self.operation_message =
                         Some((false, "Cancelling operation; waiting for completion".into()));
                     self.needs_redraw = true;
@@ -2316,7 +2347,7 @@ impl App {
         }
 
         self.prepare_operation();
-        self.scan_rx = Some(deletion::start_deletion(items, self.delete_mode));
+        self.op_rx = Some(deletion::start_deletion(items, self.delete_mode));
     }
 
     /// Get the size of a path from the tree.
@@ -2405,9 +2436,9 @@ impl App {
                     sources,
                     destination,
                     options,
-                    self.scan_token.clone(),
+                    self.op_token.clone(),
                 );
-                self.scan_rx = Some(Self::adapt_transfer_rx(rx));
+                self.op_rx = Some(Self::adapt_transfer_rx(rx));
             }
             ClipboardMode::Cut => {
                 self.mode = AppMode::Moving;
@@ -2415,9 +2446,9 @@ impl App {
                     sources,
                     destination,
                     options,
-                    self.scan_token.clone(),
+                    self.op_token.clone(),
                 );
-                self.scan_rx = Some(Self::adapt_transfer_rx(rx));
+                self.op_rx = Some(Self::adapt_transfer_rx(rx));
                 self.clipboard.clear();
             }
             ClipboardMode::Empty => {}
@@ -2548,7 +2579,7 @@ impl App {
         }
 
         if matches!(resolution, ConflictResolution::Abort) {
-            self.scan_token.cancel();
+            self.op_token.cancel();
             self.operation_message =
                 Some((false, "Cancelling operation; waiting for completion".into()));
         }
@@ -2658,10 +2689,10 @@ impl App {
         self.operation_message = Some((true, format!("Undoing: {}", entry.description)));
         self.prepare_operation();
         let mut touched = Some(entry.operation.touched_paths());
-        let mut rx = gravityfile_ops::execute_undo(entry, self.scan_token.clone());
+        let mut rx = gravityfile_ops::execute_undo(entry, self.op_token.clone());
 
         let (tx, adapted_rx) = tokio::sync::mpsc::channel(100);
-        let token = self.scan_token.clone();
+        let token = self.op_token.clone();
         tokio::spawn(async move {
             loop {
                 let result = tokio::select! {
@@ -2696,7 +2727,7 @@ impl App {
                 }
             }
         });
-        self.scan_rx = Some(adapted_rx);
+        self.op_rx = Some(adapted_rx);
         self.mode = AppMode::Undoing;
     }
 
@@ -2765,7 +2796,7 @@ impl App {
 
         // Adapt the rename result receiver
         let adapted_rx = Self::adapt_rename_rx(source, new_name.clone(), rx);
-        self.scan_rx = Some(adapted_rx);
+        self.op_rx = Some(adapted_rx);
         self.mode = AppMode::UpdatingEntry;
 
         // Show pending message
@@ -2839,7 +2870,7 @@ impl App {
         let rx = start_create_file(path.clone());
 
         let adapted_rx = Self::adapt_create_rx(path, rx);
-        self.scan_rx = Some(adapted_rx);
+        self.op_rx = Some(adapted_rx);
 
         self.operation_message = Some((true, format!("Creating file {}...", name)));
         self.mode = AppMode::UpdatingEntry;
@@ -2860,7 +2891,7 @@ impl App {
         let rx = start_create_directory(path.clone());
 
         let adapted_rx = Self::adapt_create_rx(path, rx);
-        self.scan_rx = Some(adapted_rx);
+        self.op_rx = Some(adapted_rx);
 
         self.operation_message = Some((true, format!("Creating directory {}...", name)));
         self.mode = AppMode::UpdatingEntry;
@@ -3610,7 +3641,7 @@ impl App {
                 let Some(tree) = self.load_directory_listing(&prev_root) else {
                     return;
                 };
-                self.prepare_operation();
+                self.cancel_scan();
                 self.path = tree.root_path.clone();
                 self.install_tree(tree);
                 self.duplicates = None;
@@ -3695,7 +3726,7 @@ impl App {
         self.merge_cached_scans_into_tree(&mut parent_tree.root, parent);
 
         // Create a new tree rooted at the resolved parent.
-        self.prepare_operation();
+        self.cancel_scan();
         self.path = parent_tree.root_path.clone();
         self.install_tree(parent_tree);
         self.view_root = self.path.clone();
@@ -4195,10 +4226,7 @@ impl App {
             })
             .collect();
         self.prepare_operation();
-        self.scan_rx = Some(scanning::start_bulk_rename(
-            renames,
-            self.scan_token.clone(),
-        ));
+        self.op_rx = Some(scanning::start_bulk_rename(renames, self.op_token.clone()));
         self.mode = AppMode::BulkRenaming;
         self.operation_message = Some((
             true,
@@ -4375,7 +4403,7 @@ impl App {
         self.tree_state.offset = 0;
         self.miller_state.reset();
         if let Some(tree) = replacement {
-            self.prepare_operation();
+            self.cancel_scan();
             self.path = tree.root_path.clone();
             self.install_tree(tree);
             self.tree_state = TreeState::new(self.path.clone());
@@ -6705,7 +6733,7 @@ mod tests {
             if active_creation {
                 app.execute_create_file(root.clone(), "created".into());
             }
-            let token = app.scan_token.clone();
+            let token = app.op_token.clone();
             let message = app.operation_message.clone();
             let (sender, receiver) = oneshot::channel();
             app.archive_rx = Some(receiver);
@@ -6713,10 +6741,13 @@ mod tests {
             let completion = app.archive_rx.as_mut().unwrap().await.ok();
             app.finish_archive_task(completion);
             assert!(app.archive_rx.is_none());
-            assert!(
-                app.scan_rx.is_some(),
-                "unknown outcome must refresh the filesystem view"
-            );
+            // Unknown outcome: refresh now, or once the creation finishes.
+            if active_creation {
+                assert!(app.scan_rx.is_none());
+                assert!(!app.queued_refresh.is_empty());
+            } else {
+                assert!(app.scan_rx.is_some());
+            }
             assert!(
                 app.error
                     .as_deref()
@@ -6727,16 +6758,7 @@ mod tests {
                 assert!(!token.is_cancelled());
                 assert_eq!(app.operation_message, message);
             }
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while let Some(receiver) = app.scan_rx.as_mut() {
-                    let Some(result) = receiver.recv().await else {
-                        break;
-                    };
-                    app.handle_scan_result(result);
-                }
-            })
-            .await
-            .unwrap();
+            pump(&mut app, |_| false).await;
             assert!(
                 app.tree
                     .as_ref()
@@ -6768,7 +6790,7 @@ mod tests {
             if active_creation {
                 app.execute_create_file(root.clone(), "created".into());
             }
-            let token = app.scan_token.clone();
+            let token = app.op_token.clone();
             app.handle_archive_completion(ArchiveCompletion::Extract {
                 archive_path: root.join("input.zip"),
                 destination: root.clone(),
@@ -6787,23 +6809,16 @@ mod tests {
             );
             assert!(!message.contains("private/path"));
             assert!(app.marked.contains(&source));
-            assert!(app.scan_rx.is_some());
+            assert!(if active_creation {
+                app.op_rx.is_some()
+            } else {
+                app.scan_rx.is_some()
+            });
             if active_creation {
                 assert!(!token.is_cancelled());
                 assert!(!app.queued_refresh.is_empty());
             }
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                // Unlike the operation-only helper, allow its follow-up
-                // scan to finish so the assertion observes the actual tree.
-                while let Some(receiver) = app.scan_rx.as_mut() {
-                    let Some(result) = receiver.recv().await else {
-                        break;
-                    };
-                    app.handle_scan_result(result);
-                }
-            })
-            .await
-            .unwrap();
+            pump(&mut app, |_| false).await;
             assert!(
                 app.tree
                     .as_ref()
@@ -6834,7 +6849,7 @@ mod tests {
             app.marked.insert(archived_source.clone());
             app.marked.insert(unrelated_mark.clone());
             app.execute_create_file(root.clone(), "created".into());
-            let token = app.scan_token.clone();
+            let token = app.op_token.clone();
             let message = app.operation_message.clone();
             let completion = if compress {
                 ArchiveCompletion::Compress {
@@ -6853,7 +6868,7 @@ mod tests {
             assert_eq!(app.marked.contains(&archived_source), !compress);
             assert!(app.marked.contains(&unrelated_mark));
             assert_eq!(app.mode, AppMode::UpdatingEntry);
-            assert!(app.scan_rx.is_some());
+            assert!(app.op_rx.is_some());
             assert!(!token.is_cancelled());
             assert_eq!(app.operation_message, message);
             assert!(!app.queued_refresh.is_empty());
@@ -7238,7 +7253,7 @@ mod tests {
         std::fs::write(&path, b"user content").unwrap();
         app.undo_log.record_create_file(path.clone());
         app.execute_undo();
-        let mut rx = app.scan_rx.take().unwrap();
+        let mut rx = app.op_rx.take().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let result = rx.recv().await.expect("undo completion");
@@ -7932,7 +7947,7 @@ mod tests {
                 .contains("still in progress")
         );
         app.execute_create_file(root.clone(), "file".into());
-        let later_token = app.scan_token.clone();
+        let later_token = app.op_token.clone();
         let mut take = app.take_rx.take().unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), take.recv())
             .await
@@ -7941,7 +7956,7 @@ mod tests {
         app.handle_scan_result(result);
         assert_eq!(app.mode, AppMode::UpdatingEntry);
         assert_eq!(app.view_root, root);
-        assert!(app.scan_rx.is_some());
+        assert!(app.op_rx.is_some());
         assert!(!later_token.is_cancelled());
         assert_eq!(app.undo_log.len(), 1);
         tokio::time::timeout(
@@ -8073,8 +8088,8 @@ mod tests {
         let mut app = App::with_config(directory.path().into(), crate::TuiConfig::default());
         app.undo_log.record_create_file(path.clone());
         app.execute_undo();
-        app.scan_token.cancel();
-        let mut rx = app.scan_rx.take().unwrap();
+        app.op_token.cancel();
+        let mut rx = app.op_rx.take().unwrap();
         let complete = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(result) = rx.recv().await {
                 if let ScanResult::OperationComplete {
@@ -8095,15 +8110,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_operations_cancel_previous_scan_and_clear_its_status() {
-        for operation in ["rename", "file", "directory", "take", "undo", "paste"] {
+    async fn filesystem_operations_cancel_analysis_but_not_a_scan() {
+        let operations = ["rename", "file", "directory", "take", "undo", "paste"];
+        for (operation, analyzing) in operations
+            .into_iter()
+            .flat_map(|operation| [(operation, true), (operation, false)])
+        {
             let (_dir, mut app) = scanned_app();
             let tree = Arc::clone(app.tree.as_ref().unwrap());
             let root = app.path.clone();
             let (old_tx, old_rx) = mpsc::channel(1);
             app.scan_rx = Some(old_rx);
-            app.scan_progress = Some(ScanProgress::new());
-            app.analyzing = true;
+            app.scan_progress = (!analyzing).then(ScanProgress::new);
+            app.analyzing = analyzing;
             let old_token = app.scan_token.clone();
             match operation {
                 "rename" => app.execute_rename(root.join("copy-a.bin"), "renamed".into()),
@@ -8124,16 +8143,22 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(old_token.is_cancelled(), "{operation}");
-            assert!(old_tx.is_closed(), "{operation}");
-            assert!(!app.scan_token.is_cancelled(), "{operation}");
-            assert!(app.scan_progress.is_none());
-            assert!(!app.analyzing);
+            if analyzing {
+                // Analysis of the tree the operation is about to change.
+                assert!(old_token.is_cancelled(), "{operation}");
+                assert!(old_tx.is_closed(), "{operation}");
+                assert!(!app.scan_token.is_cancelled(), "{operation}");
+                assert!(!app.analyzing);
+            } else {
+                assert!(!old_token.is_cancelled(), "{operation}");
+                assert!(app.scan_rx.is_some(), "{operation}");
+                assert!(app.scan_progress.is_some(), "{operation}");
+            }
             assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &tree));
             let mut rx = if operation == "take" {
                 app.take_rx.take()
             } else {
-                app.scan_rx.take()
+                app.op_rx.take()
             }
             .expect("operation receiver");
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -8189,7 +8214,7 @@ mod tests {
                         crossterm::event::KeyModifiers::NONE,
                     ));
                     assert_eq!(app.mode, AppMode::UpdatingEntry);
-                    assert!(app.scan_rx.is_some());
+                    assert!(app.op_rx.is_some());
                 }
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -8209,7 +8234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_background_channel_releases_operation_modes_without_claiming_success() {
+    async fn closed_operation_channel_releases_operation_modes_without_claiming_success() {
         let (_dir, mut app) = scanned_app();
         let tree = Arc::clone(app.tree.as_ref().unwrap());
         app.undo_log.record_create_file(app.path.join("recorded"));
@@ -8226,10 +8251,8 @@ mod tests {
         ] {
             let (tx, rx) = mpsc::channel(1);
             drop(tx);
-            app.scan_rx = Some(rx);
-            app.scan_token = CancellationToken::new();
-            app.scan_progress = Some(ScanProgress::new());
-            app.analyzing = true;
+            app.op_rx = Some(rx);
+            app.op_token = CancellationToken::new();
             app.operation_progress = Some(OperationProgress::new(
                 gravityfile_ops::OperationType::Copy,
                 1,
@@ -8238,24 +8261,48 @@ mod tests {
             app.operation_message = Some((true, "old success".into()));
             app.deletion_message = Some((true, "old deletion".into()));
             app.mode = mode;
-            assert!(app.scan_rx.as_mut().unwrap().recv().await.is_none());
-            app.handle_background_channel_closed();
+            let Background::Operation(None) = app.next_background().await else {
+                panic!("the closed operation channel reports first");
+            };
+            app.handle_background(Background::Operation(None));
             let expected = match mode {
                 AppMode::Search | AppMode::CreatingFile => mode,
                 _ => AppMode::Normal,
             };
             assert_eq!(app.mode, expected);
-            assert!(app.scan_token.is_cancelled());
-            assert!(app.scan_rx.is_none());
-            assert!(app.scan_progress.is_none());
-            assert!(!app.analyzing);
+            assert!(app.op_token.is_cancelled());
+            assert!(app.op_rx.is_none());
             assert!(app.operation_progress.is_none());
             assert!(app.operation_message.is_none());
             assert!(app.deletion_message.is_none());
             assert!(app.error.as_ref().unwrap().contains("outcome unknown"));
+            // Nothing is known to have changed: the tree stays until the
+            // refresh it starts reports back.
             assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &tree));
             assert_eq!(app.undo_log.len(), 1);
+            app.cancel_scan();
         }
+    }
+
+    #[tokio::test]
+    async fn closed_scan_channel_ends_the_scan_and_keeps_the_listing() {
+        let (_dir, mut app) = scanned_app();
+        let tree = Arc::clone(app.tree.as_ref().unwrap());
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        app.scan_rx = Some(rx);
+        app.scan_progress = Some(ScanProgress::new());
+        let token = app.scan_token.clone();
+        app.handle_background(Background::Scan(None));
+        assert!(token.is_cancelled());
+        assert!(app.scan_rx.is_none() && app.scan_progress.is_none());
+        assert!(
+            app.error
+                .as_ref()
+                .unwrap()
+                .contains("Scan ended without a result")
+        );
+        assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &tree));
     }
 
     #[tokio::test]
@@ -8269,7 +8316,7 @@ mod tests {
         app.undo_log.record_create_file(path.clone());
         app.execute_undo();
         assert_eq!(app.mode, AppMode::Undoing);
-        let token = app.scan_token.clone();
+        let token = app.op_token.clone();
         app.execute_undo();
         app.handle_action(KeyAction::Undo);
         app.dispatch_key_event(crossterm::event::KeyEvent::new(
@@ -8282,10 +8329,10 @@ mod tests {
         for action in [KeyAction::Cancel, KeyAction::Quit, KeyAction::ForceQuit] {
             app.handle_action(action);
             assert!(token.is_cancelled());
-            assert!(app.scan_rx.is_some());
+            assert!(app.op_rx.is_some());
             assert_eq!(app.mode, AppMode::Undoing);
         }
-        let mut rx = app.scan_rx.take().unwrap();
+        let mut rx = app.op_rx.take().unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let result = rx.recv().await.expect("undo completion");
@@ -8492,11 +8539,11 @@ mod tests {
         ));
         app.execute_bulk_rename();
         app.handle_action(KeyAction::Cancel);
-        assert!(app.scan_token.is_cancelled());
+        assert!(app.op_token.is_cancelled());
         assert_eq!(app.mode, AppMode::BulkRenaming);
-        assert!(app.scan_rx.is_some());
+        assert!(app.op_rx.is_some());
         let result =
-            tokio::time::timeout(Duration::from_secs(5), app.scan_rx.as_mut().unwrap().recv())
+            tokio::time::timeout(Duration::from_secs(5), app.op_rx.as_mut().unwrap().recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -8536,7 +8583,7 @@ mod tests {
             app.handle_action(KeyAction::MoveDown);
             assert_eq!(app.mode, AppMode::BulkRenaming);
             let result =
-                tokio::time::timeout(Duration::from_secs(5), app.scan_rx.as_mut().unwrap().recv())
+                tokio::time::timeout(Duration::from_secs(5), app.op_rx.as_mut().unwrap().recv())
                     .await
                     .unwrap()
                     .unwrap();
@@ -8608,41 +8655,43 @@ mod tests {
         root.join("copy-a.bin")
     }
 
-    /// Drive the operation channel until it reports a conflict.
+    /// Deliver results until the running operation reports a conflict.
     async fn pump_until_conflict(app: &mut App) {
-        for _ in 0..64 {
-            let Some(rx) = app.scan_rx.as_mut() else {
-                panic!("the operation channel closed before reporting a conflict");
-            };
-            let result = rx.recv().await.expect("the operation ended unexpectedly");
-            app.handle_scan_result(result);
-            if app.pending_conflict.is_some() {
-                return;
-            }
-        }
-        panic!("no conflict was reported");
+        pump(app, |background| {
+            matches!(
+                background,
+                Background::Operation(Some(ScanResult::OperationConflict(_)))
+            )
+        })
+        .await;
+        assert!(app.pending_conflict.is_some(), "no conflict was reported");
     }
 
-    /// Drive the operation channel until it reports completion.
-    async fn pump_until_complete(app: &mut App) {
-        for _ in 0..64 {
-            let Some(rx) = app.scan_rx.as_mut() else {
-                return;
-            };
-            let Some(result) = rx.recv().await else {
-                return;
-            };
-            let done = matches!(result, ScanResult::OperationComplete { .. });
-            app.handle_scan_result(result);
+    /// Deliver background results as the run loop does, until `stop` accepts
+    /// one (which is handled too) or nothing is left running.
+    async fn pump(app: &mut App, stop: impl Fn(&Background) -> bool) {
+        while app.has_background() {
+            let background =
+                tokio::time::timeout(std::time::Duration::from_secs(10), app.next_background())
+                    .await
+                    .expect("a background task stopped making progress");
+            let done = stop(&background);
+            app.handle_background(background);
             if done {
-                // `OperationComplete` kicks off a refresh scan the test does
-                // not need; drop it so nothing is left running.
-                app.scan_token.cancel();
-                app.scan_rx = None;
                 return;
             }
         }
-        panic!("the operation never completed");
+    }
+
+    /// Deliver results until the running operation completes.
+    async fn pump_until_complete(app: &mut App) {
+        pump(app, |background| {
+            matches!(
+                background,
+                Background::Operation(Some(ScanResult::OperationComplete { .. }))
+            )
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -8730,8 +8779,8 @@ mod tests {
                     crossterm::event::KeyModifiers::NONE,
                 ));
                 assert_eq!(app.mode, expected);
-                assert!(app.scan_token.is_cancelled());
-                assert!(app.scan_rx.is_some());
+                assert!(app.op_token.is_cancelled());
+                assert!(app.op_rx.is_some());
                 app.handle_action(KeyAction::Undo);
                 assert_eq!(app.mode, expected);
                 tokio::time::timeout(

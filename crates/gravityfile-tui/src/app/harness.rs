@@ -74,7 +74,6 @@ impl Harness {
             _fixture: fixture,
         };
         harness.settle().await;
-        harness.draw();
         harness
     }
 
@@ -95,6 +94,17 @@ impl Harness {
     pub async fn press(&mut self, keys: &str) {
         for key in parse_keys(keys) {
             self.event(Event::Key(key)).await;
+        }
+    }
+
+    /// Press keys without waiting for background work they start, as when a
+    /// person keeps working while a scan or operation runs.
+    pub async fn press_unsettled(&mut self, keys: &str) {
+        for key in parse_keys(keys) {
+            let old_view_root = self.app.view_root.clone();
+            self.app.handle_terminal_event(Event::Key(key));
+            self.app.after_input(&old_view_root).await;
+            self.draw();
         }
     }
 
@@ -144,10 +154,10 @@ impl Harness {
         self.app.handle_terminal_event(event);
         self.app.after_input(&old_view_root).await;
         self.settle().await;
-        self.draw();
     }
 
-    /// Wait until every background task has reported and been handled.
+    /// Wait until every background task has reported and been handled, then
+    /// draw a frame.
     pub async fn settle(&mut self) {
         loop {
             if self.app.has_background() {
@@ -161,9 +171,18 @@ impl Harness {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 self.app.search_state.poll_background();
             } else {
+                self.draw();
                 return;
             }
         }
+    }
+
+    /// Whether a tree row (not the details pane) shows `name`.
+    pub fn tree_shows(&self, name: &str) -> bool {
+        self.screen().lines().any(|line| {
+            line.split_once(name)
+                .is_some_and(|(before, _)| before.contains("├─") || before.contains("└─"))
+        })
     }
 
     /// Draw a frame as the run loop does and return it as text.

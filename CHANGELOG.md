@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the changed entries are scanned again and updated in place, with every
   parent's size recomputed. `R` likewise rescans just the directory being
   viewed.
+- Starting a copy, move, delete or other operation cancelled a scan in
+  progress. Operations now run alongside a scan; only duplicate and age
+  analysis, which they would make stale, is cancelled.
 - Explorer search found nothing when the query had a capital letter. It now
   uses smart case (a capital makes the query case-sensitive) and fzf syntax:
   space-separated terms, `^prefix`, `suffix$`, `!exclude`, `'exact`.

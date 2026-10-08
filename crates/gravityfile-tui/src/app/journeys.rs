@@ -15,11 +15,7 @@ async fn deleting_a_selected_file_removes_it_from_disk_and_view() {
     assert_eq!(harness.app.mode, AppMode::ConfirmDelete);
     harness.press("y").await;
     assert!(!harness.path("copy-b.bin").exists());
-    assert!(
-        !harness.screen().contains("copy-b.bin"),
-        "{}",
-        harness.screen()
-    );
+    assert!(!harness.tree_shows("copy-b.bin"), "{}", harness.screen());
     assert!(harness.screen().contains("copy-a.bin"));
 }
 
@@ -333,4 +329,23 @@ async fn rescanning_a_subdirectory_keeps_the_rest_of_the_scan() {
     );
     harness.press("<bs>").await;
     assert_eq!(size_on_screen(&harness, "copy-a.bin"), "8.19 kB");
+}
+
+#[tokio::test]
+async fn an_operation_during_a_scan_leaves_the_scan_running() {
+    let mut harness = Harness::scanned().await;
+    harness.select("copy-b.bin").await;
+    harness.press_unsettled("R").await;
+    assert!(harness.app.scan_rx.is_some(), "a full scan is running");
+    let scan = harness.app.scan_token.clone();
+    harness.press_unsettled("dy").await;
+    assert!(harness.app.op_rx.is_some(), "the delete is running");
+    assert!(
+        !scan.is_cancelled(),
+        "starting the delete must not cancel the scan"
+    );
+    harness.settle().await;
+    assert!(!harness.path("copy-b.bin").exists());
+    assert!(!harness.tree_shows("copy-b.bin"), "{}", harness.screen());
+    assert!(harness.screen().contains("copy-a.bin"));
 }

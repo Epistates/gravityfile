@@ -38,7 +38,7 @@ impl App {
         if let Some(completion) = completion {
             self.handle_archive_completion(completion);
         } else {
-            if self.scan_rx.is_none() {
+            if self.op_rx.is_none() {
                 self.operation_message = None;
             }
             self.error = Some(
@@ -62,7 +62,7 @@ impl App {
     }
 
     pub(super) fn handle_archive_completion(&mut self, completion: ArchiveCompletion) {
-        if self.scan_rx.is_none() {
+        if self.op_rx.is_none() {
             self.operation_message = None;
         }
         match completion {
