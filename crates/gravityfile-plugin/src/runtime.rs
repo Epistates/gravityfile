@@ -110,10 +110,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Trait that all plugin runtime implementations must satisfy.
 ///
-/// This trait abstracts over the specific scripting language (Lua or Rhai)
-/// allowing plugins to be written in any supported language.
+/// Implemented by the in-process Lua engine and by the worker-process
+/// runtime that hosts it.
 pub trait PluginRuntime: Send + Sync {
-    /// Get the name of this runtime (e.g., "lua" or "rhai").
+    /// Get the name of this runtime (e.g. "lua").
     fn name(&self) -> &'static str;
 
     /// Get the file extensions this runtime handles (e.g., [".lua"]).
@@ -166,7 +166,7 @@ pub trait PluginRuntime: Send + Sync {
 
     /// Create an isolated context for running async plugin code.
     ///
-    /// Isolated contexts have limited API access and their own Lua/Rhai state,
+    /// Isolated contexts have limited API access and their own Lua state,
     /// making them safe to run in background tasks.
     fn create_isolated_context(
         &self,
@@ -233,12 +233,6 @@ pub struct LoadedPlugin {
 
     /// Hooks this plugin implements.
     pub hooks: Vec<String>,
-}
-
-/// Owned request passed through the hook-dispatch Tower service.
-struct HookDispatch {
-    hook: Hook,
-    ctx: HookContext,
 }
 
 /// Manager for all plugin runtimes and loaded plugins.
@@ -468,13 +462,10 @@ impl PluginManager {
 
     /// Dispatch a hook to all plugins that implement it.
     ///
-    /// The dispatch runs through a small Tower service stack. Its timeout
-    /// bounds cooperatively yielding hook futures, while the runtimes' own
-    /// instruction hooks enforce deadlines for synchronous script execution.
-    /// The inner service runs the deterministic per-plugin loop.
+    /// The overall timeout bounds cooperatively yielding hook futures; worker
+    /// deadlines and the runtimes' instruction hooks bound script execution.
     pub async fn dispatch_hook(&self, hook: &Hook, ctx: &HookContext) -> Vec<HookResult> {
         use std::time::Duration;
-        use tower::{ServiceBuilder, ServiceExt, service_fn};
 
         // Overall budget scales with the plugin count so each plugin still gets
         // roughly its per-call timeout even when several are registered.
@@ -483,18 +474,7 @@ impl PluginManager {
         let budget =
             Duration::from_millis(plugin_budget.saturating_mul(active).saturating_add(500));
 
-        let request = HookDispatch {
-            hook: hook.clone(),
-            ctx: ctx.clone(),
-        };
-
-        let inner = service_fn(|req: HookDispatch| async move {
-            Ok::<_, std::convert::Infallible>(self.run_hook_dispatch(&req.hook, &req.ctx).await)
-        });
-
-        let svc = ServiceBuilder::new().timeout(budget).service(inner);
-
-        match svc.oneshot(request).await {
+        match tokio::time::timeout(budget, self.run_hook_dispatch(hook, ctx)).await {
             Ok(results) => results,
             Err(_) => {
                 tracing::warn!(
@@ -506,7 +486,7 @@ impl PluginManager {
         }
     }
 
-    /// The per-plugin dispatch loop (the inner Tower service body).
+    /// The per-plugin dispatch loop.
     async fn run_hook_dispatch(&self, hook: &Hook, ctx: &HookContext) -> Vec<HookResult> {
         let hook_name = hook.name();
         let mut results = vec![];

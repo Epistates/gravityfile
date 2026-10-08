@@ -360,20 +360,12 @@ pub struct ProcessRuntime {
     next: usize,
 }
 impl ProcessRuntime {
-    /// Configure the worker executable and the `lua` or `rhai` backend.
-    pub fn new(executable: PathBuf, language: &str) -> PluginResult<Self> {
-        let language = match language {
-            "lua" => "lua",
-            "rhai" => "rhai",
-            other => {
-                return Err(PluginError::RuntimeNotAvailable {
-                    runtime: other.into(),
-                });
-            }
-        };
+    /// Run Lua plugins in workers launched from `executable`, which must
+    /// support the private worker protocol.
+    pub fn new(executable: PathBuf) -> PluginResult<Self> {
         Ok(Self {
             executable: executable.canonicalize()?,
-            language,
+            language: "lua",
             config: PluginConfig::default(),
             plugins: HashMap::new(),
             next: 0,
@@ -399,11 +391,7 @@ impl PluginRuntime for ProcessRuntime {
         self.language
     }
     fn file_extensions(&self) -> &'static [&'static str] {
-        if self.language == "lua" {
-            &[".lua"]
-        } else {
-            &[".rhai"]
-        }
+        &[".lua"]
     }
     fn init(&mut self, config: &PluginConfig) -> PluginResult<()> {
         if config.default_timeout_ms == 0 {
@@ -656,7 +644,6 @@ pub fn run_worker(language: &str) -> PluginResult<()> {
         .map_err(|error| protocol(error.to_string()))?;
     let mut runtime: Box<dyn PluginRuntime> = match language {
         "lua" => Box::new(crate::lua::LuaRuntime::new()?),
-        "rhai" => Box::new(crate::rhai::RhaiRuntime::new()?),
         other => {
             return Err(PluginError::RuntimeNotAvailable {
                 runtime: other.into(),

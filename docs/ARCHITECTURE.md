@@ -67,12 +67,10 @@ The interactive user interface.
 
 ## 🛡️ Security Model
 
-- **Supervised Plugins**: Standard CLI/TUI launches run Lua and Rhai plugins in
-  separate persistent workers with parent-enforced deadlines and process cleanup.
-  Direct in-process runtimes remain available to library consumers. VM permission
-  controls and process supervision do not establish OS filesystem/network confinement.
+- **Supervised Plugins**: The explorer runs Lua plugins in separate persistent
+  workers with parent-enforced deadlines and process cleanup. VM permission
+  controls and process supervision are not OS filesystem/network confinement.
   `gravityfile-plugin/src/process.rs` owns lifecycle, admission and cancellation;
   its private `process/protocol.rs` module owns wire types, bounded framing and logs.
-  See [plugin process execution](PLUGIN_PROCESSES.md) for limits and qualification.
 - **Safe Operations**: Destructive operations default to **Trash** (via the `trash` crate) rather than permanent deletion.
 - **No-Root Execution**: gravityfile is designed to run with user-level permissions, gracefully handling permission errors without crashing.

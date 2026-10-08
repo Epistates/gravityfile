@@ -1,43 +1,20 @@
-//! Language-agnostic plugin system for gravityfile.
+//! Lua plugins for gravityfile.
 //!
-//! This crate provides a trait-based plugin architecture that supports multiple
-//! scripting language runtimes (Lua and Rhai).
+//! Plugins are Lua scripts that subscribe to [`Hook`]s (startup, navigation,
+//! scan completion, deletion, ...). The [`PluginManager`] dispatches hooks to
+//! a [`PluginRuntime`]; in the application that runtime is a
+//! [`ProcessRuntime`], which runs each plugin in its own supervised worker
+//! process with deadlines and bounded IPC, so a misbehaving plugin cannot
+//! block or crash the host. [`lua::LuaRuntime`] is the in-process engine the
+//! worker uses, with a memory limit and an instruction-count deadline.
 //!
-//! # Architecture
-//!
-//! The plugin system is built around the [`PluginRuntime`] trait, which defines
-//! the interface that any scripting language runtime must implement. This allows
-//! users to write plugins in their preferred language.
-//!
-//! # Plugin Types
-//!
-//! - **Analyzers**: Custom file/directory analysis (async, returns data)
-//! - **Previewers**: File content preview generation (async, isolated)
-//! - **Actions**: Custom file operations (async with progress)
-//! - **Renderers**: Custom column/cell rendering (sync)
-//! - **Filters**: Search/filter plugins (sync/async)
-//! - **Hooks**: Event listeners (sync callbacks)
-//!
-//! # Example
-//!
-//! ```ignore
-//! use gravityfile_plugin::{PluginManager, PluginConfig};
-//!
-//! let config = PluginConfig::default();
-//! let mut manager = PluginManager::new(config)?;
-//!
-//! // Load plugins from user config directory
-//! manager.discover_plugins().await?;
-//!
-//! // Dispatch a hook to all registered plugins
-//! manager.dispatch_hook(&Hook::OnScanComplete { tree }).await?;
-//! ```
+//! A hook result can veto the default action (currently deletion) through
+//! `prevent_default`.
 
 mod config;
 mod hooks;
 pub mod lua;
 mod process;
-pub mod rhai;
 mod runtime;
 mod sandbox;
 mod types;

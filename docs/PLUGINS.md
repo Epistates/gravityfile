@@ -1,29 +1,17 @@
 # gravityfile Plugin System
 
-gravityfile features a language-agnostic plugin architecture. You can extend the explorer's functionality using **Lua** or **Rhai**.
+Extend the explorer with **Lua** (5.4, via `mlua`) plugins.
 
-The standard CLI/TUI runs each plugin in a supervised child process. See
-[process execution and limits](PLUGIN_PROCESSES.md) for deadlines, recovery,
-embedding requirements, and the remaining security boundary.
+The explorer runs each plugin in its own supervised worker process: hook calls
+have deadlines, messages are size-bounded, and a stuck or crashed worker is
+killed without affecting the explorer.
 
 ## Architecture
 
 The plugin system is built on three core pieces:
 1. **Event Hooks**: React to file system events (scans, navigation, deletions).
 2. **Action Hooks**: Observe or veto supported host actions.
-3. **Isolated Contexts**: Run standalone Lua/Rhai snippets with a separate restricted runtime.
-
-## Supported Runtimes
-
-### 🌙 Lua (Recommended)
-Fast, lightweight, and the industry standard for TUI extensibility.
-- **Engine**: `mlua` (Lua 5.4)
-- **Best for**: UI modifications, event hooks, and simple file operations.
-
-### 🦀 Rhai
-A native Rust scripting language with seamless integration.
-- **Engine**: `rhai`
-- **Best for**: Performance-critical logic and deep integration with Rust types.
+3. **Isolated Contexts**: Run standalone Lua snippets with a separate restricted runtime.
 
 ---
 
@@ -52,10 +40,9 @@ return {
 
 ---
 
-## Language-Specific Examples
+## Examples
 
-- **🌙 Lua**: [Git Status Notifier](../examples/plugins/lua/git_notify.lua) - Alerts when entering a directory with untracked files.
-- **🦀 Rhai**: [Large File Warning](../examples/plugins/rhai/large_file_warning.rhai) - Logs a warning if a massive file is detected during a scan.
+- [Git Status Notifier](../examples/plugins/lua/git_notify.lua) - Alerts when entering a directory with untracked files.
 
 ---
 

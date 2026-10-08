@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Language-agnostic plugin system for gravityfile"
+description = "Lua plugin system for gravityfile"
 
 [dependencies]
 indexmap.workspace = true
@@ -17,16 +17,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Plugin runtimes
 mlua = { version = "0.12", features = ["lua54", "async", "serialize", "send", "vendored"] }
-rhai = { version = "1.26", features = ["sync", "serde"] }
-
-# Configuration
 toml = "1"
 dirs = "7"
-
-# Composable middleware for the hook-dispatch pipeline
-tower = { version = "0.5", features = ["timeout", "util"] }
 
 [dev-dependencies]
 tempfile.workspace = true

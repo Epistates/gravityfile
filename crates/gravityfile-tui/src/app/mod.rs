@@ -300,17 +300,11 @@ impl App {
         let plugin_config =
             gravityfile_plugin::PluginConfig::default().with_fs_read_roots(vec![path.clone()]);
         let mut pm_inner = gravityfile_plugin::PluginManager::new(plugin_config);
-        if let Some(executable) = &config.plugin_worker_executable {
-            for language in ["lua", "rhai"] {
-                match gravityfile_plugin::ProcessRuntime::new(executable.clone(), language)
-                    .and_then(|runtime| pm_inner.register_runtime(Box::new(runtime)))
-                {
-                    Ok(()) => {}
-                    Err(error) => {
-                        tracing::error!(%language, %error, "Plugin worker registration failed")
-                    }
-                }
-            }
+        if let Some(executable) = &config.plugin_worker_executable
+            && let Err(error) = gravityfile_plugin::ProcessRuntime::new(executable.clone())
+                .and_then(|runtime| pm_inner.register_runtime(Box::new(runtime)))
+        {
+            tracing::error!(%error, "Plugin worker registration failed");
         }
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
