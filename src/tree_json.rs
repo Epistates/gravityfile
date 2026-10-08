@@ -21,9 +21,8 @@ fn field(writer: &mut dyn Write, name: &str, value: &impl Serialize) -> Result<(
 }
 
 fn begin_node(writer: &mut dyn Write, node: &FileNode) -> Result<()> {
-    writer.write_all(b"{\"id\":")?;
-    serde_json::to_writer(&mut *writer, &node.id)?;
-    field(writer, "name", &node.name)?;
+    writer.write_all(b"{\"name\":")?;
+    serde_json::to_writer(&mut *writer, &node.name)?;
     if node.native_name.is_some() {
         field(writer, "native_name", &node.native_name)?;
     }
@@ -32,7 +31,6 @@ fn begin_node(writer: &mut dyn Write, node: &FileNode) -> Result<()> {
     field(writer, "blocks", &node.blocks)?;
     field(writer, "timestamps", &node.timestamps)?;
     field(writer, "inode", &node.inode)?;
-    field(writer, "content_hash", &node.content_hash)?;
     field(writer, "git_status", &node.git_status)?;
     writer.write_all(b",\"children\":[")?;
     Ok(())
@@ -91,7 +89,7 @@ pub(super) fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gravityfile_core::{ContentHash, GitStatus, NodeId, NodeKind, Timestamps};
+    use gravityfile_core::{GitStatus, NodeKind, Timestamps};
     use tokio_util::sync::CancellationToken;
 
     fn fixture() -> FileTree {
@@ -129,7 +127,6 @@ mod tests {
             let mut child = tree.root.children[0].clone();
             child.kind = kind;
             child.git_status = Some(GitStatus::Conflict);
-            child.content_hash = Some(ContentHash::new([255; 32]));
             tree.root.children.push(child);
         }
         compare(&tree);
@@ -152,14 +149,10 @@ mod tests {
             .stack_size(128 * 1024)
             .spawn(|| {
                 let mut tree = fixture();
-                let mut root = FileNode::new_directory(
-                    NodeId::new(0),
-                    "d",
-                    Timestamps::with_modified(std::time::UNIX_EPOCH),
-                );
-                for id in 1..10_000 {
+                let mut root =
+                    FileNode::new_directory("d", Timestamps::with_modified(std::time::UNIX_EPOCH));
+                for _ in 1..10_000 {
                     let mut parent = FileNode::new_directory(
-                        NodeId::new(id),
                         "d",
                         Timestamps::with_modified(std::time::UNIX_EPOCH),
                     );

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use gravityfile_core::{FileNode, GitStatus, NodeId, NodeKind, Timestamps};
+use gravityfile_core::{FileNode, GitStatus, Timestamps};
 
 /// A fixed timestamp, so nothing in a test depends on the wall clock.
 pub fn timestamps() -> Timestamps {
@@ -16,43 +16,24 @@ pub fn timestamps() -> Timestamps {
 }
 
 /// A regular file node.
-pub fn file(id: u64, name: &str, size: u64) -> FileNode {
-    FileNode::new_file(
-        NodeId::new(id),
-        name,
-        size,
-        size.div_ceil(512),
-        timestamps(),
-        false,
-    )
+pub fn file(name: &str, size: u64) -> FileNode {
+    FileNode::new_file(name, size, size.div_ceil(512), timestamps(), false)
 }
 
 /// An executable file node.
-pub fn executable(id: u64, name: &str, size: u64) -> FileNode {
-    FileNode::new_file(
-        NodeId::new(id),
-        name,
-        size,
-        size.div_ceil(512),
-        timestamps(),
-        true,
-    )
+pub fn executable(name: &str, size: u64) -> FileNode {
+    FileNode::new_file(name, size, size.div_ceil(512), timestamps(), true)
 }
 
 /// A symlink node.
-pub fn symlink(id: u64, name: &str, target: &str, broken: bool) -> FileNode {
-    let mut node = FileNode::new_file(NodeId::new(id), name, 0, 0, timestamps(), false);
-    node.kind = NodeKind::Symlink {
-        target: target.into(),
-        broken,
-    };
-    node
+pub fn symlink(name: &str, target: &str, broken: bool) -> FileNode {
+    FileNode::new_symlink(name, target, broken, timestamps())
 }
 
-/// A directory node whose size is the sum of its children, matching what the
-/// scanner produces.
-pub fn directory(id: u64, name: &str, children: Vec<FileNode>) -> FileNode {
-    let mut node = FileNode::new_directory(NodeId::new(id), name, timestamps());
+/// A directory node whose size is the sum of its children. (The scanner also
+/// adds the directory's own allocation; fixtures leave it at zero.)
+pub fn directory(name: &str, children: Vec<FileNode>) -> FileNode {
+    let mut node = FileNode::new_directory(name, timestamps());
     node.size = children.iter().map(|child| child.size).sum();
     node.children = children;
     node.finalize();
@@ -63,34 +44,29 @@ pub fn directory(id: u64, name: &str, children: Vec<FileNode>) -> FileNode {
 /// truncation, git indicators, symlinks, executables, and a zero-size directory
 /// (which renders as `...`).
 pub fn sample_node_tree() -> FileNode {
-    let mut modified = file(1, "modified.rs", 4096);
+    let mut modified = file("modified.rs", 4096);
     modified.git_status = Some(GitStatus::Modified);
 
-    let mut untracked = file(2, "untracked.rs", 1024);
+    let mut untracked = file("untracked.rs", 1024);
     untracked.git_status = Some(GitStatus::Untracked);
 
-    let nested = directory(3, "nested", vec![file(4, "deep.txt", 128)]);
+    let nested = directory("nested", vec![file("deep.txt", 128)]);
 
-    let src = directory(5, "src", vec![modified, untracked, nested]);
+    let src = directory("src", vec![modified, untracked, nested]);
 
     // A directory with no children and no size renders the "unknown size" path.
-    let unscanned = FileNode::new_directory(NodeId::new(6), "unscanned", timestamps());
+    let unscanned = FileNode::new_directory("unscanned", timestamps());
 
     directory(
-        0,
         "root",
         vec![
             src,
             unscanned,
-            file(
-                7,
-                "a-very-long-file-name-that-must-be-truncated.log",
-                65_536,
-            ),
-            executable(8, "run.sh", 512),
-            symlink(9, "link", "../elsewhere", false),
-            symlink(10, "dangling", "/nowhere", true),
-            file(11, "empty", 0),
+            file("a-very-long-file-name-that-must-be-truncated.log", 65_536),
+            executable("run.sh", 512),
+            symlink("link", "../elsewhere", false),
+            symlink("dangling", "/nowhere", true),
+            file("empty", 0),
         ],
     )
 }

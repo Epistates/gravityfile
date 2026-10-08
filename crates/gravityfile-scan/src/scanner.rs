@@ -1,29 +1,33 @@
-//! JWalk-based parallel directory scanner.
+//! Parallel directory scanner built on jwalk.
+//!
+//! Metadata is read on jwalk's worker threads (`process_read_dir`), so the
+//! single consumer thread makes no per-entry system calls. jwalk yields
+//! entries in depth-first pre-order, which lets the consumer build the tree
+//! directly with a stack of open directories.
 
-use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use compact_str::CompactString;
-use jwalk::{DirEntry, Parallelism, WalkDirGeneric};
+use jwalk::{Parallelism, WalkDirGeneric};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use gravityfile_core::{
-    ContentHash, FileNode, FileTree, InodeInfo, NodeId, NodeKind, ScanConfig, ScanError,
-    ScanWarning, Timestamps, TreeStats, WarningKind,
+    FileNode, FileTree, InodeInfo, NodeKind, ScanConfig, ScanError, ScanWarning, Timestamps,
+    TreeStats, WarningKind,
 };
 
 use crate::inode::InodeTracker;
 use crate::progress::ScanProgress;
 
-/// Charge yielded descendants before metadata, hashing, or retention.
+/// Entries between progress messages.
+const PROGRESS_INTERVAL: u64 = 1024;
+
+/// Charge yielded descendants before retention.
 struct EntryBudget {
     limit: Option<u64>,
     consumed: u64,
@@ -75,9 +79,16 @@ impl WarningAccumulator {
 
     fn into_vec(mut self) -> Vec<ScanWarning> {
         if self.omitted > 0 {
-            self.details.push(ScanWarning::new(PathBuf::new(),
-                WarningKind::Omitted { count: self.omitted },
-                format!("{} scan warnings omitted from retained detail (999-record / 8 KiB payload limits)", self.omitted)));
+            self.details.push(ScanWarning::new(
+                PathBuf::new(),
+                WarningKind::Omitted {
+                    count: self.omitted,
+                },
+                format!(
+                    "{} scan warnings omitted from retained detail (999-record / 8 KiB payload limits)",
+                    self.omitted
+                ),
+            ));
         }
         self.details
     }
@@ -93,15 +104,173 @@ pub(crate) fn append_scan_warning(tree: &mut FileTree, warning: ScanWarning) {
     tree.warnings = warnings.into_vec();
 }
 
+/// What a worker thread learned about one entry.
+#[derive(Debug, Default)]
+enum Probe {
+    #[default]
+    Unprobed,
+    Entry(Entry),
+    Failed(std::io::Error),
+}
+
+type Client = ((), Probe);
+
+#[derive(Debug)]
+struct Entry {
+    kind: EntryKind,
+    len: u64,
+    blocks: u64,
+    nlink: u64,
+    identity: Option<InodeInfo>,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+enum EntryKind {
+    File { executable: bool },
+    Dir,
+    Symlink { target: Box<str>, broken: bool },
+    Other,
+}
+
+impl Entry {
+    /// `path` is only consulted for symlinks, to read their target.
+    fn from_metadata(metadata: &std::fs::Metadata, path: impl FnOnce() -> PathBuf) -> Self {
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_dir() {
+            EntryKind::Dir
+        } else if file_type.is_file() {
+            EntryKind::File {
+                executable: is_executable(metadata),
+            }
+        } else if file_type.is_symlink() {
+            let (target, broken) = resolve_symlink(&path());
+            EntryKind::Symlink { target, broken }
+        } else {
+            EntryKind::Other
+        };
+        Self {
+            kind,
+            len: metadata.len(),
+            blocks: get_blocks(metadata),
+            nlink: get_nlink(metadata),
+            identity: inode_info(metadata),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    /// Display timestamps; an unreadable mtime shows as the Unix epoch.
+    fn timestamps(&self) -> Timestamps {
+        Timestamps::with_modified(self.modified.unwrap_or(std::time::UNIX_EPOCH))
+    }
+
+    /// Node for this entry; directories start empty and are sealed later.
+    fn node(&self, name: &std::ffi::OsStr, size: u64) -> FileNode {
+        let timestamps = self.timestamps();
+        let mut node = match &self.kind {
+            EntryKind::Dir => FileNode::new_directory("", timestamps),
+            EntryKind::File { executable } => {
+                FileNode::new_file("", size, self.blocks, timestamps, *executable)
+            }
+            EntryKind::Symlink { target, broken } => {
+                FileNode::new_symlink("", target.clone(), *broken, timestamps)
+            }
+            EntryKind::Other => {
+                let mut node = FileNode::new_file("", size, self.blocks, timestamps, false);
+                node.kind = NodeKind::Other;
+                node
+            }
+        };
+        node.set_file_name(name);
+        node.size = size;
+        node.blocks = self.blocks;
+        node.inode = self.identity.filter(|_| self.nlink > 1 && !self.is_dir());
+        node
+    }
+
+    fn is_dir(&self) -> bool {
+        matches!(self.kind, EntryKind::Dir)
+    }
+
+    /// Size this entry contributes, counting each multiply-linked file (and,
+    /// when following symlinks, each aliased object) once.
+    fn counted_size(&self, config: &ScanConfig, tracker: &mut InodeTracker) -> u64 {
+        if matches!(self.kind, EntryKind::Symlink { .. }) {
+            return 0;
+        }
+        let size = if config.apparent_size {
+            self.len
+        } else {
+            disk_size(self.len, self.blocks)
+        };
+        // Directory link counts reflect subdirectories, not aliases; they can
+        // only be reached twice by following symlinks.
+        let dedup = !config.count_hard_links && (!self.is_dir() || config.follow_symlinks);
+        match self.identity {
+            Some(identity) if dedup && !tracker.track(identity, self.nlink) => 0,
+            _ => size,
+        }
+    }
+}
+
+/// A directory whose contents are still arriving.
+struct Frame {
+    /// `None` below the retained depth: counted, but not kept in the tree.
+    node: Option<FileNode>,
+    size: u64,
+    files: u64,
+    dirs: u64,
+}
+
+impl Frame {
+    fn new(node: Option<FileNode>, own_size: u64) -> Self {
+        Self {
+            node,
+            size: own_size,
+            files: 0,
+            dirs: 0,
+        }
+    }
+
+    fn add_leaf(&mut self, size: u64, node: Option<FileNode>) {
+        self.size = self.size.saturating_add(size);
+        self.files += 1;
+        if let (Some(parent), Some(node)) = (&mut self.node, node) {
+            parent.children.push(node);
+        }
+    }
+
+    /// Seal the directory: final size, counts and size-ordered children.
+    fn finish(self) -> Option<FileNode> {
+        let mut node = self.node?;
+        node.size = self.size;
+        node.kind = NodeKind::Directory {
+            file_count: self.files,
+            dir_count: self.dirs,
+        };
+        node.children
+            .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.compare_name(b)));
+        Some(node)
+    }
+}
+
+/// Close the innermost open directory into its parent.
+fn close_frame(stack: &mut Vec<Frame>) {
+    let frame = stack.pop().expect("open directory");
+    let parent = stack.last_mut().expect("parent directory");
+    parent.size = parent.size.saturating_add(frame.size);
+    parent.files += frame.files;
+    parent.dirs += frame.dirs + 1;
+    if let Some(node) = frame.finish()
+        && let Some(parent) = &mut parent.node
+    {
+        parent.children.push(node);
+    }
+}
+
 /// High-performance scanner using jwalk for parallel traversal.
 pub struct JwalkScanner {
     progress_tx: broadcast::Sender<ScanProgress>,
-}
-
-struct EntryCollection<'a> {
-    inode_tracker: &'a mut InodeTracker,
-    stats: &'a mut TreeStats,
-    warnings: &'a mut WarningAccumulator,
 }
 
 impl JwalkScanner {
@@ -116,7 +285,11 @@ impl JwalkScanner {
         self.progress_tx.subscribe()
     }
 
-    /// Perform a scan of the given path.
+    /// Scan `config.root` into a tree.
+    ///
+    /// Sizes cover the whole subtree even when `max_depth` limits which nodes
+    /// are retained. Hard links count once unless `count_hard_links` is set,
+    /// and directories include their own allocation.
     pub fn scan(
         &self,
         config: &ScanConfig,
@@ -133,86 +306,152 @@ impl JwalkScanner {
             .root
             .canonicalize()
             .map_err(|e| ScanError::io(&config.root, e))?;
-
-        // Verify root is a directory
-        if !root_path.is_dir() {
+        let root_metadata =
+            std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
+        if !root_metadata.is_dir() {
             return Err(ScanError::NotADirectory { path: root_path });
         }
 
-        // Get root device for cross-filesystem detection
-        let root_metadata =
-            std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
-        let root_device = get_dev(&root_metadata);
-
-        // Set up tracking
-        let mut inode_tracker = if config.follow_symlinks {
+        let mut tracker = if config.follow_symlinks {
             InodeTracker::with_alias_tracking()
         } else {
             InodeTracker::new()
         };
-        let node_id_counter = AtomicU64::new(0);
         let mut stats = TreeStats::new();
         let mut warnings = WarningAccumulator::default();
+        let mut budget = EntryBudget::new(config.max_entries);
+        let retained_depth = config.max_depth.map_or(usize::MAX, |depth| depth as usize);
 
-        // Collect all entries first
-        let entries = {
-            let mut collection = EntryCollection {
-                inode_tracker: &mut inode_tracker,
-                stats: &mut stats,
-                warnings: &mut warnings,
+        let root_entry = Entry::from_metadata(&root_metadata, PathBuf::new);
+        let root_size = root_entry.counted_size(config, &mut tracker);
+        let root_node = root_entry.node(
+            root_path.file_name().unwrap_or(root_path.as_os_str()),
+            root_size,
+        );
+        stats.record_dir(0);
+        let mut stack = vec![Frame::new(Some(root_node), root_size)];
+
+        let walker = self.walker(config, &root_path, get_dev(&root_metadata), token.clone())?;
+        let mut seen: u64 = 0;
+        for item in walker {
+            if token.is_cancelled() {
+                return Err(ScanError::Interrupted);
+            }
+            let mut entry = match item {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(walk_warning(&error));
+                    continue;
+                }
             };
-            self.collect_entries(
-                config,
-                &root_path,
-                root_device,
-                token.clone(),
-                start,
-                &mut collection,
-            )?
-        };
-
-        // Build tree from collected entries
-        let root_node = self.build_tree(&root_path, entries, &node_id_counter, &|| {
-            token.is_cancelled()
-        })?;
+            let depth = entry.depth;
+            if depth == 0 {
+                continue;
+            }
+            budget.consume()?;
+            while stack.len() > depth {
+                close_frame(&mut stack);
+            }
+            if stack.len() < depth {
+                // Below a directory that was not recorded.
+                continue;
+            }
+            let fact = match std::mem::take(&mut entry.client_state) {
+                Probe::Entry(fact) => fact,
+                Probe::Failed(error) => {
+                    warnings.push(metadata_warning(entry.path(), &error));
+                    continue;
+                }
+                Probe::Unprobed => continue,
+            };
+            let size = fact.counted_size(config, &mut tracker);
+            let node = (depth <= retained_depth).then(|| fact.node(&entry.file_name, size));
+            match &fact.kind {
+                EntryKind::Dir => {
+                    stats.record_dir(depth as u32);
+                    // jwalk attaches a failed read_dir to the directory entry
+                    // rather than yielding it as an error item.
+                    if let Some(error) = entry.read_children.as_ref().and_then(|c| c.error()) {
+                        warnings.push(walk_warning(error));
+                    }
+                    stack.push(Frame::new(node, size));
+                }
+                EntryKind::File { .. } => {
+                    stats.record_file_with(size, fact.modified, depth as u32, || entry.path());
+                    stack
+                        .last_mut()
+                        .expect("open directory")
+                        .add_leaf(size, node);
+                }
+                EntryKind::Symlink { target, broken } => {
+                    stats.record_symlink();
+                    if *broken {
+                        warnings.push(ScanWarning::broken_symlink(entry.path(), target));
+                    }
+                    stack.last_mut().expect("open directory").add_leaf(0, node);
+                }
+                EntryKind::Other => {
+                    stack
+                        .last_mut()
+                        .expect("open directory")
+                        .add_leaf(size, node);
+                }
+            }
+            seen += 1;
+            if seen.is_multiple_of(PROGRESS_INTERVAL) {
+                let _ = self.progress_tx.send(ScanProgress {
+                    files_scanned: stats.total_files,
+                    dirs_scanned: stats.total_dirs,
+                    bytes_scanned: stats.total_size,
+                    current_path: entry.path(),
+                    errors_count: warnings.count,
+                    elapsed: start.elapsed(),
+                });
+            }
+        }
+        // Cancellation may clear the walker's last batch without yielding
+        // another entry, so the per-entry check alone is insufficient.
         if token.is_cancelled() {
             return Err(ScanError::Interrupted);
         }
-
-        let scan_duration = start.elapsed();
-
+        while stack.len() > 1 {
+            close_frame(&mut stack);
+        }
+        let root = stack
+            .pop()
+            .and_then(Frame::finish)
+            .expect("root is always retained");
         let mut tree = FileTree::new(
-            root_node,
+            root,
             root_path,
             config.clone(),
             stats,
-            scan_duration,
+            start.elapsed(),
             warnings.into_vec(),
         );
 
         #[cfg(feature = "git")]
-        crate::git::apply_git_status_cancellable(&mut tree, &token);
-
-        if token.is_cancelled() {
-            return Err(ScanError::Interrupted);
+        if config.git_status {
+            crate::git::apply_git_status_cancellable(&mut tree, &token);
+            if token.is_cancelled() {
+                return Err(ScanError::Interrupted);
+            }
         }
-        // Git enrichment is part of completing the scan, including error
-        // reporting. Do not publish pre-enrichment timing as completion time.
+        // Enrichment is part of completing the scan.
         tree.scan_duration = start.elapsed();
-        tree.scanned_at = std::time::SystemTime::now();
+        tree.scanned_at = SystemTime::now();
         Ok(tree)
     }
 
-    /// Collect all entries using jwalk.
-    fn collect_entries(
+    /// Configure the parallel walk: filtering, filesystem pruning and
+    /// metadata probing all run on jwalk's worker threads.
+    fn walker(
         &self,
         config: &ScanConfig,
         root_path: &Path,
         root_device: u64,
         token: CancellationToken,
-        start: Instant,
-        collection: &mut EntryCollection<'_>,
-    ) -> Result<HashMap<PathBuf, Vec<EntryInfo>>, ScanError> {
+    ) -> Result<WalkDirGeneric<Client>, ScanError> {
         let parallelism = match config.threads {
             0 => Parallelism::RayonExistingPool {
                 pool: scan_pool(),
@@ -221,413 +460,57 @@ impl JwalkScanner {
             },
             n => Parallelism::RayonNewPool(n),
         };
-
-        // Capture config fields needed in the closure.
-        let cross_filesystems = config.cross_filesystems;
-        let include_hidden = config.include_hidden;
-        let token_clone = token.clone();
-        let filter_root = root_path.to_path_buf();
-
-        // Re-use the GlobSet already compiled by ScanConfig when available,
-        // compiling on-the-fly otherwise (e.g. config built via the
-        // derive_builder path without calling compile_patterns).
-        let ignore_globset: Option<Arc<globset::GlobSet>> = config
+        let ignore: Option<Arc<globset::GlobSet>> = config
             .effective_ignore_globset()
             .map_err(|message| ScanError::InvalidConfig { message })?
             .map(Arc::new);
+        let cross_filesystems = config.cross_filesystems;
+        let filter_root = root_path.to_path_buf();
 
-        let walker = WalkDirGeneric::<((), ())>::new(root_path)
+        Ok(WalkDirGeneric::<Client>::new(root_path)
             .parallelism(parallelism)
-            .skip_hidden(!include_hidden)
+            .skip_hidden(!config.include_hidden)
             .follow_links(config.follow_symlinks)
             .min_depth(0)
-            .max_depth(config.max_depth.map(|d| d as usize).unwrap_or(usize::MAX))
-            .process_read_dir(move |_depth, _dir_path, _state, children| {
-                // Check for cancellation
-                if token_clone.is_cancelled() {
+            .process_read_dir(move |_depth, _dir, _state, children| {
+                if token.is_cancelled() {
                     children.clear();
                     return;
                 }
-
-                // Prune and filter early — before jwalk recurses.
-                children.retain_mut(|entry_result| {
-                    let entry = match entry_result {
-                        Ok(e) => e,
-                        Err(_) => return true, // keep errors so they surface as warnings
+                children.retain_mut(|child| {
+                    let Ok(entry) = child else {
+                        return true; // surfaces as a warning
                     };
-
-                    let name = entry.file_name.to_string_lossy();
-                    let entry_path = entry.path();
-
-                    // Apply ignore-pattern filter.
-                    if let Some(ref gs) = ignore_globset
-                        && (gs.is_match(name.as_ref())
-                            || entry_path
+                    if let Some(ignore) = &ignore
+                        && (ignore.is_match(&entry.file_name)
+                            || entry
+                                .path()
                                 .strip_prefix(&filter_root)
-                                .is_ok_and(|relative| gs.is_match(relative)))
+                                .is_ok_and(|relative| ignore.is_match(relative)))
                     {
                         return false;
                     }
-
-                    // Prune cross-filesystem subtrees for directories.
-                    if !cross_filesystems
-                        && entry.file_type.is_dir()
-                        && let Ok(meta) = entry.metadata()
-                        && get_dev(&meta) != root_device
-                    {
-                        // Setting read_children to None stops jwalk
-                        // from descending into this directory.
+                    let metadata = match entry.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            let error = error
+                                .into_io_error()
+                                .unwrap_or_else(|| std::io::Error::other("metadata unavailable"));
+                            entry.client_state = Probe::Failed(error);
+                            entry.read_children = None;
+                            return true;
+                        }
+                    };
+                    if !cross_filesystems && get_dev(&metadata) != root_device {
+                        // Another filesystem: neither counted nor descended.
                         entry.read_children = None;
-                        return false; // drop the dir entry itself too
+                        return false;
                     }
-
+                    entry.client_state =
+                        Probe::Entry(Entry::from_metadata(&metadata, || entry.path()));
                     true
                 });
-            });
-
-        // Map from parent path to children
-        let mut entries_by_parent: HashMap<PathBuf, Vec<EntryInfo>> = HashMap::new();
-        let mut progress_counter: u64 = 0;
-        let mut entry_budget = EntryBudget::new(config.max_entries);
-
-        for entry_result in walker {
-            // Check for cancellation
-            if token.is_cancelled() {
-                // Use the dedicated variant so callers can distinguish a user
-                // cancellation from a genuine scan failure.
-                return Err(ScanError::Interrupted);
-            }
-
-            let entry: DirEntry<((), ())> = match entry_result {
-                Ok(e) => e,
-                Err(err) => {
-                    let path = err.path().map(|p| p.to_path_buf()).unwrap_or_default();
-                    collection.warnings.push(ScanWarning::new(
-                        path,
-                        WarningKind::ReadError,
-                        err.to_string(),
-                    ));
-                    continue;
-                }
-            };
-
-            if entry.depth() > 0 {
-                entry_budget.consume()?;
-            }
-            let path = entry.path();
-            // Use CompactString directly to avoid an extra heap allocation.
-            let file_name = CompactString::new(entry.file_name().to_string_lossy());
-
-            // Get metadata
-            let metadata = match entry.metadata() {
-                Ok(m) => m,
-                Err(err) => {
-                    collection.warnings.push(ScanWarning::new(
-                        &path,
-                        WarningKind::MetadataError,
-                        err.to_string(),
-                    ));
-                    continue;
-                }
-            };
-
-            // Handle different file types
-            let file_type = entry.file_type();
-            let depth = entry.depth() as u32;
-
-            if file_type.is_dir() {
-                collection.stats.record_dir(depth);
-
-                // For directories, track them but size will be aggregated later
-                if let Some(parent) = path.parent() {
-                    let entry_info = EntryInfo {
-                        name: file_name,
-                        path: path.clone(),
-                        size: 0,
-                        blocks: 0,
-                        is_dir: true,
-                        is_symlink: false,
-                        symlink_target: None,
-                        symlink_broken: false,
-                        executable: false,
-                        timestamps: timestamps_from(&metadata),
-                        inode: inode_info(&metadata),
-                        content_hash: None,
-                    };
-
-                    entries_by_parent
-                        .entry(parent.to_path_buf())
-                        .or_default()
-                        .push(entry_info);
-                }
-            } else if file_type.is_file() {
-                // Filter non-directory entries on different filesystems at
-                // depth 1 (directly under scan root). Deeper entries are
-                // already excluded by the directory-prune in process_read_dir.
-                if !cross_filesystems && get_dev(&metadata) != root_device {
-                    continue;
-                }
-
-                let nlink = get_nlink(&metadata);
-                let inode = inode_info(&metadata);
-
-                let size = if config.apparent_size {
-                    metadata.len()
-                } else {
-                    // Only count size for first hardlink encounter.
-                    if inode.is_some_and(|info| !collection.inode_tracker.track(info, nlink)) {
-                        0 // Already counted this inode
-                    } else {
-                        // Use disk blocks for physical size when apparent_size == false.
-                        disk_size(&metadata)
-                    }
-                };
-
-                let blocks = get_blocks(&metadata);
-                let content_hash =
-                    if config.compute_hashes && metadata.len() >= config.min_hash_size {
-                        match compute_content_hash(&path, &metadata, &token) {
-                            Ok(hash) => Some(hash),
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                                return Err(ScanError::Interrupted);
-                            }
-                            Err(error) => {
-                                collection
-                                    .warnings
-                                    .push(ScanWarning::read_error(&path, &error));
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                collection
-                    .stats
-                    .record_file(&path, size, metadata.modified().ok(), depth);
-
-                if let Some(parent) = path.parent() {
-                    let executable = is_executable(&metadata);
-                    let entry_info = EntryInfo {
-                        name: file_name,
-                        path: path.clone(),
-                        size,
-                        blocks,
-                        is_dir: false,
-                        is_symlink: false,
-                        symlink_target: None,
-                        symlink_broken: false,
-                        executable,
-                        timestamps: timestamps_from(&metadata),
-                        inode,
-                        content_hash,
-                    };
-
-                    entries_by_parent
-                        .entry(parent.to_path_buf())
-                        .or_default()
-                        .push(entry_info);
-                }
-            } else if file_type.is_symlink() {
-                // Filter symlinks on different filesystems at depth 1.
-                if !cross_filesystems && get_dev(&metadata) != root_device {
-                    continue;
-                }
-
-                collection.stats.record_symlink();
-
-                if let Some(parent) = path.parent() {
-                    // Read symlink target once; re-use for both the warning and
-                    // the EntryInfo so we never call read_link twice.
-                    let (symlink_target, symlink_broken) = resolve_symlink(&path);
-
-                    if symlink_broken {
-                        collection
-                            .warnings
-                            .push(ScanWarning::broken_symlink(&path, symlink_target.as_str()));
-                    }
-
-                    let entry_info = EntryInfo {
-                        name: file_name,
-                        path: path.clone(),
-                        size: 0,
-                        blocks: 0,
-                        is_dir: false,
-                        is_symlink: true,
-                        symlink_target: Some(symlink_target),
-                        symlink_broken,
-                        executable: false,
-                        timestamps: timestamps_from(&metadata),
-                        inode: None,
-                        content_hash: None,
-                    };
-
-                    entries_by_parent
-                        .entry(parent.to_path_buf())
-                        .or_default()
-                        .push(entry_info);
-                }
-            }
-
-            // Update progress periodically across all accepted entries, not only files.
-            progress_counter += 1;
-            if progress_counter.is_multiple_of(1000) {
-                let _ = self.progress_tx.send(ScanProgress {
-                    files_scanned: collection.stats.total_files,
-                    dirs_scanned: collection.stats.total_dirs,
-                    bytes_scanned: collection.stats.total_size,
-                    current_path: path.clone(),
-                    errors_count: collection.warnings.count,
-                    elapsed: start.elapsed(),
-                });
-            }
-        }
-
-        // Cancellation may clear the walker's final batch without yielding
-        // another entry, so the loop's per-entry check alone is insufficient.
-        if token.is_cancelled() {
-            return Err(ScanError::Interrupted);
-        }
-        Ok(entries_by_parent)
-    }
-
-    /// Build tree structure from collected entries.
-    fn build_tree(
-        &self,
-        root_path: &Path,
-        mut entries_by_parent: HashMap<PathBuf, Vec<EntryInfo>>,
-        node_id_counter: &AtomicU64,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<FileNode, ScanError> {
-        self.build_node(
-            root_path,
-            None,
-            &mut entries_by_parent,
-            node_id_counter,
-            cancelled,
-        )
-    }
-
-    /// Recursively build a node and its children.
-    fn build_node(
-        &self,
-        path: &Path,
-        timestamps: Option<Timestamps>,
-        entries_by_parent: &mut HashMap<PathBuf, Vec<EntryInfo>>,
-        node_id_counter: &AtomicU64,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<FileNode, ScanError> {
-        if cancelled() {
-            return Err(ScanError::Interrupted);
-        }
-        let id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
-
-        // Timestamps were already captured during the walk; only the scan root
-        // (which has no EntryInfo) needs a stat here.
-        let timestamps = timestamps.unwrap_or_else(|| {
-            std::fs::metadata(path)
-                .map(|m| timestamps_from(&m))
-                .unwrap_or_else(|_| Timestamps::with_modified(std::time::UNIX_EPOCH))
-        });
-
-        let mut node = FileNode::new_directory(id, name, timestamps);
-        node.set_file_name(path.file_name().unwrap_or(path.as_os_str()));
-
-        // Get children for this path
-        let children_entries = entries_by_parent.remove(path).unwrap_or_default();
-
-        let mut total_size: u64 = 0;
-        let mut file_count: u64 = 0;
-        let mut dir_count: u64 = 0;
-
-        for entry in children_entries {
-            if cancelled() {
-                return Err(ScanError::Interrupted);
-            }
-            if entry.is_dir {
-                // Recursively build directory
-                let child_node = self.build_node(
-                    &entry.path,
-                    Some(entry.timestamps),
-                    entries_by_parent,
-                    node_id_counter,
-                    cancelled,
-                )?;
-                total_size = total_size.saturating_add(child_node.size);
-                file_count = file_count.saturating_add(child_node.file_count());
-                dir_count = dir_count.saturating_add(child_node.dir_count().saturating_add(1));
-                node.children.push(child_node);
-            } else if entry.is_symlink {
-                // Re-use the already-resolved target and broken status from EntryInfo —
-                // no second syscall needed here.
-                let child_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
-                let target = entry.symlink_target.unwrap_or_default();
-                let broken = entry.symlink_broken;
-
-                let child_node = FileNode {
-                    id: child_id,
-                    name: entry.name,
-                    native_name: entry
-                        .path
-                        .file_name()
-                        .filter(|n| n.to_str().is_none())
-                        .map(|n| Box::new(n.to_os_string())),
-                    kind: NodeKind::Symlink { target, broken },
-                    size: 0,
-                    blocks: 0,
-                    timestamps: entry.timestamps,
-                    inode: None,
-                    content_hash: None,
-                    git_status: None,
-                    children: Vec::new(),
-                };
-                node.children.push(child_node);
-            } else {
-                // Create file node
-                let child_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
-                let mut child_node = FileNode::new_file(
-                    child_id,
-                    entry.name,
-                    entry.size,
-                    entry.blocks,
-                    entry.timestamps,
-                    entry.executable,
-                );
-                child_node.set_file_name(entry.path.file_name().unwrap());
-                child_node.inode = entry.inode;
-                child_node.content_hash = entry.content_hash;
-
-                total_size = total_size.saturating_add(entry.size);
-                file_count = file_count.saturating_add(1);
-                node.children.push(child_node);
-            }
-        }
-
-        // Update node with aggregated values
-        node.size = total_size;
-        node.kind = NodeKind::Directory {
-            file_count,
-            dir_count,
-        };
-
-        // Sort children by size (descending) with a name tiebreak so equal-size
-        // siblings have a deterministic order regardless of the parallel scan's
-        // collection order. Descendants were sorted when built; recursively
-        // sorting them here repeats work at every ancestor and delays cancellation.
-        if cancelled() {
-            return Err(ScanError::Interrupted);
-        }
-        node.children
-            .sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.compare_name(b)));
-        if cancelled() {
-            return Err(ScanError::Interrupted);
-        }
-
-        Ok(node)
+            }))
     }
 }
 
@@ -637,9 +520,28 @@ impl Default for JwalkScanner {
     }
 }
 
+fn walk_warning(error: &jwalk::Error) -> ScanWarning {
+    let path = error.path().map(Path::to_path_buf).unwrap_or_default();
+    let kind = match error.io_error().map(std::io::Error::kind) {
+        Some(std::io::ErrorKind::PermissionDenied) => WarningKind::PermissionDenied,
+        _ => WarningKind::ReadError,
+    };
+    ScanWarning::new(path, kind, error.to_string())
+}
+
+fn metadata_warning(path: PathBuf, error: &std::io::Error) -> ScanWarning {
+    let kind = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        WarningKind::PermissionDenied
+    } else {
+        WarningKind::MetadataError
+    };
+    ScanWarning::new(path, kind, error.to_string())
+}
+
 /// Create a quick, non-recursive directory listing for immediate display.
 /// This function reads only the immediate children of a directory without
-/// recursing into subdirectories. Directory sizes will be 0 (unknown).
+/// recursing into subdirectories. Directory sizes cover only their own
+/// allocation until a full scan.
 ///
 /// Warnings encountered during the listing are included in the returned
 /// `FileTree` rather than being silently dropped.
@@ -647,19 +549,13 @@ impl Default for JwalkScanner {
 /// The `config` parameter controls whether hidden files are shown. Pass
 /// `None` to use a default config (hidden files included).
 pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, ScanError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
-
     let start = Instant::now();
     let root_path = path.canonicalize().map_err(|e| ScanError::io(path, e))?;
-
-    if !root_path.is_dir() {
-        return Err(ScanError::NotADirectory {
-            path: root_path.clone(),
-        });
+    let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
+    if !root_metadata.is_dir() {
+        return Err(ScanError::NotADirectory { path: root_path });
     }
 
-    // Build an owned config for the case where none was supplied.
     let owned_config;
     let cfg: &ScanConfig = match config {
         Some(c) => c,
@@ -668,313 +564,112 @@ pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, 
             &owned_config
         }
     };
-
     cfg.validate()
         .map_err(|message| ScanError::InvalidConfig { message })?;
     let ignore = cfg
         .effective_ignore_globset()
         .map_err(|message| ScanError::InvalidConfig { message })?;
 
-    let node_id_counter = AtomicU64::new(0);
     let mut stats = TreeStats::new();
     let mut warnings = WarningAccumulator::default();
-
-    // Get root directory metadata
-    let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
-    let root_timestamps = timestamps_from(&root_metadata);
-
-    let root_name = root_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| root_path.to_string_lossy().to_string());
-
-    let root_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
-    let mut root_node = FileNode::new_directory(root_id, root_name, root_timestamps);
-    root_node.set_file_name(root_path.file_name().unwrap_or(root_path.as_os_str()));
-
-    // Read immediate children
-    let read_dir = match std::fs::read_dir(&root_path) {
-        Ok(rd) => rd,
-        Err(e) => return Err(ScanError::io(&root_path, e)),
-    };
-
-    let mut total_size: u64 = 0;
-    let mut file_count: u64 = 0;
-    let mut dir_count: u64 = 0;
-    let mut entry_budget = EntryBudget::new(cfg.max_entries);
-    let mut inode_tracker = if cfg.follow_symlinks {
+    let mut budget = EntryBudget::new(cfg.max_entries);
+    let mut tracker = if cfg.follow_symlinks {
         InodeTracker::with_alias_tracking()
     } else {
         InodeTracker::new()
     };
+    let root_entry = Entry::from_metadata(&root_metadata, PathBuf::new);
+    let root_size = root_entry.counted_size(cfg, &mut tracker);
+    let root_node = root_entry.node(
+        root_path.file_name().unwrap_or(root_path.as_os_str()),
+        root_size,
+    );
+    let mut frame = Frame::new(Some(root_node), root_size);
+    stats.record_dir(0);
 
-    for entry_result in read_dir {
-        let entry = match entry_result {
-            Ok(e) => e,
-            Err(e) => {
-                warnings.push(ScanWarning::new(
-                    root_path.clone(),
-                    WarningKind::ReadError,
-                    e.to_string(),
-                ));
+    let read_dir = std::fs::read_dir(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
+    for item in read_dir {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(ScanWarning::read_error(root_path.clone(), &error));
                 continue;
             }
         };
-
         let entry_path = entry.path();
-        let entry_name = entry.file_name().to_string_lossy().to_string();
-
-        // Respect include_hidden from config.
-        if !cfg.include_hidden && entry_name.starts_with('.') {
+        let file_name = entry.file_name();
+        if !cfg.include_hidden && file_name.as_encoded_bytes().starts_with(b".") {
             continue;
         }
-
-        // Respect ignore patterns from config.
-        if ignore.as_ref().is_some_and(|set| set.is_match(&entry_name))
-            || entry_path
-                .strip_prefix(&root_path)
-                .is_ok_and(|relative| ignore.as_ref().is_some_and(|set| set.is_match(relative)))
+        if let Some(ignore) = &ignore
+            && (ignore.is_match(&file_name)
+                || entry_path
+                    .strip_prefix(&root_path)
+                    .is_ok_and(|relative| ignore.is_match(relative)))
         {
             continue;
         }
-
-        entry_budget.consume()?;
-        let metadata_result = if cfg.follow_symlinks {
+        budget.consume()?;
+        let metadata = if cfg.follow_symlinks {
             std::fs::metadata(&entry_path)
         } else {
             entry.metadata()
         };
-        let metadata = match metadata_result {
-            Ok(m) => m,
-            Err(e) => {
-                warnings.push(ScanWarning::new(
-                    entry_path,
-                    WarningKind::MetadataError,
-                    e.to_string(),
-                ));
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(metadata_warning(entry_path, &error));
                 continue;
             }
         };
-
         if !cfg.cross_filesystems && get_dev(&metadata) != get_dev(&root_metadata) {
             continue;
         }
-        let timestamps = timestamps_from(&metadata);
-
-        let child_id = NodeId::new(node_id_counter.fetch_add(1, Ordering::Relaxed));
-
-        if metadata.is_dir() {
-            // Directory - size is unknown (0) until full scan
-            let mut child_node =
-                FileNode::new_directory(child_id, CompactString::new(&entry_name), timestamps);
-            child_node.set_file_name(&entry.file_name());
-            root_node.children.push(child_node);
-            dir_count += 1;
-            stats.record_dir(1);
-        } else if metadata.is_file() {
-            let inode = inode_info(&metadata);
-            let size = if cfg.apparent_size {
-                metadata.len()
-            } else if inode.is_some_and(|info| !inode_tracker.track(info, get_nlink(&metadata))) {
-                0
-            } else {
-                disk_size(&metadata)
-            };
-            let blocks = get_blocks(&metadata);
-            let executable = is_executable(&metadata);
-
-            let mut child_node = FileNode::new_file(
-                child_id,
-                CompactString::new(&entry_name),
-                size,
-                blocks,
-                timestamps,
-                executable,
-            );
-
-            // Set inode info for potential hardlink detection
-            child_node.set_file_name(&entry.file_name());
-            child_node.inode = inode;
-
-            total_size = total_size.saturating_add(size);
-            file_count = file_count.saturating_add(1);
-            root_node.children.push(child_node);
-            stats.record_file(&entry_path, size, metadata.modified().ok(), 1);
-        } else if metadata.file_type().is_symlink() {
-            let (target, broken) = resolve_symlink(&entry_path);
-
-            if broken {
-                warnings.push(ScanWarning::broken_symlink(&entry_path, target.as_str()));
+        let fact = Entry::from_metadata(&metadata, || entry_path.clone());
+        let size = fact.counted_size(cfg, &mut tracker);
+        let node = fact.node(&file_name, size);
+        match &fact.kind {
+            EntryKind::Dir => {
+                stats.record_dir(1);
+                frame.dirs += 1;
+                // Contents unknown until a full scan: own allocation only.
+                frame.size = frame.size.saturating_add(size);
+                if let Some(root) = &mut frame.node {
+                    root.children.push(node);
+                }
             }
-
-            let child_node = FileNode {
-                id: child_id,
-                name: CompactString::new(&entry_name),
-                native_name: entry
-                    .file_name()
-                    .to_str()
-                    .is_none()
-                    .then(|| Box::new(entry.file_name())),
-                kind: NodeKind::Symlink { target, broken },
-                size: 0,
-                blocks: 0,
-                timestamps,
-                inode: None,
-                content_hash: None,
-                git_status: None,
-                children: Vec::new(),
-            };
-            root_node.children.push(child_node);
-            stats.record_symlink();
+            EntryKind::File { .. } => {
+                stats.record_file(&entry_path, size, fact.modified, 1);
+                frame.add_leaf(size, Some(node));
+            }
+            EntryKind::Symlink { target, broken } => {
+                stats.record_symlink();
+                if *broken {
+                    warnings.push(ScanWarning::broken_symlink(&entry_path, target));
+                }
+                frame.add_leaf(0, Some(node));
+            }
+            EntryKind::Other => frame.add_leaf(size, Some(node)),
         }
     }
 
-    // Update root node with aggregated values
-    root_node.size = total_size;
-    root_node.kind = NodeKind::Directory {
-        file_count,
-        dir_count,
-    };
-
-    // Sort children by name for initial display (scan will re-sort by size later)
-    root_node.children.sort_by(|a, b| a.compare_name(b));
-
-    stats.record_dir(0);
+    let mut root = frame.finish().expect("root is retained");
+    // Name order for immediate display; the full scan re-sorts by size.
+    root.children.sort_by(|a, b| a.compare_name(b));
 
     // quick_list observes only immediate children, even if supplied a recursive
     // scan configuration. Preserve the actual scope for downstream consumers.
     let mut scan_config = cfg.clone();
     scan_config.root = root_path.clone();
     scan_config.max_depth = Some(1);
-    let scan_duration = start.elapsed();
-
     Ok(FileTree::new(
-        root_node,
+        root,
         root_path,
         scan_config,
         stats,
-        scan_duration,
+        start.elapsed(),
         warnings.into_vec(),
     ))
-}
-
-/// Temporary struct for collecting entry information.
-struct EntryInfo {
-    name: CompactString,
-    path: PathBuf,
-    size: u64,
-    blocks: u64,
-    is_dir: bool,
-    is_symlink: bool,
-    /// Pre-resolved symlink target (avoids re-reading in build_node).
-    symlink_target: Option<CompactString>,
-    /// Pre-computed broken status (avoids re-calling path.exists() in build_node).
-    symlink_broken: bool,
-    executable: bool,
-    timestamps: Timestamps,
-    inode: Option<InodeInfo>,
-    content_hash: Option<ContentHash>,
-}
-
-fn compute_content_hash(
-    path: &Path,
-    observed: &std::fs::Metadata,
-    token: &CancellationToken,
-) -> std::io::Result<ContentHash> {
-    if token.is_cancelled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "scan cancelled before opening hash input",
-        ));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let mut file = options.open(path)?;
-    let before = file.metadata()?;
-    if !before.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "scan hash input must be a regular file",
-        ));
-    }
-    if observed.len() != before.len()
-        || observed.modified().ok() != before.modified().ok()
-        || inode_info(observed) != inode_info(&before)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "scan hash input changed since traversal",
-        ));
-    }
-    let hash = hash_exact_length(&mut file, before.len(), token)?;
-    let after = file.metadata()?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "scan hash input changed while reading",
-        ));
-    }
-    Ok(hash)
-}
-
-/// Read only the observed length plus one byte to detect growth, with no
-/// buffered read-ahead beyond that boundary.
-fn hash_exact_length(
-    mut reader: impl Read,
-    mut remaining: u64,
-    token: &CancellationToken,
-) -> std::io::Result<ContentHash> {
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        if token.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "scan cancelled while hashing",
-            ));
-        }
-        let requested = if remaining == 0 {
-            1
-        } else {
-            remaining.min(buffer.len() as u64) as usize
-        };
-        let read = reader.read(&mut buffer[..requested])?;
-        if read == 0 {
-            if remaining != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "scan hash input shrank while reading",
-                ));
-            }
-            break;
-        }
-        if remaining == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "scan hash input grew while reading",
-            ));
-        }
-        remaining -= read as u64;
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(ContentHash::new(*hasher.finalize().as_bytes()))
-}
-
-/// Build [`Timestamps`] from metadata, falling back to the Unix epoch only for
-/// the *node's* display timestamp when the real mtime is unreadable.
-fn timestamps_from(metadata: &std::fs::Metadata) -> Timestamps {
-    Timestamps::new(
-        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-        metadata.accessed().ok(),
-        metadata.created().ok(),
-    )
 }
 
 /// Resolve a symlink's target and whether it is broken.
@@ -983,20 +678,19 @@ fn timestamps_from(metadata: &std::fs::Metadata) -> Timestamps {
 /// any other reason (e.g. permission denied on a parent component) is *not*
 /// treated as broken, so valid links into restricted directories aren't
 /// mislabelled. The target string is empty if the link itself can't be read.
-fn resolve_symlink(path: &Path) -> (CompactString, bool) {
+fn resolve_symlink(path: &Path) -> (Box<str>, bool) {
     match std::fs::read_link(path) {
         Ok(target) => {
-            let broken = match std::fs::metadata(path) {
-                Ok(_) => false,
-                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-            };
-            (CompactString::new(target.to_string_lossy()), broken)
+            let broken = matches!(
+                std::fs::metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            (target.to_string_lossy().into(), broken)
         }
-        Err(_) => (CompactString::default(), true),
+        Err(_) => (Box::from(""), true),
     }
 }
 
-/// Check if a file is executable (Unix).
 #[cfg(unix)]
 fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1026,23 +720,18 @@ fn scan_pool() -> Arc<jwalk::rayon::ThreadPool> {
 
 // Cross-platform metadata helpers
 
-/// Get the device ID from metadata.
 #[cfg(unix)]
 fn get_dev(metadata: &std::fs::Metadata) -> u64 {
     metadata.dev()
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 fn get_dev(_metadata: &std::fs::Metadata) -> u64 {
-    0 // Windows doesn't expose a simple numeric device ID via MetadataExt
-}
-
-#[cfg(not(any(unix, windows)))]
-fn get_dev(_metadata: &std::fs::Metadata) -> u64 {
+    // No stable numeric device ID without unstable `windows_by_handle`.
     0
 }
 
-/// Get stable file identity where the standard library exposes it.
+/// Stable file identity where the standard library exposes it.
 #[cfg(unix)]
 fn inode_info(metadata: &std::fs::Metadata) -> Option<InodeInfo> {
     Some(InodeInfo::new(metadata.ino(), metadata.dev()))
@@ -1050,30 +739,23 @@ fn inode_info(metadata: &std::fs::Metadata) -> Option<InodeInfo> {
 
 #[cfg(not(unix))]
 fn inode_info(_metadata: &std::fs::Metadata) -> Option<InodeInfo> {
-    // A fabricated (0, 0) identity would make duplicate analysis incorrectly
-    // treat every file as a hardlink of every other file.
+    // A fabricated identity would make every file look like a hard link of
+    // every other one.
     None
 }
 
-/// Get the number of hard links from metadata.
 #[cfg(unix)]
 fn get_nlink(metadata: &std::fs::Metadata) -> u64 {
     metadata.nlink()
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 fn get_nlink(_metadata: &std::fs::Metadata) -> u64 {
-    // number_of_links() requires unstable `windows_by_handle` feature.
-    // Return 1 to skip hardlink dedup on Windows.
+    // number_of_links() requires unstable `windows_by_handle`.
     1
 }
 
-#[cfg(not(any(unix, windows)))]
-fn get_nlink(_metadata: &std::fs::Metadata) -> u64 {
-    1 // Assume single link on other platforms
-}
-
-/// Get the number of 512-byte blocks from metadata.
+/// 512-byte blocks allocated to the entry.
 #[cfg(unix)]
 fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
     metadata.blocks()
@@ -1081,23 +763,19 @@ fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
 
 #[cfg(not(unix))]
 fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
-    // Estimate blocks from file size (512-byte blocks, rounded up)
-    (metadata.len() + 511) / 512
+    metadata.len().div_ceil(512)
 }
 
-/// Compute the physical (disk) size of a file.
-///
-/// On Unix this is `blocks * 512` (the kernel-reported allocation unit).
-/// On other platforms we fall back to the apparent size since there is no
-/// portable way to query the on-disk allocation.
+/// On-disk usage: allocated blocks on Unix, apparent length elsewhere, where
+/// there is no portable way to query the allocation.
 #[cfg(unix)]
-fn disk_size(metadata: &std::fs::Metadata) -> u64 {
-    get_blocks(metadata) * 512
+fn disk_size(_len: u64, blocks: u64) -> u64 {
+    blocks.saturating_mul(512)
 }
 
 #[cfg(not(unix))]
-fn disk_size(metadata: &std::fs::Metadata) -> u64 {
-    metadata.len()
+fn disk_size(len: u64, _blocks: u64) -> u64 {
+    len
 }
 
 #[cfg(test)]
@@ -1106,205 +784,17 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn hash_length_boundary_rejects_growth_and_truncation() {
-        use std::io::Cursor;
-        let token = CancellationToken::new();
-        for bytes in [b"".as_slice(), b"fixture".as_slice()] {
-            assert_eq!(
-                hash_exact_length(Cursor::new(bytes), bytes.len() as u64, &token).unwrap(),
-                ContentHash::new(*blake3::hash(bytes).as_bytes())
-            );
-        }
-        let mut growing = Cursor::new(vec![42; 100_000]);
-        let error = hash_exact_length(&mut growing, 17, &token).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(growing.position(), 18);
-        let error = hash_exact_length(Cursor::new(b"short"), 6, &token).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
-    }
-
-    #[test]
-    fn bounded_hash_handles_short_reads_and_cancellation_between_reads() {
-        struct ShortReader {
-            reads: usize,
-            token: CancellationToken,
-            cancel: bool,
-        }
-        impl Read for ShortReader {
-            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                self.reads += 1;
-                if self.cancel {
-                    self.token.cancel();
-                }
-                if self.reads <= 3 {
-                    bytes[0] = b'x';
-                    Ok(1)
-                } else {
-                    Ok(0)
-                }
-            }
-        }
-        for cancel in [false, true] {
-            let token = CancellationToken::new();
-            let mut reader = ShortReader {
-                reads: 0,
-                token: token.clone(),
-                cancel,
-            };
-            let result = hash_exact_length(&mut reader, 3, &token);
-            if cancel {
-                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
-                assert_eq!(reader.reads, 1);
-            } else {
-                assert_eq!(
-                    result.unwrap(),
-                    ContentHash::new(*blake3::hash(b"xxx").as_bytes())
-                );
-                assert_eq!(reader.reads, 4);
-            }
-        }
-    }
-
-    #[test]
-    fn hash_cancellation_precedes_opening_the_path() {
-        let token = CancellationToken::new();
-        token.cancel();
-        let temp = TempDir::new().unwrap();
-        let error = compute_content_hash(
-            &temp.path().join("missing"),
-            &std::fs::metadata(temp.path()).unwrap(),
-            &token,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
-    }
-
-    #[test]
-    fn hash_input_rejects_directories() {
-        let temp = TempDir::new().unwrap();
-        assert!(
-            compute_content_hash(
-                temp.path(),
-                &std::fs::metadata(temp.path()).unwrap(),
-                &CancellationToken::new()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn hash_rejects_length_changes_since_traversal() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("file");
-        std::fs::write(&path, b"original").unwrap();
-        let observed = std::fs::metadata(&path).unwrap();
-        std::fs::write(&path, b"longer replacement contents").unwrap();
-        let error = compute_content_hash(&path, &observed, &CancellationToken::new()).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("since traversal"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hash_rejects_replacement_even_with_matching_length_and_mtime() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("file");
-        std::fs::write(&path, b"original").unwrap();
-        let observed = std::fs::metadata(&path).unwrap();
-        std::fs::rename(&path, temp.path().join("saved")).unwrap();
-        std::fs::write(&path, b"replaced").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
+    fn scan(config: &ScanConfig) -> FileTree {
+        JwalkScanner::new()
+            .scan(config, CancellationToken::new())
             .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(observed.modified().unwrap()))
-            .unwrap();
-        let current = std::fs::metadata(&path).unwrap();
-        assert_eq!(observed.len(), current.len());
-        assert_eq!(observed.modified().unwrap(), current.modified().unwrap());
-        assert_ne!(inode_info(&observed), inode_info(&current));
-        let error = compute_content_hash(&path, &observed, &CancellationToken::new()).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("since traversal"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn hash_input_rejects_fifo_without_a_writer_and_preserves_regular_symlinks() {
-        use std::os::unix::ffi::OsStrExt;
-        let temp = TempDir::new().unwrap();
-        let fifo = temp.path().join("fifo");
-        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: native is a NUL-terminated path valid for the duration of the call.
-        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
-        let error = compute_content_hash(
-            &fifo,
-            &std::fs::metadata(&fifo).unwrap(),
-            &CancellationToken::new(),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        let file = temp.path().join("file");
-        std::fs::write(&file, b"hash fixture").unwrap();
-        let link = temp.path().join("link");
-        std::os::unix::fs::symlink(&file, &link).unwrap();
-        assert_eq!(
-            compute_content_hash(
-                &link,
-                &std::fs::metadata(&file).unwrap(),
-                &CancellationToken::new()
-            )
-            .unwrap(),
-            ContentHash::new(*blake3::hash(b"hash fixture").as_bytes())
-        );
-    }
-
-    #[test]
-    fn tree_assembly_cancellation_stops_between_children() {
-        let root = PathBuf::from("root");
-        let entries = (0..1000)
-            .map(|index| EntryInfo {
-                name: CompactString::new(format!("file-{index}")),
-                path: root.join(format!("file-{index}")),
-                size: 1,
-                blocks: 0,
-                is_dir: false,
-                is_symlink: false,
-                symlink_target: None,
-                symlink_broken: false,
-                executable: false,
-                timestamps: Timestamps::with_modified(std::time::UNIX_EPOCH),
-                inode: None,
-                content_hash: None,
-            })
-            .collect();
-        let mut by_parent = HashMap::from([(root.clone(), entries)]);
-        let next_id = AtomicU64::new(0);
-        let checks = std::cell::Cell::new(0);
-        let cancelled = || {
-            checks.set(checks.get() + 1);
-            checks.get() > 5
-        };
-        let result = JwalkScanner::new().build_node(
-            &root,
-            Some(Timestamps::with_modified(std::time::UNIX_EPOCH)),
-            &mut by_parent,
-            &next_id,
-            &cancelled,
-        );
-        assert!(matches!(result, Err(ScanError::Interrupted)));
-        assert_eq!(checks.get(), 6);
-        assert_eq!(next_id.load(Ordering::Relaxed), 5);
-    }
-
-    #[test]
-    fn cancelled_tree_assembly_does_not_allocate_a_root_node() {
-        let next_id = AtomicU64::new(0);
-        let result =
-            JwalkScanner::new().build_tree(Path::new("unused"), HashMap::new(), &next_id, &|| true);
-        assert!(matches!(result, Err(ScanError::Interrupted)));
-        assert_eq!(next_id.load(Ordering::Relaxed), 0);
+    fn child<'a>(node: &'a FileNode, name: &str) -> &'a FileNode {
+        node.children
+            .iter()
+            .find(|child| child.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
     }
 
     #[test]
@@ -1346,47 +836,191 @@ mod tests {
     fn create_test_tree() -> TempDir {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-
-        // Create directory structure
         fs::create_dir(root.join("dir1")).unwrap();
         fs::create_dir(root.join("dir2")).unwrap();
         fs::create_dir(root.join("dir1/subdir")).unwrap();
-
-        // Create files
         fs::write(root.join("file1.txt"), "hello").unwrap();
         fs::write(root.join("dir1/file2.txt"), "world world world").unwrap();
         fs::write(root.join("dir1/subdir/file3.txt"), "test").unwrap();
         fs::write(root.join("dir2/file4.txt"), "another file here").unwrap();
-
         temp
     }
 
     #[test]
-    fn test_basic_scan() {
+    fn scan_counts_files_directories_and_sizes() {
         let temp = create_test_tree();
-        let config = ScanConfig::new(temp.path());
-
-        let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
-
+        let tree = scan(&ScanConfig::new(temp.path()));
         assert_eq!(tree.stats.total_files, 4);
-        // dir1, dir2, subdir + root = 4, but root not counted in walker
-        assert!(tree.stats.total_dirs >= 3);
-        assert!(tree.root.size > 0);
+        assert_eq!(tree.stats.total_dirs, 4, "three directories plus the root");
+        assert_eq!(tree.root.file_count(), 4);
+        assert_eq!(tree.root.dir_count(), 3);
+        let children: u64 = tree.root.children.iter().map(|child| child.size).sum();
+        assert!(
+            tree.root.size >= children,
+            "the root adds its own allocation"
+        );
+        let dir1 = child(&tree.root, "dir1");
+        assert_eq!(dir1.file_count(), 2);
+        assert_eq!(dir1.dir_count(), 1);
+        assert_eq!(child(dir1, "subdir").file_count(), 1);
     }
 
     #[test]
-    fn test_children_sorted_by_size() {
+    fn apparent_sizes_include_directories_themselves() {
         let temp = create_test_tree();
-        let config = ScanConfig::new(temp.path());
+        let mut config = ScanConfig::new(temp.path());
+        config.apparent_size = true;
+        let tree = scan(&config);
+        let root = temp.path();
+        let dirs: u64 = [".", "dir1", "dir2", "dir1/subdir"]
+            .iter()
+            .map(|dir| fs::metadata(root.join(dir)).unwrap().len())
+            .sum();
+        assert_eq!(tree.root.size, 5 + 17 + 4 + 17 + dirs);
+        assert_eq!(tree.stats.total_size, 43, "stats count file contents only");
+    }
 
-        let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
-
-        // Children should be sorted by size descending
-        for i in 0..tree.root.children.len().saturating_sub(1) {
-            assert!(tree.root.children[i].size >= tree.root.children[i + 1].size);
+    #[test]
+    fn children_are_sorted_by_size_then_name() {
+        let temp = create_test_tree();
+        let tree = scan(&ScanConfig::new(temp.path()));
+        for pair in tree.root.children.windows(2) {
+            assert!(
+                pair[0].size > pair[1].size
+                    || (pair[0].size == pair[1].size && pair[0].name <= pair[1].name)
+            );
         }
+    }
+
+    #[test]
+    fn max_depth_limits_retention_but_not_sizes() {
+        let temp = create_test_tree();
+        let mut config = ScanConfig::new(temp.path());
+        config.apparent_size = true;
+        let full = scan(&config);
+        config.max_depth = Some(1);
+        let shallow = scan(&config);
+        assert_eq!(shallow.root.size, full.root.size);
+        assert_eq!(shallow.stats.total_files, 4);
+        let dir1 = child(&shallow.root, "dir1");
+        assert!(
+            dir1.children.is_empty(),
+            "nothing below depth 1 is retained"
+        );
+        assert_eq!(dir1.size, child(&full.root, "dir1").size);
+        assert_eq!(dir1.file_count(), 2);
+        assert_eq!(dir1.dir_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_count_once_in_both_size_modes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        fs::write(root.join("a/data"), vec![1u8; 10_000]).unwrap();
+        fs::hard_link(root.join("a/data"), root.join("b/data")).unwrap();
+        let linked = |tree: &FileTree| {
+            child(&tree.root, "a").children[0].size + child(&tree.root, "b").children[0].size
+        };
+        for apparent in [false, true] {
+            let one = if apparent {
+                10_000
+            } else {
+                fs::metadata(root.join("a/data")).unwrap().blocks() * 512
+            };
+            let mut config = ScanConfig::new(root);
+            config.apparent_size = apparent;
+            assert_eq!(linked(&scan(&config)), one, "apparent={apparent}");
+            config.count_hard_links = true;
+            assert_eq!(linked(&scan(&config)), 2 * one, "apparent={apparent}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_files_are_listed_not_dropped() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = TempDir::new().unwrap();
+        let fifo = temp.path().join("pipe");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        let tree = scan(&ScanConfig::new(temp.path()));
+        assert!(matches!(child(&tree.root, "pipe").kind, NodeKind::Other));
+        assert_eq!(tree.root.file_count(), 1);
+        let listed = quick_list(temp.path(), None).unwrap();
+        assert!(matches!(child(&listed.root, "pipe").kind, NodeKind::Other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_kept_as_links_and_broken_ones_warned() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("target"), "x").unwrap();
+        std::os::unix::fs::symlink("target", temp.path().join("good")).unwrap();
+        std::os::unix::fs::symlink("missing", temp.path().join("bad")).unwrap();
+        let tree = scan(&ScanConfig::new(temp.path()));
+        assert!(matches!(
+            &child(&tree.root, "good").kind,
+            NodeKind::Symlink { target, broken: false } if &**target == "target"
+        ));
+        assert!(matches!(
+            child(&tree.root, "bad").kind,
+            NodeKind::Symlink { broken: true, .. }
+        ));
+        assert_eq!(tree.stats.total_symlinks, 2);
+        assert!(
+            tree.warnings
+                .iter()
+                .any(|warning| warning.kind == WarningKind::BrokenSymlink)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directories_are_reported_as_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let locked = temp.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("secret"), "x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let tree = scan(&ScanConfig::new(temp.path()));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        // Root bypasses permissions; only assert when the read was refused.
+        if child(&tree.root, "locked").children.is_empty() {
+            assert!(
+                tree.warnings
+                    .iter()
+                    .any(|warning| warning.kind == WarningKind::PermissionDenied),
+                "{:?}",
+                tree.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn entry_limit_fails_the_scan() {
+        let temp = create_test_tree();
+        let mut config = ScanConfig::new(temp.path());
+        config.max_entries = Some(2);
+        assert!(matches!(
+            JwalkScanner::new().scan(&config, CancellationToken::new()),
+            Err(ScanError::EntryLimitExceeded { limit: 2 })
+        ));
+    }
+
+    #[test]
+    fn cancellation_returns_interrupted() {
+        let temp = create_test_tree();
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            JwalkScanner::new().scan(&ScanConfig::new(temp.path()), token),
+            Err(ScanError::Interrupted)
+        ));
     }
 
     #[test]
@@ -1397,11 +1031,7 @@ mod tests {
             .ignore_patterns(vec!["dir2".to_string()])
             .build()
             .unwrap();
-
-        let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
-
-        // dir2 should be ignored
+        let tree = scan(&config);
         assert!(!tree.root.children.iter().any(|c| c.name.as_str() == "dir2"));
     }
 
@@ -1413,59 +1043,30 @@ mod tests {
             .ignore_patterns(vec!["dir1/subdir/**".to_string()])
             .build()
             .unwrap();
-
-        let scanner = JwalkScanner::new();
-        let tree = scanner.scan(&config, CancellationToken::new()).unwrap();
-        let dir1 = tree
-            .root
-            .children
-            .iter()
-            .find(|child| child.name.as_str() == "dir1")
-            .unwrap();
-        let subdir = dir1
-            .children
-            .iter()
-            .find(|child| child.name.as_str() == "subdir")
-            .unwrap();
-        assert!(subdir.children.is_empty());
+        let tree = scan(&config);
+        assert!(
+            child(child(&tree.root, "dir1"), "subdir")
+                .children
+                .is_empty()
+        );
     }
 
     #[test]
-    fn test_quick_list_respects_hidden() {
+    fn quick_list_respects_hidden() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         fs::write(root.join(".hidden"), "secret").unwrap();
         fs::write(root.join("visible"), "public").unwrap();
-
-        // Default config hides hidden files.
-        let config = ScanConfig::builder()
-            .root(root)
-            .include_hidden(false)
-            .build()
-            .unwrap();
-
-        let tree = quick_list(root, Some(&config)).unwrap();
-        let names: Vec<_> = tree.root.children.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"visible"));
-        assert!(!names.contains(&".hidden"));
-    }
-
-    #[test]
-    fn test_quick_list_includes_hidden_when_configured() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        fs::write(root.join(".hidden"), "secret").unwrap();
-        fs::write(root.join("visible"), "public").unwrap();
-
-        let config = ScanConfig::builder()
-            .root(root)
-            .include_hidden(true)
-            .build()
-            .unwrap();
-
-        let tree = quick_list(root, Some(&config)).unwrap();
-        let names: Vec<_> = tree.root.children.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"visible"));
-        assert!(names.contains(&".hidden"));
+        for include_hidden in [false, true] {
+            let config = ScanConfig::builder()
+                .root(root)
+                .include_hidden(include_hidden)
+                .build()
+                .unwrap();
+            let tree = quick_list(root, Some(&config)).unwrap();
+            let names: Vec<_> = tree.root.children.iter().map(|c| c.name.as_str()).collect();
+            assert!(names.contains(&"visible"));
+            assert_eq!(names.contains(&".hidden"), include_hidden);
+        }
     }
 }

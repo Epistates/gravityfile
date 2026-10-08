@@ -18,13 +18,9 @@ fn fixed_legacy_scan_preserves_tree_precision_warnings_and_defaults() {
     assert_eq!(tree.root.children.len(), 1);
     let child = &tree.root.children[0];
     assert_eq!(child.file_name(), "a\n.txt");
-    assert_eq!(child.id.get(), 2);
     assert_eq!(child.inode.unwrap().inode, 9_007_199_254_740_995);
     assert!(child.native_name.is_none());
     assert!(child.git_status.is_none());
-    assert!(child.content_hash.is_none());
-    assert!(child.timestamps.accessed.is_none());
-    assert!(child.timestamps.created.is_none());
     assert_eq!(
         child.timestamps.modified,
         UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789)
@@ -37,19 +33,31 @@ fn fixed_legacy_scan_preserves_tree_precision_warnings_and_defaults() {
     assert_eq!(tree.config.max_entries, None);
     assert!(tree.config.include_hidden);
     assert!(!tree.config.follow_symlinks);
-    assert_eq!(tree.config.min_hash_size, 4096);
+    assert!(!tree.config.git_status);
     assert!(tree.has_warnings());
     assert_eq!(tree.warning_count(), 1);
     assert_eq!(tree.warnings[0].kind, WarningKind::PermissionDenied);
     assert_eq!(tree.warnings[0].path, std::path::Path::new("data/private"));
 
-    // Every field supplied by the fixed consumer fixture must survive writing;
-    // newly defaulted optional fields may be added by the current writer.
+    // Every field supplied by the fixed consumer fixture must survive writing,
+    // except those schema version 2 dropped (node ids, content hashes, access
+    // and creation times, hashing options); newly defaulted optional fields
+    // may be added by the current writer.
+    const DROPPED: [&str; 6] = [
+        "id",
+        "content_hash",
+        "accessed",
+        "created",
+        "compute_hashes",
+        "min_hash_size",
+    ];
     fn assert_preserved(expected: &serde_json::Value, actual: &serde_json::Value) {
         match expected {
             serde_json::Value::Object(fields) => {
                 for (key, value) in fields {
-                    assert_preserved(value, &actual[key]);
+                    if !DROPPED.contains(&key.as_str()) {
+                        assert_preserved(value, &actual[key]);
+                    }
                 }
             }
             serde_json::Value::Array(values) => {
@@ -138,7 +146,7 @@ fn reports_roundtrip_native_paths_and_reject_foreign_or_malformed_encodings() {
 #[cfg(unix)]
 #[test]
 fn native_node_names_roundtrip_without_lossy_aliasing() {
-    use gravityfile_core::{FileNode, NodeId, Timestamps};
+    use gravityfile_core::{FileNode, Timestamps};
     use std::os::unix::ffi::OsStringExt;
     let names = [
         std::ffi::OsString::from_vec(b"bad-\xff".to_vec()),
@@ -146,11 +154,8 @@ fn native_node_names_roundtrip_without_lossy_aliasing() {
     ];
     let mut nodes = Vec::new();
     for name in &names {
-        let mut node = FileNode::new_directory(
-            NodeId::new(1),
-            "",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
+        let mut node =
+            FileNode::new_directory("", Timestamps::with_modified(std::time::UNIX_EPOCH));
         node.set_file_name(name);
         let restored: FileNode =
             serde_json::from_slice(&serde_json::to_vec(&node).unwrap()).unwrap();

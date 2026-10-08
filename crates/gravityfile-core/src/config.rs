@@ -29,12 +29,20 @@ pub struct ScanConfig {
     #[serde(default)]
     pub apparent_size: bool,
 
-    /// Maximum depth to traverse (None = unlimited).
+    /// Count every hard link to a file instead of only the first one seen.
+    #[builder(default = "false")]
+    #[serde(default)]
+    pub count_hard_links: bool,
+
+    /// Deepest level kept in the tree (None = unlimited). Everything below is
+    /// still traversed and counted into the sizes of the deepest kept
+    /// directories; only the nodes are not retained.
     #[builder(default)]
     #[serde(default)]
     pub max_depth: Option<u32>,
 
-    /// Maximum descendant entries consumed after name/depth filtering.
+    /// Maximum descendant entries consumed after hidden/ignore filtering, at
+    /// every depth (`max_depth` does not reduce the count).
     /// `None` is unlimited; zero permits only an empty scope. The root does
     /// not count. Metadata failures and unsupported file types still count.
     /// Exceeding the limit fails the scan instead of returning a partial tree.
@@ -58,15 +66,10 @@ pub struct ScanConfig {
     #[serde(default = "default_true")]
     pub include_hidden: bool,
 
-    /// Compute content hashes during scan.
+    /// Annotate nodes with Git status when the root is inside a repository.
     #[builder(default = "false")]
     #[serde(default)]
-    pub compute_hashes: bool,
-
-    /// Minimum file size to hash (skip tiny files).
-    #[builder(default = "4096")]
-    #[serde(default = "default_min_hash_size")]
-    pub min_hash_size: u64,
+    pub git_status: bool,
 
     /// Compiled glob patterns for ignore matching. Rebuilt from `ignore_patterns`.
     #[serde(skip)]
@@ -77,10 +80,6 @@ pub struct ScanConfig {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_min_hash_size() -> u64 {
-    4096
 }
 
 impl ScanConfigBuilder {
@@ -110,13 +109,13 @@ impl ScanConfig {
             follow_symlinks: false,
             cross_filesystems: false,
             apparent_size: false,
+            count_hard_links: false,
             max_depth: None,
             max_entries: None,
             ignore_patterns: Vec::new(),
             threads: 0,
             include_hidden: true,
-            compute_hashes: false,
-            min_hash_size: 4096,
+            git_status: false,
             compiled_ignore: None,
         }
     }

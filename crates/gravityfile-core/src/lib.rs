@@ -16,12 +16,11 @@
 //! # Example
 //!
 //! ```rust
-//! use gravityfile_core::{FileNode, NodeId, Timestamps, ScanConfig};
+//! use gravityfile_core::{FileNode, Timestamps, ScanConfig};
 //! use std::time::SystemTime;
 //!
 //! // Create a file node
 //! let file = FileNode::new_file(
-//!     NodeId::new(1),
 //!     "example.txt",
 //!     1024,
 //!     2,
@@ -47,6 +46,6 @@ mod tree;
 
 pub use config::{ScanConfig, ScanConfigBuilder};
 pub use error::{ScanError, ScanWarning, WarningKind};
-pub use node::{ContentHash, FileNode, GitStatus, InodeInfo, NodeId, NodeKind, Timestamps};
+pub use node::{ContentHash, FileNode, GitStatus, InodeInfo, NodeKind, Timestamps};
 pub use terminal::{escape_filename, escape_terminal_text};
 pub use tree::{FileTree, TreeStats};

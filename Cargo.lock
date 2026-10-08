@@ -1227,6 +1227,7 @@ dependencies = [
  "derive_builder",
  "globset",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -1278,8 +1279,6 @@ dependencies = [
 name = "gravityfile-scan"
 version = "0.3.1"
 dependencies = [
- "blake3",
- "compact_str 0.10.0",
  "git2",
  "globset",
  "gravityfile-core",

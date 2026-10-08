@@ -1,52 +1,9 @@
 use std::time::{Duration, SystemTime};
 
 use gravityfile_core::{
-    ContentHash, FileNode, FileTree, GitStatus, InodeInfo, NodeId, NodeKind, ScanConfig, ScanError,
+    ContentHash, FileNode, FileTree, GitStatus, InodeInfo, NodeKind, ScanConfig, ScanError,
     ScanWarning, Timestamps, TreeStats, WarningKind,
 };
-
-// ---------------------------------------------------------------------------
-// NodeId
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_node_id_operations() {
-    let id1 = NodeId::new(42);
-    let id2 = NodeId::new(42);
-
-    assert_eq!(id1, id2);
-    assert_eq!(id1.get(), 42);
-}
-
-#[test]
-fn test_node_id_zero() {
-    let id = NodeId::new(0);
-    assert_eq!(id.get(), 0);
-}
-
-#[test]
-fn test_node_id_max() {
-    let id = NodeId::new(u64::MAX);
-    assert_eq!(id.get(), u64::MAX);
-}
-
-#[test]
-fn test_node_id_display() {
-    let id = NodeId::new(42);
-    assert_eq!(format!("{id}"), "42");
-    assert_eq!(format!("{}", NodeId::new(0)), "0");
-    assert_eq!(format!("{}", NodeId::new(u64::MAX)), u64::MAX.to_string());
-}
-
-#[test]
-fn test_node_id_hash() {
-    use std::collections::HashSet;
-    let mut set = HashSet::new();
-    set.insert(NodeId::new(1));
-    set.insert(NodeId::new(2));
-    set.insert(NodeId::new(1)); // duplicate
-    assert_eq!(set.len(), 2);
-}
 
 // ---------------------------------------------------------------------------
 // ContentHash
@@ -126,29 +83,17 @@ fn test_inode_info_inequality() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_timestamps() {
+fn timestamps_round_trip_and_ignore_legacy_fields() {
     let now = SystemTime::now();
-    let timestamps = Timestamps::with_modified(now);
-
-    assert_eq!(timestamps.modified, now);
-    assert!(timestamps.accessed.is_none());
-    assert!(timestamps.created.is_none());
-
-    let accessed = now - Duration::from_secs(3600);
-    let created = now - Duration::from_secs(7200);
-
-    let full = Timestamps::new(now, Some(accessed), Some(created));
-    assert_eq!(full.modified, now);
-    assert_eq!(full.accessed, Some(accessed));
-    assert_eq!(full.created, Some(created));
-}
-
-#[test]
-fn test_timestamps_none_fields() {
-    let t = Timestamps::new(SystemTime::UNIX_EPOCH, None, None);
-    assert_eq!(t.modified, SystemTime::UNIX_EPOCH);
-    assert!(t.accessed.is_none());
-    assert!(t.created.is_none());
+    assert_eq!(Timestamps::with_modified(now).modified, now);
+    // Older exports carried access and creation times; they still load.
+    let legacy = r#"{"modified":{"secs_since_epoch":5,"nanos_since_epoch":0},
+        "accessed":null,"created":{"secs_since_epoch":1,"nanos_since_epoch":0}}"#;
+    let parsed: Timestamps = serde_json::from_str(legacy).unwrap();
+    assert_eq!(
+        parsed.modified,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(5)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -284,14 +229,7 @@ fn test_git_status_hash() {
 #[test]
 fn test_file_node_creation_and_properties() {
     let now = SystemTime::now();
-    let node = FileNode::new_file(
-        NodeId::new(1),
-        "test.txt",
-        2048,
-        4,
-        Timestamps::with_modified(now),
-        true,
-    );
+    let node = FileNode::new_file("test.txt", 2048, 4, Timestamps::with_modified(now), true);
 
     assert!(node.is_file());
     assert!(!node.is_dir());
@@ -311,8 +249,7 @@ fn test_file_node_creation_and_properties() {
 #[test]
 fn test_directory_node_creation_and_properties() {
     let now = SystemTime::now();
-    let mut node =
-        FileNode::new_directory(NodeId::new(1), "test_dir", Timestamps::with_modified(now));
+    let mut node = FileNode::new_directory("test_dir", Timestamps::with_modified(now));
 
     assert!(node.is_dir());
     assert!(!node.is_file());
@@ -322,24 +259,9 @@ fn test_directory_node_creation_and_properties() {
     assert_eq!(node.file_count(), 0);
     assert_eq!(node.dir_count(), 0);
 
-    let child1 = FileNode::new_file(
-        NodeId::new(2),
-        "file1.txt",
-        1024,
-        2,
-        Timestamps::with_modified(now),
-        false,
-    );
-    let mut child_dir =
-        FileNode::new_directory(NodeId::new(3), "subdir", Timestamps::with_modified(now));
-    let subfile = FileNode::new_file(
-        NodeId::new(5),
-        "subfile.txt",
-        256,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let child1 = FileNode::new_file("file1.txt", 1024, 2, Timestamps::with_modified(now), false);
+    let mut child_dir = FileNode::new_directory("subdir", Timestamps::with_modified(now));
+    let subfile = FileNode::new_file("subfile.txt", 256, 1, Timestamps::with_modified(now), false);
     child_dir.children.push(subfile);
     node.children.push(child1);
     node.children.push(child_dir);
@@ -348,14 +270,7 @@ fn test_directory_node_creation_and_properties() {
     assert_eq!(node.file_count(), 2);
     assert_eq!(node.dir_count(), 1);
 
-    let child2 = FileNode::new_file(
-        NodeId::new(4),
-        "file2.txt",
-        512,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let child2 = FileNode::new_file("file2.txt", 512, 1, Timestamps::with_modified(now), false);
     node.children.push(child2);
     node.sort_children_by_size();
 
@@ -367,7 +282,6 @@ fn test_directory_node_creation_and_properties() {
 fn test_file_node_with_inode() {
     let now = SystemTime::now();
     let mut node = FileNode::new_file(
-        NodeId::new(1),
         "hardlink.txt",
         4096,
         8,
@@ -383,27 +297,6 @@ fn test_file_node_with_inode() {
     assert_eq!(inode.device, 888);
 }
 
-#[test]
-fn test_file_node_with_content_hash() {
-    let now = SystemTime::now();
-    let mut node = FileNode::new_file(
-        NodeId::new(1),
-        "file.txt",
-        1024,
-        2,
-        Timestamps::with_modified(now),
-        false,
-    );
-
-    let hash_bytes = [0xde; 32];
-    node.content_hash = Some(ContentHash::new(hash_bytes));
-
-    assert!(node.content_hash.is_some());
-    let hash = node.content_hash.unwrap();
-    assert_eq!(hash.to_hex().len(), 64);
-    assert_eq!(hash.as_bytes(), &hash_bytes);
-}
-
 // ---------------------------------------------------------------------------
 // FileNode — update_counts
 // ---------------------------------------------------------------------------
@@ -411,25 +304,11 @@ fn test_file_node_with_content_hash() {
 #[test]
 fn test_update_counts_recursive() {
     let now = SystemTime::now();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
-    let mut dir1 = FileNode::new_directory(NodeId::new(2), "dir1", Timestamps::with_modified(now));
-    let mut dir2 = FileNode::new_directory(NodeId::new(3), "dir2", Timestamps::with_modified(now));
-    let file1 = FileNode::new_file(
-        NodeId::new(4),
-        "f1",
-        100,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
-    let file2 = FileNode::new_file(
-        NodeId::new(5),
-        "f2",
-        200,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
+    let mut dir1 = FileNode::new_directory("dir1", Timestamps::with_modified(now));
+    let mut dir2 = FileNode::new_directory("dir2", Timestamps::with_modified(now));
+    let file1 = FileNode::new_file("f1", 100, 1, Timestamps::with_modified(now), false);
+    let file2 = FileNode::new_file("f2", 200, 1, Timestamps::with_modified(now), false);
 
     dir2.children.push(file2);
     dir1.children.push(dir2);
@@ -446,18 +325,10 @@ fn test_update_counts_recursive() {
 #[test]
 fn test_update_counts_includes_symlinks_and_other() {
     let now = SystemTime::now();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
 
-    let file = FileNode::new_file(
-        NodeId::new(2),
-        "f1",
-        100,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let file = FileNode::new_file("f1", 100, 1, Timestamps::with_modified(now), false);
     let symlink = FileNode {
-        id: NodeId::new(3),
         name: "link".into(),
         native_name: None,
         kind: NodeKind::Symlink {
@@ -468,12 +339,11 @@ fn test_update_counts_includes_symlinks_and_other() {
         blocks: 0,
         timestamps: Timestamps::with_modified(now),
         inode: None,
-        content_hash: None,
+
         git_status: None,
         children: Vec::new(),
     };
     let other = FileNode {
-        id: NodeId::new(4),
         name: "sock".into(),
         native_name: None,
         kind: NodeKind::Other,
@@ -481,7 +351,7 @@ fn test_update_counts_includes_symlinks_and_other() {
         blocks: 0,
         timestamps: Timestamps::with_modified(now),
         inode: None,
-        content_hash: None,
+
         git_status: None,
         children: Vec::new(),
     };
@@ -499,7 +369,7 @@ fn test_update_counts_includes_symlinks_and_other() {
 #[test]
 fn test_update_counts_empty_dir() {
     let now = SystemTime::now();
-    let mut dir = FileNode::new_directory(NodeId::new(1), "empty", Timestamps::with_modified(now));
+    let mut dir = FileNode::new_directory("empty", Timestamps::with_modified(now));
     dir.update_counts();
     assert_eq!(dir.file_count(), 0);
     assert_eq!(dir.dir_count(), 0);
@@ -508,14 +378,7 @@ fn test_update_counts_empty_dir() {
 #[test]
 fn test_update_counts_noop_on_file() {
     let now = SystemTime::now();
-    let mut file = FileNode::new_file(
-        NodeId::new(1),
-        "f",
-        512,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let mut file = FileNode::new_file("f", 512, 1, Timestamps::with_modified(now), false);
     // Should not panic or change anything.
     file.update_counts();
     assert_eq!(file.file_count(), 1);
@@ -529,31 +392,10 @@ fn test_update_counts_noop_on_file() {
 #[test]
 fn test_sort_children_by_size_descending() {
     let now = SystemTime::now();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
-    let small = FileNode::new_file(
-        NodeId::new(2),
-        "small",
-        100,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
-    let large = FileNode::new_file(
-        NodeId::new(3),
-        "large",
-        999,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
-    let medium = FileNode::new_file(
-        NodeId::new(4),
-        "medium",
-        500,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
+    let small = FileNode::new_file("small", 100, 1, Timestamps::with_modified(now), false);
+    let large = FileNode::new_file("large", 999, 1, Timestamps::with_modified(now), false);
+    let medium = FileNode::new_file("medium", 500, 1, Timestamps::with_modified(now), false);
     root.children.extend([small, large, medium]);
     root.sort_children_by_size();
 
@@ -565,23 +407,9 @@ fn test_sort_children_by_size_descending() {
 #[test]
 fn test_sort_children_by_size_deterministic_tie_break() {
     let now = SystemTime::now();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
-    let b = FileNode::new_file(
-        NodeId::new(2),
-        "bbb",
-        100,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
-    let a = FileNode::new_file(
-        NodeId::new(3),
-        "aaa",
-        100,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
+    let b = FileNode::new_file("bbb", 100, 1, Timestamps::with_modified(now), false);
+    let a = FileNode::new_file("aaa", 100, 1, Timestamps::with_modified(now), false);
     root.children.extend([b, a]);
     root.sort_children_by_size();
 
@@ -597,28 +425,14 @@ fn test_sort_children_by_size_deterministic_tie_break() {
 #[test]
 fn test_finalize_updates_then_sorts() {
     let now = SystemTime::now();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
 
-    let mut dir = FileNode::new_directory(NodeId::new(2), "dir", Timestamps::with_modified(now));
+    let mut dir = FileNode::new_directory("dir", Timestamps::with_modified(now));
     dir.size = 2000;
-    let f_inside = FileNode::new_file(
-        NodeId::new(3),
-        "big",
-        2000,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let f_inside = FileNode::new_file("big", 2000, 1, Timestamps::with_modified(now), false);
     dir.children.push(f_inside);
 
-    let small = FileNode::new_file(
-        NodeId::new(4),
-        "small",
-        10,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let small = FileNode::new_file("small", 10, 1, Timestamps::with_modified(now), false);
 
     root.children.extend([small, dir]);
     root.finalize();
@@ -640,29 +454,15 @@ fn test_finalize_updates_then_sorts() {
 fn test_nested_directory_structure() {
     let now = SystemTime::now();
 
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
 
-    let mut dir1 = FileNode::new_directory(NodeId::new(2), "dir1", Timestamps::with_modified(now));
-    let file1 = FileNode::new_file(
-        NodeId::new(3),
-        "file1.txt",
-        512,
-        1,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let mut dir1 = FileNode::new_directory("dir1", Timestamps::with_modified(now));
+    let file1 = FileNode::new_file("file1.txt", 512, 1, Timestamps::with_modified(now), false);
     dir1.children.push(file1);
     dir1.size = 512;
 
-    let mut dir2 = FileNode::new_directory(NodeId::new(4), "dir2", Timestamps::with_modified(now));
-    let file2 = FileNode::new_file(
-        NodeId::new(5),
-        "file2.txt",
-        1024,
-        2,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let mut dir2 = FileNode::new_directory("dir2", Timestamps::with_modified(now));
+    let file2 = FileNode::new_file("file2.txt", 1024, 2, Timestamps::with_modified(now), false);
     dir2.children.push(file2);
     dir2.size = 1024;
 
@@ -686,7 +486,6 @@ fn test_nested_directory_structure() {
 fn test_symlink_node() {
     let now = SystemTime::now();
     let node = FileNode {
-        id: NodeId::new(1),
         name: "symlink".into(),
         native_name: None,
         kind: NodeKind::Symlink {
@@ -697,7 +496,7 @@ fn test_symlink_node() {
         blocks: 0,
         timestamps: Timestamps::with_modified(now),
         inode: None,
-        content_hash: None,
+
         git_status: None,
         children: Vec::new(),
     };
@@ -705,14 +504,13 @@ fn test_symlink_node() {
     assert!(matches!(node.kind, NodeKind::Symlink { .. }));
     match &node.kind {
         NodeKind::Symlink { target, broken } => {
-            assert_eq!(target.as_str(), "/path/to/target");
+            assert_eq!(&**target, "/path/to/target");
             assert!(!broken);
         }
         _ => panic!("Expected Symlink node kind"),
     }
 
     let broken_node = FileNode {
-        id: NodeId::new(2),
         name: "broken_symlink".into(),
         native_name: None,
         kind: NodeKind::Symlink {
@@ -723,7 +521,7 @@ fn test_symlink_node() {
         blocks: 0,
         timestamps: Timestamps::with_modified(now),
         inode: None,
-        content_hash: None,
+
         git_status: None,
         children: Vec::new(),
     };
@@ -1017,14 +815,7 @@ fn test_tree_stats_record_dir_and_symlink() {
 #[test]
 fn test_file_tree_accessors() {
     let now = SystemTime::now();
-    let root = FileNode::new_file(
-        NodeId::new(1),
-        "file.txt",
-        4096,
-        8,
-        Timestamps::with_modified(now),
-        false,
-    );
+    let root = FileNode::new_file("file.txt", 4096, 8, Timestamps::with_modified(now), false);
 
     let mut stats = TreeStats::new();
     stats.record_file(std::path::Path::new("/file.txt"), 4096, Some(now), 0);
@@ -1047,7 +838,7 @@ fn test_file_tree_accessors() {
 #[test]
 fn test_file_tree_has_warnings() {
     let now = SystemTime::now();
-    let root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let root = FileNode::new_directory("root", Timestamps::with_modified(now));
 
     let tree = FileTree::new(
         root,

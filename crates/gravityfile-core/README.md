@@ -19,25 +19,20 @@ This crate provides the fundamental data structures used throughout gravityfile,
 Represents a single file system entry:
 
 ```rust
-use gravityfile_core::{FileNode, NodeId, Timestamps, NodeKind};
+use gravityfile_core::{FileNode, Timestamps};
 use std::time::SystemTime;
 
 // Create a file node
 let file = FileNode::new_file(
-    NodeId::new(1),
     "example.txt",
     1024,  // size in bytes
-    2,     // disk blocks
+    2,     // 512-byte blocks allocated
     Timestamps::with_modified(SystemTime::now()),
     false, // not executable
 );
 
 // Create a directory node
-let dir = FileNode::new_directory(
-    NodeId::new(2),
-    "my_folder",
-    Timestamps::with_modified(SystemTime::now()),
-);
+let dir = FileNode::new_directory("my_folder", Timestamps::with_modified(SystemTime::now()));
 ```
 
 ### FileTree

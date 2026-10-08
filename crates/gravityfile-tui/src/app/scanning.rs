@@ -31,6 +31,7 @@ pub fn start_scan(
         let mut config = ScanConfig::new(&path);
         config.include_hidden = include_hidden;
         config.max_entries = max_entries;
+        config.git_status = true;
         let scanner = JwalkScanner::new();
         let progress_task = tokio::spawn(forward_progress(
             scanner.subscribe(),

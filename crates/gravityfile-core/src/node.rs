@@ -58,30 +58,6 @@ impl fmt::Display for GitStatus {
     }
 }
 
-/// Unique identifier for a node within a tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(u64);
-
-impl NodeId {
-    /// Create a new NodeId from a u64.
-    #[inline]
-    pub fn new(id: u64) -> Self {
-        Self(id)
-    }
-
-    /// Get the inner u64 value.
-    #[inline]
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// BLAKE3 content hash for duplicate detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentHash([u8; 32]);
@@ -136,40 +112,18 @@ impl InodeInfo {
     }
 }
 
-/// File metadata timestamps.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Node timestamps retained in the tree. Access and creation times are not
+/// kept per node; read them from the filesystem when a single item needs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timestamps {
     /// Last modification time.
     pub modified: SystemTime,
-    /// Last access time (if available).
-    pub accessed: Option<SystemTime>,
-    /// Creation time (if available, platform-dependent).
-    pub created: Option<SystemTime>,
 }
 
 impl Timestamps {
-    /// Create timestamps with only modified time.
     #[inline]
     pub fn with_modified(modified: SystemTime) -> Self {
-        Self {
-            modified,
-            accessed: None,
-            created: None,
-        }
-    }
-
-    /// Create timestamps with all available times.
-    #[inline]
-    pub fn new(
-        modified: SystemTime,
-        accessed: Option<SystemTime>,
-        created: Option<SystemTime>,
-    ) -> Self {
-        Self {
-            modified,
-            accessed,
-            created,
-        }
+        Self { modified }
     }
 }
 
@@ -190,8 +144,8 @@ pub enum NodeKind {
     },
     /// Symbolic link.
     Symlink {
-        /// Link target path.
-        target: CompactString,
+        /// Link target path (lossy display form).
+        target: Box<str>,
         /// Whether the link target exists.
         broken: bool,
     },
@@ -238,9 +192,6 @@ impl fmt::Display for NodeKind {
 /// descendant contents, so logging a node does not walk the entire tree.
 #[derive(Serialize, Deserialize)]
 pub struct FileNode {
-    /// Unique identifier for this node.
-    pub id: NodeId,
-
     /// File/directory name (not full path).
     pub name: CompactString,
 
@@ -251,20 +202,19 @@ pub struct FileNode {
     /// Node type and associated metadata.
     pub kind: NodeKind,
 
-    /// Size in bytes (aggregate for directories).
+    /// Size in bytes: disk usage, or apparent length when the scan used
+    /// apparent sizes. Directories aggregate their contents and their own
+    /// allocation; additional hard links to a counted file contribute zero.
     pub size: u64,
 
-    /// Disk blocks actually used.
+    /// 512-byte blocks allocated to this entry itself (not aggregated).
     pub blocks: u64,
 
     /// File metadata timestamps.
     pub timestamps: Timestamps,
 
-    /// Inode info for hardlink detection.
+    /// Identity of multiply-linked files, for hard-link aware analysis.
     pub inode: Option<InodeInfo>,
-
-    /// Content hash (computed on demand). Stored inline — 32 bytes, no heap allocation.
-    pub content_hash: Option<ContentHash>,
 
     /// Git status for this file/directory.
     #[serde(default)]
@@ -277,7 +227,6 @@ pub struct FileNode {
 impl fmt::Debug for FileNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FileNode")
-            .field("id", &self.id)
             .field("name", &self.name)
             .field("native_name", &self.native_name)
             .field("kind", &self.kind)
@@ -285,7 +234,6 @@ impl fmt::Debug for FileNode {
             .field("blocks", &self.blocks)
             .field("timestamps", &self.timestamps)
             .field("inode", &self.inode)
-            .field("content_hash", &self.content_hash)
             .field("git_status", &self.git_status)
             .field("child_count", &self.children.len())
             .finish()
@@ -318,7 +266,6 @@ impl Clone for FileNode {
             // Exhaustive destructuring makes added metadata fields require a
             // deliberate cloning decision instead of silently losing them.
             let FileNode {
-                id,
                 name,
                 native_name,
                 kind,
@@ -326,12 +273,10 @@ impl Clone for FileNode {
                 blocks,
                 timestamps,
                 inode,
-                content_hash,
                 git_status,
                 children: _,
             } = node;
             FileNode {
-                id: *id,
                 name: name.clone(),
                 native_name: native_name.clone(),
                 kind: kind.clone(),
@@ -339,7 +284,6 @@ impl Clone for FileNode {
                 blocks: *blocks,
                 timestamps: *timestamps,
                 inode: *inode,
-                content_hash: *content_hash,
                 git_status: *git_status,
                 children: Vec::new(),
             }
@@ -388,47 +332,59 @@ impl FileNode {
     }
     /// Create a new file node.
     pub fn new_file(
-        id: NodeId,
         name: impl Into<CompactString>,
         size: u64,
         blocks: u64,
         timestamps: Timestamps,
         executable: bool,
     ) -> Self {
+        Self::leaf(
+            name,
+            NodeKind::File { executable },
+            size,
+            blocks,
+            timestamps,
+        )
+    }
+
+    /// Create a new, empty directory node.
+    pub fn new_directory(name: impl Into<CompactString>, timestamps: Timestamps) -> Self {
+        let kind = NodeKind::Directory {
+            file_count: 0,
+            dir_count: 0,
+        };
+        Self::leaf(name, kind, 0, 0, timestamps)
+    }
+
+    /// Create a symbolic link node.
+    pub fn new_symlink(
+        name: impl Into<CompactString>,
+        target: impl Into<Box<str>>,
+        broken: bool,
+        timestamps: Timestamps,
+    ) -> Self {
+        let kind = NodeKind::Symlink {
+            target: target.into(),
+            broken,
+        };
+        Self::leaf(name, kind, 0, 0, timestamps)
+    }
+
+    fn leaf(
+        name: impl Into<CompactString>,
+        kind: NodeKind,
+        size: u64,
+        blocks: u64,
+        timestamps: Timestamps,
+    ) -> Self {
         Self {
-            id,
             name: name.into(),
             native_name: None,
-            kind: NodeKind::File { executable },
+            kind,
             size,
             blocks,
             timestamps,
             inode: None,
-            content_hash: None,
-            git_status: None,
-            children: Vec::new(),
-        }
-    }
-
-    /// Create a new directory node.
-    pub fn new_directory(
-        id: NodeId,
-        name: impl Into<CompactString>,
-        timestamps: Timestamps,
-    ) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            native_name: None,
-            kind: NodeKind::Directory {
-                file_count: 0,
-                dir_count: 0,
-            },
-            size: 0,
-            blocks: 0,
-            timestamps,
-            inode: None,
-            content_hash: None,
             git_status: None,
             children: Vec::new(),
         }
@@ -542,10 +498,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_node_id() {
-        let id = NodeId::new(42);
-        assert_eq!(id.get(), 42);
-        assert_eq!(format!("{id}"), "42");
+    fn node_stays_compact() {
+        // Every scanned entry is a node; growth here multiplies across
+        // millions of files.
+        assert!(
+            std::mem::size_of::<FileNode>() <= 144,
+            "{}",
+            std::mem::size_of::<FileNode>()
+        );
+        assert!(std::mem::size_of::<NodeKind>() <= 24);
     }
 
     #[test]
@@ -567,7 +528,6 @@ mod tests {
     #[test]
     fn test_file_node_creation() {
         let node = FileNode::new_file(
-            NodeId::new(1),
             "test.txt",
             1024,
             2,
@@ -581,87 +541,10 @@ mod tests {
 
     #[test]
     fn test_directory_node_creation() {
-        let node = FileNode::new_directory(
-            NodeId::new(1),
-            "test_dir",
-            Timestamps::with_modified(SystemTime::now()),
-        );
+        let node =
+            FileNode::new_directory("test_dir", Timestamps::with_modified(SystemTime::now()));
         assert!(node.is_dir());
         assert!(!node.is_file());
-    }
-
-    #[test]
-    #[ignore = "manual optimized tree lifecycle scale benchmark"]
-    fn tree_lifecycle_scale_benchmark() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        for files in [100_000u64, 1_000_000, 10_000_000] {
-            let started = Instant::now();
-            let stamp = Timestamps::with_modified(std::time::UNIX_EPOCH);
-            let mut root = FileNode::new_directory(NodeId::new(0), "root", stamp);
-            for group in 0..files / 1000 {
-                let mut directory = FileNode::new_directory(
-                    NodeId::new(files + group + 1),
-                    format!("d{group:05}"),
-                    stamp,
-                );
-                directory.children = (0..1000)
-                    .map(|offset| {
-                        let id = group * 1000 + offset + 1;
-                        FileNode::new_file(
-                            NodeId::new(id),
-                            format!("f{id:09}"),
-                            256,
-                            1,
-                            stamp,
-                            false,
-                        )
-                    })
-                    .collect();
-                directory.size = 256_000;
-                root.children.push(directory);
-            }
-            root.size = files * 256;
-            let construction_ns = started.elapsed().as_nanos();
-            let started = Instant::now();
-            let mut cloned = black_box(&root).clone();
-            let clone_ns = started.elapsed().as_nanos();
-            let started = Instant::now();
-            cloned.finalize();
-            let finalize_ns = started.elapsed().as_nanos();
-            assert_eq!(cloned.file_count(), files);
-            assert_eq!(cloned.dir_count(), files / 1000);
-            assert_eq!(cloned.size, files * 256);
-            assert_eq!(
-                cloned
-                    .children
-                    .first()
-                    .unwrap()
-                    .children
-                    .first()
-                    .unwrap()
-                    .id,
-                NodeId::new(1)
-            );
-            assert_eq!(
-                cloned.children.last().unwrap().children.last().unwrap().id,
-                NodeId::new(files)
-            );
-            assert_eq!(
-                root.file_count(),
-                0,
-                "clone finalization must leave source counts untouched"
-            );
-            let started = Instant::now();
-            drop(black_box(cloned));
-            let clone_drop_ns = started.elapsed().as_nanos();
-            let started = Instant::now();
-            drop(black_box(root));
-            let source_drop_ns = started.elapsed().as_nanos();
-            println!(
-                "TREE_BENCH {{\"files\":{files},\"construction_ns\":{construction_ns},\"clone_ns\":{clone_ns},\"finalize_ns\":{finalize_ns},\"clone_drop_ns\":{clone_drop_ns},\"source_drop_ns\":{source_drop_ns}}}"
-            );
-        }
     }
 
     #[test]
@@ -671,19 +554,16 @@ mod tests {
             .spawn(|| {
                 let depth = 50_000u64;
                 let mut root = FileNode::new_directory(
-                    NodeId::new(depth),
                     "leaf",
                     Timestamps::with_modified(std::time::UNIX_EPOCH),
                 );
-                for id in (0..depth).rev() {
+                for _ in 0..depth {
                     let mut parent = FileNode::new_directory(
-                        NodeId::new(id),
                         "d",
                         Timestamps::with_modified(std::time::UNIX_EPOCH),
                     );
                     parent.children.push(root);
                     parent.children.push(FileNode::new_file(
-                        NodeId::new(depth + id + 1),
                         "sibling",
                         1,
                         1,
@@ -709,17 +589,11 @@ mod tests {
     #[test]
     fn deep_tree_clone_is_independent_without_recursive_traversal() {
         let depth = 20_000u64;
-        let mut root = FileNode::new_directory(
-            NodeId::new(depth),
-            "leaf",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
-        for id in (0..depth).rev() {
-            let mut parent = FileNode::new_directory(
-                NodeId::new(id),
-                "d",
-                Timestamps::with_modified(std::time::UNIX_EPOCH),
-            );
+        let mut root =
+            FileNode::new_directory("leaf", Timestamps::with_modified(std::time::UNIX_EPOCH));
+        for _ in 0..depth {
+            let mut parent =
+                FileNode::new_directory("d", Timestamps::with_modified(std::time::UNIX_EPOCH));
             parent.children.push(root);
             root = parent;
         }
@@ -730,7 +604,7 @@ mod tests {
             copied_depth += 1;
             current = &mut current.children[0];
         }
-        let copied_id = current.id;
+        let copied_name = current.name.clone();
         current.name = "changed".into();
         let mut original = &root;
         while let Some(child) = original.children.first() {
@@ -740,31 +614,27 @@ mod tests {
         drop(root);
         drop(cloned);
         assert_eq!(copied_depth, depth);
-        assert_eq!(copied_id, NodeId::new(depth));
-        assert_eq!(original_name, "leaf");
+        assert_eq!(copied_name, "leaf");
+        assert_eq!(
+            original_name, "leaf",
+            "editing the clone left the source alone"
+        );
     }
 
     #[test]
     fn deep_directory_finalization_avoids_recursive_traversal() {
         let depth = 20_000u64;
-        let mut node = FileNode::new_directory(
-            NodeId::new(depth),
-            "empty",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
-        for id in (0..depth).rev() {
-            let mut parent = FileNode::new_directory(
-                NodeId::new(id),
-                "d",
-                Timestamps::with_modified(std::time::UNIX_EPOCH),
-            );
+        let mut node =
+            FileNode::new_directory("empty", Timestamps::with_modified(std::time::UNIX_EPOCH));
+        for _ in 0..depth {
+            let mut parent =
+                FileNode::new_directory("d", Timestamps::with_modified(std::time::UNIX_EPOCH));
             parent.kind = NodeKind::Directory {
                 file_count: u64::MAX,
                 dir_count: u64::MAX,
             };
             parent.children.push(node);
             parent.children.push(FileNode::new_file(
-                NodeId::new(depth + id + 1),
                 "f",
                 1,
                 1,
@@ -796,28 +666,11 @@ mod tests {
     #[test]
     fn test_update_counts_recursive() {
         let now = SystemTime::now();
-        let mut root =
-            FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
-        let mut dir1 =
-            FileNode::new_directory(NodeId::new(2), "dir1", Timestamps::with_modified(now));
-        let mut dir2 =
-            FileNode::new_directory(NodeId::new(3), "dir2", Timestamps::with_modified(now));
-        let file1 = FileNode::new_file(
-            NodeId::new(4),
-            "f1",
-            100,
-            1,
-            Timestamps::with_modified(now),
-            false,
-        );
-        let file2 = FileNode::new_file(
-            NodeId::new(5),
-            "f2",
-            200,
-            1,
-            Timestamps::with_modified(now),
-            false,
-        );
+        let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
+        let mut dir1 = FileNode::new_directory("dir1", Timestamps::with_modified(now));
+        let mut dir2 = FileNode::new_directory("dir2", Timestamps::with_modified(now));
+        let file1 = FileNode::new_file("f1", 100, 1, Timestamps::with_modified(now), false);
+        let file2 = FileNode::new_file("f2", 200, 1, Timestamps::with_modified(now), false);
 
         dir2.children.push(file2);
         dir1.children.push(dir2);
@@ -834,18 +687,9 @@ mod tests {
     #[test]
     fn test_update_counts_includes_symlinks() {
         let now = SystemTime::now();
-        let mut root =
-            FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
-        let file = FileNode::new_file(
-            NodeId::new(2),
-            "f1",
-            100,
-            1,
-            Timestamps::with_modified(now),
-            false,
-        );
+        let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
+        let file = FileNode::new_file("f1", 100, 1, Timestamps::with_modified(now), false);
         let symlink = FileNode {
-            id: NodeId::new(3),
             name: "link".into(),
             native_name: None,
             kind: NodeKind::Symlink {
@@ -856,7 +700,7 @@ mod tests {
             blocks: 0,
             timestamps: Timestamps::with_modified(now),
             inode: None,
-            content_hash: None,
+
             git_status: None,
             children: Vec::new(),
         };
@@ -869,24 +713,9 @@ mod tests {
     #[test]
     fn test_sort_deterministic() {
         let now = SystemTime::now();
-        let mut root =
-            FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
-        let f1 = FileNode::new_file(
-            NodeId::new(2),
-            "bbb",
-            100,
-            1,
-            Timestamps::with_modified(now),
-            false,
-        );
-        let f2 = FileNode::new_file(
-            NodeId::new(3),
-            "aaa",
-            100,
-            1,
-            Timestamps::with_modified(now),
-            false,
-        );
+        let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
+        let f1 = FileNode::new_file("bbb", 100, 1, Timestamps::with_modified(now), false);
+        let f2 = FileNode::new_file("aaa", 100, 1, Timestamps::with_modified(now), false);
         root.children.push(f1);
         root.children.push(f2);
         root.sort_children_by_size();

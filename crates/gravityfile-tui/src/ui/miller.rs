@@ -967,7 +967,7 @@ mod tests {
     fn renders_filename_controls_visibly_without_changing_entry_identity() {
         use crate::test_support::{directory, file};
         let name = "a\u{202e}txt";
-        let root = directory(0, "root", vec![file(1, name, 1)]);
+        let root = directory("root", vec![file(name, 1)]);
         let root_path = sample_root_path();
         let theme = Theme::dark();
         let marked = HashSet::new();
@@ -1189,11 +1189,7 @@ mod tests {
 
     #[test]
     fn an_empty_directory_says_so() {
-        let empty = FileNode::new_directory(
-            gravityfile_core::NodeId::new(0),
-            "empty",
-            crate::test_support::timestamps(),
-        );
+        let empty = FileNode::new_directory("empty", crate::test_support::timestamps());
         let root_path = sample_root_path();
         let theme = Theme::dark();
         let marked = HashSet::new();

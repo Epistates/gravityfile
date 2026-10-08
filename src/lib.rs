@@ -72,7 +72,7 @@ impl<'a, T> ReportEnvelope<'a, T> {
         data: &'a T,
     ) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             tool_version: env!("CARGO_PKG_VERSION"),
             kind,
             root: &tree.root_path,
@@ -1214,7 +1214,7 @@ mod tests {
 
     #[test]
     fn scan_summary_stops_after_cancellation_during_output() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
+        use gravityfile_core::{FileNode, Timestamps};
         use std::io::Write;
         let cancel = tokio_util::sync::CancellationToken::new();
         struct CancelAfterLine {
@@ -1233,16 +1233,10 @@ mod tests {
                 Ok(())
             }
         }
-        let mut root = FileNode::new_directory(
-            NodeId::new(0),
-            "root",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
-        root.children.push(FileNode::new_directory(
-            NodeId::new(1),
-            "child",
-            root.timestamps,
-        ));
+        let mut root =
+            FileNode::new_directory("root", Timestamps::with_modified(std::time::UNIX_EPOCH));
+        root.children
+            .push(FileNode::new_directory("child", root.timestamps));
         for top in [0, 1] {
             let token = cancel.child_token();
             let mut writer = CancelAfterLine {
@@ -1270,18 +1264,14 @@ mod tests {
 
     #[test]
     fn scan_summary_preserves_order_depth_and_omission_lines() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
-        let make = |id, name: &str| {
-            FileNode::new_directory(
-                NodeId::new(id),
-                name,
-                Timestamps::with_modified(std::time::UNIX_EPOCH),
-            )
+        use gravityfile_core::{FileNode, Timestamps};
+        let make = |name: &str| {
+            FileNode::new_directory(name, Timestamps::with_modified(std::time::UNIX_EPOCH))
         };
-        let mut root = make(0, "root");
-        let mut child = make(1, "child");
-        child.children = vec![make(2, "grandchild"), make(3, "hidden")];
-        root.children = vec![child, make(4, "hidden-root")];
+        let mut root = make("root");
+        let mut child = make("child");
+        child.children = vec![make("grandchild"), make("hidden")];
+        root.children = vec![child, make("hidden-root")];
         let mut output = Vec::new();
         super::print_node(
             &root,
@@ -1336,15 +1326,13 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(|| {
-                use gravityfile_core::{FileNode, NodeId, Timestamps};
+                use gravityfile_core::{FileNode, Timestamps};
                 let mut node = FileNode::new_directory(
-                    NodeId::new(0),
                     "leaf",
                     Timestamps::with_modified(std::time::UNIX_EPOCH),
                 );
-                for id in 1..=5000 {
+                for _ in 1..=5000 {
                     let mut parent = FileNode::new_directory(
-                        NodeId::new(id),
                         "parent",
                         Timestamps::with_modified(std::time::UNIX_EPOCH),
                     );
@@ -1379,7 +1367,6 @@ mod tests {
             }
         }
         let node = gravityfile_core::FileNode::new_directory(
-            gravityfile_core::NodeId::new(0),
             "root",
             gravityfile_core::Timestamps::with_modified(std::time::UNIX_EPOCH),
         );

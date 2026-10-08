@@ -493,11 +493,7 @@ mod tests {
         assert!(rects_for(Rect::new(0, 0, 10, 0)).is_empty());
 
         // A zero-size root has no proportions to lay out.
-        let empty = FileNode::new_directory(
-            gravityfile_core::NodeId::new(0),
-            "root",
-            crate::test_support::timestamps(),
-        );
+        let empty = FileNode::new_directory("root", crate::test_support::timestamps());
         let root_path = sample_root_path();
         let theme = Theme::dark();
         let marked = HashSet::new();
@@ -574,15 +570,11 @@ mod tests {
         // Quick-scan trees report a parent size that can be smaller than the
         // sum of its children. The remaining-size subtraction must saturate
         // rather than wrap into an enormous denominator.
-        let mut root = FileNode::new_directory(
-            gravityfile_core::NodeId::new(0),
-            "root",
-            crate::test_support::timestamps(),
-        );
+        let mut root = FileNode::new_directory("root", crate::test_support::timestamps());
         root.children = vec![
-            crate::test_support::file(1, "a", 1_000),
-            crate::test_support::file(2, "b", 1_000),
-            crate::test_support::file(3, "c", 1_000),
+            crate::test_support::file("a", 1_000),
+            crate::test_support::file("b", 1_000),
+            crate::test_support::file("c", 1_000),
         ];
         root.size = 10; // deliberately inconsistent with the children
 
@@ -615,11 +607,7 @@ mod tests {
 
     #[test]
     fn an_empty_treemap_says_so() {
-        let empty = FileNode::new_directory(
-            gravityfile_core::NodeId::new(0),
-            "root",
-            crate::test_support::timestamps(),
-        );
+        let empty = FileNode::new_directory("root", crate::test_support::timestamps());
         let root_path = sample_root_path();
         let theme = Theme::dark();
         let marked = HashSet::new();

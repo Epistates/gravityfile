@@ -15,6 +15,18 @@ fn scanner() -> JwalkScanner {
     JwalkScanner::new()
 }
 
+/// Size an entry contributes for itself, under the scan's size measure.
+fn own_size(path: &std::path::Path, apparent: bool) -> u64 {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    #[cfg(unix)]
+    if !apparent {
+        use std::os::unix::fs::MetadataExt;
+        return metadata.blocks() * 512;
+    }
+    let _ = apparent;
+    metadata.len()
+}
+
 #[test]
 fn full_and_quick_statistics_choose_same_path_for_tied_extremes() {
     let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
@@ -138,13 +150,17 @@ fn quick_listing_honors_symlink_following_and_alias_sizes() {
         assert_eq!(tree.config.max_depth, Some(1));
         assert_eq!(tree.stats.total_files, 2);
         assert_eq!(tree.stats.total_dirs, 3); // Root and two paths to the directory.
+        // Each aliased object counts once, in both size modes.
+        let file_size = if apparent {
+            8192
+        } else {
+            fs::metadata(&file).unwrap().blocks() * 512
+        };
         assert_eq!(
             tree.root.size,
-            if apparent {
-                16384
-            } else {
-                fs::metadata(&file).unwrap().blocks() * 512
-            }
+            file_size
+                + own_size(tmp.path(), apparent)
+                + own_size(&tmp.path().join("directory"), apparent)
         );
         assert!(
             tree.root
@@ -175,8 +191,8 @@ fn quick_listing_deduplicates_physical_hardlinks_within_visible_scope() {
     for apparent in [false, true] {
         config.apparent_size = apparent;
         let tree = quick_list(tmp.path(), Some(&config)).unwrap();
-        let expected = if apparent { 2 * 8192 } else { physical };
-        assert_eq!(tree.root.size, expected);
+        let expected = if apparent { 8192 } else { physical };
+        assert_eq!(tree.root.size, expected + own_size(tmp.path(), apparent));
         assert_eq!(tree.stats.total_size, expected);
         assert_eq!(tree.stats.total_files, 2);
         assert_eq!(
@@ -188,7 +204,7 @@ fn quick_listing_deduplicates_physical_hardlinks_within_visible_scope() {
     config.apparent_size = false;
     config.ignore_patterns = vec!["original".into()];
     let tree = quick_list(tmp.path(), Some(&config)).unwrap();
-    assert_eq!(tree.root.size, physical);
+    assert_eq!(tree.root.size, physical + own_size(tmp.path(), false));
     assert_eq!(tree.stats.total_files, 1);
     assert_eq!(tree.root.children[0].name, "alias");
 }
@@ -216,12 +232,13 @@ fn followed_directory_aliases_count_physical_bytes_once() {
             .follow_symlinks(true)
             .build()
             .unwrap();
+        let dirs = |apparent| own_size(tmp.path(), apparent) + own_size(&real, apparent);
         let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
         assert_eq!(tree.stats.total_files, if hardlink { 6 } else { 3 });
-        assert_eq!(tree.root.size, physical);
+        assert_eq!(tree.root.size, physical + dirs(false));
         config.apparent_size = true;
         let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
-        assert_eq!(tree.root.size, 8192 * if hardlink { 6 } else { 3 });
+        assert_eq!(tree.root.size, 8192 + dirs(true));
     }
 }
 
@@ -292,16 +309,12 @@ fn entry_budget_respects_filters_and_counts_nested_descendants() {
         scanner().scan(&config, CancellationToken::new()),
         Err(gravityfile_core::ScanError::EntryLimitExceeded { limit: 1 })
     ));
+    // Depth limits retention, not traversal: deeper entries still count.
     config.max_depth = Some(1);
-    assert_eq!(
-        scanner()
-            .scan(&config, CancellationToken::new())
-            .unwrap()
-            .root
-            .children
-            .len(),
-        1
-    );
+    assert!(matches!(
+        scanner().scan(&config, CancellationToken::new()),
+        Err(gravityfile_core::ScanError::EntryLimitExceeded { limit: 1 })
+    ));
     config.max_depth = None;
     config.max_entries = Some(2);
     let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
@@ -334,10 +347,12 @@ fn scan_assembly_sorts_each_directory_with_name_ties() {
             .map(|child| child.name.as_str())
             .collect();
         assert_eq!(names, ["large", "alpha", "zeta"]);
-        assert_eq!(directory.size, 8);
+        let path = tmp.path().join(directory.name.as_str());
+        assert_eq!(directory.size, 8 + own_size(&path, true));
         assert_eq!(directory.file_count(), 3);
     }
-    assert_eq!(tree.root.size, 16);
+    let children: u64 = tree.root.children.iter().map(|child| child.size).sum();
+    assert_eq!(tree.root.size, children + own_size(tmp.path(), true));
 }
 
 #[cfg(unix)]
@@ -405,14 +420,14 @@ fn test_scan_aggregates_size_into_directories() {
     // Root size must be >= the single file we wrote.
     assert!(tree.root.size >= 4096);
 
-    // The sub-directory node should carry the file's size.
+    // The sub-directory node carries the file's size plus its own.
     let sub = tree
         .root
         .children
         .iter()
         .find(|c| c.name == "sub")
         .expect("sub dir must exist");
-    assert_eq!(sub.size, 4096);
+    assert_eq!(sub.size, 4096 + own_size(&root.join("sub"), true));
 }
 
 #[test]
@@ -571,7 +586,7 @@ fn test_scan_counts_hardlink_size_once() {
 
 #[cfg(unix)]
 #[test]
-fn test_scan_apparent_size_counts_all_hardlink_entries() {
+fn test_scan_apparent_size_counts_hardlinks_once_unless_asked() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
@@ -579,19 +594,17 @@ fn test_scan_apparent_size_counts_all_hardlink_entries() {
     fs::write(&original, vec![0u8; 4096]).unwrap();
     fs::hard_link(&original, root.join("link.bin")).unwrap();
 
-    let config = ScanConfig::builder()
+    let mut config = ScanConfig::builder()
         .root(root)
         .apparent_size(true)
         .build()
         .unwrap();
     let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+    assert_eq!(tree.root.size, 4096 + own_size(root, true));
 
-    // In apparent-size mode every directory entry is counted independently.
-    assert_eq!(
-        tree.root.size,
-        4096 * 2,
-        "apparent size must count each hardlink entry"
-    );
+    config.count_hard_links = true;
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+    assert_eq!(tree.root.size, 2 * 4096 + own_size(root, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +704,7 @@ fn test_scan_symlink_node_carries_target_and_broken_flag() {
     match &bad.kind {
         NodeKind::Symlink { broken, target } => {
             assert!(broken, "bad_link must be marked broken");
-            assert_eq!(target.as_str(), "/does/not/exist");
+            assert_eq!(&**target, "/does/not/exist");
         }
         other => panic!("expected Symlink, got {other:?}"),
     }
@@ -939,7 +952,7 @@ fn test_quick_list_broken_symlink_appears_and_warns() {
     match &dead.kind {
         NodeKind::Symlink { broken, target } => {
             assert!(broken);
-            assert_eq!(target.as_str(), "/nowhere");
+            assert_eq!(&**target, "/nowhere");
         }
         other => panic!("expected Symlink, got {other:?}"),
     }
@@ -1128,6 +1141,13 @@ mod git_tests {
 
     use super::scanner;
 
+    /// Git annotation is opt-in.
+    fn git_config(root: impl Into<std::path::PathBuf>) -> ScanConfig {
+        let mut config = ScanConfig::new(root);
+        config.git_status = true;
+        config
+    }
+
     #[test]
     fn ignored_directory_cache_does_not_expand_with_generated_descendants() {
         let temp = TempDir::new().unwrap();
@@ -1192,7 +1212,7 @@ mod git_tests {
         assert_eq!(cache.get_status(&directory.join("tracked")), None);
         assert_eq!(cache.get_status(&temp.path().join(".gitignore")), None);
         let scan = scanner()
-            .scan(&ScanConfig::new(&directory), CancellationToken::new())
+            .scan(&git_config(&directory), CancellationToken::new())
             .unwrap();
         let nested = scan
             .root
@@ -1227,11 +1247,11 @@ mod git_tests {
         let repo = git2::Repository::init(temp.path()).unwrap();
         fs::write(temp.path().join("file"), b"contents").unwrap();
         let mut previous = scanner()
-            .scan(&ScanConfig::new(temp.path()), CancellationToken::new())
+            .scan(&git_config(temp.path()), CancellationToken::new())
             .unwrap();
         fs::write(repo.path().join("index"), b"not a valid git index").unwrap();
         let tree = scanner()
-            .scan(&ScanConfig::new(temp.path()), CancellationToken::new())
+            .scan(&git_config(temp.path()), CancellationToken::new())
             .unwrap();
         assert!(
             tree.warnings
@@ -1266,7 +1286,7 @@ mod git_tests {
         let repo = git2::Repository::init(temp.path()).unwrap();
         fs::write(temp.path().join("file"), b"contents").unwrap();
         let mut tree = scanner()
-            .scan(&ScanConfig::new(temp.path()), CancellationToken::new())
+            .scan(&git_config(temp.path()), CancellationToken::new())
             .unwrap();
         let file_status = |tree: &gravityfile_core::FileTree| {
             tree.root
@@ -1417,7 +1437,7 @@ mod git_tests {
         git2::Repository::init(repository.path()).unwrap();
         fs::write(repository.path().join("untracked.txt"), "untracked").unwrap();
 
-        let mut config = ScanConfig::new(repository.path());
+        let mut config = git_config(repository.path());
         config.include_hidden = false;
         let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
         let untracked = tree
@@ -1463,29 +1483,6 @@ fn test_scan_progress_events_are_emitted_for_large_file_set() {
     );
 }
 
-#[test]
-fn test_scan_compute_hashes_populates_eligible_files() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path();
-    let content = b"hash me";
-    fs::write(root.join("file.txt"), content).unwrap();
-
-    let mut config = ScanConfig::new(root);
-    config.compute_hashes = true;
-    config.min_hash_size = 1;
-    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
-    let file = tree
-        .root
-        .children
-        .iter()
-        .find(|child| child.name.as_str() == "file.txt")
-        .unwrap();
-
-    assert_eq!(
-        file.content_hash.as_ref().map(|hash| hash.as_bytes()),
-        Some(blake3::hash(content).as_bytes())
-    );
-}
 #[test]
 fn invalid_and_mutated_scopes_are_honored_by_both_scan_modes() {
     let root = tempfile::tempdir().unwrap();

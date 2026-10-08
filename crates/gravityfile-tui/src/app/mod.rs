@@ -442,7 +442,6 @@ impl App {
                 "blocks": node.blocks,
                 "timestamps": node.timestamps,
                 "inode": node.inode,
-                "content_hash": node.content_hash,
                 "git_status": node.git_status,
                 "child_count": node.children.len(),
             });
@@ -5160,23 +5159,13 @@ mod tests {
 
     #[test]
     fn all_explorer_sort_modes_handle_deep_trees() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
-        let depth = 20_000u64;
-        let mut root = FileNode::new_directory(
-            NodeId::new(depth),
-            "d",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
-        for id in (0..depth).rev() {
-            let mut parent = FileNode::new_directory(
-                NodeId::new(id),
-                "d",
-                Timestamps::with_modified(std::time::UNIX_EPOCH),
-            );
-            parent
-                .children
-                .push(crate::test_support::file(depth + id + 1, "z", 10));
-            let mut file = crate::test_support::file(depth + id + 1, "z", 10);
+        use gravityfile_core::{FileNode, Timestamps};
+        let timestamps = Timestamps::with_modified(std::time::UNIX_EPOCH);
+        let mut root = FileNode::new_directory("d", timestamps);
+        for _ in 0..20_000 {
+            let mut parent = FileNode::new_directory("d", timestamps);
+            parent.children.push(crate::test_support::file("z", 10));
+            let mut file = crate::test_support::file("z", 10);
             file.timestamps.modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
             parent.children.push(file);
             parent.children.push(root);
@@ -5221,10 +5210,9 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let low = std::ffi::OsString::from_vec(b"same-\xfe".to_vec());
         let high = std::ffi::OsString::from_vec(b"same-\xff".to_vec());
-        let mut a = crate::test_support::file(1, "", 10);
+        let mut a = crate::test_support::file("", 10);
         a.set_file_name(&low);
         let mut b = a.clone();
-        b.id = gravityfile_core::NodeId::new(2);
         b.set_file_name(&high);
         assert_eq!(a.name, b.name);
         for mode in [
@@ -5238,7 +5226,7 @@ mod tests {
             SortMode::CountAscending,
         ] {
             for children in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
-                let mut root = crate::test_support::directory(0, "root", children);
+                let mut root = crate::test_support::directory("root", children);
                 App::sort_node_tree(&mut root, mode);
                 let expected = if matches!(mode, SortMode::NameDescending) {
                     &high
@@ -5257,7 +5245,7 @@ mod tests {
             Ok(UserSettings::default()),
         );
         let tree = Arc::make_mut(app.tree.as_mut().unwrap());
-        tree.root = crate::test_support::directory(0, "root", vec![b, a]);
+        tree.root = crate::test_support::directory("root", vec![b, a]);
         let rects = crate::ui::TreemapView::new(
             &tree.root,
             &tree.root_path,
@@ -5290,8 +5278,8 @@ mod tests {
             std::ffi::OsString::from_vec(b"bad-\xfe".to_vec()),
         ];
         let tree = Arc::make_mut(app.tree.as_mut().unwrap());
-        for (index, name) in names.iter().enumerate() {
-            let mut child = crate::test_support::file(index as u64 + 1, "", 1);
+        for name in &names {
+            let mut child = crate::test_support::file("", 1);
             child.set_file_name(name);
             tree.root.children.push(child);
         }
@@ -5500,10 +5488,9 @@ mod tests {
                 crate::TuiConfig::default(),
             );
             Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
-                0,
                 "root",
                 (1..=count)
-                    .map(|index| file(index, &format!("report-{index:07}.rs"), 1))
+                    .map(|index| file(&format!("report-{index:07}.rs"), 1))
                     .collect(),
             );
             app.search_state.enable_background();
@@ -5789,12 +5776,11 @@ mod tests {
         );
         let root = app.path.clone();
         Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
-            0,
             "root",
             vec![
-                directory(1, "first", vec![]),
-                directory(2, "two  日本", vec![]),
-                file(3, "file.txt", 1),
+                directory("first", vec![]),
+                directory("two  日本", vec![]),
+                file("file.txt", 1),
             ],
         );
         app.cd_to_path("./first");
@@ -5891,10 +5877,9 @@ mod tests {
     fn scope_lookup_cancellation_stops_within_wide_directory() {
         use crate::test_support::{directory, file};
         let root = directory(
-            0,
             "root",
             (1..=1000)
-                .map(|index| file(index, &format!("file-{index:04}"), 1))
+                .map(|index| file(&format!("file-{index:04}"), 1))
                 .collect(),
         );
         let root_path = Path::new("root");
@@ -5922,18 +5907,16 @@ mod tests {
         let mut app = App::with_config(root.path().to_path_buf(), crate::TuiConfig::default());
         let scan_root = app.tree.as_ref().unwrap().root_path.clone();
         Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
-            0,
             "root",
             vec![
                 directory(
-                    1,
                     "src",
                     vec![
-                        file(2, "日本.rs", 1),
-                        directory(3, "nested", vec![file(4, "deep.rs", 1)]),
+                        file("日本.rs", 1),
+                        directory("nested", vec![file("deep.rs", 1)]),
                     ],
                 ),
-                directory(5, "src-other", vec![file(6, "outside.rs", 1)]),
+                directory("src-other", vec![file("outside.rs", 1)]),
             ],
         );
         let tree = app.tree.as_ref().unwrap();
@@ -7252,31 +7235,25 @@ mod tests {
 
     #[test]
     fn mutable_node_lookup_handles_deep_synthetic_paths() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
-        let depth = 20_000u64;
-        let mut node = FileNode::new_directory(
-            NodeId::new(depth),
-            "d",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
+        use gravityfile_core::{FileNode, Timestamps};
+        let timestamps = Timestamps::with_modified(std::time::UNIX_EPOCH);
+        // The deepest node is the only one with a nonzero size.
+        let mut node = FileNode::new_directory("d", timestamps);
+        node.size = 42;
         let mut target = PathBuf::from("root");
-        for id in (0..depth).rev() {
-            let mut parent = FileNode::new_directory(
-                NodeId::new(id),
-                "d",
-                Timestamps::with_modified(std::time::UNIX_EPOCH),
-            );
+        for _ in 0..20_000 {
+            let mut parent = FileNode::new_directory("d", timestamps);
             parent.children.push(node);
             node = parent;
             target.push("d");
         }
         let actual =
-            App::find_node_mut(&mut node, &target, Path::new("root")).map(|found| found.id);
+            App::find_node_mut(&mut node, &target, Path::new("root")).map(|found| found.size);
         let mut pending = std::mem::take(&mut node.children);
         while let Some(mut child) = pending.pop() {
             pending.append(&mut child.children);
         }
-        assert_eq!(actual, Some(NodeId::new(depth)));
+        assert_eq!(actual, Some(42));
     }
 
     #[tokio::test]
@@ -7299,13 +7276,9 @@ mod tests {
         ] {
             assert!(App::find_node_mut(&mut tree.root, &path, &app.path).is_none());
         }
-        let root_id = tree.root.id;
-        assert_eq!(
-            App::find_node_mut(&mut tree.root, &app.path, &app.path)
-                .unwrap()
-                .id,
-            root_id
-        );
+        let root: *const FileNode = &tree.root;
+        let found = App::find_node_mut(&mut tree.root, &app.path, &app.path).unwrap();
+        assert!(std::ptr::eq(found, root));
     }
 
     #[tokio::test]

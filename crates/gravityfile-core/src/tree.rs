@@ -52,30 +52,63 @@ impl TreeStats {
         modified: Option<SystemTime>,
         depth: u32,
     ) {
+        self.record_file_with(size, modified, depth, || path.to_path_buf());
+    }
+
+    /// [`Self::record_file`] that builds the path only when it is needed:
+    /// when this file may become the largest, oldest or newest.
+    pub fn record_file_with(
+        &mut self,
+        size: u64,
+        modified: Option<SystemTime>,
+        depth: u32,
+        path: impl FnOnce() -> PathBuf,
+    ) {
         self.total_files += 1;
         self.total_size = self.total_size.saturating_add(size);
         self.max_depth = self.max_depth.max(depth);
 
-        // Track largest file
-        if self
-            .largest_file
-            .as_ref()
-            .is_none_or(|(previous, s)| size > *s || (size == *s && path < previous.as_path()))
-        {
-            self.largest_file = Some((path.to_path_buf(), size));
+        let largest = self.largest_file.as_ref().is_none_or(|(_, s)| size >= *s);
+        let (oldest, newest) = match modified {
+            Some(modified) => (
+                self.oldest_file
+                    .as_ref()
+                    .is_none_or(|(_, t)| modified <= *t),
+                self.newest_file
+                    .as_ref()
+                    .is_none_or(|(_, t)| modified >= *t),
+            ),
+            None => (false, false),
+        };
+        if !(largest || oldest || newest) {
+            return;
         }
-
-        // Track oldest/newest only for files with a real modification time.
+        // Ties are broken by the smaller path, independent of arrival order.
+        let path = path();
+        if largest
+            && self
+                .largest_file
+                .as_ref()
+                .is_none_or(|(previous, s)| size > *s || path < *previous)
+        {
+            self.largest_file = Some((path.clone(), size));
+        }
         if let Some(modified) = modified {
-            if self.oldest_file.as_ref().is_none_or(|(previous, t)| {
-                modified < *t || (modified == *t && path < previous.as_path())
-            }) {
-                self.oldest_file = Some((path.to_path_buf(), modified));
+            if oldest
+                && self
+                    .oldest_file
+                    .as_ref()
+                    .is_none_or(|(previous, t)| modified < *t || path < *previous)
+            {
+                self.oldest_file = Some((path.clone(), modified));
             }
-            if self.newest_file.as_ref().is_none_or(|(previous, t)| {
-                modified > *t || (modified == *t && path < previous.as_path())
-            }) {
-                self.newest_file = Some((path.to_path_buf(), modified));
+            if newest
+                && self
+                    .newest_file
+                    .as_ref()
+                    .is_none_or(|(previous, t)| modified > *t || path < *previous)
+            {
+                self.newest_file = Some((path, modified));
             }
         }
     }

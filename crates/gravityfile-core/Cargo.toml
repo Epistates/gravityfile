@@ -13,3 +13,6 @@ thiserror.workspace = true
 compact_str.workspace = true
 derive_builder.workspace = true
 globset.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

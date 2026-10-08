@@ -409,18 +409,14 @@ mod tests {
 
     #[test]
     fn annotation_handles_deep_trees_on_a_small_thread_stack() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
+        use gravityfile_core::{FileNode, Timestamps};
         std::thread::Builder::new()
             .stack_size(128 * 1024)
             .spawn(|| {
-                let mut root = FileNode::new_directory(
-                    NodeId::new(0),
-                    "d",
-                    Timestamps::with_modified(std::time::UNIX_EPOCH),
-                );
-                for id in 1..4000 {
+                let mut root =
+                    FileNode::new_directory("d", Timestamps::with_modified(std::time::UNIX_EPOCH));
+                for _ in 1..4000 {
                     let mut parent = FileNode::new_directory(
-                        NodeId::new(id),
                         "d",
                         Timestamps::with_modified(std::time::UNIX_EPOCH),
                     );
@@ -452,19 +448,12 @@ mod tests {
 
     #[test]
     fn annotation_restores_parent_path_after_non_component_names() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
-        let mut root = FileNode::new_directory(
-            NodeId::new(0),
-            "root",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
+        use gravityfile_core::{FileNode, Timestamps};
+        let mut root =
+            FileNode::new_directory("root", Timestamps::with_modified(std::time::UNIX_EPOCH));
         let mut cache = GitStatusCache::new();
-        for (index, name) in ["nested/name", "", "../outside", "sibling"]
-            .into_iter()
-            .enumerate()
-        {
+        for name in ["nested/name", "", "../outside", "sibling"] {
             root.children.push(FileNode::new_directory(
-                NodeId::new(index as u64 + 1),
                 name,
                 Timestamps::with_modified(std::time::UNIX_EPOCH),
             ));
@@ -561,15 +550,11 @@ mod tests {
 
     #[test]
     fn annotation_cancellation_stops_before_remaining_nodes() {
-        use gravityfile_core::{FileNode, NodeId, Timestamps};
-        let mut root = FileNode::new_directory(
-            NodeId::new(0),
-            "root",
-            Timestamps::with_modified(std::time::UNIX_EPOCH),
-        );
+        use gravityfile_core::{FileNode, Timestamps};
+        let mut root =
+            FileNode::new_directory("root", Timestamps::with_modified(std::time::UNIX_EPOCH));
         for index in 1..1001 {
             root.children.push(FileNode::new_directory(
-                NodeId::new(index),
                 index.to_string(),
                 Timestamps::with_modified(std::time::UNIX_EPOCH),
             ));

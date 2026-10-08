@@ -57,6 +57,6 @@ pub use scanner::{JwalkScanner, quick_list};
 
 // Re-export core types for convenience
 pub use gravityfile_core::{
-    FileNode, FileTree, NodeId, NodeKind, ScanConfig, ScanError, ScanWarning, Timestamps,
-    TreeStats, WarningKind,
+    FileNode, FileTree, NodeKind, ScanConfig, ScanError, ScanWarning, Timestamps, TreeStats,
+    WarningKind,
 };

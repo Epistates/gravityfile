@@ -307,7 +307,7 @@ fn versioned_reports_identify_scope_kind_and_completeness() {
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["schema_version"], 2);
         assert_eq!(
             report["kind"],
             if command == "export" { "scan" } else { command }

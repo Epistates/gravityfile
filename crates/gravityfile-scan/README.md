@@ -81,8 +81,8 @@ let scanner = JwalkScanner::new();
 let tree = scanner.scan(&config, CancellationToken::new())?;
 ```
 
-`max_entries` applies to descendant entries yielded after name/depth filtering;
-the root is excluded. Metadata failures and unsupported file types still consume
+`max_entries` applies to descendant entries yielded after hidden/ignore
+filtering, at every depth (`max_depth` does not reduce it); the root is excluded. Metadata failures and unsupported file types still consume
 the budget. `None` (the default) is unlimited; zero permits an empty scope.
 Both recursive scans and `quick_list` fail with `ScanError::EntryLimitExceeded`
 on the first excess entry, without returning a partial tree. The CLI report commands expose this as `--max-entries`; the TUI uses the saved
@@ -102,13 +102,28 @@ The scanner produces a `FileTree` containing:
 
 Children are automatically sorted by size (largest first) for efficient display.
 
+## Size accounting
+
+- Sizes are allocated disk usage (`blocks × 512`) unless `apparent_size` is set.
+- Directories include their own allocation, like `du`.
+- A file with several hard links counts once, in both size modes, unless
+  `count_hard_links` is set. When following symlinks, an object reached through
+  several aliases also counts once.
+- `max_depth` limits which nodes are kept, not what is counted: directories at
+  the deepest kept level still report the full size of their contents.
+- FIFOs, sockets and device files are listed as `NodeKind::Other`.
+- Unreadable directories and entries are reported as `PermissionDenied`
+  warnings, so a partial size is never silent.
+- Git status is only computed when `git_status` is set.
+
 ## Performance
 
-- Uses rayon thread pool via jwalk for parallel directory traversal
-- Physical-size accounting retains hard-linked identities for the scan lifetime;
-  following symlinks also tracks single-link identities to suppress path aliases
-- Progress updates are batched every 1000 accepted entries
-- Collection retains entry paths before building the in-memory tree; large scans require proportional memory
+- File metadata is read on jwalk's worker threads, so the consumer thread does
+  no system calls; it builds the tree in one pass from jwalk's depth-first
+  order, with no intermediate index of paths.
+- Scans share a dedicated thread pool, separate from rayon's global pool.
+- Hard-linked identities are retained for the scan's lifetime.
+- Progress updates are sent every 1024 entries.
 
 ## Re-exports
 
@@ -116,7 +131,7 @@ This crate re-exports common types from `gravityfile-core` for convenience:
 
 ```rust
 use gravityfile_scan::{
-    FileNode, FileTree, NodeId, NodeKind,
+    FileNode, FileTree, NodeKind,
     ScanConfig, ScanError, ScanWarning,
     Timestamps, TreeStats, WarningKind,
 };

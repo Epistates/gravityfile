@@ -1,5 +1,5 @@
 use gravityfile_analyze::{AgeAnalyzer, AgeBucket, AgeConfig, DuplicateConfig, DuplicateFinder};
-use gravityfile_core::{FileNode, FileTree, NodeId, ScanConfig, Timestamps};
+use gravityfile_core::{FileNode, FileTree, ScanConfig, Timestamps};
 use std::fs;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -10,11 +10,7 @@ fn filtered_scans_do_not_certify_stale_directories() {
     use gravityfile_analyze::StaleDirectoryStatus;
     let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     for hidden in [true, false] {
-        let root = test_dir(
-            0,
-            "data",
-            vec![test_file(1, "old", 100, SystemTime::UNIX_EPOCH)],
-        );
+        let root = test_dir("data", vec![test_file("old", 100, SystemTime::UNIX_EPOCH)]);
         let mut tree = test_tree(std::path::Path::new("data"), root);
         if hidden {
             tree.config.include_hidden = false;
@@ -51,11 +47,10 @@ fn filtered_scans_do_not_certify_stale_directories() {
 fn average_age_preserves_subsecond_observations() {
     let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
     let root = test_dir(
-        0,
         "data",
         vec![
-            test_file(1, "a", 1, reference - Duration::from_millis(1900)),
-            test_file(2, "b", 1, reference - Duration::from_millis(2900)),
+            test_file("a", 1, reference - Duration::from_millis(1900)),
+            test_file("b", 1, reference - Duration::from_millis(2900)),
         ],
     );
     let tree = test_tree(std::path::Path::new("data"), root);
@@ -103,12 +98,11 @@ fn age_configuration_rejects_ambiguous_or_incomplete_buckets() {
 fn valid_age_buckets_partition_every_file_including_boundary_ages() {
     let reference = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let root = test_dir(
-        0,
         "data",
         vec![
-            test_file(1, "new", 1, reference),
-            test_file(2, "boundary", 2, reference - Duration::from_secs(60)),
-            test_file(3, "older", 3, reference - Duration::from_secs(61)),
+            test_file("new", 1, reference),
+            test_file("boundary", 2, reference - Duration::from_secs(60)),
+            test_file("older", 3, reference - Duration::from_secs(61)),
         ],
     );
     let tree = test_tree(std::path::Path::new("data"), root);
@@ -285,7 +279,7 @@ fn test_find_duplicates_with_empty_tree() {
 
     // Create an empty tree
     let now = std::time::SystemTime::now();
-    let root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let root = FileNode::new_directory("root", Timestamps::with_modified(now));
     let config = ScanConfig::new("/test");
     let stats = gravityfile_core::TreeStats::default();
 
@@ -634,12 +628,11 @@ fn test_age_analyzer_reports_buckets_average_median_and_top_files() {
     let reference_time = SystemTime::UNIX_EPOCH + days(500);
 
     let root = test_dir(
-        1,
         "root",
         vec![
-            test_file(2, "fresh.bin", 100, reference_time - days(1)),
-            test_file(3, "warm.bin", 500, reference_time - days(3)),
-            test_file(4, "old.bin", 1_000, reference_time - days(400)),
+            test_file("fresh.bin", 100, reference_time - days(1)),
+            test_file("warm.bin", 500, reference_time - days(3)),
+            test_file("old.bin", 1_000, reference_time - days(400)),
         ],
     );
     let tree = test_tree(root_path, root);
@@ -690,28 +683,23 @@ fn test_age_analyzer_reports_stale_directories_sorted_and_limited() {
     let reference_time = SystemTime::UNIX_EPOCH + days(1_000);
 
     let root = test_dir(
-        1,
         "root",
         vec![
             test_dir(
-                2,
                 "old_big",
-                vec![test_file(3, "data.bin", 2_000, reference_time - days(500))],
+                vec![test_file("data.bin", 2_000, reference_time - days(500))],
             ),
             test_dir(
-                4,
                 "old_bigger",
-                vec![test_file(5, "data.bin", 4_000, reference_time - days(450))],
+                vec![test_file("data.bin", 4_000, reference_time - days(450))],
             ),
             test_dir(
-                6,
                 "old_small",
-                vec![test_file(7, "data.bin", 500, reference_time - days(600))],
+                vec![test_file("data.bin", 500, reference_time - days(600))],
             ),
             test_dir(
-                8,
                 "new_big",
-                vec![test_file(9, "data.bin", 10_000, reference_time - days(2))],
+                vec![test_file("data.bin", 10_000, reference_time - days(2))],
             ),
         ],
     );
@@ -746,31 +734,27 @@ fn stale_directories_report_only_the_outermost_of_a_stale_subtree() {
     let reference_time = SystemTime::UNIX_EPOCH + days(1_000);
     let old = reference_time - days(500);
     let root = test_dir(
-        1,
         "root",
         vec![
             test_dir(
-                2,
                 "archive",
                 vec![test_dir(
-                    3,
                     "2019",
                     vec![
-                        test_dir(4, "photos", vec![test_file(5, "a.jpg", 3_000, old)]),
-                        test_file(6, "notes.txt", 1_000, old),
+                        test_dir("photos", vec![test_file("a.jpg", 3_000, old)]),
+                        test_file("notes.txt", 1_000, old),
                     ],
                 )],
             ),
             test_dir(
-                7,
                 "mixed",
                 vec![
-                    test_dir(8, "old", vec![test_file(9, "x", 2_000, old)]),
-                    test_file(10, "fresh", 10, reference_time - days(1)),
+                    test_dir("old", vec![test_file("x", 2_000, old)]),
+                    test_file("fresh", 10, reference_time - days(1)),
                 ],
             ),
             // Too small on its own, but subsumed by nothing: never reported.
-            test_dir(11, "tiny", vec![test_file(12, "t", 10, old)]),
+            test_dir("tiny", vec![test_file("t", 10, old)]),
         ],
     );
     let tree = test_tree(root_path, root);
@@ -805,9 +789,8 @@ fn test_age_analyzer_honors_pre_cancelled_token() {
     let temp = TempDir::new().unwrap();
     let reference_time = SystemTime::UNIX_EPOCH + days(100);
     let root = test_dir(
-        1,
         "root",
-        vec![test_file(2, "ignored.bin", 100, reference_time - days(10))],
+        vec![test_file("ignored.bin", 100, reference_time - days(10))],
     );
     let tree = test_tree(temp.path(), root);
     let token = CancellationToken::new();
@@ -835,15 +818,14 @@ fn create_test_tree_with_files(
     paths: &[std::path::PathBuf],
 ) -> FileTree {
     let now = std::time::SystemTime::now();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
 
-    for (i, path) in paths.iter().enumerate() {
+    for path in paths {
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let metadata = fs::metadata(path).unwrap();
         let size = metadata.len();
 
         let mut node = FileNode::new_file(
-            NodeId::new((i + 2) as u64),
             &file_name,
             size,
             (size / 512) as u64, // Approximate blocks
@@ -857,16 +839,6 @@ fn create_test_tree_with_files(
             node.inode = Some(gravityfile_core::InodeInfo::new(
                 metadata.ino(),
                 metadata.dev(),
-            ));
-        }
-
-        // Read actual content for hashing
-        if let Ok(content) = fs::read(path) {
-            use blake3::Hasher;
-            let mut hasher = Hasher::new();
-            hasher.update(&content);
-            node.content_hash = Some(gravityfile_core::ContentHash::new(
-                *hasher.finalize().as_bytes(),
             ));
         }
 
@@ -905,9 +877,9 @@ fn create_test_tree_with_nested_files(
 ) -> FileTree {
     let now = std::time::SystemTime::now();
     let root_dir_components: usize = root_dir.components().count();
-    let mut root = FileNode::new_directory(NodeId::new(1), "root", Timestamps::with_modified(now));
+    let mut root = FileNode::new_directory("root", Timestamps::with_modified(now));
 
-    for (i, (path, name)) in paths.iter().enumerate() {
+    for (path, name) in paths {
         let metadata = fs::metadata(path).unwrap();
         let size = metadata.len();
 
@@ -921,11 +893,8 @@ fn create_test_tree_with_nested_files(
         {
             let parent_name_str = parent_name.as_os_str().to_string_lossy().to_string();
             if !current.children.iter().any(|c| c.name == parent_name_str) {
-                let dir_node = FileNode::new_directory(
-                    NodeId::new(i as u64 * 10 + current.children.len() as u64 + 2),
-                    &parent_name_str,
-                    Timestamps::with_modified(now),
-                );
+                let dir_node =
+                    FileNode::new_directory(&parent_name_str, Timestamps::with_modified(now));
                 current.children.push(dir_node);
             }
             current = current
@@ -937,7 +906,6 @@ fn create_test_tree_with_nested_files(
 
         // Add the file
         let mut node = FileNode::new_file(
-            NodeId::new(i as u64 + 2),
             name.to_string(),
             size,
             (size / 512) as u64,
@@ -951,15 +919,6 @@ fn create_test_tree_with_nested_files(
             node.inode = Some(gravityfile_core::InodeInfo::new(
                 metadata.ino(),
                 metadata.dev(),
-            ));
-        }
-
-        if let Ok(content) = fs::read(path) {
-            use blake3::Hasher;
-            let mut hasher = Hasher::new();
-            hasher.update(&content);
-            node.content_hash = Some(gravityfile_core::ContentHash::new(
-                *hasher.finalize().as_bytes(),
             ));
         }
 
@@ -1004,9 +963,8 @@ fn days(days: u64) -> Duration {
     Duration::from_secs(days * 24 * 60 * 60)
 }
 
-fn test_file(id: u64, name: &str, size: u64, modified: SystemTime) -> FileNode {
+fn test_file(name: &str, size: u64, modified: SystemTime) -> FileNode {
     FileNode::new_file(
-        NodeId::new(id),
         name,
         size,
         (size / 512).max(1),
@@ -1015,12 +973,8 @@ fn test_file(id: u64, name: &str, size: u64, modified: SystemTime) -> FileNode {
     )
 }
 
-fn test_dir(id: u64, name: &str, children: Vec<FileNode>) -> FileNode {
-    let mut node = FileNode::new_directory(
-        NodeId::new(id),
-        name,
-        Timestamps::with_modified(SystemTime::UNIX_EPOCH),
-    );
+fn test_dir(name: &str, children: Vec<FileNode>) -> FileNode {
+    let mut node = FileNode::new_directory(name, Timestamps::with_modified(SystemTime::UNIX_EPOCH));
     node.size = children.iter().map(|child| child.size).sum();
     node.children = children;
     node.update_counts();
@@ -1054,13 +1008,10 @@ fn bucket<'a>(
 #[test]
 fn age_analysis_handles_deep_library_trees_without_recursive_traversal() {
     let depth = 5000;
-    let mut node = test_file(depth + 1, "leaf", 10, SystemTime::UNIX_EPOCH);
+    let mut node = test_file("leaf", 10, SystemTime::UNIX_EPOCH);
     for id in (0..depth).rev() {
-        let mut parent = FileNode::new_directory(
-            NodeId::new(id),
-            "d",
-            Timestamps::with_modified(SystemTime::UNIX_EPOCH),
-        );
+        let mut parent =
+            FileNode::new_directory("d", Timestamps::with_modified(SystemTime::UNIX_EPOCH));
         parent.kind = gravityfile_core::NodeKind::Directory {
             file_count: 1,
             dir_count: depth - id - 1,
@@ -1114,10 +1065,9 @@ fn equal_size_age_files_have_stable_report_order() {
     ] {
         let children = names
             .iter()
-            .enumerate()
-            .map(|(id, name)| test_file(id as u64 + 1, name, 10, modified))
+            .map(|name| test_file(name, 10, modified))
             .collect();
-        let tree = test_tree(std::path::Path::new("root"), test_dir(0, "root", children));
+        let tree = test_tree(std::path::Path::new("root"), test_dir("root", children));
         let report = AgeAnalyzer::with_config(AgeConfig {
             reference_time: modified + Duration::from_secs(1),
             top_files_per_bucket: 4,
@@ -1154,9 +1104,9 @@ fn many_age_buckets_preserve_inclusive_boundaries_and_catch_all() {
     let children = ages
         .iter()
         .enumerate()
-        .map(|(i, age)| test_file(i as u64 + 1, &format!("f{i}"), 10, reference - *age))
+        .map(|(i, age)| test_file(&format!("f{i}"), 10, reference - *age))
         .collect();
-    let tree = test_tree(std::path::Path::new("root"), test_dir(0, "root", children));
+    let tree = test_tree(std::path::Path::new("root"), test_dir("root", children));
     let report = AgeAnalyzer::with_config(AgeConfig {
         reference_time: reference,
         buckets,
@@ -1189,14 +1139,13 @@ fn age_analysis_scale_benchmark() {
         let children = (0..files)
             .map(|i| {
                 test_file(
-                    i as u64 + 1,
                     &format!("f{i:09}"),
                     256,
                     reference - Duration::from_secs((i % 2000) as u64),
                 )
             })
             .collect();
-        let tree = test_tree(std::path::Path::new("root"), test_dir(0, "root", children));
+        let tree = test_tree(std::path::Path::new("root"), test_dir("root", children));
         for custom in [false, true] {
             let mut config = AgeConfig {
                 reference_time: reference,
