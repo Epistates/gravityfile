@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Snapshots.** `grav export` saves a complete scan as JSON or, with
+  `-f ncdu`, as an ncdu dump; a `.zst` output is compressed. `scan`, `age`,
+  `duplicates` and `export` accept a snapshot in place of a directory, including
+  dumps from `ncdu -o`, and `-A`/`-l` re-measure it without rescanning.
 - `grav init bash|zsh|fish` prints the shell function that follows the
   explorer's directory on exit, `grav completions <shell>` prints completions,
   and `grav man` prints a manual page.

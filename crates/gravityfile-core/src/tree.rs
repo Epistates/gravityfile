@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ScanConfig;
 use crate::error::ScanWarning;
-use crate::node::FileNode;
+use crate::node::{FileNode, NodeKind};
 
 /// Summary statistics for a scanned tree.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,6 +123,45 @@ impl TreeStats {
     pub fn record_symlink(&mut self) {
         self.total_symlinks += 1;
     }
+
+    /// Statistics of an existing tree whose root is at `root_path`, as a scan
+    /// of it would have recorded them.
+    pub fn collect(root: &FileNode, root_path: &Path) -> Self {
+        let mut stats = Self::new();
+        stats.record_dir(0);
+        let mut path = root_path.to_path_buf();
+        let mut stack = vec![root.children.iter()];
+        while let Some(children) = stack.last_mut() {
+            let Some(node) = children.next() else {
+                stack.pop();
+                if !stack.is_empty() {
+                    path.pop();
+                }
+                continue;
+            };
+            let depth = stack.len() as u32;
+            match node.kind {
+                NodeKind::Directory { .. } => {
+                    stats.record_dir(depth);
+                    if !node.children.is_empty() {
+                        path.push(node.file_name());
+                        stack.push(node.children.iter());
+                    }
+                }
+                NodeKind::File { .. } => {
+                    stats.record_file_with(
+                        node.size,
+                        Some(node.timestamps.modified),
+                        depth,
+                        || path.join(node.file_name()),
+                    );
+                }
+                NodeKind::Symlink { .. } => stats.record_symlink(),
+                NodeKind::Other => {}
+            }
+        }
+        stats
+    }
 }
 
 /// Complete scanned file tree with metadata.
@@ -207,6 +246,15 @@ impl FileTree {
         self.warnings.iter().fold(0u64, |count, warning| {
             count.saturating_add(warning.represented_count())
         })
+    }
+
+    /// Re-express every size in another measure without rescanning: apparent
+    /// lengths or allocated blocks, with hard links counted once or each time.
+    pub fn remeasure(&mut self, apparent: bool, count_hard_links: bool) {
+        self.root.remeasure(apparent, count_hard_links);
+        self.config.apparent_size = apparent;
+        self.config.count_hard_links = count_hard_links;
+        self.stats = TreeStats::collect(&self.root, &self.root_path);
     }
 }
 

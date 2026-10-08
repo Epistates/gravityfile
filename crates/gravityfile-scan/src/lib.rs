@@ -47,8 +47,10 @@
 
 mod git;
 mod inode;
+pub mod ncdu;
 mod progress;
 mod scanner;
+pub mod snapshot;
 
 pub use git::{GitStatusCache, apply_git_status};
 pub use inode::InodeTracker;

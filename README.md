@@ -91,12 +91,25 @@ Completions: `grav completions <bash|zsh|fish|elvish|powershell>`.
 Bulk rename and the text editor use `VISUAL` or `EDITOR`; GUI editors must wait
 for the file to close (for example `code --wait`).
 
+### Snapshots
+
+Save a scan and look at it later, or somewhere else. Any command that takes a
+directory also takes a snapshot, and ncdu dumps work too:
+
+```sh
+grav export / -o root.json.zst          # complete scan, zstd-compressed
+grav scan root.json.zst -d 3            # browse it without rescanning
+grav scan root.json.zst -A              # switch to apparent sizes, instantly
+ssh server 'ncdu -xo- /' > server.json  # a dump from a machine without grav
+grav scan server.json
+grav export ~ -f ncdu -o home.json      # for ncdu -f or gdu -f
+```
+
 ## Reports and automation
 
 ```sh
 grav scan . -f json | jq '.data.entries[0]'
 grav duplicates /data -f json --strict > duplicates.json
-grav export /data -o snapshot.json
 ```
 
 JSON output always carries a `schema_version`, the scan scope, and a `status`

@@ -183,6 +183,7 @@ impl Entry {
         };
         node.set_file_name(name);
         node.size = size;
+        node.len = self.len;
         node.blocks = self.blocks;
         node.inode = self.identity.filter(|_| self.nlink > 1 && !self.is_dir());
         node
@@ -198,10 +199,11 @@ impl Entry {
         if matches!(self.kind, EntryKind::Symlink { .. }) {
             return 0;
         }
+        // Same measure as `FileNode::own_size`, so a scan and a remeasure agree.
         let size = if config.apparent_size {
             self.len
         } else {
-            disk_size(self.len, self.blocks)
+            self.blocks.saturating_mul(512)
         };
         // Directory link counts reflect subdirectories, not aliases; they can
         // only be reached twice by following symlinks.
@@ -761,21 +763,11 @@ fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
     metadata.blocks()
 }
 
+/// Estimated from the length: the standard library does not expose the
+/// allocation here.
 #[cfg(not(unix))]
 fn get_blocks(metadata: &std::fs::Metadata) -> u64 {
     metadata.len().div_ceil(512)
-}
-
-/// On-disk usage: allocated blocks on Unix, apparent length elsewhere, where
-/// there is no portable way to query the allocation.
-#[cfg(unix)]
-fn disk_size(_len: u64, blocks: u64) -> u64 {
-    blocks.saturating_mul(512)
-}
-
-#[cfg(not(unix))]
-fn disk_size(len: u64, _blocks: u64) -> u64 {
-    len
 }
 
 #[cfg(test)]
@@ -935,6 +927,36 @@ mod tests {
             assert_eq!(linked(&scan(&config)), one, "apparent={apparent}");
             config.count_hard_links = true;
             assert_eq!(linked(&scan(&config)), 2 * one, "apparent={apparent}");
+        }
+    }
+
+    #[test]
+    fn remeasuring_a_scan_matches_scanning_with_that_measure() {
+        let temp = create_test_tree();
+        #[cfg(unix)]
+        fs::hard_link(temp.path().join("file1.txt"), temp.path().join("dir2/link")).unwrap();
+        for (apparent, links) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut config = ScanConfig::new(temp.path());
+            config.apparent_size = apparent;
+            config.count_hard_links = links;
+            let direct = scan(&config);
+            let mut converted = scan(&ScanConfig::new(temp.path()));
+            converted.remeasure(apparent, links);
+            let label = format!("apparent={apparent} links={links}");
+            assert_eq!(converted.root.size, direct.root.size, "{label}");
+            assert_eq!(
+                converted.stats.total_size, direct.stats.total_size,
+                "{label}"
+            );
+            assert_eq!(
+                converted.stats.total_files, direct.stats.total_files,
+                "{label}"
+            );
+            assert_eq!(
+                child(&converted.root, "dir1").size,
+                child(&direct.root, "dir1").size,
+                "{label}"
+            );
         }
     }
 

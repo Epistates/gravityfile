@@ -63,6 +63,13 @@ jobs:
           cargo build --bins --locked
           python3 -m unittest discover -s scripts -p test_shell_integration.py
 
+      - name: ncdu dump compatibility
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends ncdu jq
+          cargo build --bins --locked
+          scripts/ncdu-interop.sh target/debug/grav
+
       - name: Terminal startup and restoration
         if: runner.os != 'Windows'
         run: |

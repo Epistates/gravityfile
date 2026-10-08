@@ -63,9 +63,11 @@ counts for their whole subtree; symlinks carry `target`; `git` appears with
 `--git`. `omitted` summarizes children beyond the limit, on the directory whose
 children were listed, or at the top level for the root.
 
-**`export`** contains the complete tree: every node with `name`, `kind`, `size`,
-`blocks`, `timestamps`, `inode` (for multiply linked files), `git_status` and
-`children`, plus `stats` and `warnings`. It is the snapshot format.
+**`export`** contains the complete tree: every node with `name`, `kind`, `size`
+(aggregated, in the scan's measure), `len` and `blocks` (the entry's own length
+and 512-byte blocks), `timestamps`, `inode` (for multiply linked files),
+`git_status` and `children`, plus `stats` and `warnings`. It is the snapshot
+format; see [Snapshots](#snapshots).
 
 **`duplicates`** contains groups of identical files (`size`, `wasted_bytes`,
 `paths`), sorted by wasted space, with totals computed before `--limit`
@@ -148,6 +150,28 @@ fails the error says the export was published but durability is uncertain.
 `--max-entries N` fails the command before any output if the scan reaches more
 than `N` entries below the root, and leaves an existing export untouched. It
 bounds the scanner's work, not total memory.
+
+## Snapshots
+
+`grav export` saves a complete scan. `-f json` (the default) writes the envelope
+above; `-f ncdu` writes an [ncdu dump](https://dev.yorhel.nl/ncdu/jsonfmt)
+(format 1.2) that `ncdu -f` and `gdu -f` can browse. With `-o FILE.zst` the
+file is zstd-compressed.
+
+`scan`, `age`, `duplicates` and `export` accept a snapshot wherever they accept
+a directory. They detect the format and compression themselves and also read
+dumps made by `ncdu -o` and by grav 0.3. Because every entry keeps its own
+length and blocks, `-A` and `-l` re-measure a snapshot exactly as a fresh scan
+would. Options that only make sense while walking a filesystem (`-L`,
+`--cross-fs`, `--no-hidden`, `-e`, `-j`, `--git`) are rejected. `duplicates`
+re-reads the files the snapshot names, so it only works where they still exist.
+
+Both readers stream: neither the nesting depth nor the size of a snapshot is
+limited by the stack, and a 300,000-entry snapshot loads in a fraction of the
+time a rescan takes. In ncdu dumps, entries ncdu marked `excluded` are skipped,
+`read_error` entries become warnings, `notreg` entries (symlinks, devices and
+the like) are listed as `other`, and names that are not valid UTF-8 are kept
+byte for byte in both directions.
 
 ## Compatibility fixtures
 

@@ -550,3 +550,71 @@ fn logging_is_opt_in() {
             .contains(concat!("gravityfile v", env!("CARGO_PKG_VERSION")))
     );
 }
+
+#[test]
+fn snapshots_in_every_format_reproduce_the_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("sub")).unwrap();
+    std::fs::write(directory.path().join("sub/data"), vec![7u8; 5000]).unwrap();
+    std::fs::write(directory.path().join("small"), b"x").unwrap();
+    let saved = tempfile::tempdir().unwrap();
+    let path = directory.path().to_str().unwrap();
+    let total = |args: &[&str]| {
+        let output = run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let report = json(&output);
+        (
+            report["data"]["total"]["size"].as_u64().unwrap(),
+            report["data"]["total"]["files"].as_u64().unwrap(),
+        )
+    };
+    let live = total(&["scan", path, "-f", "json"]);
+    let live_apparent = total(&["scan", path, "-A", "-f", "json"]);
+    for (format, name) in [
+        ("json", "snapshot.json"),
+        ("json", "snapshot.json.zst"),
+        ("ncdu", "dump.json"),
+        ("ncdu", "dump.json.zst"),
+    ] {
+        let file = saved.path().join(name);
+        let file = file.to_str().unwrap();
+        let output = run(&["export", path, "-f", format, "-o", file]);
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert_eq!(total(&["scan", file, "-f", "json"]), live, "{name}");
+        assert_eq!(
+            total(&["scan", file, "-A", "-f", "json"]),
+            live_apparent,
+            "{name}"
+        );
+        let text = String::from_utf8(run(&["scan", file]).stdout).unwrap();
+        assert!(text.contains("from a snapshot taken"), "{name}: {text}");
+        assert!(run(&["age", file, "-f", "json"]).status.success(), "{name}");
+    }
+}
+
+#[test]
+fn snapshot_errors_are_explained() {
+    let saved = tempfile::tempdir().unwrap();
+    let garbage = saved.path().join("notes.txt");
+    std::fs::write(&garbage, "hello").unwrap();
+    let output = run(&["scan", garbage.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expected a grav export or an ncdu dump")
+    );
+
+    let legacy = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/reports/legacy-scan.json"
+    );
+    let output = run(&["scan", legacy, "-e", "*.tmp", "--git"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--exclude, --git cannot be used with a snapshot")
+    );
+    // Snapshots written by grav 0.3 still load.
+    let output = run(&["scan", legacy, "-f", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(json(&output)["data"]["entries"][0]["path"], "a\n.txt");
+}

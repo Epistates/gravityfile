@@ -19,6 +19,7 @@ use crate::report::{
 use crate::style::paint;
 
 pub fn run(command: &ScanCommand, context: &Context) -> Result<Completeness> {
+    let snapshot = super::is_snapshot(&command.scan);
     let tree = super::scan_tree(&command.scan, context)?;
     let view = View::build(&tree, command.depth, command.limit, &context.cancel)?;
     let status = scan_status(&tree);
@@ -32,7 +33,7 @@ pub fn run(command: &ScanCommand, context: &Context) -> Result<Completeness> {
             });
             write_json_report(&envelope, &mut stdout, &context.cancel)?;
         }
-        Format::Text => write_text(&tree, &view, &mut stdout, context)?,
+        Format::Text => write_text(&tree, &view, snapshot, &mut stdout, context)?,
     }
     Ok(completeness(&status, &context.err))
 }
@@ -197,9 +198,11 @@ impl<'a> Entry<'a> {
 
 const SIZE_WIDTH: usize = 9;
 
+/// `snapshot`: the tree was loaded from a saved snapshot, not scanned now.
 fn write_text(
     tree: &FileTree,
     view: &View<'_>,
+    snapshot: bool,
     destination: &mut impl Write,
     context: &Context,
 ) -> Result<()> {
@@ -214,16 +217,21 @@ fn write_text(
         paint(styles.heading, escape_filename(tree.root_path.as_os_str())),
         paint(styles.size, context.size(view.total.size))
     )?;
+    let when = if snapshot {
+        let saved: chrono::DateTime<chrono::Local> = tree.scanned_at.into();
+        format!("from a snapshot taken {}", saved.format("%Y-%m-%d %H:%M"))
+    } else {
+        format!("scanned in {:.2}s", tree.scan_duration.as_secs_f64())
+    };
     writeln!(
         out,
         "{}",
         paint(
             styles.dim,
             format!(
-                "{}, {}, scanned in {:.2}s",
+                "{}, {}, {when}",
                 counted(view.total.files, "file", "files"),
                 counted(view.total.directories, "directory", "directories"),
-                tree.scan_duration.as_secs_f64()
             )
         )
     )?;
@@ -365,7 +373,7 @@ mod tests {
         let context = Context::plain(CancellationToken::new());
         let view = View::build(tree, depth, limit, &context.cancel).unwrap();
         let mut output = Vec::new();
-        write_text(tree, &view, &mut output, &context).unwrap();
+        write_text(tree, &view, false, &mut output, &context).unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -461,7 +469,7 @@ mod tests {
             token: context.cancel.clone(),
             bytes: Vec::new(),
         };
-        assert!(write_text(&tree, &view, &mut writer, &context).is_err());
+        assert!(write_text(&tree, &view, false, &mut writer, &context).is_err());
         assert_eq!(
             writer.bytes.iter().filter(|byte| **byte == b'\n').count(),
             1
@@ -483,7 +491,7 @@ mod tests {
         let tree = sample();
         let context = Context::plain(CancellationToken::new());
         let view = View::build(&tree, 1, 0, &context.cancel).unwrap();
-        let error = write_text(&tree, &view, &mut Broken, &context).unwrap_err();
+        let error = write_text(&tree, &view, false, &mut Broken, &context).unwrap_err();
         assert!(crate::is_broken_pipe(&error));
     }
 

@@ -117,7 +117,7 @@ pub enum InitShell {
 #[derive(Debug, Clone, Args)]
 #[command(next_help_heading = "Scanning")]
 pub struct ScanArgs {
-    /// Directory to scan
+    /// Directory to scan, or a snapshot saved by `grav export` or `ncdu -o`
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -159,6 +159,21 @@ pub struct ScanArgs {
 }
 
 impl ScanArgs {
+    /// Options given that only make sense when walking a filesystem.
+    pub fn walk_only_options(&self) -> Vec<&'static str> {
+        [
+            (self.follow_symlinks, "--follow-symlinks"),
+            (self.cross_fs, "--cross-fs"),
+            (self.no_hidden, "--no-hidden"),
+            (!self.exclude.is_empty(), "--exclude"),
+            (self.threads.is_some(), "--threads"),
+            (self.git, "--git"),
+        ]
+        .into_iter()
+        .filter_map(|(given, name)| given.then_some(name))
+        .collect()
+    }
+
     pub fn config(&self, root: &Path) -> ScanConfig {
         let mut config = ScanConfig::new(root);
         config.apparent_size = self.apparent_size;
@@ -193,6 +208,14 @@ pub enum Format {
     Text,
     /// Versioned JSON (see `schema_version`)
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    /// The complete tree in versioned JSON, readable by every grav command
+    Json,
+    /// An ncdu dump, readable by `ncdu -f` and `gdu -f`
+    Ncdu,
 }
 
 #[derive(Debug, Args)]
@@ -275,7 +298,12 @@ pub struct ExportCommand {
     #[command(flatten)]
     pub scan: ScanArgs,
 
-    /// Write to FILE instead of standard output; replaced atomically
+    /// Snapshot format
+    #[arg(short, long, value_enum, default_value_t = ExportFormat::Json, help_heading = "Output")]
+    pub format: ExportFormat,
+
+    /// Write to FILE instead of standard output, replacing it atomically;
+    /// compressed with zstd if FILE ends in .zst
     #[arg(short, long, value_name = "FILE", help_heading = "Output")]
     pub output: Option<PathBuf>,
 

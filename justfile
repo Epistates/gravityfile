@@ -49,3 +49,7 @@ smoke: release
 
 # Everything CI runs, locally
 ci: lint test doc msrv supply-chain smoke
+
+# Check ncdu dump compatibility against ncdu itself (needs ncdu and jq)
+ncdu-interop: build
+    scripts/ncdu-interop.sh target/debug/grav

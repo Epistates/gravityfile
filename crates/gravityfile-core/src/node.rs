@@ -205,7 +205,12 @@ pub struct FileNode {
     /// Size in bytes: disk usage, or apparent length when the scan used
     /// apparent sizes. Directories aggregate their contents and their own
     /// allocation; additional hard links to a counted file contribute zero.
+    /// Derived from `len` and `blocks`; see [`FileNode::remeasure`].
     pub size: u64,
+
+    /// Apparent length of this entry itself (`st_size`), not aggregated.
+    #[serde(default)]
+    pub len: u64,
 
     /// 512-byte blocks allocated to this entry itself (not aggregated).
     pub blocks: u64,
@@ -231,6 +236,7 @@ impl fmt::Debug for FileNode {
             .field("native_name", &self.native_name)
             .field("kind", &self.kind)
             .field("size", &self.size)
+            .field("len", &self.len)
             .field("blocks", &self.blocks)
             .field("timestamps", &self.timestamps)
             .field("inode", &self.inode)
@@ -270,6 +276,7 @@ impl Clone for FileNode {
                 native_name,
                 kind,
                 size,
+                len,
                 blocks,
                 timestamps,
                 inode,
@@ -281,6 +288,7 @@ impl Clone for FileNode {
                 native_name: native_name.clone(),
                 kind: kind.clone(),
                 size: *size,
+                len: *len,
                 blocks: *blocks,
                 timestamps: *timestamps,
                 inode: *inode,
@@ -370,6 +378,7 @@ impl FileNode {
         Self::leaf(name, kind, 0, 0, timestamps)
     }
 
+    /// A childless node whose apparent length is `size`.
     fn leaf(
         name: impl Into<CompactString>,
         kind: NodeKind,
@@ -382,6 +391,7 @@ impl FileNode {
             native_name: None,
             kind,
             size,
+            len: size,
             blocks,
             timestamps,
             inode: None,
@@ -491,6 +501,76 @@ impl FileNode {
         self.update_counts();
         self.sort_children_by_size();
     }
+
+    /// This entry's own size under `apparent`: its length, or its allocated
+    /// blocks. Symbolic links count as zero, as in a scan.
+    pub fn own_size(&self, apparent: bool) -> u64 {
+        match self.kind {
+            NodeKind::Symlink { .. } => 0,
+            _ if apparent => self.len,
+            _ => self.blocks.saturating_mul(512),
+        }
+    }
+
+    /// Recompute every `size` below and including this node from the entries'
+    /// own lengths and blocks, then re-sort children by size.
+    ///
+    /// A multiply linked file (one with an `inode`) counts once, at its first
+    /// occurrence in the current child order, unless `count_hard_links`.
+    /// Iterative, so deep trees cannot exhaust the stack.
+    pub fn remeasure(&mut self, apparent: bool, count_hard_links: bool) {
+        let mut seen = std::collections::HashSet::new();
+        let mut counted = |node: &FileNode| match node.inode {
+            Some(identity) if !count_hard_links && !seen.insert(identity) => 0,
+            _ => node.own_size(apparent),
+        };
+        self.size = counted(self);
+        // A directory's children are taken out while they are measured and
+        // put back, sorted, once all of them are done.
+        struct Frame {
+            children: Vec<FileNode>,
+            next: usize,
+            total: u64,
+        }
+        let mut stack = vec![Frame {
+            children: std::mem::take(&mut self.children),
+            next: 0,
+            total: 0,
+        }];
+        while let Some(frame) = stack.last_mut() {
+            if let Some(child) = frame.children.get_mut(frame.next) {
+                frame.next += 1;
+                child.size = counted(child);
+                if child.children.is_empty() {
+                    frame.total = frame.total.saturating_add(child.size);
+                } else {
+                    let children = std::mem::take(&mut child.children);
+                    stack.push(Frame {
+                        children,
+                        next: 0,
+                        total: 0,
+                    });
+                }
+                continue;
+            }
+            let Frame {
+                mut children,
+                total,
+                ..
+            } = stack.pop().expect("active frame");
+            children.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.compare_name(b)));
+            let directory = match stack.last_mut() {
+                Some(parent) => &mut parent.children[parent.next - 1],
+                None => &mut *self,
+            };
+            directory.size = directory.size.saturating_add(total);
+            directory.children = children;
+            let size = directory.size;
+            if let Some(parent) = stack.last_mut() {
+                parent.total = parent.total.saturating_add(size);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -502,11 +582,76 @@ mod tests {
         // Every scanned entry is a node; growth here multiplies across
         // millions of files.
         assert!(
-            std::mem::size_of::<FileNode>() <= 144,
+            std::mem::size_of::<FileNode>() <= 152,
             "{}",
             std::mem::size_of::<FileNode>()
         );
         assert!(std::mem::size_of::<NodeKind>() <= 24);
+    }
+
+    fn file(name: &str, len: u64, blocks: u64) -> FileNode {
+        FileNode::new_file(
+            name,
+            len,
+            blocks,
+            Timestamps::with_modified(SystemTime::UNIX_EPOCH),
+            false,
+        )
+    }
+
+    fn directory(name: &str, blocks: u64, children: Vec<FileNode>) -> FileNode {
+        let mut node =
+            FileNode::new_directory(name, Timestamps::with_modified(SystemTime::UNIX_EPOCH));
+        node.len = 64;
+        node.blocks = blocks;
+        node.children = children;
+        node
+    }
+
+    #[test]
+    fn remeasure_switches_measures_and_counts_hard_links_once() {
+        let mut linked = file("linked", 1000, 8);
+        linked.inode = Some(InodeInfo::new(7, 1));
+        let mut tree = directory(
+            "root",
+            1,
+            vec![
+                directory("a", 1, vec![linked.clone(), file("small", 10, 1)]),
+                directory("b", 1, vec![linked]),
+                FileNode::new_symlink(
+                    "link",
+                    "a",
+                    false,
+                    Timestamps::with_modified(SystemTime::UNIX_EPOCH),
+                ),
+            ],
+        );
+        tree.remeasure(false, false);
+        assert_eq!(tree.size, 512 * (1 + 1 + 8 + 1 + 1));
+        assert_eq!(tree.children[0].name, "a", "the counted copy sorts first");
+        assert_eq!(tree.children[0].size, 512 * 10);
+        assert_eq!(tree.children[1].size, 512);
+        tree.remeasure(true, false);
+        assert_eq!(tree.size, 64 * 3 + 1000 + 10);
+        tree.remeasure(true, true);
+        assert_eq!(tree.size, 64 * 3 + 2000 + 10);
+    }
+
+    #[test]
+    fn remeasure_handles_deep_trees_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut node = file("leaf", 1, 1);
+                for _ in 0..20_000 {
+                    node = directory("d", 1, vec![node]);
+                }
+                node.remeasure(false, false);
+                assert_eq!(node.size, 512 * 20_001);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
@@ -697,6 +842,7 @@ mod tests {
                 broken: false,
             },
             size: 0,
+            len: 0,
             blocks: 0,
             timestamps: Timestamps::with_modified(now),
             inode: None,

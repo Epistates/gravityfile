@@ -14,6 +14,11 @@ tokio = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true }
 globset.workspace = true
 git2 = { workspace = true, optional = true }
+serde.workspace = true
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+serde_stacker.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
 
 [features]
 default = ["git"]

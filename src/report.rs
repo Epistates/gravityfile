@@ -144,13 +144,13 @@ pub fn write_json_report(
     destination: &mut impl Write,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    write_json_report_with(destination, cancel, |writer| {
+    write_report_with(destination, cancel, |writer| {
         serde_json::to_writer_pretty(writer, value)?;
         Ok(())
     })
 }
 
-pub fn write_json_report_with(
+pub fn write_report_with(
     destination: &mut impl Write,
     cancel: &CancellationToken,
     encode: impl FnOnce(&mut dyn Write) -> Result<()>,
@@ -177,30 +177,32 @@ pub fn write_json_report_with(
     Ok(())
 }
 
-/// Publish a complete JSON document from the same filesystem. Serialization or
-/// write failures leave an existing report intact; a final symlink is replaced,
-/// never followed. Keep the temporary file private because scans expose paths.
 #[cfg(test)]
 fn write_json_atomic(
     path: &Path,
     value: &impl serde::Serialize,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    write_json_atomic_with(path, cancel, |writer| {
+    publish_atomic(path, cancel, |writer| {
         serde_json::to_writer_pretty(writer, value)?;
         Ok(())
     })
 }
 
-pub fn write_json_atomic_with(
+/// Write what `encode` produces, plus a final newline, to `path`, publishing
+/// it only once complete: a private temporary file beside `path` is written,
+/// synced and renamed into place. Any failure first leaves an existing file
+/// intact; a symlink at `path` is replaced, never followed. A `.zst` path is
+/// compressed with zstd.
+pub fn publish_atomic(
     path: &Path,
     cancel: &CancellationToken,
     encode: impl FnOnce(&mut dyn Write) -> Result<()>,
 ) -> Result<()> {
-    write_json_atomic_with_sync(path, cancel, encode, StagedExport::sync_parent)
+    publish_atomic_with_sync(path, cancel, encode, StagedExport::sync_parent)
 }
 
-fn write_json_atomic_with_sync(
+fn publish_atomic_with_sync(
     path: &Path,
     cancel: &CancellationToken,
     encode: impl FnOnce(&mut dyn Write) -> Result<()>,
@@ -213,8 +215,17 @@ fn write_json_atomic_with_sync(
             output: staged.file_mut(),
             cancel,
         });
-        encode(&mut writer)?;
-        writeln!(writer)?;
+        if path.extension().is_some_and(|extension| extension == "zst") {
+            let mut compressed = zstd::stream::write::Encoder::new(&mut writer, 3)?;
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            compressed.multithread(threads as u32)?;
+            encode(&mut compressed)?;
+            writeln!(compressed)?;
+            compressed.finish()?;
+        } else {
+            encode(&mut writer)?;
+            writeln!(writer)?;
+        }
         writer.flush()?;
     }
     check_report_cancel(cancel)?;
@@ -407,7 +418,7 @@ mod tests {
         let output = directory.path().join("report.json");
         std::fs::write(&output, b"old report").unwrap();
         let token = CancellationToken::new();
-        let error = write_json_atomic_with_sync(
+        let error = publish_atomic_with_sync(
             &output,
             &token,
             |writer| Ok(writer.write_all(b"[1,2,3]")?),
@@ -449,7 +460,7 @@ mod tests {
                 let output = parent.join("report.json");
                 std::fs::write(&output, b"original").unwrap();
                 let mut staging_name = None;
-                let result = write_json_atomic_with(&output, &CancellationToken::new(), |writer| {
+                let result = publish_atomic(&output, &CancellationToken::new(), |writer| {
                     let name = std::fs::read_dir(&parent)
                         .unwrap()
                         .map(|entry| entry.unwrap().file_name())
@@ -521,7 +532,7 @@ mod tests {
         let output = directory.path().join("report.json");
         std::fs::create_dir(&output).unwrap();
         std::fs::write(output.join("keep"), b"original").unwrap();
-        let error = write_json_atomic_with_sync(
+        let error = publish_atomic_with_sync(
             &output,
             &CancellationToken::new(),
             |writer| Ok(writer.write_all(b"[]")?),

@@ -7,7 +7,7 @@ pub mod scan;
 pub mod shell;
 
 use color_eyre::Result;
-use color_eyre::eyre::Context as _;
+use color_eyre::eyre::{Context as _, eyre};
 use gravityfile_core::units::Units;
 use gravityfile_core::{FileTree, escape_filename};
 use tokio_util::sync::CancellationToken;
@@ -47,8 +47,29 @@ pub fn counted(count: u64, one: &str, many: &str) -> String {
     format!("{} {noun}", gravityfile_core::units::format_count(count))
 }
 
-/// Scan the directory named by `args`.
+/// Whether `args` names a saved snapshot rather than a directory to scan.
+pub fn is_snapshot(args: &ScanArgs) -> bool {
+    std::fs::metadata(&args.path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Scan the directory named by `args`, or read the snapshot it names.
 pub fn scan_tree(args: &ScanArgs, context: &Context) -> Result<FileTree> {
+    if is_snapshot(args) {
+        let ignored = args.walk_only_options();
+        if !ignored.is_empty() {
+            return Err(eyre!(
+                "{} cannot be used with a snapshot, which was already scanned",
+                ignored.join(", ")
+            ));
+        }
+        let options = gravityfile_scan::snapshot::ImportOptions {
+            apparent: args.apparent_size,
+            count_hard_links: args.count_links,
+            max_entries: args.max_entries,
+        };
+        return gravityfile_scan::snapshot::read(&args.path, &options)
+            .wrap_err_with(|| format!("cannot load {}", escape_filename(args.path.as_os_str())));
+    }
     let root = args
         .path
         .canonicalize()

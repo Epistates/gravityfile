@@ -23,17 +23,31 @@ fn field(writer: &mut dyn Write, name: &str, value: &impl Serialize) -> Result<(
 }
 
 fn begin_node(writer: &mut dyn Write, node: &FileNode) -> Result<()> {
+    // Exhaustive, so a new node field cannot be silently left out of exports.
+    let FileNode {
+        name,
+        native_name,
+        kind,
+        size,
+        len,
+        blocks,
+        timestamps,
+        inode,
+        git_status,
+        children: _,
+    } = node;
     writer.write_all(b"{\"name\":")?;
-    serde_json::to_writer(&mut *writer, &node.name)?;
-    if node.native_name.is_some() {
-        field(writer, "native_name", &node.native_name)?;
+    serde_json::to_writer(&mut *writer, name)?;
+    if native_name.is_some() {
+        field(writer, "native_name", native_name)?;
     }
-    field(writer, "kind", &node.kind)?;
-    field(writer, "size", &node.size)?;
-    field(writer, "blocks", &node.blocks)?;
-    field(writer, "timestamps", &node.timestamps)?;
-    field(writer, "inode", &node.inode)?;
-    field(writer, "git_status", &node.git_status)?;
+    field(writer, "kind", kind)?;
+    field(writer, "size", size)?;
+    field(writer, "len", len)?;
+    field(writer, "blocks", blocks)?;
+    field(writer, "timestamps", timestamps)?;
+    field(writer, "inode", inode)?;
+    field(writer, "git_status", git_status)?;
     writer.write_all(b",\"children\":[")?;
     Ok(())
 }
@@ -84,7 +98,7 @@ pub(crate) fn write(writer: &mut dyn Write, envelope: &ReportEnvelope<'_, FileTr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{scan_status, write_json_atomic_with, write_json_report_with};
+    use crate::report::{publish_atomic, scan_status, write_report_with};
     use gravityfile_core::{GitStatus, NodeKind, Timestamps};
     use tokio_util::sync::CancellationToken;
 
@@ -161,11 +175,9 @@ mod tests {
                 tree.root = root;
                 let output = encoded(&tree, |output, envelope| {
                     let mut destination = Vec::new();
-                    write_json_report_with(
-                        &mut destination,
-                        &CancellationToken::new(),
-                        |writer| write(writer, envelope),
-                    )?;
+                    write_report_with(&mut destination, &CancellationToken::new(), |writer| {
+                        write(writer, envelope)
+                    })?;
                     output.write_all(&destination)?;
                     Ok(())
                 });
@@ -191,14 +203,14 @@ mod tests {
             Ok(())
         };
         let mut output = Vec::new();
-        assert!(write_json_report_with(&mut output, &token, encode).is_err());
+        assert!(write_report_with(&mut output, &token, encode).is_err());
         assert!(output.is_empty());
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("report.json");
         std::fs::write(&destination, b"previous").unwrap();
         let token = CancellationToken::new();
         assert!(
-            write_json_atomic_with(&destination, &token, |writer| {
+            publish_atomic(&destination, &token, |writer| {
                 write(writer, &envelope)?;
                 token.cancel();
                 Ok(())
