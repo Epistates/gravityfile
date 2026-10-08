@@ -519,3 +519,37 @@ fn parser_errors_escape_control_arguments_and_keep_exit_status() {
         );
     }
 }
+
+#[test]
+fn logging_is_opt_in() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("file"), b"data").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let run = |extra: &[&std::ffi::OsStr]| {
+        Command::new(env!("CARGO_BIN_EXE_grav"))
+            .arg("scan")
+            .arg(fixture.path())
+            .args(extra)
+            .env("TMPDIR", temp.path())
+            .env_remove("RUST_LOG")
+            .env_remove("GRAVITYFILE_LOG_FILE")
+            .output()
+            .unwrap()
+    };
+    let output = run(&[]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read_dir(temp.path()).unwrap().count(),
+        0,
+        "no stray log files"
+    );
+
+    let log = temp.path().join("grav.log");
+    let output = run(&["--log-file".as_ref(), log.as_os_str()]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("Starting gravityfile")
+    );
+}

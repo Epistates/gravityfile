@@ -111,6 +111,10 @@ pub struct App {
     /// Images are encoded to fit this, so it is captured during draw and used
     /// by the next preview load. `Cell` because rendering takes `&self`.
     preview_area: std::cell::Cell<ratatui::layout::Size>,
+    /// Scroll offsets computed by the last render (tree, miller). Rendering
+    /// is `&self`, so these are adopted into the view states after each frame;
+    /// mouse hit-testing depends on them matching what is on screen.
+    rendered_offsets: std::cell::Cell<(usize, usize)>,
     /// Scanned file tree.
     ///
     /// Shared rather than owned: `FileTree::clone` is a deep copy of every
@@ -140,6 +144,9 @@ pub struct App {
     /// Clipboard state for yank/cut/paste.
     clipboard: ClipboardState,
     active_paste_mode: ClipboardMode,
+    /// Whether the current marks were added by `d` itself (so a declined
+    /// confirmation removes them) rather than by the user.
+    delete_auto_marked: bool,
     /// Undo log for reversible operations.
     undo_log: UndoLog,
     /// Disposal of items replaced by an approved overwrite.
@@ -318,6 +325,7 @@ impl App {
             theme: Theme::dark(),
             image_picker: None,
             preview_area: std::cell::Cell::new(ratatui::layout::Size::new(40, 20)),
+            rendered_offsets: std::cell::Cell::new((0, 0)),
             tree: quick_tree.map(Arc::new),
             tree_state: TreeState::new(path.clone()),
             cached_tree_len: 0,
@@ -334,6 +342,7 @@ impl App {
             marked: HashSet::new(),
             clipboard: ClipboardState::default(),
             active_paste_mode: ClipboardMode::Empty,
+            delete_auto_marked: false,
             undo_log: UndoLog::new(100),
             replace_policy: config.replace_policy,
             layout_mode: LayoutMode::default(),
@@ -517,6 +526,7 @@ impl App {
         while self.mode != AppMode::Quit {
             if self.needs_redraw {
                 terminal.draw(|frame| self.draw(frame))?;
+                self.adopt_rendered_offsets();
                 self.needs_redraw = false;
             }
 
@@ -1594,8 +1604,11 @@ impl App {
                         self.execute_deletion();
                     }
                     KeyAction::Quit | KeyAction::Cancel => {
-                        // Clear marks if user cancels (they may have been auto-marked)
-                        self.marked.clear();
+                        // Drop only the marks `d` added itself; hand-made
+                        // selections survive a declined confirmation.
+                        if std::mem::take(&mut self.delete_auto_marked) {
+                            self.marked.clear();
+                        }
                         self.mode = AppMode::Normal;
                     }
                     _ => {}
@@ -1822,6 +1835,7 @@ impl App {
             // File operations
             KeyAction::Delete => {
                 // If nothing marked, auto-mark items for deletion based on current view
+                self.delete_auto_marked = self.marked.is_empty();
                 if self.marked.is_empty() {
                     if self.view == View::Duplicates {
                         // In duplicates view, special handling
@@ -1854,18 +1868,24 @@ impl App {
                                 Vec::new()
                             };
                         for path in paths_to_mark {
-                            self.marked.insert(path);
+                            self.mark(path);
                         }
                     } else if self.view == View::Errors {
-                        // In Errors view, get the selected warning's path
-                        if let Some(warning) = self.displayed_warning(self.selected_warning) {
-                            // Only allow deleting broken symlinks, not permission errors etc.
-                            if warning.kind == gravityfile_core::WarningKind::BrokenSymlink {
-                                self.marked.insert(warning.path.clone());
-                            }
+                        // Only broken symlinks are deletable from the Errors view.
+                        if let Some(warning) = self.displayed_warning(self.selected_warning)
+                            && warning.kind == gravityfile_core::WarningKind::BrokenSymlink
+                        {
+                            let path = warning.path.clone();
+                            self.mark(path);
                         }
-                    } else if let Some(path) = self.get_selected_path() {
-                        self.marked.insert(path);
+                    } else if let Some(path) = self.get_selected_path()
+                        && !self.mark(path)
+                    {
+                        self.operation_message = Some((
+                            false,
+                            "The scanned or viewed directory cannot be deleted from here"
+                                .to_string(),
+                        ));
                     }
                 }
                 if !self.marked.is_empty() {
@@ -2039,10 +2059,9 @@ impl App {
                             self.marked.remove(path);
                         }
                     } else {
-                        for path in &group.paths {
-                            if path != &self.path {
-                                self.marked.insert(path.clone());
-                            }
+                        // Always keep one copy, matching `d` on a header.
+                        for path in group.paths.iter().skip(1) {
+                            self.mark(path.clone());
                         }
                     }
                     return;
@@ -2075,21 +2094,19 @@ impl App {
         };
 
         if let Some(path) = path
-            && path != self.path
+            && !self.marked.remove(&path)
         {
-            if self.marked.contains(&path) {
-                self.marked.remove(&path);
-            } else {
-                self.marked.insert(path);
-            }
+            self.mark(path);
         }
     }
 
     /// Execute deletion of all marked items asynchronously.
     fn execute_deletion(&mut self) {
+        self.delete_auto_marked = false;
         let paths_with_sizes: Vec<(PathBuf, u64)> = self
             .marked
             .iter()
+            .filter(|path| !self.is_protected(path))
             .map(|p| (p.clone(), self.get_path_size(p).unwrap_or(0)))
             .collect();
 
@@ -4350,35 +4367,32 @@ impl App {
                 self.execute_bulk_rename();
             }
             KeyCode::Char('e') => {
-                // Re-edit the names
-                if let Some(state) = &self.bulk_rename_state {
-                    // Create temp file with current names
-                    let temp_dir = std::env::temp_dir();
-                    let temp_file =
-                        temp_dir.join(format!("gravityfile-rename-{}.txt", std::process::id()));
-
-                    let content: String = state
-                        .entries
-                        .iter()
-                        .map(|e| e.new_name.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    if std::fs::write(&temp_file, &content).is_ok() {
-                        let editor = std::env::var("EDITOR")
-                            .or_else(|_| std::env::var("VISUAL"))
-                            .unwrap_or_else(|_| "vi".to_string());
-
-                        let mut cmd = std::process::Command::new(&editor);
-                        cmd.arg(&temp_file);
-
-                        // Store temp file path
-                        if let Some(state) = &mut self.bulk_rename_state {
-                            state.error = Some(temp_file.to_string_lossy().to_string());
-                        }
-
-                        self.pending_suspend_command = Some(cmd);
+                // Re-open the pending names in the configured editor through
+                // the same private, validated handoff as the first edit.
+                let Some(state) = self.bulk_rename_state.take() else {
+                    return;
+                };
+                let (paths, names) = state
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.original, entry.new_name))
+                    .unzip();
+                let prepared = bulk_edit::BulkRenameEdit::with_names(paths, names)
+                    .map_err(|error| format!("Cannot prepare bulk rename: {error}"))
+                    .and_then(|edit| {
+                        crate::opener::editor_command(edit.path(), &self.user_settings.editor)
+                            .map(|command| (edit, command))
+                            .map_err(|error| {
+                                format!("Cannot configure bulk rename editor: {error}")
+                            })
+                    });
+                self.mode = AppMode::Normal;
+                match prepared {
+                    Ok((edit, command)) => {
+                        self.bulk_rename_edit = Some(edit);
+                        self.pending_suspend_command = Some(command);
                     }
+                    Err(error) => self.error = Some(error),
                 }
             }
             _ => {}
@@ -4450,8 +4464,9 @@ impl App {
             // Quick actions while in visual mode
             (KeyCode::Char('d'), KeyModifiers::NONE)
             | (KeyCode::Char('D'), KeyModifiers::SHIFT) => {
-                // Delete selected range
+                // Delete selected range; the user chose these marks.
                 self.apply_visual_selection_as_marks();
+                self.delete_auto_marked = false;
                 self.visual_state = None;
                 self.mode = AppMode::Normal;
                 // Now trigger delete confirmation
@@ -4538,10 +4553,29 @@ impl App {
             }
         };
 
-        // Now mark all the collected paths
         for path in paths_to_mark {
-            self.marked.insert(path);
+            self.mark(path);
         }
+    }
+
+    /// Keep the scroll offsets the last frame actually used.
+    fn adopt_rendered_offsets(&mut self) {
+        (self.tree_state.offset, self.miller_state.offset) = self.rendered_offsets.get();
+    }
+
+    /// Paths the UI never operates on destructively: the scan root, the
+    /// directory being viewed, and any ancestor of either.
+    fn is_protected(&self, path: &Path) -> bool {
+        self.path.starts_with(path) || self.view_root.starts_with(path)
+    }
+
+    /// Mark `path` unless it is protected. Returns whether it is now marked.
+    fn mark(&mut self, path: PathBuf) -> bool {
+        if self.is_protected(&path) {
+            return false;
+        }
+        self.marked.insert(path);
+        true
     }
 
     /// Handle a mouse action.
@@ -5549,6 +5583,100 @@ mod tests {
         assert!(app.error.as_deref().unwrap().contains("press u to retry"));
         let (success, message) = app.operation_message.clone().unwrap();
         assert!(!success && message.contains("undo incomplete"));
+    }
+
+    #[tokio::test]
+    async fn delete_and_marks_never_target_the_scan_root() {
+        let (_dir, mut app) = scanned_app();
+        app.tree_state.selected = 0;
+        assert_eq!(app.get_selected_path().unwrap(), app.view_root);
+        app.handle_action(KeyAction::Delete);
+        assert!(app.marked.is_empty());
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.operation_message.as_ref().unwrap().0);
+        app.handle_action(KeyAction::ToggleMark);
+        assert!(app.marked.is_empty());
+        app.marked.insert(app.path.clone());
+        app.marked.insert(app.path.parent().unwrap().to_path_buf());
+        app.mode = AppMode::ConfirmDelete;
+        app.handle_action(KeyAction::Confirm);
+        assert!(
+            app.pending_deletion.is_none(),
+            "protected paths must be filtered out before deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn declining_a_delete_keeps_hand_made_marks() {
+        let (_dir, mut app) = scanned_app();
+        let chosen = app.path.join("copy-a.bin");
+        app.marked.insert(chosen.clone());
+        app.handle_action(KeyAction::Delete);
+        assert_eq!(app.mode, AppMode::ConfirmDelete);
+        app.handle_action(KeyAction::Cancel);
+        assert!(
+            app.marked.contains(&chosen),
+            "user marks survive a declined delete"
+        );
+
+        app.marked.clear();
+        app.tree_state.selected = tree_row(&app, "copy-a.bin");
+        app.handle_action(KeyAction::Delete);
+        assert_eq!(app.mode, AppMode::ConfirmDelete);
+        app.handle_action(KeyAction::Cancel);
+        assert!(app.marked.is_empty(), "the automatic mark is dropped");
+    }
+
+    #[tokio::test]
+    async fn marking_a_duplicate_group_keeps_one_copy() {
+        use gravityfile_analyze::{AnalysisStatus, DuplicateGroup, DuplicateReport};
+        let (_dir, mut app) = scanned_app();
+        let paths = vec![app.path.join("copy-a.bin"), app.path.join("copy-b.bin")];
+        let report = Arc::new(DuplicateReport {
+            status: AnalysisStatus::default(),
+            groups: vec![DuplicateGroup {
+                hash: gravityfile_core::ContentHash::new([0; 32]),
+                size: 8192,
+                paths: paths.clone(),
+                wasted_bytes: 8192,
+            }],
+            total_duplicate_size: 16384,
+            total_wasted_space: 8192,
+            files_analyzed: 2,
+            files_with_duplicates: 2,
+            group_count: 1,
+            groups_omitted: 0,
+        });
+        let counts =
+            duplicate_filter::prepare_counts(&report, &app.path, &CancellationToken::new())
+                .unwrap();
+        app.duplicate_filter.seed(&report, app.path.clone(), counts);
+        app.duplicates = Some(report);
+        app.view = View::Duplicates;
+        app.handle_action(KeyAction::ToggleMark);
+        assert_eq!(app.marked, HashSet::from([paths[1].clone()]));
+        app.handle_action(KeyAction::ToggleMark);
+        assert!(app.marked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clicks_hit_the_row_on_screen_after_scrolling() {
+        let (_dir, mut app) = scanned_app();
+        let src = tree_row(&app, "src");
+        app.tree_state.selected = src;
+        app.toggle_selected();
+        let area = Rect::new(0, 0, 80, 12);
+        app.tree_state.selected = app.cached_tree_len - 1;
+        render(&app, area);
+        app.adopt_rendered_offsets();
+        let offset = app.tree_state.offset;
+        assert!(offset > 0, "the selection forced a scroll");
+        let top = app.estimated_list_top_row();
+        app.handle_mouse_action(MouseAction::Click { x: 5, y: top });
+        assert_eq!(
+            app.tree_state.selected, offset,
+            "the first visible row was hit"
+        );
     }
 
     #[test]
@@ -7353,6 +7481,7 @@ mod tests {
     async fn delete_requires_confirmation_and_cancelling_drops_the_auto_mark() {
         let (_dir, mut app) = scanned_app();
         assert!(app.marked.is_empty());
+        app.tree_state.selected = tree_row(&app, "copy-a.bin");
 
         app.handle_action(KeyAction::Delete);
         assert_eq!(app.mode, AppMode::ConfirmDelete);
@@ -7436,7 +7565,8 @@ mod tests {
         assert!(app.marked.is_empty());
         app.duplicates_state.selected_in_group.insert(0, 0);
         app.toggle_mark();
-        assert_eq!(app.marked, paths.iter().cloned().collect());
+        // A header marks every copy but the first, like `d` on a header.
+        assert_eq!(app.marked, paths.iter().skip(1).cloned().collect());
         app.toggle_mark();
         assert!(app.marked.is_empty());
         app.marked.insert(paths[0].clone());

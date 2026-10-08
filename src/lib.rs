@@ -17,7 +17,7 @@ mod shutdown;
 mod terminal;
 mod tree_json;
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -225,6 +225,11 @@ struct Cli {
     #[arg(long, global = true)]
     envelope: bool,
 
+    /// Append diagnostic logs to this file (filter with RUST_LOG). Without it,
+    /// reports log to stderr only when RUST_LOG is set; the explorer does not log.
+    #[arg(long, global = true, value_name = "PATH", env = "GRAVITYFILE_LOG_FILE")]
+    log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -373,20 +378,8 @@ pub fn run() -> Result<()> {
         envelope: cli.envelope,
     };
 
-    // Initialize tracing
-    let (log_file, file) = create_log_file()?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_writer(std::sync::Arc::new(bounded_log::BoundedLog::new(file)))
-        .with_ansi(false)
-        .try_init()
-        .map_err(|error| eyre!("failed to initialize tracing: {error}"))?;
-
+    init_logging(cli.log_file.as_deref(), cli.command.is_none())?;
     tracing::info!("Starting gravityfile v{}", env!("CARGO_PKG_VERSION"));
-    tracing::info!("Log file: {}", escape_filename(log_file.as_os_str()));
 
     let observation = matches!(
         &cli.command,
@@ -495,37 +488,37 @@ fn is_broken_pipe(error: &color_eyre::Report) -> bool {
     })
 }
 
-fn create_log_file() -> Result<(PathBuf, File)> {
-    let directory = std::env::temp_dir();
-    let process_id = std::process::id();
-
-    for attempt in 0..100 {
-        let path = directory.join(format!("gravityfile-{process_id}-{attempt}.log"));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).wrap_err_with(|| {
-                    format!(
-                        "failed to create log file {}",
-                        escape_filename(path.as_os_str())
-                    )
-                });
+/// Install logging only where it was asked for: an explicit log file, or
+/// stderr for report commands when `RUST_LOG` is set. The explorer owns the
+/// terminal, so it never logs to stderr.
+fn init_logging(log_file: Option<&Path>, explorer: bool) -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_ansi(false);
+    let result = match log_file {
+        Some(path) => {
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
+            let file = options.open(path).wrap_err_with(|| {
+                format!("cannot open log file {}", escape_filename(path.as_os_str()))
+            })?;
+            builder
+                .with_env_filter(filter())
+                .with_writer(std::sync::Arc::new(bounded_log::BoundedLog::new(file)))
+                .try_init()
         }
-    }
-
-    Err(eyre!(
-        "failed to reserve a unique log file in {}",
-        escape_filename(directory.as_os_str())
-    ))
+        None if !explorer && std::env::var_os("RUST_LOG").is_some() => builder
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .try_init(),
+        None => return Ok(()),
+    };
+    result.map_err(|error| eyre!("failed to initialize tracing: {error}"))
 }
 
 /// Run a quick scan and display summary.

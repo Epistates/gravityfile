@@ -378,12 +378,22 @@ impl AgeAnalyzer {
         total_age: &mut AgeSum,
         token: &CancellationToken,
     ) -> Option<SystemTime> {
-        // Frames preserve post-order aggregation without consuming the call stack.
-        let mut stack = vec![(node, current_path.to_path_buf(), 0usize, None::<SystemTime>)];
-        while let Some((node, path, next_child, newest)) = stack.last_mut() {
+        // Frames preserve post-order aggregation without consuming the call
+        // stack. Each frame also holds stale descendants that may yet be
+        // absorbed by a stale ancestor: only the outermost stale directory of
+        // a stale subtree is reported, so no bytes are counted twice.
+        let mut stack = vec![(
+            node,
+            current_path.to_path_buf(),
+            0usize,
+            None::<SystemTime>,
+            Vec::<StaleCandidate>::new(),
+        )];
+        while let Some((node, path, next_child, newest, stale_below)) = stack.last_mut() {
             if token.is_cancelled() {
                 return None;
             }
+            let mut stale_up = Vec::new();
             let completed = match &node.kind {
                 NodeKind::File { .. } => {
                     let modified = node.timestamps.modified;
@@ -406,35 +416,55 @@ impl AgeAnalyzer {
                     if let Some(child) = node.children.get(*next_child) {
                         *next_child += 1;
                         let child_path = path.join(child.file_name());
-                        stack.push((child, child_path, 0, None));
+                        stack.push((child, child_path, 0, None, Vec::new()));
                         continue;
                     }
-                    if node.size >= self.config.min_stale_size
-                        && let Some(modified) = *newest
-                    {
-                        let age = self
-                            .config
+                    let below = std::mem::take(stale_below);
+                    let age = newest.map(|modified| {
+                        self.config
                             .reference_time
                             .duration_since(modified)
-                            .unwrap_or(Duration::ZERO);
-                        if age >= self.config.stale_threshold {
-                            stale_dirs.add(path, node.size, age, *file_count);
+                            .unwrap_or(Duration::ZERO)
+                    });
+                    match age {
+                        Some(age) if age >= self.config.stale_threshold => {
+                            if node.size >= self.config.min_stale_size {
+                                // This directory subsumes every stale one below it.
+                                stale_up.push((path.clone(), node.size, age, *file_count));
+                            } else {
+                                stale_up = below;
+                            }
                         }
+                        // A recent file here means no ancestor can be stale,
+                        // so the candidates below are final.
+                        Some(_) => {
+                            for (path, size, age, files) in below {
+                                stale_dirs.add(&path, size, age, files);
+                            }
+                        }
+                        None => stale_up = below,
                     }
                     *newest
                 }
                 _ => None,
             };
             stack.pop();
-            if let Some((_, _, _, parent_newest)) = stack.last_mut() {
+            if let Some((_, _, _, parent_newest, parent_stale)) = stack.last_mut() {
                 *parent_newest = (*parent_newest).max(completed);
+                parent_stale.append(&mut stale_up);
             } else {
+                for (path, size, age, files) in stale_up {
+                    stale_dirs.add(&path, size, age, files);
+                }
                 return completed;
             }
         }
         None
     }
 }
+
+/// `(path, size, newest file age, file count)` of a stale directory.
+type StaleCandidate = (PathBuf, u64, Duration, u64);
 
 /// Retain only the requested largest stale directories. The heap root is the
 /// worst retained result: smallest size, then lexically greatest path.

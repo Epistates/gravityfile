@@ -740,6 +740,67 @@ fn test_age_analyzer_reports_stale_directories_sorted_and_limited() {
 }
 
 #[test]
+fn stale_directories_report_only_the_outermost_of_a_stale_subtree() {
+    let temp = TempDir::new().unwrap();
+    let root_path = temp.path();
+    let reference_time = SystemTime::UNIX_EPOCH + days(1_000);
+    let old = reference_time - days(500);
+    let root = test_dir(
+        1,
+        "root",
+        vec![
+            test_dir(
+                2,
+                "archive",
+                vec![test_dir(
+                    3,
+                    "2019",
+                    vec![
+                        test_dir(4, "photos", vec![test_file(5, "a.jpg", 3_000, old)]),
+                        test_file(6, "notes.txt", 1_000, old),
+                    ],
+                )],
+            ),
+            test_dir(
+                7,
+                "mixed",
+                vec![
+                    test_dir(8, "old", vec![test_file(9, "x", 2_000, old)]),
+                    test_file(10, "fresh", 10, reference_time - days(1)),
+                ],
+            ),
+            // Too small on its own, but subsumed by nothing: never reported.
+            test_dir(11, "tiny", vec![test_file(12, "t", 10, old)]),
+        ],
+    );
+    let tree = test_tree(root_path, root);
+    let config = AgeConfig::builder()
+        .reference_time(reference_time)
+        .stale_threshold(days(365))
+        .min_stale_size(1_000u64)
+        .buckets(vec![AgeBucket::new("Any", Duration::MAX)])
+        .build()
+        .unwrap();
+    let report = AgeAnalyzer::with_config(config)
+        .unwrap()
+        .analyze(&tree, CancellationToken::new());
+
+    let paths: Vec<_> = report
+        .stale_directories
+        .iter()
+        .map(|stale| stale.path.strip_prefix(root_path).unwrap().to_path_buf())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            std::path::PathBuf::from("archive"),
+            std::path::PathBuf::from("mixed/old")
+        ]
+    );
+    assert_eq!(report.total_stale_size(), 6_000, "no bytes counted twice");
+}
+
+#[test]
 fn test_age_analyzer_honors_pre_cancelled_token() {
     let temp = TempDir::new().unwrap();
     let reference_time = SystemTime::UNIX_EPOCH + days(100);

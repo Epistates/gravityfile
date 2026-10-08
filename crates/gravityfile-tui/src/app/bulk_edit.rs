@@ -11,20 +11,33 @@ pub(super) struct BulkRenameEdit {
 }
 
 impl BulkRenameEdit {
+    /// An edit list seeded with each path's current name, sorted by path.
     pub fn new(mut paths: Vec<PathBuf>) -> io::Result<Self> {
         paths.sort();
+        let names = paths
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Bulk rename editor requires UTF-8 filenames",
+                        )
+                    })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Self::with_names(paths, names)
+    }
+
+    /// An edit list seeded with `names` (one per path, same order), used to
+    /// re-open a pending rename for further editing.
+    pub fn with_names(paths: Vec<PathBuf>, names: Vec<String>) -> io::Result<Self> {
+        debug_assert_eq!(paths.len(), names.len());
         let mut content = String::new();
-        for path in &paths {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Bulk rename editor requires UTF-8 filenames",
-                    )
-                })?;
-            if gravityfile_core::escape_terminal_text(name) != name {
+        for name in &names {
+            if gravityfile_core::escape_terminal_text(name) != name.as_str() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Bulk rename editor cannot represent filenames containing controls or directional formatting",

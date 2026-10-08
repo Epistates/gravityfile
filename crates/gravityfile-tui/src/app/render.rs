@@ -73,6 +73,9 @@ fn duplicate_viewport(
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        // Views that are not drawn this frame keep their current offsets.
+        self.rendered_offsets
+            .set((self.tree_state.offset, self.miller_state.offset));
         // Fill entire area with theme background color
         let base_style = Style::default()
             .bg(self.theme.background)
@@ -579,6 +582,8 @@ impl App {
                         buf,
                         &mut tree_state,
                     );
+                    let (_, miller) = self.rendered_offsets.get();
+                    self.rendered_offsets.set((tree_state.offset, miller));
                 }
                 LayoutMode::Miller => {
                     // Record the preview column's inner size so the next image
@@ -613,6 +618,8 @@ impl App {
                         buf,
                         &mut miller_state,
                     );
+                    let (tree, _) = self.rendered_offsets.get();
+                    self.rendered_offsets.set((tree, miller_state.offset));
                 }
             }
         } else if let Some(error) = &self.error {

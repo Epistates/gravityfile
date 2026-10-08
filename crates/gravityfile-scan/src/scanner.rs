@@ -213,12 +213,13 @@ impl JwalkScanner {
         start: Instant,
         collection: &mut EntryCollection<'_>,
     ) -> Result<HashMap<PathBuf, Vec<EntryInfo>>, ScanError> {
-        // Use global rayon pool to avoid lingering threads from new pools.
         let parallelism = match config.threads {
-            0 => Parallelism::RayonDefaultPool {
-                busy_timeout: std::time::Duration::from_millis(100),
+            0 => Parallelism::RayonExistingPool {
+                pool: scan_pool(),
+                // The consumer never runs on this pool, so it cannot deadlock.
+                busy_timeout: None,
             },
-            n => Parallelism::RayonNewPool(n), // Explicit thread count still gets its own pool
+            n => Parallelism::RayonNewPool(n),
         };
 
         // Capture config fields needed in the closure.
@@ -1005,6 +1006,22 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+/// Thread pool shared by every scan. Kept separate from rayon's global pool so
+/// CPU-bound work there (hashing, sorting) can never starve a walk, which
+/// jwalk would otherwise report as an empty result.
+fn scan_pool() -> Arc<jwalk::rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Arc<jwalk::rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        Arc::new(
+            jwalk::rayon::ThreadPoolBuilder::new()
+                .thread_name(|index| format!("gravityfile-scan-{index}"))
+                .build()
+                .expect("scan thread pool"),
+        )
+    })
+    .clone()
 }
 
 // Cross-platform metadata helpers
