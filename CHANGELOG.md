@@ -96,6 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `default_layout` setting was ignored at startup.
 - Directory sizes in the tree were shifted out of their column.
 - Double-click enters a directory, as the help says.
+- **The explorer stays responsive on huge trees.** Marking files made every
+  frame walk the whole tree once per mark (over two seconds per frame with 100
+  marks in a million-file scan), and every frame rebuilt every visible row and
+  every entry of each Miller column. A frame now builds only the rows on screen:
+  under 3 ms at any scroll position, with or without marks.
+- The Miller parent column scrolls to keep the current directory in view.
 
 ## [0.3.1] - 2026-07-24
 

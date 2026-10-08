@@ -2207,15 +2207,15 @@ impl App {
                 if let Some((node, root_path)) = self.get_view_root_node() {
                     match self.layout_mode {
                         LayoutMode::Tree => {
-                            let items = TreeView::new(
+                            let selected = TreeView::new(
                                 node,
                                 &root_path,
                                 &self.theme,
                                 &self.marked,
                                 &self.clipboard,
                             )
-                            .flatten(&self.tree_state);
-                            items.get(self.tree_state.selected).map(|i| i.path.clone())
+                            .row(&self.tree_state, self.tree_state.selected);
+                            selected.as_ref().map(|i| i.path.clone())
                         }
                         LayoutMode::Miller => node
                             .children
@@ -2351,27 +2351,9 @@ impl App {
     }
 
     /// Get the size of a path from the tree.
+    /// The size of the entry at `target`, looked up by its path's components.
     fn get_path_size(&self, target: &Path) -> Option<u64> {
-        let tree = self.tree.as_ref()?;
-
-        fn find_size(
-            node: &gravityfile_core::FileNode,
-            target: &Path,
-            current: &Path,
-        ) -> Option<u64> {
-            if current == target {
-                return Some(node.size);
-            }
-            for child in &node.children {
-                let child_path = current.join(child.file_name());
-                if let Some(size) = find_size(child, target, &child_path) {
-                    return Some(size);
-                }
-            }
-            None
-        }
-
-        find_size(&tree.root, target, &tree.root_path)
+        Some(self.tree.as_ref()?.find(target)?.size)
     }
 
     /// Yank (copy) selected items to clipboard.
@@ -3230,9 +3212,10 @@ impl App {
 
     fn expand_selected(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                .flatten(&self.tree_state);
-            if let Some(item) = items.get(self.tree_state.selected) {
+            let selected =
+                TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                    .row(&self.tree_state, self.tree_state.selected);
+            if let Some(item) = selected.as_ref() {
                 // Lazy load directory contents if directory has no children
                 if matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. }) {
                     let needs_lazy_load = if let Some(tree) = &self.tree {
@@ -3260,9 +3243,10 @@ impl App {
     /// This provides vim-style navigation where 'h' goes up when there's nothing to collapse.
     fn collapse_selected(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                .flatten(&self.tree_state);
-            if let Some(item) = items.get(self.tree_state.selected) {
+            let selected =
+                TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                    .row(&self.tree_state, self.tree_state.selected);
+            if let Some(item) = selected.as_ref() {
                 // Check if this is an expanded directory
                 let is_expanded_dir = matches!(
                     item.node.kind,
@@ -3283,9 +3267,10 @@ impl App {
 
     fn toggle_selected(&mut self) {
         if let Some((node, root_path)) = self.get_view_root_node() {
-            let items = TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                .flatten(&self.tree_state);
-            if let Some(item) = items.get(self.tree_state.selected) {
+            let selected =
+                TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
+                    .row(&self.tree_state, self.tree_state.selected);
+            if let Some(item) = selected.as_ref() {
                 self.tree_state.toggle_expand(&item.path);
                 self.update_cached_tree_len();
             }
@@ -3337,17 +3322,15 @@ impl App {
         match self.layout_mode {
             LayoutMode::Tree => {
                 if let Some((view_node, view_path)) = self.get_view_root_node() {
-                    let items = TreeView::new(
+                    return TreeView::new(
                         view_node,
                         &view_path,
                         &self.theme,
                         &self.marked,
                         &self.clipboard,
                     )
-                    .flatten(&self.tree_state);
-                    return items
-                        .get(self.tree_state.selected)
-                        .map(|item| item.path.clone());
+                    .row(&self.tree_state, self.tree_state.selected)
+                    .map(|item| item.path);
                 }
                 None
             }
@@ -3403,15 +3386,15 @@ impl App {
             return;
         };
 
-        let items = TreeView::new(
+        let selected = TreeView::new(
             view_node,
             &view_path,
             &self.theme,
             &self.marked,
             &self.clipboard,
         )
-        .flatten(&self.tree_state);
-        let Some(item) = items.get(self.tree_state.selected) else {
+        .row(&self.tree_state, self.tree_state.selected);
+        let Some(item) = selected.as_ref() else {
             return;
         };
 
@@ -7706,6 +7689,87 @@ mod tests {
         app.duplicates_state.selected_group = usize::MAX;
         app.toggle_mark();
         assert!(app.marked.is_empty());
+    }
+
+    /// Manual release-mode measurement of explorer frames over a synthetic
+    /// million-file tree with a 200,000-file directory expanded.
+    #[tokio::test]
+    #[ignore = "manual million-file explorer benchmark; run with --release --ignored --nocapture"]
+    async fn explorer_frame_benchmark() {
+        use gravityfile_core::{FileNode, FileTree, ScanConfig, Timestamps, TreeStats};
+        let directory = tempfile::tempdir().unwrap();
+        let root_path = directory.path().canonicalize().unwrap();
+        let time = Timestamps::with_modified(std::time::UNIX_EPOCH);
+        let mut root = FileNode::new_directory("root", time);
+        root.set_file_name(root_path.file_name().unwrap());
+        for dir in 0..100 {
+            let mut node = FileNode::new_directory(format!("dir-{dir:03}"), time);
+            let files = if dir == 0 { 200_000 } else { 8_000 };
+            node.children = (0..files)
+                .map(|file| {
+                    FileNode::new_file(
+                        format!("file-{file:07}.bin"),
+                        (file as u64 * 7919) % 100_000,
+                        8,
+                        time,
+                        false,
+                    )
+                })
+                .collect();
+            root.children.push(node);
+        }
+        root.update_counts();
+        let mut tree = FileTree::new(
+            root,
+            root_path.clone(),
+            ScanConfig::new(&root_path),
+            TreeStats::new(),
+            std::time::Duration::ZERO,
+            Vec::new(),
+        );
+        tree.remeasure(true, true);
+        let mut app = App::with_config(root_path.clone(), crate::TuiConfig::default());
+        app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+        app.scan_rx = None;
+        app.tree_state.expand(&root_path.join("dir-000"));
+        app.update_cached_tree_len();
+        let area = Rect::new(0, 0, 160, 50);
+        let frame = |app: &App| {
+            let mut samples: Vec<f64> = (0..21)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    std::hint::black_box(render(app, area));
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            samples[10]
+        };
+        let tree_ms = frame(&app);
+        for file in 0..100 {
+            app.marked
+                .insert(root_path.join(format!("dir-001/file-{file:07}.bin")));
+        }
+        let marked_ms = frame(&app);
+        app.marked.clear();
+        app.tree_state.selected = 150_000;
+        let deep_ms = frame(&app);
+        let start = std::time::Instant::now();
+        app.handle_action(KeyAction::MoveDown);
+        let key_ms = start.elapsed().as_secs_f64() * 1000.0;
+        app.layout_mode = LayoutMode::Miller;
+        app.update_cached_miller_len();
+        let miller_ms = frame(&app);
+        app.view_root = root_path.join("dir-000");
+        app.update_cached_miller_len();
+        app.miller_state.selected = 150_000;
+        let miller_large_ms = frame(&app);
+        println!(
+            "explorer frame (median of 21), 1M files, 200k expanded: tree {tree_ms:.2} ms, \
+             with 100 marks {marked_ms:.2} ms, selection 150k deep {deep_ms:.2} ms, \
+             miller {miller_ms:.2} ms, miller inside the 200k directory {miller_large_ms:.2} ms; \
+             j key {key_ms:.2} ms"
+        );
     }
 
     /// Manual release-mode measurement; synthetic paths do not touch disk.

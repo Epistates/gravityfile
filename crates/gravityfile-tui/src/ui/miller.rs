@@ -175,18 +175,13 @@ impl<'a> MillerColumns<'a> {
         self
     }
 
-    /// Get entries for a directory node.
-    fn get_entries(node: &FileNode) -> Vec<ColumnEntry> {
-        node.children.iter().map(ColumnEntry::from_node).collect()
-    }
-
     /// Render a single column.
     #[allow(clippy::too_many_arguments)]
     fn render_column(
         &self,
         area: Rect,
         buf: &mut Buffer,
-        entries: &[ColumnEntry],
+        children: &[FileNode],
         selected: Option<usize>,
         highlight_name: Option<&std::ffi::OsStr>,
         offset: usize,
@@ -220,10 +215,11 @@ impl<'a> MillerColumns<'a> {
         let size_bar_width: u16 = if inner.width >= 8 { 8 } else { 0 };
 
         let viewport_height = inner.height as usize;
-        let end = (offset + viewport_height).min(entries.len());
+        let end = (offset + viewport_height).min(children.len());
 
+        // Only the rows on screen are converted for display.
         for (row_idx, entry_idx) in (offset..end).enumerate() {
-            let entry = &entries[entry_idx];
+            let entry = &ColumnEntry::from_node(&children[entry_idx]);
             let y = inner.y + row_idx as u16;
 
             let is_selected = selected == Some(entry_idx);
@@ -379,7 +375,7 @@ impl<'a> MillerColumns<'a> {
         }
 
         // Show empty message if no entries
-        if entries.is_empty() {
+        if children.is_empty() {
             let msg = Line::styled("(empty)", Style::default().fg(self.theme.muted));
             let msg_area = Rect::new(inner.x, inner.y, inner.width, 1);
             Widget::render(msg, msg_area, buf);
@@ -709,37 +705,6 @@ impl<'a> MillerColumns<'a> {
         }
     }
 
-    /// Render placeholder for directory not yet scanned.
-    fn render_directory_placeholder(&self, area: Rect, buf: &mut Buffer, entry: &ColumnEntry) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(self.theme.border)
-            .title(" Preview ")
-            .title_style(self.theme.title);
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        let lines = vec![
-            Line::styled(
-                gravityfile_core::escape_terminal_text(&entry.name),
-                self.theme.title.add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("Type: ", self.theme.help_desc),
-                Span::raw("Directory"),
-            ]),
-            Line::raw(""),
-            Line::styled(
-                "Press Enter to navigate",
-                Style::default().fg(self.theme.muted),
-            ),
-        ];
-
-        Paragraph::new(lines).render(inner, buf);
-    }
-
     /// Render basic file info (no content preview).
     fn render_basic_info(&self, area: Rect, buf: &mut Buffer, entry: &ColumnEntry) {
         // Show "calculating..." for directories with unknown size
@@ -802,13 +767,12 @@ impl StatefulWidget for MillerColumns<'_> {
         ])
         .areas(inner_area);
 
-        // Get entries
-        let current_entries = Self::get_entries(self.current);
-        let parent_entries = self.parent.map(Self::get_entries).unwrap_or_default();
+        let current_children = &self.current.children;
+        let parent_children = self.parent.map_or(&[][..], |p| &p.children);
 
         // Ensure selection is valid
-        if state.selected >= current_entries.len() && !current_entries.is_empty() {
-            state.selected = current_entries.len() - 1;
+        if state.selected >= current_children.len() && !current_children.is_empty() {
+            state.selected = current_children.len() - 1;
         }
 
         // Ensure visibility
@@ -822,18 +786,27 @@ impl StatefulWidget for MillerColumns<'_> {
         let parent_total_size = self.parent.map(|p| p.size).unwrap_or(0);
         let current_total_size = self.current.size;
 
-        // Render parent column
+        // Render parent column, scrolled so the current directory is on screen
+        let current_name = self
+            .view_root
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new(self.current_name));
+        let parent_viewport = parent_area.height.saturating_sub(2) as usize;
+        let parent_offset = parent_children
+            .iter()
+            .position(|child| child.file_name() == current_name)
+            .map_or(0, |index| {
+                index
+                    .saturating_sub(parent_viewport / 2)
+                    .min(parent_children.len().saturating_sub(parent_viewport))
+            });
         self.render_column(
             parent_area,
             buf,
-            &parent_entries,
+            parent_children,
             None,
-            Some(
-                self.view_root
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new(self.current_name)),
-            ),
-            0,
+            Some(current_name),
+            parent_offset,
             Some("Parent"),
             parent_base_path.as_deref(),
             parent_total_size,
@@ -843,7 +816,7 @@ impl StatefulWidget for MillerColumns<'_> {
         self.render_column(
             current_area,
             buf,
-            &current_entries,
+            current_children,
             Some(state.selected),
             None,
             state.offset,
@@ -853,36 +826,22 @@ impl StatefulWidget for MillerColumns<'_> {
         );
 
         // Render preview column
-        if let Some(selected_entry) = current_entries.get(state.selected) {
-            if selected_entry.is_dir {
-                // Find the child node and show its contents
-                if let Some(child_node) = self
-                    .current
-                    .children
-                    .iter()
-                    .find(|c| c.file_name() == selected_entry.native_name)
-                {
-                    let preview_entries = Self::get_entries(child_node);
-                    let preview_base_path = self.view_root.join(&selected_entry.native_name);
-                    let preview_total_size = child_node.size;
-                    self.render_column(
-                        preview_area,
-                        buf,
-                        &preview_entries,
-                        None,
-                        None,
-                        0,
-                        Some("Preview"),
-                        Some(&preview_base_path),
-                        preview_total_size,
-                    );
-                } else {
-                    // Directory children not loaded yet - show placeholder
-                    self.render_directory_placeholder(preview_area, buf, selected_entry);
-                }
+        if let Some(child_node) = current_children.get(state.selected) {
+            if child_node.is_dir() {
+                let preview_base_path = self.view_root.join(child_node.file_name());
+                self.render_column(
+                    preview_area,
+                    buf,
+                    &child_node.children,
+                    None,
+                    None,
+                    0,
+                    Some("Preview"),
+                    Some(&preview_base_path),
+                    child_node.size,
+                );
             } else {
-                // Show file info preview
-                self.render_file_preview(preview_area, buf, selected_entry);
+                self.render_file_preview(preview_area, buf, &ColumnEntry::from_node(child_node));
             }
         } else {
             // Empty preview
@@ -1185,6 +1144,37 @@ mod tests {
                 "missing {title} column: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn the_parent_column_scrolls_to_the_current_directory() {
+        let time = crate::test_support::timestamps();
+        let mut parent = FileNode::new_directory("parent", time);
+        parent.children = (0..100)
+            .map(|index| FileNode::new_directory(format!("d-{index:03}"), time))
+            .collect();
+        let current = parent.children[80].clone();
+        let view_root = sample_root_path().join("d-080");
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buf = Buffer::empty(area);
+
+        let miller = MillerColumns::new(
+            &current,
+            Some(&parent),
+            "d-080",
+            &view_root,
+            &marked,
+            &clipboard,
+            &theme,
+        );
+        StatefulWidget::render(miller, area, &mut buf, &mut MillerState::new());
+
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("d-080"), "{rendered}");
+        assert!(!rendered.contains("d-000"), "{rendered}");
     }
 
     #[test]

@@ -162,96 +162,114 @@ impl<'a> TreeView<'a> {
         self
     }
 
-    /// Flatten tree to visible items based on expansion state.
+    /// Every visible row, in order.
     pub fn flatten(&self, state: &TreeState) -> Vec<VisibleItem> {
+        self.rows(state, 0..usize::MAX)
+    }
+
+    /// The visible row at `index`.
+    pub fn row(&self, state: &TreeState, index: usize) -> Option<VisibleItem> {
+        self.rows(state, index..index.saturating_add(1)).pop()
+    }
+
+    /// The visible rows whose positions fall in `range`. Rows outside it are
+    /// counted but not built, so a frame costs the rows on screen plus a pass
+    /// over expanded directories, not an allocation per visible entry.
+    pub fn rows(&self, state: &TreeState, range: std::ops::Range<usize>) -> Vec<VisibleItem> {
         let mut items = Vec::new();
-        self.flatten_node(
-            self.root,
-            self.root_path.clone(),
-            0,
-            true,
-            Vec::new(),
-            state,
-            &mut items,
-        );
+        self.walk(state, range, |item| items.push(item()));
         items
     }
 
-    /// Count visible items without allocating a Vec.
-    /// Use this when only the count is needed (e.g. updating `cached_tree_len`).
+    /// The number of visible rows.
     pub fn flatten_count(&self, state: &TreeState) -> usize {
-        self.count_node(self.root, &self.root_path.clone(), state)
+        self.walk(state, usize::MAX..usize::MAX, |_| {})
     }
 
-    fn count_node(&self, node: &FileNode, path: &PathBuf, state: &TreeState) -> usize {
-        let is_expanded = state.is_expanded(path);
-        let mut count = 1; // this node itself
-        if is_expanded && node.is_dir() {
-            for child in &node.children {
-                let child_path = path.join(child.file_name());
-                count += self.count_node(child, &child_path, state);
-            }
-        }
-        count
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn flatten_node(
+    /// Visit the visible rows in `range`, in order, giving `visit` a way to
+    /// build each one. Rows before the range are only counted. Iterative, so
+    /// deep expanded trees cannot exhaust the stack. Returns the number of
+    /// rows walked.
+    fn walk(
         &self,
-        node: &FileNode,
-        path: PathBuf,
-        depth: usize,
-        is_last: bool,
-        parent_last_siblings: Vec<bool>,
         state: &TreeState,
-        items: &mut Vec<VisibleItem>,
-    ) {
-        let is_expanded = state.is_expanded(&path);
-
-        let kind = match &node.kind {
-            NodeKind::Directory { .. } => VisibleNodeKind::Directory {
-                expanded: is_expanded,
-            },
-            NodeKind::File { executable } => VisibleNodeKind::File {
-                executable: *executable,
-            },
-            NodeKind::Symlink { broken, .. } => VisibleNodeKind::Symlink { broken: *broken },
-            NodeKind::Other => VisibleNodeKind::Other,
-        };
-
-        items.push(VisibleItem {
-            path: path.clone(),
-            node: VisibleNode {
-                name: node.display_name().into_owned(),
-                size: node.size,
-                kind,
-                git_status: node.git_status,
-            },
-            depth,
-            is_last_sibling: is_last,
-            parent_last_siblings: parent_last_siblings.clone(),
-        });
-
-        // If directory is expanded, add children
-        if is_expanded && node.is_dir() {
-            let child_count = node.children.len();
-            for (i, child) in node.children.iter().enumerate() {
-                let child_path = path.join(child.file_name());
-                let child_is_last = i == child_count - 1;
-                let mut child_parent_lasts = parent_last_siblings.clone();
-                child_parent_lasts.push(is_last);
-
-                self.flatten_node(
-                    child,
-                    child_path,
-                    depth + 1,
-                    child_is_last,
-                    child_parent_lasts,
-                    state,
-                    items,
-                );
+        range: std::ops::Range<usize>,
+        mut visit: impl FnMut(&dyn Fn() -> VisibleItem),
+    ) -> usize {
+        let stop = range.end;
+        let build =
+            |node: &FileNode, path: &Path, depth, is_last, lasts: &[bool], expanded| VisibleItem {
+                path: path.to_path_buf(),
+                node: VisibleNode {
+                    name: node.display_name().into_owned(),
+                    size: node.size,
+                    kind: match &node.kind {
+                        NodeKind::Directory { .. } => VisibleNodeKind::Directory { expanded },
+                        NodeKind::File { executable } => VisibleNodeKind::File {
+                            executable: *executable,
+                        },
+                        NodeKind::Symlink { broken, .. } => {
+                            VisibleNodeKind::Symlink { broken: *broken }
+                        }
+                        NodeKind::Other => VisibleNodeKind::Other,
+                    },
+                    git_status: node.git_status,
+                },
+                depth,
+                is_last_sibling: is_last,
+                parent_last_siblings: lasts.to_vec(),
+            };
+        if stop == 0 {
+            return 0;
+        }
+        let mut path = self.root_path.clone();
+        let root_expanded = state.is_expanded(&path);
+        if range.contains(&0) {
+            visit(&|| build(self.root, &path, 0, true, &[], root_expanded));
+        }
+        let mut index = 1;
+        if !(root_expanded && self.root.is_dir()) {
+            return index;
+        }
+        // Each open directory's remaining children, and whether each
+        // ancestor was its parent's last child (for the guide lines).
+        let mut stack = vec![(
+            self.root.children.iter().enumerate(),
+            self.root.children.len(),
+        )];
+        let mut lasts = vec![true];
+        while let Some((children, count)) = stack.last_mut() {
+            if index >= stop {
+                break;
+            }
+            let count = *count;
+            let Some((position, child)) = children.next() else {
+                stack.pop();
+                lasts.pop();
+                path.pop();
+                continue;
+            };
+            if index < range.start && !child.is_dir() {
+                // Nothing below a file, so it is one row to count.
+                index += 1;
+                continue;
+            }
+            let is_last = position + 1 == count;
+            let depth = stack.len();
+            path.push(child.file_name());
+            let expanded = child.is_dir() && state.is_expanded(&path);
+            if index >= range.start {
+                visit(&|| build(child, &path, depth, is_last, &lasts, expanded));
+            }
+            index += 1;
+            if expanded && !child.children.is_empty() {
+                lasts.push(is_last);
+                stack.push((child.children.iter().enumerate(), child.children.len()));
+            } else {
+                path.pop();
             }
         }
+        index
     }
 }
 
@@ -272,15 +290,15 @@ impl StatefulWidget for TreeView<'_> {
             return;
         }
 
-        let items = self.flatten(state);
         let viewport_height = inner_area.height as usize;
 
         // Ensure selected item is visible
         state.ensure_visible(viewport_height);
 
-        // Calculate visible range
+        // Build only the rows on screen.
         let start = state.offset;
-        let end = (start + viewport_height).min(items.len());
+        let items = self.rows(state, start..start + viewport_height);
+        let end = start + items.len();
 
         // Size bar width. A column narrower than the bar cannot show it, and in
         // that case the row text gets the space back instead of being squeezed
@@ -289,7 +307,7 @@ impl StatefulWidget for TreeView<'_> {
         let size_text_width: u16 = 10;
 
         for (row_idx, item_idx) in (start..end).enumerate() {
-            let item = &items[item_idx];
+            let item = &items[row_idx];
             let y = inner_area.y + row_idx as u16;
             let is_selected = item_idx == state.selected;
             let is_marked = self.marked.contains(&item.path);
@@ -556,6 +574,36 @@ mod tests {
             let counted = view.flatten_count(&state);
             let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
             assert_eq!(counted, view.flatten(&state).len());
+        }
+    }
+
+    #[test]
+    fn every_window_matches_the_same_slice_of_flatten() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let mut state = expanded_state();
+        state.expand(&root_path.join("src").join("nested"));
+        let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+
+        // Rows before a window are skipped without being built, which must
+        // not shift guide lines, depths or paths of the rows inside it.
+        let all: Vec<String> = view
+            .flatten(&state)
+            .iter()
+            .map(|item| format!("{item:?}"))
+            .collect();
+        for start in 0..=all.len() {
+            for end in start..=all.len() + 1 {
+                let window: Vec<String> = view
+                    .rows(&state, start..end)
+                    .iter()
+                    .map(|item| format!("{item:?}"))
+                    .collect();
+                assert_eq!(window, all[start..end.min(all.len())], "{start}..{end}");
+            }
         }
     }
 
