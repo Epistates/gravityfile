@@ -35,7 +35,7 @@
 //! - `?` - Help
 //! - `q` - Quit
 
-pub mod app;
+mod app;
 mod event;
 mod event_source;
 mod graphics_query;
@@ -49,8 +49,8 @@ mod test_support;
 mod theme;
 mod ui;
 
-pub use app::{App, AppResult};
-pub use theme::Theme;
+use app::App;
+pub use app::AppResult;
 
 /// Configuration for the TUI application.
 #[derive(Debug, Clone, Default)]

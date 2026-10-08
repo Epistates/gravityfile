@@ -118,18 +118,6 @@ impl VisualState {
         (start, end)
     }
 
-    /// Check if an index is within the selection range.
-    pub fn is_selected(&self, index: usize) -> bool {
-        let (start, end) = self.selection_range();
-        index >= start && index <= end
-    }
-
-    /// Get the number of selected items.
-    pub fn selection_count(&self) -> usize {
-        let (start, end) = self.selection_range();
-        end - start + 1
-    }
-
     /// Move the cursor up.
     pub fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
@@ -215,11 +203,6 @@ impl ClipboardState {
     /// Check if the clipboard is empty.
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()
-    }
-
-    /// Get the number of items in the clipboard.
-    pub fn len(&self) -> usize {
-        self.paths.len()
     }
 }
 
@@ -338,6 +321,7 @@ pub struct DeletionProgress {
 
 impl DeletionProgress {
     /// Create new deletion progress.
+    #[cfg(test)]
     pub fn new(total: usize) -> Self {
         Self {
             total,
@@ -361,9 +345,6 @@ impl DeletionProgress {
 /// Result from a background scan operation.
 pub enum ScanResult {
     Progress(ScanProgress),
-    Warning(gravityfile_core::ScanWarning),
-    /// Partial tree snapshot for real-time updates during scanning.
-    PartialTree(FileTree),
     ScanComplete(Result<FileTree, gravityfile_scan::ScanError>),
     AnalysisComplete {
         duplicates: DuplicateReport,
@@ -442,8 +423,6 @@ pub struct DuplicatesViewState {
     /// When a group is expanded, the selected file index within that group (0 = group header).
     /// Key is group index, value is selected item (0 = header, 1..=n = files).
     pub selected_in_group: std::collections::HashMap<usize, usize>,
-    /// Scroll offset for the view.
-    pub scroll_offset: usize,
 }
 
 impl DuplicatesViewState {
@@ -539,45 +518,28 @@ impl DuplicatesViewState {
             group.paths.get(selected - 1)
         }
     }
-
-    /// Get all file paths in the selected group (for bulk operations).
-    pub fn selected_group_paths<'a>(
-        &self,
-        groups: &'a [&gravityfile_analyze::DuplicateGroup],
-    ) -> Option<&'a [PathBuf]> {
-        groups.get(self.selected_group).map(|g| g.paths.as_slice())
-    }
 }
 
 /// A single tab representing an independent directory exploration context.
 #[derive(Debug, Clone)]
 pub struct Tab {
-    /// Unique identifier for this tab.
-    pub id: usize,
     /// Display label for the tab (typically the directory name).
     pub label: String,
-    /// Root path being explored in this tab.
-    pub path: PathBuf,
-    /// Current view root (may be different from path after drilling down).
+    /// The directory the tab shows.
     pub view_root: PathBuf,
-    /// Navigation history for back navigation.
-    pub history: Vec<(PathBuf, usize, std::collections::HashSet<PathBuf>)>,
 }
 
 impl Tab {
     /// Create a new tab for a given path.
-    pub fn new(id: usize, path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         let label = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
 
         Self {
-            id,
             label,
-            path: path.clone(),
             view_root: path,
-            history: Vec::new(),
         }
     }
 
@@ -594,8 +556,6 @@ pub struct TabManager {
     tabs: Vec<Tab>,
     /// Index of the currently active tab.
     active: usize,
-    /// Next tab ID to assign.
-    next_id: usize,
     /// Maximum number of tabs allowed.
     max_tabs: usize,
 }
@@ -612,7 +572,6 @@ impl TabManager {
         Self {
             tabs: Vec::new(),
             active: 0,
-            next_id: 0,
             max_tabs,
         }
     }
@@ -627,11 +586,6 @@ impl TabManager {
     /// Get the number of open tabs.
     pub fn len(&self) -> usize {
         self.tabs.len()
-    }
-
-    /// Check if there are no tabs.
-    pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
     }
 
     /// Get the active tab index.
@@ -661,8 +615,7 @@ impl TabManager {
             return false;
         }
 
-        let tab = Tab::new(self.next_id, path);
-        self.next_id += 1;
+        let tab = Tab::new(path);
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         true
@@ -678,21 +631,6 @@ impl TabManager {
         self.tabs.remove(self.active);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
-        }
-        true
-    }
-
-    /// Close a tab by index.
-    pub fn close_tab(&mut self, index: usize) -> bool {
-        if self.tabs.len() <= 1 || index >= self.tabs.len() {
-            return false;
-        }
-
-        self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        } else if self.active > index {
-            self.active -= 1;
         }
         true
     }
@@ -715,27 +653,10 @@ impl TabManager {
         }
     }
 
-    /// Switch to a specific tab by index.
-    pub fn switch_to(&mut self, index: usize) {
-        if index < self.tabs.len() {
-            self.active = index;
-        }
-    }
-
     /// Switch to a tab by number (1-indexed, for Alt+1 through Alt+9).
     pub fn switch_to_number(&mut self, number: usize) {
         if number > 0 && number <= self.tabs.len() {
             self.active = number - 1;
-        }
-    }
-
-    /// Duplicate the active tab (open same directory in new tab).
-    pub fn duplicate_active_tab(&mut self) -> bool {
-        if let Some(tab) = self.active_tab() {
-            let path = tab.view_root.clone();
-            self.new_tab(path)
-        } else {
-            false
         }
     }
 }
@@ -836,16 +757,6 @@ impl BookmarkListState {
             self.selected += 1;
         }
     }
-
-    /// Get the number of entries.
-    pub fn len(&self) -> usize {
-        self.entries_count
-    }
-
-    /// Check if empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries_count == 0
-    }
 }
 
 /// A single rename operation in bulk rename.
@@ -864,8 +775,6 @@ pub struct BulkRenameState {
     pub entries: Vec<RenameEntry>,
     /// Currently selected entry in the confirmation modal.
     pub selected: usize,
-    /// Scroll offset for display.
-    pub offset: usize,
     /// Error message if validation failed.
     pub error: Option<String>,
 }
@@ -890,14 +799,8 @@ impl BulkRenameState {
         Self {
             entries,
             selected: 0,
-            offset: 0,
             error: None,
         }
-    }
-
-    /// Get the number of entries.
-    pub fn len(&self) -> usize {
-        self.entries.len()
     }
 
     /// Check if empty.
@@ -1037,15 +940,6 @@ impl UserSettings {
         };
         Self::load_from(&path).map_err(|error| {
             std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })
-    }
-
-    /// Compatibility helper that logs errors and falls back to defaults.
-    /// Interactive callers should use `try_load` to display failures.
-    pub fn load() -> Self {
-        Self::try_load().unwrap_or_else(|error| {
-            tracing::warn!(%error, "Cannot load settings; using defaults");
-            Self::default()
         })
     }
 
@@ -1247,7 +1141,7 @@ mod tests {
             "👩‍💻🇺🇸1️⃣",
             "e\u{301}e\u{301}",
         ] {
-            let mut tab = super::Tab::new(0, std::path::PathBuf::from("directory"));
+            let mut tab = super::Tab::new(std::path::PathBuf::from("directory"));
             tab.label = label.into();
             for width in 0..=32 {
                 for slice in [
@@ -1453,29 +1347,6 @@ mod tests {
 
         state.cursor = 2;
         assert_eq!(state.selection_range(), (2, 5));
-    }
-
-    #[test]
-    fn test_visual_state_is_selected() {
-        let mut state = VisualState::new(3);
-        state.cursor = 7;
-
-        assert!(!state.is_selected(0));
-        assert!(!state.is_selected(2));
-        assert!(state.is_selected(3));
-        assert!(state.is_selected(5));
-        assert!(state.is_selected(7));
-        assert!(!state.is_selected(8));
-    }
-
-    #[test]
-    fn test_visual_state_selection_count() {
-        let mut state = VisualState::new(3);
-        state.cursor = 7;
-        assert_eq!(state.selection_count(), 5); // 3, 4, 5, 6, 7
-
-        state.cursor = 3;
-        assert_eq!(state.selection_count(), 1); // just 3
     }
 
     #[test]

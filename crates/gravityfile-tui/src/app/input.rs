@@ -10,8 +10,6 @@ pub struct InputState {
     buffer: String,
     /// UTF-8 byte offset at a grapheme boundary within the buffer.
     cursor: usize,
-    /// Original value (for rename operations to show what's being renamed).
-    original: Option<String>,
     /// Validation error message.
     error: Option<String>,
     /// Path context (parent directory for create, full path for rename).
@@ -29,17 +27,8 @@ impl InputState {
         Self {
             buffer: value.to_string(),
             cursor: value.len(),
-            original: Some(value.to_string()),
             error: None,
             context_path: None,
-        }
-    }
-
-    /// Create an input state with context path.
-    pub fn with_context(context_path: std::path::PathBuf) -> Self {
-        Self {
-            context_path: Some(context_path),
-            ..Default::default()
         }
     }
 
@@ -51,11 +40,6 @@ impl InputState {
     /// Get the cursor position.
     pub fn cursor(&self) -> usize {
         self.cursor
-    }
-
-    /// Get the original value (if any).
-    pub fn original(&self) -> Option<&str> {
-        self.original.as_deref()
     }
 
     /// Get the current error message (if any).
@@ -212,11 +196,6 @@ impl InputState {
             .map(|(index, _)| index)
             .find(|&index| index >= self.cursor)
             .unwrap_or(self.buffer.len());
-    }
-
-    /// Check if the buffer has changed from the original value.
-    pub fn has_changed(&self) -> bool {
-        self.original.as_deref() != Some(&self.buffer)
     }
 }
 

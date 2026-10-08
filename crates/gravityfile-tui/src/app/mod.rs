@@ -1052,31 +1052,6 @@ impl App {
             ScanResult::Progress(progress) => {
                 self.scan_progress = Some(progress);
             }
-            ScanResult::Warning(warning) => {
-                self.warnings.push(warning);
-            }
-            ScanResult::PartialTree(tree) => {
-                // Update tree with partial results during scanning
-                // This allows the UI to show progressive updates as directories are scanned
-                let root_path = tree.root_path.clone();
-                self.install_tree(tree);
-
-                // Preserve selection position if possible
-                if self.tree_state.expanded.is_empty() {
-                    self.tree_state = TreeState::new(root_path.clone());
-                }
-                self.tree_state.expand(&root_path);
-                self.update_cached_tree_len();
-                self.update_cached_miller_len();
-                // Keep treemap selection bounded if the user is watching the
-                // treemap while partial results stream in.
-                self.update_cached_treemap_len();
-
-                // Clamp selection to valid range
-                if self.tree_state.selected >= self.cached_tree_len && self.cached_tree_len > 0 {
-                    self.tree_state.selected = self.cached_tree_len - 1;
-                }
-            }
             ScanResult::ScanComplete(Ok(tree)) => {
                 let root_path = tree.root_path.clone();
                 let scan_path = root_path.clone();
@@ -1210,7 +1185,7 @@ impl App {
                 succeeded,
                 failed,
                 skipped,
-                bytes_processed: _,
+                bytes_processed,
                 errors,
                 undo_info,
                 undo_remaining,
@@ -1264,6 +1239,13 @@ impl App {
                 // separately and does not mark the operation unsuccessful.
                 let success = failed == 0 && error_count == 0 && !cancelled && !undo_incomplete;
                 let mut msg = format!("{action} {succeeded} items");
+                if matches!(
+                    operation_type,
+                    gravityfile_ops::OperationType::Copy | gravityfile_ops::OperationType::Move
+                ) && bytes_processed > 0
+                {
+                    msg.push_str(&format!(" ({})", crate::ui::format_size(bytes_processed)));
+                }
                 if undo_incomplete {
                     msg.push_str("; undo incomplete");
                 }
@@ -7293,7 +7275,6 @@ mod tests {
         let input = app.input_state.as_ref().unwrap();
         assert_eq!(input.context_path, Some(path));
         assert_eq!(input.buffer(), "");
-        assert!(input.original().is_none());
         assert!(
             app.operation_message
                 .as_ref()

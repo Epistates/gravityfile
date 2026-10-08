@@ -108,6 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The bulk rename confirmation scrolls with the selection. It used to show
   only the renames that fit, so the rest could not be reviewed before
   confirming.
+- Copy and move report how much data they transferred.
 - The treemap dims cut items and italicises copied ones, as the tree does.
 - Text previews show how many lines the file has, so a truncated preview says
   so.

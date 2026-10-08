@@ -54,10 +54,6 @@ pub struct Theme {
     pub symlink: Style,
     pub executable: Style,
 
-    // Progress
-    pub progress_bar: Style,
-    pub progress_bg: Style,
-
     // Header/Footer
     pub header: Style,
     pub footer: Style,
@@ -67,14 +63,6 @@ pub struct Theme {
     pub help_key_fg: Color,
     pub help_desc_fg: Color,
     pub footer_bg: Color,
-
-    // Command palette
-    pub command_prompt: Style,
-    pub command_input: Style,
-    pub command_cursor: Style,
-
-    // Marked items
-    pub marked: Style,
 
     // Git status colors
     pub git_modified: Color,
@@ -106,7 +94,6 @@ impl Theme {
         let orange_500 = Color::Rgb(249, 115, 22);
         let red_500 = Color::Rgb(239, 68, 68);
         let cyan_400 = Color::Rgb(34, 211, 238);
-        let amber_500 = Color::Rgb(245, 158, 11);
 
         Self {
             variant: ThemeVariant::Dark,
@@ -142,9 +129,6 @@ impl Theme {
             symlink: Style::new().fg(cyan_400),
             executable: Style::new().fg(green_500),
 
-            progress_bar: Style::new().fg(blue_500),
-            progress_bg: Style::new().fg(slate_700),
-
             header: Style::new().bg(slate_800).fg(slate_100),
             footer: Style::new().bg(slate_800).fg(slate_400),
 
@@ -153,12 +137,6 @@ impl Theme {
             help_key_fg: blue_400,
             help_desc_fg: slate_400,
             footer_bg: slate_800,
-
-            command_prompt: Style::new().fg(blue_400).add_modifier(Modifier::BOLD),
-            command_input: Style::new().fg(slate_100),
-            command_cursor: Style::new().add_modifier(Modifier::REVERSED),
-
-            marked: Style::new().fg(amber_500).add_modifier(Modifier::BOLD),
 
             // Git status colors
             git_modified: orange_500,
@@ -190,7 +168,6 @@ impl Theme {
         let orange_600 = Color::Rgb(234, 88, 12);
         let red_600 = Color::Rgb(220, 38, 38);
         let cyan_600 = Color::Rgb(8, 145, 178);
-        let amber_600 = Color::Rgb(217, 119, 6);
 
         Self {
             variant: ThemeVariant::Light,
@@ -226,9 +203,6 @@ impl Theme {
             symlink: Style::new().fg(cyan_600),
             executable: Style::new().fg(green_600),
 
-            progress_bar: Style::new().fg(blue_600),
-            progress_bg: Style::new().fg(slate_200),
-
             header: Style::new().bg(slate_100).fg(slate_800),
             footer: Style::new().bg(slate_100).fg(slate_600),
 
@@ -238,26 +212,12 @@ impl Theme {
             help_desc_fg: slate_600,
             footer_bg: slate_100,
 
-            command_prompt: Style::new().fg(blue_700).add_modifier(Modifier::BOLD),
-            command_input: Style::new().fg(slate_900),
-            command_cursor: Style::new().add_modifier(Modifier::REVERSED),
-
-            marked: Style::new().fg(amber_600).add_modifier(Modifier::BOLD),
-
             // Git status colors
             git_modified: orange_600,
             git_staged: green_600,
             git_untracked: Color::Rgb(124, 58, 237), // Purple
             git_ignored: slate_400,
             git_conflict: red_600,
-        }
-    }
-
-    /// Create theme from variant.
-    pub fn from_variant(variant: ThemeVariant) -> Self {
-        match variant {
-            ThemeVariant::Dark => Self::dark(),
-            ThemeVariant::Light => Self::light(),
         }
     }
 
