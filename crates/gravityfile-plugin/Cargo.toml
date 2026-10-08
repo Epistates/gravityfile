@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Lua plugin system for gravityfile"
 
 [dependencies]
+gravityfile-core.workspace = true
 indexmap.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
@@ -19,7 +20,6 @@ tracing-subscriber.workspace = true
 
 mlua = { version = "0.12", features = ["lua54", "async", "serialize", "send", "vendored"] }
 toml = "1"
-dirs = "7"
 
 [dev-dependencies]
 tempfile.workspace = true

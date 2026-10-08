@@ -41,6 +41,7 @@ mod config;
 mod error;
 mod node;
 pub mod path_serde;
+pub mod paths;
 mod terminal;
 mod tree;
 pub mod units;

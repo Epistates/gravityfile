@@ -82,7 +82,7 @@ fn run(cli: Cli, out: Styles, err: Styles) -> Result<ExitCode> {
         command,
     } = cli;
     let Some(command) = command else {
-        return explore(path, scan, cwd_file, print_cwd, &global);
+        return explore(path, scan, cwd_file, print_cwd, &global, &err);
     };
     let mut stdout = std::io::stdout().lock();
     match command {
@@ -158,8 +158,25 @@ fn explore(
     cwd_file: Option<PathBuf>,
     print_cwd: bool,
     global: &GlobalArgs,
+    err: &Styles,
 ) -> Result<ExitCode> {
     init_logging(global.log_file.as_deref(), true)?;
+    match gravityfile_core::paths::migrate_legacy_config() {
+        Ok(Some((from, to))) => note(
+            err,
+            &format!(
+                "moved settings and plugins from {} to {}",
+                escape_filename(from.as_os_str()),
+                escape_filename(to.as_os_str())
+            ),
+        ),
+        Ok(None) => {}
+        // The old directory keeps working until it can be moved.
+        Err(error) => warn(
+            err,
+            &format!("cannot move settings to their new location: {error}"),
+        ),
+    }
     let requested = path.unwrap_or_else(|| PathBuf::from("."));
     let path = requested
         .canonicalize()

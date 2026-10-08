@@ -38,13 +38,12 @@ pub struct PluginConfig {
 
 impl Default for PluginConfig {
     fn default() -> Self {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("gravityfile");
+        let dirs = gravityfile_core::paths::Dirs::discover()
+            .unwrap_or_else(|| gravityfile_core::paths::Dirs::under(std::path::Path::new(".")));
 
         Self {
-            plugin_dir: config_dir.join("plugins"),
-            config_dir,
+            plugin_dir: dirs.plugin_dir(),
+            config_dir: dirs.config,
             enabled: true,
             default_timeout_ms: 5000,
             max_memory_mb: 256,

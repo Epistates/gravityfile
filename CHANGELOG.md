@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare `m` is rejected as ambiguous: use `min` or `mo`.
 - **Exit status:** 3 for incomplete results with `--strict`, 130/143 when
   interrupted (was 1 for both).
+- **Settings and plugins moved to `~/.config/gravityfile` on macOS**, matching
+  Linux, from `~/Library/Application Support/gravityfile`; the old directory is
+  moved automatically on first run. `GRAVITYFILE_HOME` puts all of
+  gravityfile's files under one directory.
 - Git status is computed only when asked for (`--git`; always in the explorer).
 - Overwriting a file on paste moves the old one to the Trash. Copies, moves,
   renames and archive extraction are staged and published with a single

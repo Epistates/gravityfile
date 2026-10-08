@@ -91,6 +91,9 @@ Completions: `grav completions <bash|zsh|fish|elvish|powershell>`.
 Bulk rename and the text editor use `VISUAL` or `EDITOR`; GUI editors must wait
 for the file to close (for example `code --wait`).
 
+Settings and plugins live in `~/.config/gravityfile` (`%AppData%\gravityfile` on
+Windows), or under `$GRAVITYFILE_HOME/config` when that variable is set.
+
 ### Snapshots
 
 Save a scan and look at it later, or somewhere else. Any command that takes a

@@ -734,19 +734,20 @@ pub struct Bookmarks {
 impl Bookmarks {
     /// Create bookmarks with sensible defaults.
     pub fn with_defaults() -> Self {
+        use gravityfile_core::paths;
         let mut marks = HashMap::new();
-        if let Some(home) = dirs::home_dir() {
-            marks.insert('h', home);
-        }
         marks.insert('r', PathBuf::from("/"));
-        if let Some(config) = dirs::config_dir() {
+        if let Some(config) = paths::config_root() {
             marks.insert('c', config);
         }
-        if let Some(downloads) = dirs::download_dir() {
-            marks.insert('d', downloads);
-        }
-        if let Some(documents) = dirs::document_dir() {
-            marks.insert('o', documents);
+        if let Some(home) = paths::home() {
+            for (key, name) in [('d', "Downloads"), ('o', "Documents")] {
+                let directory = home.join(name);
+                if directory.is_dir() {
+                    marks.insert(key, directory);
+                }
+            }
+            marks.insert('h', home);
         }
         Self { marks }
     }
@@ -1002,7 +1003,7 @@ impl Default for FileOpeners {
 impl UserSettings {
     /// Get the config file path.
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("gravityfile").join("settings.toml"))
+        gravityfile_core::paths::Dirs::discover().map(|dirs| dirs.settings_file())
     }
 
     const MAX_BYTES: u64 = 1024 * 1024;

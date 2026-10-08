@@ -17,10 +17,13 @@ The plugin system is built on three core pieces:
 
 ## Getting Started
 
-Plugins are discovered in the following directories:
-- **macOS**: `~/Library/Application Support/gravityfile/plugins/`
-- **Linux**: `~/.config/gravityfile/plugins/`
+Plugins are discovered in:
+- **Linux and macOS**: `${XDG_CONFIG_HOME:-~/.config}/gravityfile/plugins/`
 - **Windows**: `%AppData%\gravityfile\plugins`
+- **With `GRAVITYFILE_HOME` set**: `$GRAVITYFILE_HOME/config/plugins/`
+
+Versions before 0.4 used `~/Library/Application Support/gravityfile` on macOS;
+it is moved to the new location the first time grav runs.
 
 ### Example: Lua Hook (`plugins/notify.lua`)
 

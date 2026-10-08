@@ -2447,7 +2447,7 @@ impl App {
     fn execute_goto(&mut self, path_str: &str) {
         let path = if let Some(rest) = path_str.strip_prefix('~') {
             // Expand tilde
-            if let Some(home) = dirs::home_dir() {
+            if let Some(home) = gravityfile_core::paths::home() {
                 home.join(rest.trim_start_matches('/'))
             } else {
                 std::path::PathBuf::from(path_str)

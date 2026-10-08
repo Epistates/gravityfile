@@ -6,15 +6,15 @@ This crate provides a feature-rich TUI for exploring disk usage, finding duplica
 
 ## Scan entry budget
 
-Set a top-level value in `gravityfile/settings.toml` under the platform config
-directory, then restart the TUI:
+Set a top-level value in the settings file, then restart the TUI:
 
 ```toml
 max_scan_entries = 100000
 ```
 
-On macOS this file is normally `~/Library/Application Support/gravityfile/settings.toml`;
-on Linux it is `${XDG_CONFIG_HOME:-~/.config}/gravityfile/settings.toml`.
+The file is `${XDG_CONFIG_HOME:-~/.config}/gravityfile/settings.toml` on Linux
+and macOS, `%AppData%\gravityfile\settings.toml` on Windows, and
+`$GRAVITYFILE_HOME/config/settings.toml` when that variable is set.
 The limit applies to startup listings, navigation listings, and recursive rescans.
 It counts descendants, excluding the root. Zero permits an empty scope; removing
 the value restores unlimited traversal. An exceeded limit displays an error;

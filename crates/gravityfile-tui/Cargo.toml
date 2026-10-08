@@ -39,7 +39,6 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp", "qoi", "pnm", "tga"] }
 
 # Path utilities
-dirs = "7"
 
 # Settings persistence
 serde.workspace = true
