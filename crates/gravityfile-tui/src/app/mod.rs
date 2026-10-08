@@ -6,7 +6,11 @@ mod commands;
 mod constants;
 mod deletion;
 mod duplicate_filter;
+#[cfg(test)]
+mod harness;
 pub mod input;
+#[cfg(test)]
+mod journeys;
 mod navigation;
 mod render;
 mod scanning;
@@ -85,6 +89,15 @@ fn quick_list_with_settings(
     gravityfile_scan::quick_list(path, Some(&config))
 }
 
+/// A result from one of the explorer's background tasks; `None` when the task
+/// ended without reporting.
+enum Background {
+    Scan(Option<ScanResult>),
+    Take(Option<ScanResult>),
+    Preview(Option<PreviewLoad>),
+    Archive(Option<ArchiveCompletion>),
+}
+
 /// Main application state.
 pub struct App {
     /// Path being analyzed (scan root).
@@ -115,6 +128,8 @@ pub struct App {
     /// is `&self`, so these are adopted into the view states after each frame;
     /// mouse hit-testing depends on them matching what is on screen.
     rendered_offsets: std::cell::Cell<(usize, usize)>,
+    /// Recent clicks, to recognize double clicks.
+    clicks: crate::event::ClickTracker,
     /// Scanned file tree.
     ///
     /// Shared rather than owned: `FileTree::clone` is a deep copy of every
@@ -151,6 +166,8 @@ pub struct App {
     undo_log: UndoLog,
     /// Disposal of items replaced by an approved overwrite.
     replace_policy: gravityfile_ops::ReplacePolicy,
+    /// Disposal of deleted items.
+    delete_mode: gravityfile_ops::DeleteMode,
     /// Layout mode (tree vs miller).
     layout_mode: LayoutMode,
     /// Miller columns state.
@@ -320,6 +337,7 @@ impl App {
             image_picker: None,
             preview_area: std::cell::Cell::new(ratatui::layout::Size::new(40, 20)),
             rendered_offsets: std::cell::Cell::new((0, 0)),
+            clicks: crate::event::ClickTracker::default(),
             tree: quick_tree.map(Arc::new),
             tree_state: TreeState::new(path.clone()),
             cached_tree_len: 0,
@@ -339,7 +357,8 @@ impl App {
             delete_auto_marked: false,
             undo_log: UndoLog::new(100),
             replace_policy: config.replace_policy,
-            layout_mode: LayoutMode::default(),
+            delete_mode: config.delete_mode,
+            layout_mode: user_settings.default_layout,
             miller_state: crate::ui::MillerState::new(),
             cached_miller_len: 0,
             input_state: None,
@@ -553,53 +572,8 @@ impl App {
                     self.needs_redraw = true;
                 }
 
-                result = async {
-                    if let Some(rx) = &mut self.scan_rx {
-                        rx.recv().await
-                    } else {
-                        std::future::pending().await
-                    }
-                }, if self.scan_rx.is_some() => {
-                    if let Some(result) = result {
-                        self.handle_scan_result(result);
-                    } else {
-                        self.handle_background_channel_closed();
-                    }
-                    self.needs_redraw = true;
-                }
-
-                take = async {
-                    self.take_rx.as_mut().expect("guarded take receiver").recv().await
-                }, if self.take_rx.is_some() => {
-                    self.take_rx = None;
-                    if let Some(ScanResult::TakeComplete { path, result }) = take {
-                        self.finish_take(path, result);
-                    } else {
-                        self.error = Some("Create-and-enter ended without completion; outcome unknown".into());
-                    }
-                    self.needs_redraw = true;
-                }
-
-                preview = async {
-                    if let Some(rx) = &mut self.preview_rx {
-                        rx.await.ok()
-                    } else {
-                        std::future::pending().await
-                    }
-                }, if self.preview_rx.is_some() => {
-                    self.finish_preview(preview);
-                    self.needs_redraw = true;
-                }
-
-                archive = async {
-                    if let Some(rx) = &mut self.archive_rx {
-                        rx.await.ok()
-                    } else {
-                        std::future::pending().await
-                    }
-                }, if self.archive_rx.is_some() => {
-                    self.finish_archive_task(archive);
-                    self.needs_redraw = true;
+                background = self.next_background(), if self.has_background() => {
+                    self.handle_background(background);
                 }
 
                 _ = interval.tick(), if self.scan_progress.is_some() || self.deletion_progress.is_some() || self.search_state.has_background_work() => {
@@ -614,13 +588,7 @@ impl App {
                 break;
             }
 
-            self.check_navigation(&old_view_root).await;
-
-            // Run the plugin veto check for a staged deletion, then start or abort it.
-            if let Some(items) = self.pending_deletion.take() {
-                self.finalize_deletion(items).await;
-                self.needs_redraw = true;
-            }
+            self.after_input(&old_view_root).await;
 
             // Handle pending suspend command (opening files in external apps)
             if let Some(mut cmd) = self.pending_suspend_command.take() {
@@ -693,6 +661,63 @@ impl App {
         Ok(crate::ExitData {
             last_cwd: self.view_root,
         })
+    }
+
+    /// Work that follows each turn of the event loop: navigation hooks, then
+    /// the plugin veto check for a staged deletion, which starts or aborts it.
+    async fn after_input(&mut self, old_view_root: &Path) {
+        self.check_navigation(old_view_root).await;
+        if let Some(items) = self.pending_deletion.take() {
+            self.finalize_deletion(items).await;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Whether any background task can still report back.
+    fn has_background(&self) -> bool {
+        self.scan_rx.is_some()
+            || self.take_rx.is_some()
+            || self.preview_rx.is_some()
+            || self.archive_rx.is_some()
+    }
+
+    /// The next result from a background task. Never completes when
+    /// [`Self::has_background`] is false.
+    async fn next_background(&mut self) -> Background {
+        tokio::select! {
+            result = async {
+                self.scan_rx.as_mut().expect("guarded scan receiver").recv().await
+            }, if self.scan_rx.is_some() => Background::Scan(result),
+            take = async {
+                self.take_rx.as_mut().expect("guarded take receiver").recv().await
+            }, if self.take_rx.is_some() => Background::Take(take),
+            preview = async {
+                self.preview_rx.as_mut().expect("guarded preview receiver").await.ok()
+            }, if self.preview_rx.is_some() => Background::Preview(preview),
+            archive = async {
+                self.archive_rx.as_mut().expect("guarded archive receiver").await.ok()
+            }, if self.archive_rx.is_some() => Background::Archive(archive),
+            else => std::future::pending().await,
+        }
+    }
+
+    fn handle_background(&mut self, background: Background) {
+        match background {
+            Background::Scan(Some(result)) => self.handle_scan_result(result),
+            Background::Scan(None) => self.handle_background_channel_closed(),
+            Background::Take(take) => {
+                self.take_rx = None;
+                if let Some(ScanResult::TakeComplete { path, result }) = take {
+                    self.finish_take(path, result);
+                } else {
+                    self.error =
+                        Some("Create-and-enter ended without completion; outcome unknown".into());
+                }
+            }
+            Background::Preview(preview) => self.finish_preview(preview),
+            Background::Archive(archive) => self.finish_archive_task(archive),
+        }
+        self.needs_redraw = true;
     }
 
     /// Start a background scan of the current view_root directory.
@@ -854,7 +879,7 @@ impl App {
                 // Update tree with partial results during scanning
                 // This allows the UI to show progressive updates as directories are scanned
                 let root_path = tree.root_path.clone();
-                self.tree = Some(Arc::new(tree));
+                self.install_tree(tree);
 
                 // Preserve selection position if possible
                 if self.tree_state.expanded.is_empty() {
@@ -881,7 +906,7 @@ impl App {
 
                 self.merge_scan_warnings(&tree.warnings);
 
-                self.tree = Some(Arc::new(tree));
+                self.install_tree(tree);
 
                 // Preserve tree state (selection, expanded) across rescans
                 // Only reset if this is a different root path
@@ -1549,7 +1574,10 @@ impl App {
                 self.dispatch_key_event(key_event);
             }
             Event::Mouse(mouse_event) if self.mode == AppMode::Normal => {
-                let action = MouseAction::from_mouse_event(mouse_event);
+                let action = self.clicks.classify(
+                    MouseAction::from_mouse_event(mouse_event),
+                    std::time::Instant::now(),
+                );
                 self.handle_mouse_action(action);
             }
             _ => {}
@@ -1723,20 +1751,22 @@ impl App {
                 self.tab_manager.new_tab(self.view_root.clone());
             }
             KeyAction::CloseDirTab => {
-                self.tab_manager.close_active_tab();
+                if self.tab_manager.close_active_tab() {
+                    self.sync_from_active_tab();
+                }
             }
             KeyAction::NextDirTab if self.tab_manager.len() > 1 => {
-                // Only switch tabs if there are multiple
+                self.sync_to_active_tab();
                 self.tab_manager.next_tab();
                 self.sync_from_active_tab();
             }
             KeyAction::PrevDirTab if self.tab_manager.len() > 1 => {
-                // Only switch tabs if there are multiple
+                self.sync_to_active_tab();
                 self.tab_manager.prev_tab();
                 self.sync_from_active_tab();
             }
             KeyAction::DirTab(n) if self.tab_manager.len() > 1 => {
-                // Only switch tabs if there are multiple
+                self.sync_to_active_tab();
                 self.tab_manager.switch_to_number(n as usize);
                 self.sync_from_active_tab();
             }
@@ -2130,8 +2160,7 @@ impl App {
         let results = self
             .dispatch_hook_collect(gravityfile_plugin::Hook::OnDeleteStart {
                 items: paths,
-                // `start_deletion` uses the recoverable trash by default.
-                use_trash: true,
+                use_trash: self.delete_mode == gravityfile_ops::DeleteMode::Trash,
             })
             .await;
 
@@ -2145,7 +2174,7 @@ impl App {
         }
 
         self.prepare_operation();
-        self.scan_rx = Some(deletion::start_deletion(items));
+        self.scan_rx = Some(deletion::start_deletion(items, self.delete_mode));
     }
 
     /// Get the size of a path from the tree.
@@ -2461,68 +2490,8 @@ impl App {
 
         // Canonicalize to resolve .. and .
         let path = path.canonicalize().unwrap_or(path);
-
         if path.is_dir() {
-            // Check if target path is within our already-scanned tree
-            let within_scanned_tree = if let Some(tree) = &self.tree {
-                path.starts_with(&tree.root_path) || tree.root_path.starts_with(&path)
-            } else {
-                false
-            };
-
-            if within_scanned_tree {
-                // Navigate within the existing tree - no rescan needed
-                self.view_root = path.clone();
-                self.view_history.clear();
-                self.forward_history.clear();
-                self.tree_state.selected = 0;
-                self.tree_state.offset = 0;
-                self.tree_state.expand(&self.view_root);
-                self.miller_state.reset();
-                self.update_cached_tree_len();
-                self.update_cached_miller_len();
-                self.clear_preview();
-
-                // Update the active tab view_root but keep the tree
-                if let Some(tab) = self.tab_manager.active_tab_mut() {
-                    tab.view_root = self.view_root.clone();
-                }
-            } else {
-                // Going to a new location - use quick_list for immediate display
-                // Don't auto-scan; user can press R to scan if needed
-                self.path = path.clone();
-                self.view_root = path.clone();
-                self.view_history.clear();
-                self.forward_history.clear();
-                self.tree_state = TreeState::new(self.path.clone());
-                self.miller_state.reset();
-                self.marked.clear();
-                self.clipboard.clear();
-                self.duplicates = None;
-                self.age_report = None;
-                self.warnings.clear();
-                self.clear_preview();
-                self.scan_progress = None;
-
-                // Load quick tree for immediate display
-                self.tree = self.load_directory_listing(&path).map(Arc::new);
-                self.update_cached_tree_len();
-                self.update_cached_miller_len();
-
-                // Update the active tab
-                if let Some(tab) = self.tab_manager.active_tab_mut() {
-                    tab.path = self.path.clone();
-                    tab.view_root = self.view_root.clone();
-                    tab.label = self
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| self.path.to_string_lossy().to_string());
-                    tab.history.clear();
-                }
-
-                // Don't auto-start scan - user can press R when ready
-            }
+            self.navigate_to(path);
         } else {
             self.error = Some(format!("Not a directory: {}", path.display()));
         }
@@ -3400,6 +3369,7 @@ impl App {
         let Some(root_path) = self.tree.as_ref().map(|tree| tree.root_path.clone()) else {
             return;
         };
+        let sort_mode = self.sort_mode;
 
         // First check if we have cached scan data for this directory
         if let Some(cached_tree) = self
@@ -3415,6 +3385,7 @@ impl App {
             {
                 // Replace with the cached node (preserves all scan data)
                 *node = cached_tree.root.clone();
+                Self::order_new_subtree(node, sort_mode);
             }
             return;
         }
@@ -3428,6 +3399,7 @@ impl App {
                     Self::find_node_mut(&mut Arc::make_mut(tree).root, path, &root_path)
             {
                 node.children = std::mem::take(&mut quick_tree.root.children);
+                Self::order_new_subtree(node, sort_mode);
             }
         }
     }
@@ -3492,7 +3464,7 @@ impl App {
                 };
                 self.prepare_operation();
                 self.path = tree.root_path.clone();
-                self.tree = Some(Arc::new(tree));
+                self.install_tree(tree);
                 self.duplicates = None;
                 self.age_report = None;
                 self.has_full_scan = false;
@@ -3577,7 +3549,7 @@ impl App {
         // Create a new tree rooted at the resolved parent.
         self.prepare_operation();
         self.path = parent_tree.root_path.clone();
-        self.tree = Some(Arc::new(parent_tree));
+        self.install_tree(parent_tree);
         self.view_root = self.path.clone();
         self.duplicates = None;
         self.age_report = None;
@@ -4223,6 +4195,15 @@ impl App {
             self.error = Some(format!("Bookmark '{key}' is not a directory"));
             return;
         }
+        self.navigate_to(path);
+    }
+
+    /// Show the directory `path` (canonical), remembering where we came from.
+    /// Within the loaded tree this only moves the view; anywhere else, such as
+    /// an ancestor of the scan root or a directory not yet listed, it lists
+    /// `path` and scans it if scanning on open is enabled. Marks and the
+    /// clipboard are kept.
+    fn navigate_to(&mut self, path: PathBuf) {
         let loaded = self.tree.as_ref().is_some_and(|tree| {
             Self::find_node_at_path(&tree.root, &path, &tree.root_path)
                 .is_some_and(|node| node.is_dir())
@@ -4251,7 +4232,7 @@ impl App {
         if let Some(tree) = replacement {
             self.prepare_operation();
             self.path = tree.root_path.clone();
-            self.tree = Some(Arc::new(tree));
+            self.install_tree(tree);
             self.tree_state = TreeState::new(self.path.clone());
             self.duplicates = None;
             self.age_report = None;
@@ -5052,6 +5033,21 @@ impl App {
         self.settings_state = None;
         self.mode = AppMode::Normal;
         self.needs_redraw = true;
+    }
+
+    /// Display `tree`, ordered by the current sort mode. Every new tree goes
+    /// through here so a chosen order survives rescans and navigation.
+    fn install_tree(&mut self, mut tree: gravityfile_core::FileTree) {
+        Self::order_new_subtree(&mut tree.root, self.sort_mode);
+        self.tree = Some(Arc::new(tree));
+    }
+
+    /// Order a subtree that just arrived from a scan, listing or cache.
+    fn order_new_subtree(node: &mut gravityfile_core::FileNode, mode: SortMode) {
+        // Scans and listings already arrive in the default order.
+        if mode != SortMode::SizeDescending {
+            Self::sort_node_tree(node, mode);
+        }
     }
 
     /// Apply the current sort mode to the file tree.
@@ -6218,6 +6214,7 @@ mod tests {
             root.clone(),
             crate::TuiConfig {
                 replace_policy: gravityfile_ops::ReplacePolicy::Permanent,
+                delete_mode: gravityfile_ops::DeleteMode::Permanent,
                 ..crate::TuiConfig::default()
             },
         );
@@ -7038,7 +7035,7 @@ mod tests {
         let removed = app.path.join("temporary-delete-target");
         std::fs::write(&removed, b"temporary").unwrap();
         app.operation_message = Some((true, "Old copy summary".into()));
-        let mut rx = deletion::start_deletion_with_mode(
+        let mut rx = deletion::start_deletion(
             vec![(missing.clone(), 0), (removed.clone(), 9)],
             gravityfile_ops::DeleteMode::Permanent,
         );

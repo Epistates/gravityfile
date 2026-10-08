@@ -10,6 +10,7 @@ use std::sync::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
 
 const MAX_SEARCH_RESULTS: usize = 1000;
@@ -516,8 +517,10 @@ impl SearchState {
     /// Score every candidate, retaining only bounded lightweight references.
     /// Materialize paths and highlighting for the winners after ranking.
     fn execute_fuzzy_search(&mut self) {
-        let mut pattern_buf = Vec::new();
-        let pattern = Utf32Str::new(&self.query, &mut pattern_buf);
+        // Smart case: a lowercase query ignores case, any capital makes it
+        // exact. Also fzf syntax: space-separated terms, ^prefix, suffix$,
+        // !exclusion and 'exact.
+        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
         let mut haystack_buf = Vec::new();
         let mut best = BinaryHeap::with_capacity(MAX_SEARCH_RESULTS);
         for (index, (_, display, _)) in self.all_paths.iter().enumerate() {
@@ -526,7 +529,7 @@ impl SearchState {
             }
             haystack_buf.clear();
             let haystack = Utf32Str::new(display, &mut haystack_buf);
-            if let Some(score) = self.matcher.fuzzy_match(haystack, pattern) {
+            if let Some(score) = pattern.score(haystack, &mut self.matcher) {
                 // Largest heap entry is worst: lowest score, then latest input.
                 let candidate = (Reverse(score), index);
                 if best.len() < MAX_SEARCH_RESULTS {
@@ -546,11 +549,14 @@ impl SearchState {
             haystack_buf.clear();
             let haystack = Utf32Str::new(display, &mut haystack_buf);
             let mut indices = Vec::new();
-            self.matcher.fuzzy_indices(haystack, pattern, &mut indices);
+            pattern.indices(haystack, &mut self.matcher, &mut indices);
+            // Several terms can match the same characters.
+            indices.sort_unstable();
+            indices.dedup();
             self.results.push(SearchResult {
                 path: path.clone(),
                 display: display.clone(),
-                score: score as u32,
+                score,
                 is_dir: *is_dir,
                 matched_indices: indices.into_iter().map(|index| index as usize).collect(),
             });

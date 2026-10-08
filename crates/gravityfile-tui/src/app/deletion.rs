@@ -8,16 +8,9 @@ use tokio::sync::mpsc;
 use super::constants::SCAN_CHANNEL_SIZE;
 use super::state::{DeletionProgress, ScanResult};
 
-/// Delete `(path, size)` items in the background (to the Trash by default).
+/// Delete `(path, size)` items in the background.
 /// Dropping the receiver stops after the current item.
-pub fn start_deletion(items: Vec<(PathBuf, u64)>) -> mpsc::Receiver<ScanResult> {
-    start_deletion_with_mode(items, DeleteMode::Trash)
-}
-
-pub fn start_deletion_with_mode(
-    items: Vec<(PathBuf, u64)>,
-    mode: DeleteMode,
-) -> mpsc::Receiver<ScanResult> {
+pub fn start_deletion(items: Vec<(PathBuf, u64)>, mode: DeleteMode) -> mpsc::Receiver<ScanResult> {
     let total = items.len();
     let token = CancellationToken::new();
     let mut rx = gravityfile_ops::start_delete(items, mode, token.clone());
@@ -116,8 +109,7 @@ mod tests {
         }
         let mut items: Vec<_> = paths.iter().cloned().map(|path| (path, 10)).collect();
         items.push((temp.path().join("missing"), 5));
-        let (deleted, failed, bytes) =
-            complete(start_deletion_with_mode(items, DeleteMode::Permanent)).await;
+        let (deleted, failed, bytes) = complete(start_deletion(items, DeleteMode::Permanent)).await;
         assert_eq!(deleted, paths);
         assert_eq!((failed, bytes), (1, 40));
         assert!(paths.iter().all(|path| !path.exists()));
@@ -126,7 +118,7 @@ mod tests {
     #[tokio::test]
     async fn empty_batches_complete() {
         let (deleted, failed, _) =
-            complete(start_deletion_with_mode(Vec::new(), DeleteMode::Permanent)).await;
+            complete(start_deletion(Vec::new(), DeleteMode::Permanent)).await;
         assert!(deleted.is_empty() && failed == 0);
     }
 

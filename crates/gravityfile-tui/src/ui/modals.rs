@@ -800,7 +800,7 @@ impl Widget for SettingsModal<'_> {
         // Default layout
         lines.push(self.render_choice(
             "Default layout",
-            &self.state.settings.default_layout,
+            self.state.settings.default_layout.name(),
             self.state.selected == 2,
         ));
 

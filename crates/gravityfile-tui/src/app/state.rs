@@ -65,7 +65,8 @@ pub enum AppMode {
 }
 
 /// Layout mode for the explorer view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LayoutMode {
     /// Tree view (default, current behavior).
     #[default]
@@ -80,6 +81,14 @@ impl LayoutMode {
         match self {
             Self::Tree => Self::Miller,
             Self::Miller => Self::Tree,
+        }
+    }
+
+    /// The name used in settings.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Miller => "miller",
         }
     }
 }
@@ -935,8 +944,8 @@ pub struct UserSettings {
     pub scan_on_startup: bool,
     /// Show hidden files by default.
     pub show_hidden: bool,
-    /// Default layout mode.
-    pub default_layout: String,
+    /// Layout the explorer opens in.
+    pub default_layout: LayoutMode,
     /// File opener configuration.
     pub openers: FileOpeners,
     /// Editor configuration for opensesame.
@@ -965,7 +974,7 @@ impl Default for UserSettings {
             max_scan_entries: None,
             scan_on_startup: true, // Enabled by default
             show_hidden: false,
-            default_layout: "tree".to_string(),
+            default_layout: LayoutMode::Tree,
             openers: FileOpeners::default(),
             editor: opensesame::EditorConfig::default(),
             bookmarks: Bookmarks::with_defaults(),
@@ -1003,6 +1012,10 @@ impl Default for FileOpeners {
 impl UserSettings {
     /// Get the config file path.
     pub fn config_path() -> Option<PathBuf> {
+        // Unit tests must never read or write the user's real settings.
+        if cfg!(test) {
+            return None;
+        }
         gravityfile_core::paths::Dirs::discover().map(|dirs| dirs.settings_file())
     }
 
@@ -1181,11 +1194,7 @@ impl SettingsState {
             }
             2 => {
                 // Cycle layout mode
-                self.settings.default_layout = match self.settings.default_layout.as_str() {
-                    "tree" => "miller".to_string(),
-                    "miller" => "tree".to_string(),
-                    _ => "tree".to_string(),
-                };
+                self.settings.default_layout = self.settings.default_layout.toggle();
                 self.dirty = true;
             }
             _ => {}
@@ -1298,7 +1307,10 @@ mod tests {
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, b"original").unwrap();
         let settings = UserSettings {
-            default_layout: "x".repeat(UserSettings::MAX_BYTES as usize),
+            openers: FileOpeners {
+                md: "x".repeat(UserSettings::MAX_BYTES as usize),
+                ..FileOpeners::default()
+            },
             ..UserSettings::default()
         };
         assert_eq!(
@@ -1336,14 +1348,15 @@ mod tests {
         UserSettings::default().save_to(&path).unwrap();
         let settings = UserSettings {
             scan_on_startup: false,
-            default_layout: "miller".into(),
+            default_layout: LayoutMode::Miller,
             ..UserSettings::default()
         };
         settings.save_to(&path).unwrap();
-        let restored: UserSettings =
-            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("default_layout = \"miller\""), "{saved}");
+        let restored: UserSettings = toml::from_str(&saved).unwrap();
         assert!(!restored.scan_on_startup);
-        assert_eq!(restored.default_layout, "miller");
+        assert_eq!(restored.default_layout, LayoutMode::Miller);
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1

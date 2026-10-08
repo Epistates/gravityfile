@@ -655,9 +655,9 @@ pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, 
         }
     }
 
-    let mut root = frame.finish().expect("root is retained");
-    // Name order for immediate display; the full scan re-sorts by size.
-    root.children.sort_by(|a, b| a.compare_name(b));
+    // Ordered by size like every other tree, so a caller's sort applies the
+    // same way to a listing and to a scan.
+    let root = frame.finish().expect("root is retained");
 
     // quick_list observes only immediate children, even if supplied a recursive
     // scan configuration. Preserve the actual scope for downstream consumers.

@@ -70,6 +70,8 @@ pub struct TuiConfig {
     pub print_cwd: bool,
     /// What happens to an item the user chooses to overwrite on paste.
     pub replace_policy: gravityfile_ops::ReplacePolicy,
+    /// What happens to items the user deletes.
+    pub delete_mode: gravityfile_ops::DeleteMode,
     /// How sizes are displayed.
     pub units: gravityfile_core::units::Units,
 }

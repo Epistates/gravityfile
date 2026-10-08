@@ -122,9 +122,7 @@ pub enum KeyAction {
 pub enum MouseAction {
     /// Left click at a position.
     Click { x: u16, y: u16 },
-    /// Double click at a position.
-    /// Reserved for future double-click detection with timing logic.
-    #[allow(dead_code)]
+    /// Second click on the same row in quick succession; see [`ClickTracker`].
     DoubleClick { x: u16, y: u16 },
     /// Right click at a position.
     RightClick { x: u16, y: u16 },
@@ -158,6 +156,40 @@ impl MouseAction {
             MouseEventKind::ScrollUp => MouseAction::ScrollUp { x, y },
             MouseEventKind::ScrollDown => MouseAction::ScrollDown { x, y },
             _ => MouseAction::None,
+        }
+    }
+}
+
+/// Recognizes double clicks: terminals report each press separately.
+#[derive(Debug, Default)]
+pub struct ClickTracker {
+    last: Option<(std::time::Instant, u16)>,
+}
+
+impl ClickTracker {
+    /// Longest gap between the two clicks of a double click.
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+    /// `action`, turned into a double click if it is a second left click on
+    /// the same row within [`Self::WINDOW`]. A third click starts over.
+    pub fn classify(&mut self, action: MouseAction, now: std::time::Instant) -> MouseAction {
+        match action {
+            MouseAction::Click { x, y } => {
+                if let Some((at, row)) = self.last.take()
+                    && row == y
+                    && now.saturating_duration_since(at) <= Self::WINDOW
+                {
+                    return MouseAction::DoubleClick { x, y };
+                }
+                self.last = Some((now, y));
+                action
+            }
+            // Releasing the button belongs to the click.
+            MouseAction::DragEnd | MouseAction::None => action,
+            _ => {
+                self.last = None;
+                action
+            }
         }
     }
 }
@@ -597,6 +629,30 @@ pub fn get_key_bindings() -> Vec<KeyBinding> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
+
+    #[test]
+    fn a_quick_second_click_on_the_same_row_is_a_double_click() {
+        let start = std::time::Instant::now();
+        let at = |millis| start + std::time::Duration::from_millis(millis);
+        let click = |y| MouseAction::Click { x: 3, y };
+        let mut clicks = ClickTracker::default();
+        assert_eq!(clicks.classify(click(5), at(0)), click(5));
+        assert_eq!(
+            clicks.classify(MouseAction::DragEnd, at(50)),
+            MouseAction::DragEnd
+        );
+        assert_eq!(
+            clicks.classify(click(5), at(300)),
+            MouseAction::DoubleClick { x: 3, y: 5 }
+        );
+        // A third click starts over rather than double-clicking again.
+        assert_eq!(clicks.classify(click(5), at(350)), click(5));
+        // Too slow, another row, or something in between: two single clicks.
+        assert_eq!(clicks.classify(click(5), at(900)), click(5));
+        assert_eq!(clicks.classify(click(6), at(950)), click(6));
+        clicks.classify(MouseAction::ScrollDown { x: 3, y: 6 }, at(960));
+        assert_eq!(clicks.classify(click(6), at(970)), click(6));
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {

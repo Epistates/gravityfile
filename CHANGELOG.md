@@ -74,6 +74,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate group keeps one copy.
 - Mouse clicks select the row under the pointer after scrolling.
 - `grav scan`'s total is the full disk usage of the root, not just its files.
+- Explorer search found nothing when the query had a capital letter. It now
+  uses smart case (a capital makes the query case-sensitive) and fzf syntax:
+  space-separated terms, `^prefix`, `suffix$`, `!exclude`, `'exact`.
+- The chosen sort order is kept after a rescan or when moving to a new
+  directory; directory listings no longer briefly appear in name order.
+- Going to an ancestor of the scanned directory (Ctrl-g) showed an empty pane.
+  Go-to now behaves like jumping to a bookmark: Backspace returns, and marks and
+  the clipboard are kept.
+- Closing a directory tab returned to the closed tab's directory.
+- The `default_layout` setting was ignored at startup.
+- Directory sizes in the tree were shifted out of their column.
+- Double-click enters a directory, as the help says.
 
 ## [0.3.1] - 2026-07-24
 

@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, StatefulWidget, Widget};
 
 use gravityfile_core::{FileNode, GitStatus, NodeKind};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
@@ -360,8 +361,9 @@ impl StatefulWidget for TreeView<'_> {
                 base_style
             };
 
-            // Calculate available width for name
-            let prefix_width = prefix.len() + checkbox_width as usize + expand_indicator.len();
+            // Available width for the name, in terminal columns: the guide
+            // lines and indicators are multi-byte but one column per char.
+            let prefix_width = prefix.width() + checkbox_width as usize + expand_indicator.width();
             let available_for_name = inner_area
                 .width
                 .saturating_sub(prefix_width as u16)
@@ -392,14 +394,8 @@ impl StatefulWidget for TreeView<'_> {
 
             // Pad name to fill space (accounting for git indicator)
             // Use display width, not byte length, for correct Unicode padding
-            let git_display_width = {
-                use unicode_width::UnicodeWidthStr;
-                git_indicator.width() as u16
-            };
-            let name_display_width = {
-                use unicode_width::UnicodeWidthStr;
-                name.width() as u16
-            };
+            let git_display_width = git_indicator.width() as u16;
+            let name_display_width = name.width() as u16;
             let name_padding = " ".repeat(
                 available_for_name
                     .saturating_sub(name_display_width)
