@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unix PTY smoke: silent/responding queries, navigation, quit and restoration.
 
-Usage: python3 scripts/qualification/terminal-smoke.py target/release/grav
+Usage: python3 scripts/terminal-smoke.py target/release/grav
 Uses disposable fixtures, simulated replies and a forced initialization failure.
 No latency or graphics-rendering claim.
 """

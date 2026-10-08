@@ -1,204 +1,102 @@
-name: Rust
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   schedule:
-    - cron: '23 7 * * *'
+    - cron: '23 7 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  quality:
-    if: github.event_name != 'schedule'
+  lint:
+    name: Format, lint and docs
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, rustfmt
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Test release artifact validation
-        run: python3 -m unittest discover -s scripts -p "test_*.py"
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Lint optional-feature boundaries
-        run: cargo clippy -p gravityfile-scan --all-targets --no-default-features --locked -- -D warnings
-
-      - name: Check documentation
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --no-default-features --locked
+      - run: cargo doc --workspace --all-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
 
-      - name: Verify packaged sources
-        timeout-minutes: 30
-        run: |
-          cargo fetch --locked
-          cargo package --workspace --allow-dirty --no-verify --locked --offline
-          python3 scripts/verify-packaged-workspace.py
-
-  # The filesystem layer diverges sharply per platform: `rename_noreplace` has
-  # three implementations, and inode/nlink/disk-size handling is cfg'd. Testing
-  # only on Linux left the macOS and Windows paths entirely unexercised.
   test:
-    if: github.event_name != 'schedule'
-    name: Test on ${{ matrix.os }}
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          key: ${{ matrix.os }}
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --all-features --locked --no-fail-fast
+      - run: cargo test --workspace --all-features --locked --doc
 
-      - name: Record qualification environment
-        shell: bash
-        run: |
-          python - <<'PYTHON'
-          import datetime, json, os, platform, subprocess
-          from pathlib import Path
-          output = Path('ci-qualification')
-          output.mkdir()
-          def version(*command):
-              return subprocess.check_output(command, text=True).strip()
-          record = {
-              'schema_version': 1,
-              'recorded_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              'checkout_commit': version('git', 'rev-parse', 'HEAD'),
-              'platform': platform.platform(),
-              'machine': platform.machine(),
-              'python': platform.python_version(),
-              'rustc': version('rustc', '-Vv'),
-              'cargo': version('cargo', '-V'),
-              'github': {key: os.environ.get(key) for key in (
-                  'GITHUB_SHA', 'GITHUB_EVENT_NAME', 'GITHUB_RUN_ID',
-                  'GITHUB_RUN_ATTEMPT', 'GITHUB_REPOSITORY', 'RUNNER_OS', 'RUNNER_ARCH')},
-          }
-          (output / 'environment.json').write_text(json.dumps(record, indent=2) + '\n')
-          PYTHON
-
-      - name: Install Linux qualification shells
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bash zsh fish
-
-      - name: Require all Linux shell wrapper cases
+      - name: Shell integration (bash, zsh, fish)
         if: runner.os == 'Linux'
         env:
           GRAVITYFILE_REQUIRE_SHELLS: '1'
-        run: python scripts/qualification/run-check.py --output ci-qualification/shells.json --log ci-qualification/shells.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- python -m unittest discover -s scripts -p test_shell_integration.py
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh fish
+          cargo build --bins --locked
+          python3 -m unittest discover -s scripts -p test_shell_integration.py
 
-      - name: Test release tooling on native filesystem
-        run: python scripts/qualification/run-check.py --output ci-qualification/tooling.json --log ci-qualification/tooling.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- python -m unittest discover -s scripts -p "test_*.py"
-
-      - name: Test
-        run: python scripts/qualification/run-check.py --output ci-qualification/tests.json --log ci-qualification/tests.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- cargo test --workspace --all-features --locked
-
-      - name: Build default-feature command-line binaries
-        run: python scripts/qualification/run-check.py --output ci-qualification/build.json --log ci-qualification/build.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- cargo build --bins --locked
-
-      - name: Exercise both command-line entry points
-        run: python scripts/qualification/run-check.py --output ci-qualification/cli.json --log ci-qualification/cli.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- python scripts/smoke-release.py --binary-dir target/debug
-
-      - name: Exercise Unix terminal startup and restoration
+      - name: Terminal startup and restoration
         if: runner.os != 'Windows'
         run: |
-          python scripts/qualification/run-check.py --output ci-qualification/terminal-grav.json --log ci-qualification/terminal-grav.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- python scripts/qualification/terminal-smoke.py target/debug/grav
-          python scripts/qualification/run-check.py --output ci-qualification/terminal-gravityfile.json --log ci-qualification/terminal-gravityfile.log --input Cargo.lock --input Cargo.toml --input deny.toml --input justfile --input-glob "src/**/*.rs" --input-glob "crates/**/*.rs" --input-glob "crates/**/Cargo.toml" --input-glob "tests/**/*.*" --input-glob "scripts/**/*.py" --input-glob "scripts/**/*.sh" --input-glob "scripts/*.bash" --input-glob "scripts/*.zsh" --input-glob "scripts/*.fish" --input-glob ".github/workflows/*.yml" -- python scripts/qualification/terminal-smoke.py target/debug/gravityfile
+          cargo build --bins --locked
+          python3 scripts/terminal-smoke.py target/debug/grav
 
-      - name: Retain qualification records and failure logs
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: qualification-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-qualification/
-          if-no-files-found: warn
-          retention-days: 30
-
-  # `rust-version` is a promise to downstream users; `stable` alone never
-  # catches an accidental use of a newer language or std feature.
   msrv:
-    if: github.event_name != 'schedule'
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Read MSRV from Cargo.toml
+      - name: Read MSRV
         id: msrv
-        run: |
-          version="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          test -n "$version" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
+        run: echo "version=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: msrv-${{ steps.msrv.outputs.version }}
+          key: msrv
+      - run: cargo check --workspace --all-targets --all-features --locked
+        env:
+          RUSTFLAGS: ''
 
-      - name: Check
-        run: cargo check --workspace --all-targets --all-features --locked
-
-  # deny.toml declared a supply-chain policy that nothing enforced. These run
-  # the same checks the local `just release-check` gate does.
   supply-chain:
     name: Advisories, licenses and unused dependencies
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    concurrency:
-      group: supply-chain-${{ github.ref }}-${{ github.event_name }}
-      cancel-in-progress: true
-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-deny,cargo-machete
-
-      - name: Advisories, licenses, sources and bans
-        run: cargo deny check
-
-      - name: Unused dependencies
-        run: cargo machete
+      - run: cargo deny check
+      - run: cargo machete

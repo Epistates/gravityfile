@@ -88,8 +88,7 @@ keywords.workspace = true
 categories.workspace = true
 description = "A state-of-the-art file system analyzer with TUI"
 autobins = false
-# Internal working notes and planning material are not part of the package.
-exclude = ["AUDIT_FIXES.md", ".strategy/", ".claude/", ".codex/", ".agents/", "scripts/"]
+include = ["src/**/*.rs", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 [[bin]]
 name = "grav"

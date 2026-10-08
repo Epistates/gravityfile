@@ -247,7 +247,7 @@ impl DuplicateFinder {
 
         // Phase 3: For groups with 2+ files, compute hashes.
         // Parallelize independent size groups. Unbounded file-level parallelism
-        // regressed the measured small-file workload; see docs/BENCHMARKS.md.
+        // regressed small-file workloads.
         let duplicate_groups: Vec<DuplicateGroup> = if self.config.quick_compare {
             size_groups
                 .into_par_iter()
