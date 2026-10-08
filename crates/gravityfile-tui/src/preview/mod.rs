@@ -7,11 +7,8 @@ mod content;
 mod image;
 mod syntax;
 
-pub use content::{ImageContext, PreviewContent, PreviewMode, PreviewState};
-#[allow(unused_imports)]
-pub use image::{ImageProtocol, is_image_path};
-
-// Re-export for potential future use
-#[allow(unused_imports)]
-pub use content::{ArchiveEntry, PreviewError, PreviewLoader};
-pub use syntax::SyntaxHighlighter;
+#[cfg(test)]
+pub use content::ArchiveEntry;
+pub use content::{
+    ImageContext, PreviewContent, PreviewError, PreviewLoader, PreviewMode, PreviewState,
+};

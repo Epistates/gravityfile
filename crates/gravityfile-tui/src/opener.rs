@@ -99,9 +99,6 @@ pub enum OpenResult {
     Opened,
     /// Need to suspend terminal for TUI app.
     NeedsSuspend(Command),
-    /// File type not supported or opener not found.
-    #[allow(dead_code)]
-    NotSupported(String),
     /// Error opening file.
     Error(String),
 }

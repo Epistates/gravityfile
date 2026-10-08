@@ -11,7 +11,6 @@ mod harness;
 pub mod input;
 #[cfg(test)]
 mod journeys;
-mod navigation;
 mod render;
 mod scanning;
 pub mod state;
@@ -1797,7 +1796,7 @@ impl App {
                 match action {
                     // 'y'/Enter both confirm deletion.
                     // KeyAction::Yank covers the 'y' key since that is its normal-mode mapping.
-                    KeyAction::Confirm | KeyAction::DrillDown | KeyAction::Yank => {
+                    KeyAction::DrillDown | KeyAction::Yank => {
                         self.execute_deletion();
                     }
                     KeyAction::Quit | KeyAction::Cancel => {
@@ -1955,7 +1954,7 @@ impl App {
             KeyAction::JumpToTop => self.jump_to_top(),
             KeyAction::JumpToBottom => self.jump_to_bottom(),
 
-            KeyAction::MoveRight | KeyAction::Expand => {
+            KeyAction::MoveRight => {
                 if self.view == View::Explorer {
                     match self.layout_mode {
                         LayoutMode::Tree => self.expand_selected(),
@@ -1974,7 +1973,7 @@ impl App {
                     self.drill_into_treemap_selected();
                 }
             }
-            KeyAction::MoveLeft | KeyAction::Collapse => {
+            KeyAction::MoveLeft => {
                 if self.view == View::Explorer {
                     match self.layout_mode {
                         LayoutMode::Tree => self.collapse_selected(),
@@ -2110,15 +2109,7 @@ impl App {
                 self.execute_undo();
             }
 
-            KeyAction::Confirm => {
-                if !self.marked.is_empty() {
-                    self.mode = AppMode::ConfirmDelete;
-                } else if self.view == View::Explorer {
-                    self.toggle_selected();
-                }
-            }
-
-            KeyAction::DrillDown | KeyAction::OpenFile if self.view == View::Explorer => {
+            KeyAction::DrillDown if self.view == View::Explorer => {
                 // Check if selected item is a file or directory
                 let is_file = self.is_selected_file();
                 if is_file {
@@ -2130,14 +2121,14 @@ impl App {
                     }
                 }
             }
-            KeyAction::DrillDown | KeyAction::OpenFile if self.view == View::Treemap => {
+            KeyAction::DrillDown if self.view == View::Treemap => {
                 if self.is_selected_file() {
                     self.open_selected_file();
                 } else {
                     self.drill_into_treemap_selected();
                 }
             }
-            KeyAction::DrillDown | KeyAction::OpenFile => {}
+            KeyAction::DrillDown => {}
             KeyAction::NavigateBack if self.view == View::Explorer => {
                 self.navigate_back();
             }
@@ -3362,9 +3353,6 @@ impl App {
             crate::opener::OpenResult::NeedsSuspend(cmd) => {
                 // Need to suspend terminal and run command
                 self.suspend_and_run(cmd);
-            }
-            crate::opener::OpenResult::NotSupported(msg) => {
-                self.error = Some(msg);
             }
             crate::opener::OpenResult::Error(msg) => {
                 self.error = Some(msg);
@@ -5733,7 +5721,7 @@ mod tests {
         app.marked.insert(app.path.clone());
         app.marked.insert(app.path.parent().unwrap().to_path_buf());
         app.mode = AppMode::ConfirmDelete;
-        app.handle_action(KeyAction::Confirm);
+        app.handle_action(KeyAction::DrillDown);
         assert!(
             app.pending_deletion.is_none(),
             "protected paths must be filtered out before deletion"

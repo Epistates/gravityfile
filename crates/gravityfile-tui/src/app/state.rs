@@ -361,7 +361,6 @@ impl DeletionProgress {
 /// Result from a background scan operation.
 pub enum ScanResult {
     Progress(ScanProgress),
-    #[allow(dead_code)] // For future real-time warning streaming
     Warning(gravityfile_core::ScanWarning),
     /// Partial tree snapshot for real-time updates during scanning.
     PartialTree(FileTree),

@@ -132,12 +132,8 @@ pub(crate) fn visible_input_parts(text: &str, cursor: usize, width: usize) -> (&
 /// Layout areas for the application.
 #[derive(Debug, Clone, Copy)]
 pub struct AppLayout {
-    #[allow(dead_code)]
-    pub header: Rect,
     pub main: Rect,
     pub details: Option<Rect>,
-    #[allow(dead_code)]
-    pub footer: Rect,
 }
 
 impl AppLayout {
@@ -163,16 +159,7 @@ impl AppLayout {
             (area, None)
         };
 
-        Self {
-            // These are unused — kept only so downstream code that reads
-            // them will not break. They intentionally point at the content
-            // area since the real header/footer rects are owned by
-            // `render_app` and are not passed down.
-            header: area,
-            main,
-            details,
-            footer: area,
-        }
+        Self { main, details }
     }
 }
 
@@ -199,7 +186,6 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 /// Format a duration in human-readable form.
-#[allow(dead_code)]
 pub fn format_duration(duration: std::time::Duration) -> String {
     let secs = duration.as_secs();
     if secs < 60 {

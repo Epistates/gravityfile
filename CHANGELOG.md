@@ -102,6 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every entry of each Miller column. A frame now builds only the rows on screen:
   under 3 ms at any scroll position, with or without marks.
 - The Miller parent column scrolls to keep the current directory in view.
+- The treemap dims cut items and italicises copied ones, as the tree does.
+- Text previews show how many lines the file has, so a truncated preview says
+  so.
 
 ## [0.3.1] - 2026-07-24
 

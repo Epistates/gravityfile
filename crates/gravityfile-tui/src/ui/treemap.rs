@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 
 use gravityfile_core::FileNode;
 
-use crate::app::state::ClipboardState;
+use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
 use crate::ui::fit_to_width;
 
@@ -63,9 +63,6 @@ pub struct TreemapRect {
     pub is_dir: bool,
     /// Calculated rectangle.
     pub rect: Rect,
-    /// Depth in hierarchy (for future depth-based coloring).
-    #[allow(dead_code)]
-    pub depth: usize,
 }
 
 /// Treemap widget.
@@ -74,7 +71,6 @@ pub struct TreemapView<'a> {
     root_path: &'a PathBuf,
     theme: &'a Theme,
     marked: &'a HashSet<PathBuf>,
-    #[allow(dead_code)]
     clipboard: &'a ClipboardState,
     block: Option<Block<'a>>,
     /// Selected rectangle index for highlighting.
@@ -133,7 +129,7 @@ impl<'a> TreemapView<'a> {
         items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.compare_name(b.0)));
 
         // Apply squarified algorithm
-        self.squarify(&items, area, self.root.size, 0, &mut rects);
+        self.squarify(&items, area, self.root.size, &mut rects);
 
         rects
     }
@@ -144,7 +140,6 @@ impl<'a> TreemapView<'a> {
         items: &[(&FileNode, u64)],
         area: Rect,
         total_size: u64,
-        depth: usize,
         rects: &mut Vec<TreemapRect>,
     ) {
         if items.is_empty() || area.width == 0 || area.height == 0 || total_size == 0 {
@@ -160,7 +155,6 @@ impl<'a> TreemapView<'a> {
                 size,
                 is_dir: node.is_dir(),
                 rect: area,
-                depth,
             });
             return;
         }
@@ -270,7 +264,6 @@ impl<'a> TreemapView<'a> {
                     size,
                     is_dir: node.is_dir(),
                     rect: item_rect,
-                    depth,
                 });
             }
         }
@@ -281,13 +274,7 @@ impl<'a> TreemapView<'a> {
         // parent's reported size (e.g. quick-scan trees with unmeasured dirs).
         let remaining_size = total_size.saturating_sub(row_size);
 
-        self.squarify(
-            &remaining_items,
-            remaining_area,
-            remaining_size,
-            depth,
-            rects,
-        );
+        self.squarify(&remaining_items, remaining_area, remaining_size, rects);
     }
 }
 
@@ -342,6 +329,16 @@ impl Widget for TreemapView<'_> {
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(color)
+            };
+            // Cut items are dimmed and copied items italic, as in the tree.
+            let style = match self.clipboard.mode {
+                ClipboardMode::Cut if self.clipboard.paths.contains(&treemap_rect.path) => {
+                    style.add_modifier(Modifier::DIM)
+                }
+                ClipboardMode::Copy if self.clipboard.paths.contains(&treemap_rect.path) => {
+                    style.add_modifier(Modifier::ITALIC)
+                }
+                _ => style,
             };
 
             // Background style for fill

@@ -123,8 +123,6 @@ pub struct MillerColumns<'a> {
     clipboard: &'a ClipboardState,
     /// Theme.
     theme: &'a Theme,
-    /// Optional block around the whole widget.
-    block: Option<Block<'a>>,
     /// File preview content (for non-directory items).
     file_preview: Option<&'a PreviewContent>,
     /// Current preview mode.
@@ -150,17 +148,9 @@ impl<'a> MillerColumns<'a> {
             marked,
             clipboard,
             theme,
-            block: None,
             file_preview: None,
             preview_mode: crate::preview::PreviewMode::Auto,
         }
-    }
-
-    /// Set the block for the widget.
-    #[allow(dead_code)]
-    pub fn block(mut self, block: Block<'a>) -> Self {
-        self.block = Some(block);
-        self
     }
 
     /// Set the file preview content.
@@ -398,7 +388,9 @@ impl<'a> MillerColumns<'a> {
         if let Some(preview) = self.file_preview {
             match preview {
                 PreviewContent::Text {
-                    lines, highlighted, ..
+                    lines,
+                    highlighted,
+                    total_lines,
                 } => {
                     // Add header with file name and highlighting indicator
                     let header = Line::from(vec![
@@ -408,11 +400,10 @@ impl<'a> MillerColumns<'a> {
                         ),
                         Span::raw(" "),
                         Span::styled(
-                            if *highlighted {
-                                "[highlighted]"
-                            } else {
-                                "[plain]"
-                            },
+                            format!(
+                                "[{total_lines} lines, {}]",
+                                if *highlighted { "highlighted" } else { "plain" }
+                            ),
                             Style::default().fg(self.theme.muted),
                         ),
                     ]);
@@ -745,16 +736,7 @@ impl<'a> MillerColumns<'a> {
 impl StatefulWidget for MillerColumns<'_> {
     type State = MillerState;
 
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        // Handle outer block
-        let inner_area = if let Some(block) = &self.block {
-            let inner = block.inner(area);
-            block.clone().render(area, buf);
-            inner
-        } else {
-            area
-        };
-
+    fn render(self, inner_area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         if inner_area.height == 0 || inner_area.width == 0 {
             return;
         }
@@ -862,12 +844,6 @@ fn format_timestamp(secs: u64) -> String {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
         None => "—".to_string(),
     }
-}
-
-/// Get the selected entry from Miller state.
-#[allow(dead_code)]
-pub fn get_selected_entry<'a>(state: &MillerState, node: &'a FileNode) -> Option<&'a FileNode> {
-    node.children.get(state.selected)
 }
 
 #[cfg(test)]

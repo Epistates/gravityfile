@@ -25,22 +25,15 @@ pub struct TreeState {
     pub offset: usize,
     /// Set of expanded directory paths.
     pub expanded: HashSet<PathBuf>,
-    /// Current root path.
-    #[allow(dead_code)]
-    root_path: PathBuf,
 }
 
 impl TreeState {
-    /// Create new tree state.
+    /// Create new tree state with the root expanded.
     pub fn new(root_path: PathBuf) -> Self {
-        let mut expanded = HashSet::new();
-        // Expand root by default
-        expanded.insert(root_path.clone());
         Self {
             selected: 0,
             offset: 0,
-            expanded,
-            root_path,
+            expanded: HashSet::from([root_path]),
         }
     }
 
@@ -484,15 +477,6 @@ impl StatefulWidget for TreeView<'_> {
             }
         }
     }
-}
-
-/// Get the selected item from a tree state and flattened items.
-#[allow(dead_code)]
-pub fn get_selected_item<'a>(
-    state: &TreeState,
-    items: &'a [VisibleItem],
-) -> Option<&'a VisibleItem> {
-    items.get(state.selected)
 }
 
 #[cfg(test)]

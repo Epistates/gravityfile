@@ -47,16 +47,13 @@ impl SearchMode {
     }
 }
 
-/// A search result with path and match score.
+/// A search result, in ranked order within the result list.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SearchResult {
     /// Path to the matched item.
     pub path: PathBuf,
     /// Display name (filename or relative path).
     pub display: String,
-    /// Match score (higher is better).
-    pub score: u32,
     /// Whether this is a directory.
     pub is_dir: bool,
     /// Indices of matched characters for highlighting.
@@ -272,7 +269,7 @@ impl SearchState {
     }
 
     /// Set the query and execute search.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_query(&mut self, query: String) {
         self.query = query;
         self.cursor = self.query_char_len();
@@ -541,7 +538,7 @@ impl SearchState {
         }
         let mut winners = best.into_vec();
         winners.sort_unstable();
-        for (Reverse(score), index) in winners {
+        for (_, index) in winners {
             let (path, display, is_dir) = &self.all_paths[index];
             if self.cancelled() {
                 return;
@@ -556,7 +553,6 @@ impl SearchState {
             self.results.push(SearchResult {
                 path: path.clone(),
                 display: display.clone(),
-                score,
                 is_dir: *is_dir,
                 matched_indices: indices.into_iter().map(|index| index as usize).collect(),
             });
@@ -583,7 +579,6 @@ impl SearchState {
                 self.results.push(SearchResult {
                     path: path.clone(),
                     display: display.clone(),
-                    score: 100, // Fixed score for glob matches
                     is_dir: *is_dir,
                     matched_indices: Vec::new(),
                 });
@@ -617,7 +612,6 @@ impl SearchState {
                 self.results.push(SearchResult {
                     path: path.clone(),
                     display: display.clone(),
-                    score: 100, // Fixed score for regex matches
                     is_dir: *is_dir,
                     matched_indices,
                 });
@@ -913,9 +907,8 @@ mod tests {
         state.update_paths(paths.clone());
         state.set_query("ab".into());
         assert_eq!(state.results.len(), MAX_SEARCH_RESULTS);
-        for (actual, (Reverse(score), index, indices)) in state.results.iter().zip(expected) {
+        for (actual, (_, index, indices)) in state.results.iter().zip(expected) {
             assert_eq!(actual.path, paths[index].0);
-            assert_eq!(actual.score, score as u32);
             assert_eq!(
                 actual.matched_indices,
                 indices

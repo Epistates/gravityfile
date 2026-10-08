@@ -16,18 +16,12 @@ pub enum KeyAction {
     PageDown,
 
     // Tree operations
-    #[allow(dead_code)]
-    Expand,
-    #[allow(dead_code)]
-    Collapse,
     ToggleExpand,
 
     // Directory navigation
+    /// Enter a directory, or open a file with the configured opener.
     DrillDown,
     NavigateBack,
-    /// Open file with configured opener (Enter on file).
-    #[allow(dead_code)]
-    OpenFile,
 
     // Selection
     /// Toggle mark on current item (Space).
@@ -79,10 +73,6 @@ pub enum KeyAction {
     /// Go to a specific directory (opens path input).
     GoTo,
 
-    // Confirmation
-    /// Explicit confirmation action (e.g. mapped from 'y' via dedicated confirm logic).
-    #[allow(dead_code)]
-    Confirm,
     Cancel,
 
     // View switching (for View enum: Explorer, Duplicates, Age, Errors)
@@ -130,10 +120,6 @@ pub enum MouseAction {
     ScrollUp { x: u16, y: u16 },
     /// Scroll down at a position.
     ScrollDown { x: u16, y: u16 },
-    /// Drag started at a position.
-    /// Reserved for future drag-and-drop support.
-    #[allow(dead_code)]
-    DragStart { x: u16, y: u16 },
     /// Drag continued to a position.
     DragTo { x: u16, y: u16 },
     /// Drag ended.
@@ -614,15 +600,6 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
         (":delmark <key>", "Delete a bookmark"),
         (":help", "Show help"),
     ]
-}
-
-/// Get all key bindings as a flat list (for backwards compatibility).
-#[allow(dead_code)]
-pub fn get_key_bindings() -> Vec<KeyBinding> {
-    get_help_sections()
-        .into_iter()
-        .flat_map(|s| s.bindings)
-        .collect()
 }
 
 #[cfg(test)]

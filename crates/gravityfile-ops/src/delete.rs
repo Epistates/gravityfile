@@ -105,7 +105,7 @@ fn delete_one(path: &std::path::Path, mode: DeleteMode) -> Result<(), String> {
 /// On macOS the Finder (AppleScript) method needs automation permission and
 /// spawns a process per call; `NSFileManager` is fast and prompt-free.
 pub(crate) fn trash_context() -> trash::TrashContext {
-    #[allow(unused_mut)]
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut context = trash::TrashContext::default();
     #[cfg(target_os = "macos")]
     {

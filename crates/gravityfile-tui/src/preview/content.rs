@@ -8,8 +8,7 @@ use ratatui::layout::Size;
 use ratatui::text::Line;
 
 use super::image::ImageProtocol;
-
-use super::SyntaxHighlighter;
+use super::syntax::SyntaxHighlighter;
 
 /// Maximum file size to attempt preview (10 MB).
 const MAX_PREVIEW_SIZE: u64 = 10 * 1024 * 1024;
@@ -87,16 +86,11 @@ const TAB_SIZE: u8 = 4;
 
 /// Error that can occur during preview loading.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum PreviewError {
     /// File is too large to preview.
     TooLarge(u64),
-    /// File is binary.
-    Binary,
     /// File could not be read.
     IoError(String),
-    /// File is a directory.
-    IsDirectory,
     /// No preview available.
     NoPreview,
 }
@@ -105,9 +99,7 @@ impl std::fmt::Display for PreviewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooLarge(size) => write!(f, "File too large: {} bytes", size),
-            Self::Binary => write!(f, "Binary file"),
             Self::IoError(e) => write!(f, "I/O error: {}", e),
-            Self::IsDirectory => write!(f, "Is a directory"),
             Self::NoPreview => write!(f, "No preview available"),
         }
     }
@@ -178,7 +170,6 @@ pub enum PreviewContent {
     /// Syntax-highlighted text lines.
     Text {
         lines: Vec<Line<'static>>,
-        #[allow(dead_code)]
         total_lines: usize,
         highlighted: bool,
     },
@@ -250,11 +241,6 @@ pub struct ImageContext {
 pub struct PreviewLoader;
 
 impl PreviewLoader {
-    /// Load preview content for a path (auto mode, no image support).
-    pub fn load(path: &Path) -> Result<PreviewContent, PreviewError> {
-        Self::load_with_mode(path, PreviewMode::Auto, None)
-    }
-
     /// Load preview content with a specific mode.
     ///
     /// `image_context` supplies the terminal's graphics capabilities and the
@@ -793,14 +779,6 @@ impl PreviewLoader {
             total_entries,
         })
     }
-
-    /// Load preview content asynchronously (for use in TUI event loop).
-    #[allow(dead_code)]
-    pub fn load_async(
-        path: PathBuf,
-    ) -> std::thread::JoinHandle<Result<PreviewContent, PreviewError>> {
-        std::thread::spawn(move || Self::load(&path))
-    }
 }
 
 /// State for managing preview in the app.
@@ -810,8 +788,6 @@ pub struct PreviewState {
     pub content: PreviewContent,
     /// Path being previewed.
     pub path: Option<PathBuf>,
-    /// Scroll offset.
-    pub scroll: usize,
     /// Whether preview is loading.
     pub loading: bool,
     /// Current preview mode.
@@ -831,7 +807,6 @@ impl PreviewState {
             return false;
         }
         self.path = Some(path.to_path_buf());
-        self.scroll = 0;
         self.loading = true;
         self.content = PreviewContent::Loading;
         true
@@ -856,45 +831,12 @@ impl PreviewState {
     pub fn clear(&mut self) {
         self.path = None;
         self.content = PreviewContent::Empty;
-        self.scroll = 0;
         self.loading = false;
     }
 
     /// Cycle to the next preview mode. The application schedules the reload.
     pub fn cycle_mode(&mut self) {
         self.mode = self.mode.cycle();
-    }
-
-    /// Scroll preview up.
-    #[allow(dead_code)]
-    pub fn scroll_up(&mut self, amount: usize) {
-        self.scroll = self.scroll.saturating_sub(amount);
-    }
-
-    /// Scroll preview down.
-    #[allow(dead_code)]
-    pub fn scroll_down(&mut self, amount: usize, max_lines: usize) {
-        let content_lines = self.content_line_count();
-        if content_lines > max_lines {
-            self.scroll = (self.scroll + amount).min(content_lines - max_lines);
-        }
-    }
-
-    /// Get the number of lines in the current content.
-    #[allow(dead_code)]
-    fn content_line_count(&self) -> usize {
-        match &self.content {
-            PreviewContent::Text { lines, .. } => lines.len(),
-            PreviewContent::Hex { lines, .. } => lines.len(),
-            PreviewContent::Metadata { .. } => 10, // Fixed number of metadata lines
-            PreviewContent::Directory { entries, .. } => entries.len(),
-            PreviewContent::Archive { entries, .. } => entries.len() + 3, // Header + entries
-            // An image occupies its whole pane and does not scroll by lines.
-            PreviewContent::Image { .. } => 0,
-            PreviewContent::Error(_) => 1,
-            PreviewContent::Loading => 1,
-            PreviewContent::Empty => 0,
-        }
     }
 }
 
@@ -1460,11 +1402,9 @@ mod tests {
         let path = Path::new("preview.txt");
 
         assert!(state.begin_update(path, false));
-        state.scroll = 10;
         state.clear();
 
         assert!(state.path.is_none());
-        assert_eq!(state.scroll, 0);
         assert!(!state.loading);
         assert!(matches!(state.content, PreviewContent::Empty));
         assert!(state.begin_update(path, false));
