@@ -78,8 +78,8 @@ Completions: `grav completions <bash|zsh|fish|elvish|powershell>`.
 | `j` / `k` | Move down / up |
 | `h` / `l` | Collapse / expand |
 | `Enter` / `Backspace` | Enter directory / go back |
-| `v` | Cycle tree, Miller and treemap layouts |
-| `Tab` | Switch explorer, duplicates, age and errors views |
+| `v` | Switch between tree and Miller columns |
+| `Tab` | Switch explorer, duplicates, age, errors and treemap views |
 | `Space` / `V` | Mark item / range selection |
 | `y` / `x` / `p` | Copy / cut / paste |
 | `d` / `D` | Delete through Trash |
@@ -87,6 +87,43 @@ Completions: `grav completions <bash|zsh|fish|elvish|powershell>`.
 | `/` / `:` | Search / command palette |
 | `P` | Cycle preview mode |
 | `?` / `q` | Help / quit |
+
+`?` lists every binding in effect, including your own.
+
+### Key bindings
+
+`keymap.toml` in the config directory adds bindings and replaces existing
+ones for the same keys:
+
+```toml
+[[keymap]]
+on = "<C-n>"
+run = "move_down"
+
+[[keymap]]
+on = ["d", "D"]
+run = "none"      # unbind
+```
+
+A key is one character (`j`, `G`, `?`) or a name in angle brackets, with
+optional `C-`, `S-` and `A-` modifiers: `<Enter>`, `<Esc>`, `<Tab>`, `<S-Tab>`,
+`<Backspace>`, `<Delete>`, `<Space>`, `<Up>`, `<PageDown>`, `<Home>`, `<F5>`,
+`<C-u>`, `<lt>` for `<`. Mistakes are reported at startup and the rest of the
+file still applies. Dialogs such as the delete confirmation keep their own keys.
+
+Actions:
+
+- Navigation: `move_down`, `move_up`, `move_left`, `move_right`, `top`,
+  `bottom`, `page_up`, `page_down`, `enter`, `back`, `toggle_expand`, `go_to`,
+  `search`
+- Selection: `toggle_mark`, `visual`, `clear_marks`
+- Files: `yank`, `cut`, `paste`, `delete`, `rename`, `create_file`,
+  `create_directory`, `take`, `undo`
+- View: `next_view`, `prev_view`, `toggle_layout`, `toggle_details`,
+  `cycle_preview`, `sort`, `reverse_sort`, `refresh`, `toggle_theme`
+- Tabs: `new_tab`, `close_tab`, `next_tab`, `prev_tab`, `tab_1` to `tab_9`
+- Bookmarks: `set_bookmark`, `jump_to_bookmark`, `bookmarks`
+- General: `command`, `settings`, `help`, `cancel`, `quit`, `force_quit`
 
 Bulk rename and the text editor use `VISUAL` or `EDITOR`; GUI editors must wait
 for the file to close (for example `code --wait`).

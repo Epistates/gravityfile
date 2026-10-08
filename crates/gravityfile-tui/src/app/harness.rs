@@ -14,6 +14,7 @@ use ratatui::backend::TestBackend;
 use tokio_util::sync::CancellationToken;
 
 use super::App;
+use crate::keymap::Key;
 use crate::test_support::sample_dir_on_disk;
 
 /// Longest a single background step may take before the test fails.
@@ -87,10 +88,9 @@ impl Harness {
         self.root.join(relative)
     }
 
-    /// Press keys written in a vim-like notation: plain characters are typed
-    /// as themselves (uppercase with Shift), and `<name>` stands for a special
-    /// key: `<enter> <esc> <space> <tab> <s-tab> <bs> <del> <up> <down>
-    /// <left> <right> <home> <end> <pgup> <pgdn>`, or `<c-x>` for Ctrl+x.
+    /// Press keys written in the keymap notation: plain characters are typed
+    /// as themselves (uppercase with Shift), and `<name>` stands for a named
+    /// key such as `<enter>`, `<s-tab>`, `<bs>` or `<c-x>` for Ctrl+x.
     pub async fn press(&mut self, keys: &str) {
         for key in parse_keys(keys) {
             self.event(Event::Key(key)).await;
@@ -240,43 +240,20 @@ impl Harness {
     }
 }
 
+/// Split `keys` into the keymap's notation, one character or one `<...>`
+/// name at a time, and turn each into the event a terminal would send.
 fn parse_keys(keys: &str) -> Vec<KeyEvent> {
     let mut events = Vec::new();
-    let mut characters = keys.chars();
-    while let Some(character) = characters.next() {
-        if character != '<' {
-            let modifiers = if character.is_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            events.push(KeyEvent::new(KeyCode::Char(character), modifiers));
-            continue;
-        }
-        let name: String = characters.by_ref().take_while(|&c| c != '>').collect();
-        let code = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        events.push(match name.as_str() {
-            "enter" => code(KeyCode::Enter),
-            "esc" => code(KeyCode::Esc),
-            "space" => code(KeyCode::Char(' ')),
-            "tab" => code(KeyCode::Tab),
-            "s-tab" => KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-            "bs" => code(KeyCode::Backspace),
-            "del" => code(KeyCode::Delete),
-            "up" => code(KeyCode::Up),
-            "down" => code(KeyCode::Down),
-            "left" => code(KeyCode::Left),
-            "right" => code(KeyCode::Right),
-            "home" => code(KeyCode::Home),
-            "end" => code(KeyCode::End),
-            "pgup" => code(KeyCode::PageUp),
-            "pgdn" => code(KeyCode::PageDown),
-            control if control.starts_with("c-") && control.chars().count() == 3 => {
-                let key = control.chars().nth(2).expect("checked length");
-                KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)
-            }
-            other => panic!("unknown key <{other}>"),
-        });
+    let mut rest = keys;
+    while let Some(first) = rest.chars().next() {
+        let length = if first == '<' && rest.len() > 1 {
+            rest.find('>').expect("unclosed <key>") + 1
+        } else {
+            first.len_utf8()
+        };
+        let key = Key::parse(&rest[..length]).unwrap_or_else(|problem| panic!("{problem}"));
+        events.push(key.event());
+        rest = &rest[length..];
     }
     events
 }

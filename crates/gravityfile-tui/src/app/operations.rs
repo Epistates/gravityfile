@@ -75,6 +75,24 @@ impl App {
         }
     }
 
+    /// Answer the delete confirmation. Its keys are fixed rather than taken
+    /// from the keymap, so rebinding `y` cannot change what confirms.
+    pub(super) fn handle_delete_confirmation(&mut self, event: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        match event.code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.execute_deletion(),
+            KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
+                // Drop only the marks `d` added itself; hand-made selections
+                // survive a declined confirmation.
+                if std::mem::take(&mut self.delete_auto_marked) {
+                    self.marked.clear();
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
     /// Execute deletion of all marked items asynchronously.
     pub(super) fn execute_deletion(&mut self) {
         self.delete_auto_marked = false;

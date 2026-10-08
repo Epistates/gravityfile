@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Configurable keys.** `keymap.toml` in the config directory rebinds or
+  unbinds explorer keys using names like `<C-u>` and actions like
+  `move_down`; the README lists them. The help overlay and footer hints are
+  generated from the bindings in effect, so they always match, and the help
+  now scrolls instead of cutting off what did not fit. Uppercase bindings
+  work whether or not the terminal reports Shift.
 - **Snapshots.** `grav export` saves a complete scan as JSON or, with
   `-f ncdu`, as an ncdu dump; a `.zst` output is compressed. `scan`, `age`,
   `duplicates` and `export` accept a snapshot in place of a directory, including

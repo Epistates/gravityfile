@@ -36,9 +36,11 @@
 //! - `q` - Quit
 
 mod app;
+mod config;
 mod event;
 mod event_source;
 mod graphics_query;
+mod keymap;
 mod opener;
 mod preview;
 mod search;

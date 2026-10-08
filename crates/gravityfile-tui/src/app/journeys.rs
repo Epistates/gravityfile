@@ -20,6 +20,61 @@ async fn deleting_a_selected_file_removes_it_from_disk_and_view() {
 }
 
 #[tokio::test]
+async fn rebound_keys_take_effect_and_the_delete_dialog_keeps_its_own() {
+    let mut harness = Harness::scanned().await;
+    let file: crate::keymap::KeymapFile = toml::from_str(
+        r#"
+        [[keymap]]
+        on = "<C-n>"
+        run = "move_down"
+
+        [[keymap]]
+        on = "y"
+        run = "none"
+
+        [[keymap]]
+        on = "X"
+        run = "delete"
+        "#,
+    )
+    .unwrap();
+    assert!(harness.app.keymap.apply(&file).is_empty());
+    harness.select("copy-a.bin").await;
+    harness.press("<c-n>").await;
+    assert_eq!(harness.selected(), Some(harness.path("copy-b.bin")));
+    // With y unbound, copying has no key, so the footer stops offering it.
+    let screen = harness.screen();
+    assert!(
+        !screen.contains("Copy") && screen.contains("Cut"),
+        "{screen}"
+    );
+    // y is unbound in the explorer but still confirms a delete.
+    harness.press("Xy").await;
+    assert!(!harness.path("copy-b.bin").exists());
+}
+
+#[tokio::test]
+async fn the_whole_help_can_be_scrolled_into_view() {
+    let mut harness = Harness::scanned_sized(70, 24).await;
+    harness.press("?").await;
+    assert!(
+        harness.screen().contains("Move down"),
+        "{}",
+        harness.screen()
+    );
+    let (last_command, _) = *crate::event::get_command_help().last().unwrap();
+    assert!(!harness.screen().contains(last_command));
+    harness.press("G").await;
+    assert!(
+        harness.screen().contains(last_command),
+        "{}",
+        harness.screen()
+    );
+    harness.press("<esc>").await;
+    assert_eq!(harness.app.mode, AppMode::Normal);
+}
+
+#[tokio::test]
 async fn delete_never_targets_the_directory_being_viewed() {
     let mut harness = Harness::scanned().await;
     harness.press("g").await;

@@ -932,8 +932,6 @@ impl UserSettings {
         gravityfile_core::paths::Dirs::discover().map(|dirs| dirs.settings_file())
     }
 
-    const MAX_BYTES: u64 = 1024 * 1024;
-
     /// Load settings, using defaults when no settings file exists.
     /// Other read and parse failures are returned to the caller.
     pub fn try_load() -> std::io::Result<Self> {
@@ -946,37 +944,11 @@ impl UserSettings {
     }
 
     fn load_from(path: &std::path::Path) -> std::io::Result<Self> {
-        use std::io::{Error, ErrorKind, Read};
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Permit dotfile-manager symlinks, but never wait for a FIFO writer.
-            options.custom_flags(libc::O_NONBLOCK);
-        }
-        let file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error),
+        let Some(content) = crate::config::read(path)? else {
+            return Ok(Self::default());
         };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > Self::MAX_BYTES {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "settings must be a regular UTF-8 file of at most 1 MiB",
-            ));
-        }
-        let mut content = String::new();
-        file.take(Self::MAX_BYTES + 1)
-            .read_to_string(&mut content)?;
-        if content.len() as u64 > Self::MAX_BYTES {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "settings grew beyond 1 MiB",
-            ));
-        }
-        toml::from_str(&content).map_err(|error| Error::new(ErrorKind::InvalidData, error))
+        toml::from_str(&content)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     /// Sync a private sibling file, atomically replace settings, and on Unix sync
@@ -1002,7 +974,7 @@ impl UserSettings {
         use std::io::Write;
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if content.len() as u64 > Self::MAX_BYTES {
+        if content.len() as u64 > crate::config::MAX_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "settings exceed 1 MiB",
@@ -1195,7 +1167,7 @@ mod tests {
             );
         }
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(UserSettings::MAX_BYTES + 1).unwrap();
+        file.set_len(crate::config::MAX_BYTES + 1).unwrap();
         assert_eq!(
             UserSettings::load_from(&path).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
@@ -1210,7 +1182,7 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         let settings = UserSettings {
             openers: FileOpeners {
-                md: "x".repeat(UserSettings::MAX_BYTES as usize),
+                md: "x".repeat(crate::config::MAX_BYTES as usize),
                 ..FileOpeners::default()
             },
             ..UserSettings::default()

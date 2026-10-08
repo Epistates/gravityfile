@@ -44,8 +44,10 @@ impl App {
             self.handle_bulk_rename_input(key_event);
         } else if self.mode == AppMode::Visual {
             self.handle_visual_mode_input(key_event);
+        } else if self.mode == AppMode::ConfirmDelete {
+            self.handle_delete_confirmation(key_event);
         } else {
-            let action = KeyAction::from_key_event(key_event);
+            let action = self.keymap.action(key_event);
             self.handle_action(action);
         }
     }
@@ -87,10 +89,18 @@ impl App {
                 return;
             }
             AppMode::Help => {
+                let max = self.help_max_scroll.get();
+                let page = self.viewport_height.max(1);
                 match action {
                     KeyAction::ToggleHelp | KeyAction::Quit | KeyAction::Cancel => {
                         self.mode = AppMode::Normal;
                     }
+                    KeyAction::MoveDown => self.help_scroll = (self.help_scroll + 1).min(max),
+                    KeyAction::MoveUp => self.help_scroll = self.help_scroll.saturating_sub(1),
+                    KeyAction::PageDown => self.help_scroll = (self.help_scroll + page).min(max),
+                    KeyAction::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                    KeyAction::JumpToTop => self.help_scroll = 0,
+                    KeyAction::JumpToBottom => self.help_scroll = max,
                     _ => {}
                 }
                 return;
@@ -99,26 +109,9 @@ impl App {
                 self.handle_settings_input(action);
                 return;
             }
-            AppMode::ConfirmDelete => {
-                match action {
-                    // 'y'/Enter both confirm deletion.
-                    // KeyAction::Yank covers the 'y' key since that is its normal-mode mapping.
-                    KeyAction::DrillDown | KeyAction::Yank => {
-                        self.execute_deletion();
-                    }
-                    KeyAction::Quit | KeyAction::Cancel => {
-                        // Drop only the marks `d` added itself; hand-made
-                        // selections survive a declined confirmation.
-                        if std::mem::take(&mut self.delete_auto_marked) {
-                            self.marked.clear();
-                        }
-                        self.mode = AppMode::Normal;
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            AppMode::Deleting => {
+            // The confirmation reads its keys directly; no action applies
+            // behind it.
+            AppMode::ConfirmDelete | AppMode::Deleting => {
                 return;
             }
             AppMode::Command => {
@@ -439,6 +432,7 @@ impl App {
                 self.show_details = !self.show_details;
             }
             KeyAction::ToggleHelp => {
+                self.help_scroll = 0;
                 self.mode = AppMode::Help;
             }
             KeyAction::ToggleTheme => {

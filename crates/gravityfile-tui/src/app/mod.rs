@@ -93,6 +93,8 @@ enum Background {
 
 /// Main application state.
 pub struct App {
+    /// Key bindings: defaults with the user's `keymap.toml` applied.
+    keymap: crate::keymap::Keymap,
     /// Path being analyzed (scan root).
     path: PathBuf,
     /// The active tab's directory, selection and history. Inactive tabs'
@@ -118,6 +120,10 @@ pub struct App {
     /// is `&self`, so these are adopted into the view states after each frame;
     /// mouse hit-testing depends on them matching what is on screen.
     rendered_offsets: std::cell::Cell<(usize, usize)>,
+    /// How far the help is scrolled.
+    help_scroll: usize,
+    /// The help's largest useful scroll, recorded when it is drawn.
+    help_max_scroll: std::cell::Cell<usize>,
     /// Recent clicks, to recognize double clicks.
     clicks: crate::event::ClickTracker,
     /// Scanned file tree.
@@ -317,8 +323,12 @@ impl App {
         }
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
+        let (keymap, keymap_problems) = crate::keymap::Keymap::load();
+        let keymap_error = (!keymap_problems.is_empty())
+            .then(|| format!("Ignored keymap entries: {}", keymap_problems.join("; ")));
 
         let mut app = Self {
+            keymap,
             path: path.clone(),
             nav: state::Navigation::new(path.clone()),
             mode: AppMode::default(),
@@ -327,6 +337,8 @@ impl App {
             image_picker: None,
             preview_area: std::cell::Cell::new(ratatui::layout::Size::new(40, 20)),
             rendered_offsets: std::cell::Cell::new((0, 0)),
+            help_scroll: 0,
+            help_max_scroll: std::cell::Cell::new(0),
             clicks: crate::event::ClickTracker::default(),
             tree: quick_tree.map(Arc::new),
             cached_tree_len: 0,
@@ -336,10 +348,10 @@ impl App {
             duplicates_state: DuplicatesViewState::new(),
             selected_stale_dir: 0,
             show_details: true,
-            error: match (settings_error, listing_error) {
-                (Some(settings), Some(listing)) => Some(format!("{settings}; {listing}")),
-                (settings, listing) => settings.or(listing),
-            },
+            error: [settings_error, keymap_error, listing_error]
+                .into_iter()
+                .flatten()
+                .reduce(|first, next| format!("{first}; {next}")),
             marked: HashSet::new(),
             clipboard: ClipboardState::default(),
             active_paste_mode: ClipboardMode::Empty,
@@ -1225,7 +1237,9 @@ mod tests {
         app.marked.insert(app.path.clone());
         app.marked.insert(app.path.parent().unwrap().to_path_buf());
         app.mode = AppMode::ConfirmDelete;
-        app.handle_action(KeyAction::DrillDown);
+        app.handle_delete_confirmation(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Enter,
+        ));
         assert!(
             app.pending_deletion.is_none(),
             "protected paths must be filtered out before deletion"
@@ -1239,7 +1253,9 @@ mod tests {
         app.marked.insert(chosen.clone());
         app.handle_action(KeyAction::Delete);
         assert_eq!(app.mode, AppMode::ConfirmDelete);
-        app.handle_action(KeyAction::Cancel);
+        app.handle_delete_confirmation(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Esc,
+        ));
         assert!(
             app.marked.contains(&chosen),
             "user marks survive a declined delete"
@@ -1249,7 +1265,9 @@ mod tests {
         app.nav.tree_state.selected = tree_row(&app, "copy-a.bin");
         app.handle_action(KeyAction::Delete);
         assert_eq!(app.mode, AppMode::ConfirmDelete);
-        app.handle_action(KeyAction::Cancel);
+        app.handle_delete_confirmation(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Esc,
+        ));
         assert!(app.marked.is_empty(), "the automatic mark is dropped");
     }
 
@@ -3092,7 +3110,12 @@ mod tests {
         assert_eq!(app.mode, AppMode::ConfirmDelete);
         assert!(!app.marked.is_empty(), "delete auto-marks the selection");
 
+        // Actions do not reach behind the dialog; only its own keys answer.
         app.handle_action(KeyAction::Cancel);
+        assert_eq!(app.mode, AppMode::ConfirmDelete);
+        app.handle_delete_confirmation(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char('n'),
+        ));
         assert_eq!(app.mode, AppMode::Normal);
         assert!(
             app.marked.is_empty(),

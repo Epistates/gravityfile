@@ -62,6 +62,11 @@ impl Dirs {
         self.config.join("settings.toml")
     }
 
+    /// Key binding overrides for the explorer.
+    pub fn keymap_file(&self) -> PathBuf {
+        self.config.join("keymap.toml")
+    }
+
     /// Installed plugins.
     pub fn plugin_dir(&self) -> PathBuf {
         self.config.join("plugins")

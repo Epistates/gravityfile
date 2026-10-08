@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use gravityfile_analyze::format_age;
 
 use crate::app::App;
+use crate::event::KeyAction;
 use crate::ui::modals::{
     BookmarkListModal, BookmarkPrompt, BulkRenameConfirmModal, CommandPalette, ConflictModal,
     DeleteConfirmModal, DeletionProgressModal, InputModal, OperationProgressModal, SettingsModal,
@@ -345,7 +346,9 @@ impl App {
     fn render_overlays(&self, area: Rect, footer: Rect, buf: &mut Buffer) {
         match self.mode {
             AppMode::Help => {
-                HelpOverlay::new(&self.theme).render(area, buf);
+                HelpOverlay::new(&self.theme, &self.keymap, self.help_scroll)
+                    .max_scroll(&self.help_max_scroll)
+                    .render(area, buf);
             }
             AppMode::ConfirmDelete => {
                 let modal =
@@ -1358,37 +1361,50 @@ impl App {
     fn render_footer(&self, area: Rect, buf: &mut Buffer) {
         let in_visual_mode = self.mode == AppMode::Visual;
 
-        let mut keys: Vec<(&str, &str)> = if in_visual_mode {
-            let mut v = vec![
+        // Keys come from the keymap, so rebinding one updates its hint, and an
+        // unbound action drops out. Visual mode reads its keys directly.
+        let hint = |actions: &[KeyAction]| self.keymap.hint(actions);
+        let up_down = hint(&[KeyAction::MoveDown, KeyAction::MoveUp]);
+        let mark = hint(&[KeyAction::ToggleMark]);
+        let delete = hint(&[KeyAction::Delete]);
+        let cancel = hint(&[KeyAction::Cancel]);
+        let mut keys: Vec<(String, &str)> = if in_visual_mode {
+            [
+                ("V", "VISUAL"),
                 ("j/k", "Extend"),
                 ("Enter", "Apply"),
                 ("Esc", "Cancel"),
                 ("y", "Yank"),
                 ("d", "Delete"),
-            ];
-            v.insert(0, ("V", "VISUAL"));
-            v
+            ]
+            .map(|(key, label)| (key.to_string(), label))
+            .to_vec()
         } else {
             match self.view {
                 View::Explorer => {
-                    let mut v = vec![("j/k", "Nav"), ("y", "Copy"), ("x", "Cut"), ("d", "Del")];
+                    let mut v = vec![
+                        (up_down, "Nav"),
+                        (hint(&[KeyAction::Yank]), "Copy"),
+                        (hint(&[KeyAction::Cut]), "Cut"),
+                        (delete, "Del"),
+                    ];
                     if !self.clipboard.is_empty() {
-                        v.push(("p", "Paste"));
-                        v.push(("Esc", "Unclip"));
+                        v.push((hint(&[KeyAction::Paste]), "Paste"));
+                        v.push((cancel, "Unclip"));
                     } else if !self.marked.is_empty() {
-                        v.push(("Esc", "Unmark"));
+                        v.push((cancel, "Unmark"));
                     } else {
-                        v.push(("Spc", "+Sel"));
+                        v.push((mark, "+Sel"));
                     }
-                    v.push(("V", "Visual"));
+                    v.push((hint(&[KeyAction::EnterVisual]), "Visual"));
                     v.push((
-                        "v",
+                        hint(&[KeyAction::ToggleLayout]),
                         match self.layout_mode {
                             LayoutMode::Tree => "Miller",
                             LayoutMode::Miller => "Tree",
                         },
                     ));
-                    v.push(("s", self.sort_mode.short_label()));
+                    v.push((hint(&[KeyAction::Sort]), self.sort_mode.short_label()));
                     v
                 }
                 View::Duplicates => {
@@ -1399,53 +1415,60 @@ impl App {
                             .duplicates_state
                             .selected_item(self.duplicates_state.selected_group)
                             == 0;
-                    let mut v = vec![("j/k", "Nav"), ("h/l", "±Grp")];
+                    let mut v = vec![
+                        (up_down, "Nav"),
+                        (hint(&[KeyAction::MoveLeft, KeyAction::MoveRight]), "±Grp"),
+                    ];
                     if is_on_header {
-                        v.push(("d", "Del Dups"));
-                        v.push(("Spc", "Sel All"));
+                        v.push((delete, "Del Dups"));
+                        v.push((mark, "Sel All"));
                     } else {
-                        v.push(("d", "Del File"));
-                        v.push(("Spc", "Toggle"));
+                        v.push((delete, "Del File"));
+                        v.push((mark, "Toggle"));
                     }
                     if !self.marked.is_empty() {
-                        v.push(("Esc", "Clear"));
+                        v.push((cancel, "Clear"));
                     }
                     if self.has_full_scan && self.duplicates.is_none() && !self.analyzing {
-                        v.push((":analyze", "Run"));
+                        v.push((":analyze".to_string(), "Run"));
                     }
                     v
                 }
                 View::Age => {
-                    let mut v = vec![("j/k", "Nav"), ("y", "Copy"), ("d", "Del")];
+                    let mut v = vec![
+                        (up_down, "Nav"),
+                        (hint(&[KeyAction::Yank]), "Copy"),
+                        (delete, "Del"),
+                    ];
                     if !self.clipboard.is_empty() {
-                        v.push(("Esc", "Unclip"));
+                        v.push((cancel, "Unclip"));
                     } else if !self.marked.is_empty() {
-                        v.push(("Esc", "Unmark"));
+                        v.push((cancel, "Unmark"));
                     } else {
-                        v.push(("Spc", "+Sel"));
+                        v.push((mark, "+Sel"));
                     }
                     if self.has_full_scan && self.age_report.is_none() && !self.analyzing {
-                        v.push((":analyze", "Run"));
+                        v.push((":analyze".to_string(), "Run"));
                     }
                     v
                 }
                 View::Errors => {
-                    let mut v = vec![("j/k", "Nav"), ("Spc", "+Sel"), ("d", "Del")];
+                    let mut v = vec![(up_down, "Nav"), (mark, "+Sel"), (delete, "Del")];
                     if !self.marked.is_empty() {
-                        v.push(("Esc", "Clear"));
+                        v.push((cancel, "Clear"));
                     }
                     v
                 }
                 View::Treemap => {
                     let mut v = vec![
-                        ("j/k", "Select"),
-                        ("Enter", "Drill"),
-                        ("Bksp", "Back"),
-                        ("Spc", "+Sel"),
-                        ("d", "Del"),
+                        (up_down, "Select"),
+                        (hint(&[KeyAction::DrillDown]), "Drill"),
+                        (hint(&[KeyAction::NavigateBack]), "Back"),
+                        (mark, "+Sel"),
+                        (delete, "Del"),
                     ];
                     if !self.marked.is_empty() {
-                        v.push(("Esc", "Clear"));
+                        v.push((cancel, "Clear"));
                     }
                     v
                 }
@@ -1461,18 +1484,23 @@ impl App {
             } else {
                 "Cancel analysis"
             };
-            keys.insert(0, ("Esc", label));
+            keys.insert(0, (hint(&[KeyAction::Cancel]), label));
         }
 
         if self.scan_progress.is_none() && !self.analyzing {
             if !self.has_full_scan {
-                keys.insert(0, ("⇧R", "Scan"));
+                keys.insert(0, (hint(&[KeyAction::Refresh]), "Scan"));
             } else {
-                keys.push(("⇧R", "Rescan"));
+                keys.push((hint(&[KeyAction::Refresh]), "Rescan"));
             }
         }
 
-        keys.extend([("Tab", "Views"), ("?", "Help"), ("q", "Quit")]);
+        keys.extend([
+            (hint(&[KeyAction::NextView]), "Views"),
+            (hint(&[KeyAction::ToggleHelp]), "Help"),
+            (hint(&[KeyAction::Quit]), "Quit"),
+        ]);
+        keys.retain(|(key, _)| !key.is_empty());
 
         let spans: Vec<Span> = keys
             .iter()
