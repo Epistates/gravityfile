@@ -163,7 +163,7 @@ def probe_initialization_failure(binary):
             _, error = process.communicate(timeout=20)
             checks = {
                 'exit_failure': process.returncode == 1,
-                'diagnostic_reported': error.startswith(b'Error:'),
+                'diagnostic_reported': error.startswith(b'error:'),
                 'termios_restored': before == termios.tcgetattr(master),
                 'fixture_intact': not any(Path(temporary).iterdir()),
             }

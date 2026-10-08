@@ -7,421 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `grav init bash|zsh|fish` prints the shell function that follows the
+  explorer's directory on exit, `grav completions <shell>` prints completions,
+  and `grav man` prints a manual page.
+- Scan options on every report command: `-A/--apparent-size`,
+  `-l/--count-links`, `-L/--follow-symlinks`, `--cross-fs`, `--no-hidden`,
+  `-e/--exclude`, `-j/--threads` and `--git`.
+- `--color auto|always|never` (honouring `NO_COLOR` and `CLICOLOR_FORCE`), a
+  progress spinner while scanning, and `--binary` for KiB/MiB units.
+- Copies use reflinks where the filesystem supports them and `copy_file_range`
+  on Linux, and preserve sparse files, hard links and extended attributes.
+- Archive extraction limits total size, entry count and compression ratio, and
+  supports `.tar.zst`.
+
 ### Changed
 
-- Add identity-checked, coordinated bulk-rename recovery with synced batch plans,
-  commit markers and resumable no-replace restoration. `recover --rollback-rename`
-  refuses committed batches, replaced objects and occupied original paths.
+- **Sizes now match `du`.** Directories include their own allocation, hard
+  links count once in apparent-size mode too (`-l` counts every link), and
+  `max_depth` limits only what is listed, not what is counted. FIFOs, sockets
+  and devices are listed instead of silently skipped.
+- **The scanner is about 2.5× faster and uses less than half the memory.**
+  Metadata is read in parallel and the tree is built in a single pass.
+- **Sizes display in decimal units** (`kB`, `MB`, like Finder). Size arguments
+  accept both: `MB` is 10^6 bytes and `MiB` is 2^20.
+- **One binary, `grav`.** The `gravityfile` executable is gone; the package is
+  still `gravityfile`.
+- **Report commands:** `-f/--format text|json` replaces `--format`/`--envelope`;
+  JSON always uses the versioned envelope, now `schema_version` 2. `grav scan`
+  lists the largest entries with `-d/--depth` (default 1) and `-n/--limit`
+  (default 20) in place of `--max-depth`/`--top`, and its JSON is a flat list of
+  entries. `duplicates` and `age` take `-n/--limit`. Ages need a unit, and a
+  bare `m` is rejected as ambiguous: use `min` or `mo`.
+- **Exit status:** 3 for incomplete results with `--strict`, 130/143 when
+  interrupted (was 1 for both).
+- Git status is computed only when asked for (`--git`; always in the explorer).
+- Overwriting a file on paste moves the old one to the Trash. Copies, moves,
+  renames and archive extraction are staged and published with a single
+  no-clobber rename.
+- Plugins are Lua only.
+- Logging is off unless `--log-file` or `RUST_LOG` is given.
 
-- Journal archive extraction before destination publication. Failed publication
-  retains owned output instead of deleting it; `recover --retain-extraction`
-  moves interrupted output into retained storage and preserves unrelated data.
-  Recovery JSON adds `archive_records` and optional rename object identities.
-  Neither protocol provides snapshot isolation or qualified power-loss durability.
+### Removed
 
-- Record bounded, immutable bulk-rename progress before and after installation
-  and rollback moves. Recovery inspection exposes the last historical phase;
-  invalid histories preserve valid intents and report incomplete inspection.
-  Failed final recording retains an installed batch and warns before retrying.
-
-- Cap each process's diagnostic log at 8 MiB, sharing the budget across logging
-  threads and recording truncation once. Failed writes stop further log output.
-
-- Prevent failed stderr diagnostic writes from aborting the CLI; preserve report
-  output and the operation’s success or failure status.
-
-- Distinguish completed recovery restores from failed output acknowledgements,
-  including flush failures, and advise inspection before retrying.
-
-- Keep failed recovery JSON writes unsuccessful, including closed output pipes;
-  restrict non-strict broken-pipe success handling to observation commands.
-
-- Add portable `error_kind` categories to recovery JSON issues so consumers can
-  distinguish busy, malformed and inaccessible records without parsing messages.
-
-- Preserve recovery lock error kinds and OS diagnostics; report active journals
-  as `WouldBlock` rather than flattening every lock failure to `Other`.
-
-- Separate plugin IPC framing, wire types and log budgets from worker supervision
-  into a private protocol module, retaining protocol compatibility.
-
-- Include plugin request serialization in the reply timeout budget and retire
-  workers before dispatch when encoding has exhausted that budget.
-
-- Abort queued plugin blocking tasks when their async caller times out or is
-  dropped, preventing deferred dispatch after worker termination.
-
-- Preserve extracted paths with changed or unrecorded Unix filesystem identities
-  during rollback; report incomplete cleanup instead of removing replacements.
-
-- Prevent extraction rollback from recursively deleting a directory that another
-  writer substituted for an extracted file; report incomplete cleanup instead.
-
-- Report incomplete archive extraction rollback with publication and cleanup
-  errors; refresh the TUI to show remaining output while preserving selection.
-
-- Refresh LuaJIT sources and zerocopy dependencies; update the pinned CI installer
-  action to 2.87.22, retaining Rust 1.90 compatibility.
-
-- Add cooperative archive extraction cancellation to the API and TUI. Cancel
-  decoding/preflight without publishing; finish or roll back a merge already begun.
-
-- Add cooperative archive creation cancellation and connect TUI cancel/quit
-  requests to it. Cancelled staging is removed; already published archives remain.
-
-- Isolate TUI archive admission, destination and completion handling in a dedicated
-  module so its publication and refresh policy can be reviewed together.
-
-- Create archive output files with owner-only Unix permissions that persist
-  after publication; sharing now requires an explicit permission change.
-
-- Remove completed archive sources directly from the marked-path hash set,
-  avoiding quadratic selection cleanup while preserving unrelated marks.
-
-- Include project licenses and generated dependency notices in binary release
-  archives, with a pinned generator, checksum-pinned source texts, explicit
-  text-source limitations, and required-document verification.
-
-- Refresh Cargo dependencies, including jwalk 0.9, dirs 7 and Rhai 1.26;
-  migrate scanner pruning to jwalk's current API. Retain verified Rust 1.90 support.
-- Refresh pinned GitHub Actions releases and enable weekly Cargo dependency PRs.
+- `grav recover` and the recovery journals: operations are staged and
+  published atomically instead, and replaced files go to the Trash.
+- Rhai plugins.
+- Report JSON node ids, content hashes, and access and creation times, and the
+  scanner's content-hashing option.
 
 ### Fixed
 
-- Refresh the TUI after an archive worker loses its completion reply, clearing
-  stale progress and reporting uncertain output without replaying the operation.
-
-- Preserve significant whitespace in ZIP symlink targets and reject invalid
-  target bytes instead of silently trimming or replacing them.
-
-- Preserve ordinary Unix permissions for regular files in ZIP archives, avoiding
-  broadened private-file modes and lost executable bits during a round trip.
-
-- Bound ZIP source reads to the inspected length and fail on detected growth,
-  truncation or metadata changes instead of publishing an unstable input.
-
-- Open ZIP file inputs without following replacement symlinks or blocking on
-  FIFOs on Unix, and reject inode/type changes between inspection and opening.
-
-- Append default archive extensions without converting native paths to display
-  text, preventing output in a different directory with a lossy look-alike name.
-
-- Refresh the TUI after an archive is published with uncertain durability,
-  preserving its warning and source selection instead of reporting creation failure.
-
-- Sync the destination directory after archive publication on Unix. New
-  `ArchiveError::PublishedDurability` distinguishes a complete visible archive
-  with uncertain persistence from failure before publication.
-
-- Preserve non-UTF-8 top-level names when creating TAR archives, including
-  compressed variants, directories and symlinks. ZIP retains its UTF-8 requirement.
-
-- Attempt both journal and parent-directory synchronization after overwrite or
-  copy-undo moves, reporting all failures instead of skipping the second sync.
-
-- Preserve directory-sync failures in overwrite rollback errors, explicitly
-  reporting uncertain durability and retaining recovery data for inspection.
-
-- Include blocking-executor queue time in async plugin deadlines and abort queued
-  tasks when calls time out or are dropped, preventing unbounded admission waits.
-
-- Terminate plugin workers and release their permits when request dispatch finds
-  a disconnected or unexpectedly full I/O channel, preventing stale live handles.
-
-- Verify the complete release notice body against its generated checksum, rejecting
-  truncation or alteration even when its dependency provenance header is intact.
-
-- Reject release notices generated for a different target, lockfile, notice
-  configuration or workspace manifests, including feature-only changes.
-
-- TAR previews validate compression trailers and concatenated members before
-  reporting a successful inventory; reject hidden trailing data and excessive
-  padding under the existing read budgets.
-
-- Bound TAR parser metadata reads before GNU/PAX extensions and sparse maps can
-  grow without the existing entry limits taking effect; reject excessive
-  cumulative metadata while preserving separate payload budgets.
-
-- Unix exports anchor staging, replacement, and cleanup to an open parent directory,
-  preventing later parent-path substitution from redirecting those operations.
-
-- Unix file exports sync their parent directory after atomic replacement and
-  report post-publication sync failures without deleting the completed report.
-
-- Toggling a single duplicate file no longer clones every path in its group.
-
-- Duplicate filtering and visible-header counts share a single-directory cache
-  keyed by immutable report identity and directory scope. Repeated rendering and
-  navigation reuse counts; report or scope changes rebuild them in one pass.
-
-- Duplicate-view rendering computes the visible row range before constructing
-  file rows, avoiding allocations for every expanded duplicate. Heat-map scale
-  is computed once per frame instead of once per visible group header.
-
-- TUI final-warning merge uses hash-based lookup instead of quadratic path
-  scans. Distinct warning kinds/messages on the same path remain visible, exact
-  repeated final warnings are deduplicated, and encounter order is preserved.
-
-- Background scan completion no longer closes active dialogs or clears unrelated
-  errors. Escape in normal mode acknowledges an error before clearing marks,
-  clipboard state, or cancelling background work.
-
-- Updated `lru` to 0.18.2 for RUSTSEC-2026-0253 and made the local release gate
-  reject unsoundness advisories. Package assembly excludes local agent state,
-  including `.claude`, `.codex`, and `.agents` directories.
-
-- ZIP preflight checks entry count before metadata traversal, propagates entry
-  read errors, and rejects per-entry/remaining-budget violations and nonempty
-  output claims with zero compressed bytes before decoding.
-
-- XZ extraction enforces a 256 MiB decoder-memory limit instead of allowing
-  unbounded dictionary allocation, while retaining concatenated XZ support.
-
-- Gzip, bzip2, and xz TAR inputs decode concatenated compression members.
-  A TAR stream split across members extracts correctly, while hidden decoded
-  content or truncated trailers in later members fail before publication.
-
-- TAR extraction finishes reading the decoder after the TAR end marker so
-  truncated compression trailers and checksum errors fail before publication.
-  Decoded trailing data must be zero padding of at most 1 MiB.
-
-- Archive extraction opens and validates one regular-file handle before creating
-  staging paths, then passes that handle to the decoder. Unix FIFO inputs cannot
-  wait for a writer; regular-file symlinks remain supported. Non-missing input
-  errors are no longer mislabeled as missing files.
-
-- TAR preflight uses effective entry sizes, including sparse logical extents
-  and PAX overrides, and checks the remaining extraction budget before unpacking.
-  FIFO/device headers are rejected instead of silently becoming ordinary files.
-
-- TAR extraction resolves hard links relative to the archive staging root,
-  using `unpack_in` instead of cwd-relative `unpack`. Targets must be existing
-  extracted regular files inside staging; traversal and symlink targets fail.
-
-- Archive extraction skips root-directory headers so TAR metadata cannot change
-  staging-root permissions. Non-directory entries resolving to the extraction
-  root are rejected; ordinary archives containing `.`/`./` directories work.
-
-- Copy staging, archive staging, and overwrite recovery directories now request
-  Unix `0700` permissions at creation instead of inheriting potentially readable
-  directory modes from the process umask. All operation staging uses one helper.
-
-- Bulk-rename editor lists use owned private temporary directories instead of
-  predictable shared paths. Reads enforce regular UTF-8 files, a 1 MiB cap,
-  exact line counts, and valid names; Unix symlinks/FIFOs are rejected. Source
-  ordering is deterministic, and failed editor commands stop processing.
-
-- Bulk rename exposes `rename_paths_with_cancellation`. Cancellation before
-  final installation attempts uncancelled rollback, reporting retained paths
-  when restoration is blocked. TUI cancel/quit requests cancellation and waits
-  for the worker result before accepting further commands.
-
-- TUI bulk rename runs on a blocking worker instead of the event-loop thread.
-  A running state prevents overlapping commands until completion or rollback;
-  successful completion clears marks and failures preserve them.
-
-- Bulk-rename preflight resolves parent-directory aliases, validates no-op
-  entries, and rejects duplicate or nested source/destination batches before
-  staging. Leaf symlinks remain renameable without following their targets.
-
-- Bulk-rename rollback no longer restores an occupied staging path after
-  restaging an installed target fails. Missing staged payloads are reported as
-  rollback failures, and independent recoverable entries still restore.
-
-- Overwrite moves check cancellation before publication and restore the staged
-  source when possible. A blocked rollback retains a discoverable, recoverable
-  payload without overwriting a concurrent writer. Pre-cancelled overwrite moves
-  do not create journals.
-
-- Copy/move progress delivery is best-effort under queue backpressure. Dropped
-  result receivers cancel work through executor/TUI adapters, while in-flight
-  filesystem work is awaited for cooperative cleanup. Conflicts and completion
-  retain reliable delivery.
-
-- Copy/move completion carries an explicit `cancelled` flag through executor
-  and TUI adapters. Cancellation and conflict aborts no longer report success
-  or count the aborted item as a user skip. Completed work retains undo records.
-  Callers constructing `OperationComplete` must now provide `cancelled`.
-
-- Startup surfaces settings read/parse failures while using defaults. Settings
-  reads and saves enforce a 1 MiB limit; Unix FIFO reads do not block startup.
-  Image-preview detection uses the application's loaded settings.
-
-- Failed settings-dialog saves retain dirty edits for retry and leave active
-  settings unchanged; successful saves apply the persisted settings.
-
-- Settings saves sync a private temporary file before replacing the live file,
-  preserving existing data on publication failure and replacing leaf symlinks.
-  Bookmark changes now surface persistence errors instead of ignoring them.
-
-- Background analysis emits explicit cancellation/failure results and cancels
-  its shared work token when the UI receiver closes. Join failures are surfaced
-  instead of appearing only as an unexpected channel closure.
-
-- TUI scan progress recovers after broadcast lag, stops promptly on cancellation
-  even with a full UI queue, and cancels scans when their receiver is dropped.
-
-- Recovery lock guards explicitly unlock at the end of ownership so duplicated
-  descriptors cannot prolong completed transactions’ locks.
-
-- TUI quick-listing failures at startup and requested navigation populate the
-  error state instead of silently appearing empty. Failed lazy loads retain
-  the current tree; parent-cache refresh clears stale Miller-column data.
-
-- Hidden/ignored descendants now suppress stale-directory recommendations, as
-  depth limits already did. Age reports expose recommendation availability;
-  legacy reports default to unknown, and CLI/TUI labels show suppression.
-
-- Discovery and explicit plugin loading share one validated implementation;
-  discovery logs individual failures and continues with subsequent candidates.
-
-- Plugin discovery sorts candidate paths for stable identity selection and hook
-  order. Directory-enumeration errors are surfaced instead of silently omitted.
-
-- Explicit plugin loading honors global/per-plugin disable settings. Both load
-  paths prevent duplicate loaded identities and repeated discovery side effects.
-
-- Plugin managers reject duplicate runtime registration, retain handles after
-  failed unloads, and attempt every runtime during shutdown even after an error.
-
-- Plugin manifests use a bounded 64 KiB reader in both discovery and direct
-  loading. Unix manifest reads reject symlinks and nonregular files without
-  blocking on FIFOs; oversized manifests no longer allocate unbounded host memory.
-
-- Human-readable CLI reports and progress lines escape control characters and
-  Unicode direction overrides from filenames and messages; JSON retains the
-  original values.
-
-- Duplicate analysis hashes a file once when partial ranges would cover its
-  entire contents, preserving canonical full hashes and identity validation.
-
-- Stale-directory analysis retains at most `max_stale_dirs` candidates during
-  traversal, with deterministic path ordering for equal-size results.
-
-- Average file age preserves nanosecond precision and avoids understating the
-  result when accumulated seconds exceed a 64-bit counter.
-
-- Age analysis rejects empty, ambiguous, and non-exhaustive bucket sets instead
-  of silently omitting files from the distribution. `AgeAnalyzer::with_config`
-  now returns `Result`; builders and direct configurations share validation.
-
-- ZIP creation preserves symlinks using explicit link entries and rejects
-  non-UTF-8 nested filenames/link targets rather than silently changing them.
-- Archive creation rejects selected sources with duplicate top-level names
-  before writing, preventing ambiguous entries and extraction-time data loss.
-
-- Archive creation explicitly finishes compressed TAR streams and propagates
-  final write errors. Synced staged archives publish with atomic no-replace
-  rename; unsupported filesystems no longer fall back to visible partial copies.
-
-- Observation CLI commands share signal-driven cancellation across scanning and
-  analysis; a second interrupt forces exit. Interrupted commands fail even when
-  strict mode is disabled. See the report contract for interruption and export behavior.
-
-- Standard CLI/TUI plugin execution uses independent supervised processes with
-  parent-enforced deadlines, cancellation, bounded IPC/logs and worker counts.
-  Embedded TUI users must configure a worker executable to enable plugins.
-- Rhai isolated globals now persist instead of silently ignoring assignments.
-- Plugin source loading rejects files larger than 1 MiB and nonregular files.
-
-- Duplicate analysis reports unreadable, missing, or changing candidates instead
-  of silently dropping them. Partial and full reads validate the same file
-  observation; Unix reads reject substituted leaf symlinks and nonregular files.
-- Analysis cancellation and source scan warnings are explicit report states.
-  Incomplete age analysis suppresses stale-directory recommendations.
-- Scanner cancellation is checked at traversal and completion boundaries, including
-  when cancellation prunes the final directory batch without yielding another entry.
-- CLI output propagates broken-pipe errors without panicking. Ordinary mode accepts
-  early pipe closure; strict mode requires delivery of the report.
-
-- **Undo of a move no longer overwrites an unrelated file** recreated at the original
-  path. `rename_noreplace` now reports *why* it failed, and the copy+delete fallback is
-  reached only for a genuine cross-device rename.
-- **Move no longer clobbers a destination that appears mid-flight.** Previously any rename
-  failure fell through to `fs::copy`, which truncates.
-- **Copy/move/rename of files with names near the 255-byte limit** no longer fail with
-  `ENAMETOOLONG`: the staging name's prefix is accounted for.
-- Filesystems without an atomic no-replace rename now return an unsupported-operation
-  error instead of using a racy check followed by a potentially overwriting rename.
-- Windows no-replace rename uses `MoveFileExW` with replacement disabled, instead
-  of `std::fs::rename`, which can replace existing files.
-- Cross-filesystem moves and move undo share private staging and exclusive publication.
-  A failed source removal retains the complete destination for recovery, even when
-  source removal has already deleted some children.
-- Cancelling a copy or move interrupts unanswered conflict requests and blocked
-  conflict delivery. Rollback is not disabled by a cancelled operation token.
-- JSON exports stream through a private temporary file before replacement, preserving
-  existing output on serialization failures and avoiding writes through final symlinks.
-- CLI size parsing preserves integer precision, rejects repeated suffixes and overflow;
-  duration overflow returns an error instead of panicking. `m` and `mo` both denote months.
-- Help and version no longer require writable log storage; Unix logs use mode 0600.
-- Cancelling a large directory copy takes effect immediately instead of only between
-  top-level items, and leaves no partial destination or staging directory behind.
-- The copy pre-scan no longer runs blocking filesystem walks on an async worker thread.
-- Git status annotation no longer costs one `canonicalize` syscall per node.
-- **The TUI no longer aborts on a narrow terminal.** The right-anchored size bar in both
-  the tree and Miller views computed an out-of-bounds rect once its column was narrower
-  than the bar, panicking the process. Miller columns are percentage splits, so this hit
-  at terminal widths well above the point where the tree view was affected. Narrow columns
-  now drop the bar and give the row its columns back.
-
-### Changed
-
-- Scan pattern compilation/matching APIs and `DuplicateFinder::with_config` now
-  return `Result`. Invalid patterns and inverted duplicate-size bounds are errors,
-  including configurations built through public fields rather than builders.
-- Compiled ignore filters are tied to their exact inputs, so public pattern
-  mutation cannot leave stale filters active. Quick listings record their actual
-  root and depth; depth-limited analysis does not recommend stale directories.
-
-- **Minimum supported Rust version raised from 1.88 to 1.90.** Required by the sixel
-  encoder behind the new image previews (`ratatui-image` → `icy_sixel` → `quantette`,
-  which pins rustc 1.90). No source in this workspace needs it.
-
-### Added
-
-- Copy and move overwrites record recovery intent before moving paths, retain
-  payload/original data on interruption, and coordinate recovery with file locks.
-- `grav recover DIR` discovers interrupted overwrite journals. Explicit restore
-  options recover an original or staged payload only to an unoccupied path.
-- Process-exit tests cover journal discovery and preservation at overwrite
-  publication boundaries, alongside malformed-record and CLI recovery tests.
-
-- `--envelope` emits schema-versioned JSON with report kind, root, scan scope,
-  completeness, and data. `--strict` emits incomplete reports then fails for automation.
-- Analysis diagnostics retain total failure counts with at most 100 path-ordered
-  details. Duplicate group/path ordering is deterministic for equal waste.
-- A reproducible benchmark harness records whole-command time, Unix peak RSS,
-  binary identity, workload, and successful file-count verification.
-
-- **Inline image previews** using the terminal's graphics protocol (Kitty, iTerm2, Sixel,
-  halfblocks fallback), with a new `image` preview mode. Decoding and encoding happen off
-  the render thread. Disable with `image_previews = false` in settings.
-- **Interactive conflict resolution.** Copy and move now pause on each conflict and wait
-  for an answer, so resolving one item no longer restarts the whole operation with a
-  blanket policy. "Apply to all" answers are honoured for the remainder.
-- Skipped items are reported separately from failures.
-- CI now runs the test suite on macOS and Windows, checks the declared MSRV, and enforces
-  `cargo deny` and `cargo machete`.
-- TUI test coverage for the previously untested navigation, layout, and rendering code:
-  every view and mode is now rendered at 33 terminal sizes, tree/Miller/treemap navigation
-  is checked against its bounds, the key map is pinned against its help text, and the
-  conflict prompt is driven end to end against a real colliding paste.
-
-### Security
-
-- **Plugin Lua sandbox now whitelists standard libraries** (`io`, `os`, `debug` and
-  `package` are never loaded) instead of nil-ing globals after the fact, which left them
-  reachable via captured references.
-- `print` is redirected to the log; it previously wrote straight to the alternate screen.
-- Plugin execution runs on a blocking thread so the wall-clock timeout can actually
-  preempt a host call. It previously wrapped a future with no await points and could
-  never fire.
-- Filesystem existence probes no longer leak through a symlink pointing out of the
-  sandbox.
-- ZIP symlink targets are read with a bound; a crafted entry could previously allocate
-  gigabytes.
-
+- Unreadable directories are reported as warnings instead of silently
+  producing a smaller total.
+- Delete and marking can no longer target the scan root or the directory being
+  viewed; declining a delete keeps the marks you made yourself; marking a
+  duplicate group keeps one copy.
+- Mouse clicks select the row under the pointer after scrolling.
+- `grav scan`'s total is the full disk usage of the root, not just its files.
 
 ## [0.3.1] - 2026-07-24
 

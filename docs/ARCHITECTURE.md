@@ -1,76 +1,94 @@
-# gravityfile Architecture
+# Architecture
 
-gravityfile is designed as a modular, high-performance system for file system exploration and analysis.
+A Cargo workspace: one binary crate (`grav`) over six libraries.
 
-## Core Design Principles
+```
+gravityfile (bin: grav)
+├── gravityfile-tui      explorer
+│   ├── gravityfile-ops      file operations
+│   └── gravityfile-plugin   Lua plugin host and workers
+├── gravityfile-analyze  duplicates, ages
+├── gravityfile-scan     parallel scanner, Git status
+└── gravityfile-core     shared types: FileNode, FileTree, ScanConfig, units
+```
 
-1.  **Targeted Concurrency**: Directory traversal uses `jwalk`/Rayon, while `tokio` coordinates scans, previews, archives, and file operations without putting filesystem I/O in the input/render loop.
-2.  **Memory Efficiency**: Large file trees minimize repeated allocations through `CompactString` and compact node metadata.
-3.  **Unified State**: A single, source-of-truth `FileTree` structure powers all views (Usage, Duplicates, Age, Treemap).
-4.  **Asynchronous TUI**: Long-running host filesystem work is scheduled on background tasks and reports completion through channels.
+## `gravityfile-core`
 
----
+`FileNode` is one entry: name (with the exact native name when it is not valid
+UTF-8), kind, size, allocated blocks, modification time, identity of multiply
+linked files, Git status, and children sorted by size. Nodes are kept small
+(a test bounds them) because a scan holds millions. `FileTree` adds the root
+path, the configuration, statistics and warnings. `units` formats and parses
+sizes and ages for every frontend. Paths in JSON use `path_serde`, which keeps
+non-Unicode paths exact.
 
-## 🏗️ Crate Overview
+## `gravityfile-scan`
 
-### `gravityfile-core`
-The heartbeat of the system.
-- **`FileNode`**: The fundamental tree unit, with a stable scan-local ID and optional hash/Git metadata.
-- **`FileTree`**: A high-performance container for nodes. Includes advanced statistics tracking.
-- **Error Types**: Unified error handling across all crates.
+`JwalkScanner` walks directories in parallel with jwalk on a dedicated Rayon
+pool. Metadata is read on the walker's threads inside `process_read_dir`, along
+with ignore filtering, filesystem-boundary pruning and symlink resolution, so
+the consumer makes no per-entry system calls. jwalk yields entries in
+depth-first order, which lets the consumer build the tree in one pass with a
+stack of open directories, aggregating sizes and counts as each directory
+closes.
 
-### `gravityfile-scan`
-The high-speed traversal engine.
-- **`JwalkScanner`**: Implements parallel directory traversal with glob-based ignore rules matched against names and root-relative paths.
-- **`InodeTracker`**: Prevents double-counting hardlinks across a single device by tracking (inode, device) pairs.
-- **Git Integration**: Uses `libgit2` (via `git2-rs`) to annotate nodes after a full scan.
+Sizes follow `du`: allocated blocks by default, directories include their own
+allocation, and an `InodeTracker` counts each hard-linked file once (and, when
+following symlinks, each aliased object once). `max_depth` limits which nodes
+are kept, not what is counted. Unreadable directories become warnings, so a
+partial result is never silent. Git status is applied afterwards with libgit2
+when requested.
 
-### `gravityfile-analyze`
-The intelligence layer.
-- **Duplicate Detection**: Uses a 3-phase algorithm for efficiency:
-  1.  **Size Matching**: Instant filtering of unique-sized files.
-  2.  **Partial Hashing**: Reads only the first and last 4KB of size-matched candidates.
-  3.  **Full BLAKE3**: Only performs full cryptographic hashes on final candidate groups.
-- **Age Analysis**: Computes the distribution of file ages and identifies "stale" directories.
+`quick_list` reads a single directory for immediate display before a full scan.
 
-### `gravityfile-ops`
-The file operation and safety engine.
-- **`OperationExecutor`**: Orchestrates copy, move, rename, and delete tasks.
-- **Conflict Resolution**: Implements interactive policies (Overwrite, Rename, Skip) for destination collisions.
-- **Undo System**: Maintains a rolling log for operations whose prior state can be represented safely. Overwrites and deletions are intentionally not recorded as undoable.
+## `gravityfile-analyze`
 
-Bulk rename writes all native-path intents and a shared batch plan before source
-mutation. `rename_batch.rs` locks participant journals in sorted order, validates
-the recorded object and parent identities, and restores uncommitted batches using
-no-replace moves and resumable checkpoints. Archive extraction prepares identities
-and a publication plan in `archive_journal.rs`; failed or interrupted publication
-retains decoded staging and moves owned output into recovery storage. Inspection
-and explicit recovery remain separate APIs. These protocols preserve uncertain
-data but do not provide snapshot isolation, atomic multi-file publication, or
-qualified power-loss durability. See [the recovery contract](RECOVERY.md).
+- **Duplicates:** group by size, then hash the head and tail of candidates, then
+  hash full contents with BLAKE3. Files are re-checked around reads so a file
+  changing mid-analysis is reported rather than misgrouped.
+- **Ages:** a distribution over configurable buckets and the outermost
+  directories whose newest file is older than a threshold.
 
-### `gravityfile-tui`
+Both report a status that says whether anything in scope could not be read.
 
-`app/archive.rs` owns archive task admission, destination construction and
-completion policy. It keeps successful creation, published-but-uncertain
-persistence, and failure before publication distinct, and coordinates refresh
-with active mutations through the application state. The operations crate owns
-format handling and filesystem publication.
-The interactive user interface.
-- **Layouts**:
-  - **Tree**: Classical hierarchical view.
-  - **Miller Columns**: Ranger-style navigation for deep drill-downs.
-  - **Treemap**: Squarified space-filling visualization for rapid disk usage identification.
-- **Rendering**: Uses Ratatui's buffered, diff-based terminal drawing and explicit application state.
+## `gravityfile-ops`
 
----
+Copy, move, rename, create, archive and delete, each as a background task
+reporting progress over a channel and honouring a cancellation token.
 
-## 🛡️ Security Model
+Nothing is ever overwritten in place. Results are built in a private staging
+directory beside the destination and published with a single no-clobber rename
+(`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS,
+`MoveFileExW` on Windows). An item the user chooses to replace goes to the
+system Trash first. Copies use reflinks where the filesystem supports them,
+otherwise `copy_file_range` on Linux or a chunked copy elsewhere, preserving
+sparse regions, hard links, extended attributes and permissions. Bulk renames run in two phases through temporary
+names, so swaps and cycles work and a failure rolls back. Archive extraction
+enforces size, entry-count and compression-ratio limits and rejects entries or
+links that would escape the destination.
 
-- **Supervised Plugins**: The explorer runs Lua plugins in separate persistent
-  workers with parent-enforced deadlines and process cleanup. VM permission
-  controls and process supervision are not OS filesystem/network confinement.
-  `gravityfile-plugin/src/process.rs` owns lifecycle, admission and cancellation;
-  its private `process/protocol.rs` module owns wire types, bounded framing and logs.
-- **Safe Operations**: Destructive operations default to **Trash** (via the `trash` crate) rather than permanent deletion.
-- **No-Root Execution**: gravityfile is designed to run with user-level permissions, gracefully handling permission errors without crashing.
+`UndoLog` records how to reverse moves, copies, renames, new files and (on
+Linux and Windows) deletions to the Trash.
+
+## `gravityfile-plugin`
+
+Lua 5.4 plugins run in a separate worker process per runtime, started by
+re-executing `grav` with a private entry point. Calls have deadlines and
+messages are size-bounded; a stuck worker is killed. This isolates the explorer
+from plugin failures but is not an OS sandbox. See [plugins](PLUGINS.md).
+
+## `gravityfile-tui`
+
+The explorer, on Ratatui. Tree, Miller-column and treemap layouts share one
+`FileTree`; duplicate and age views read the same tree. Scans, previews,
+archives and file operations run on background tasks and report back through
+channels, so the render loop never blocks on the filesystem.
+
+## `grav`
+
+`src/cli.rs` defines the command line; each subcommand lives in
+`src/commands/`. Report commands share one scan path with a progress spinner,
+one envelope and completeness check (`src/report.rs`), and atomic publication
+for exports. Text output is escaped for the terminal and styled according to
+`--color`, `NO_COLOR` and whether the stream is a terminal. See
+[reports](REPORTS.md).

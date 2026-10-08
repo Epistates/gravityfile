@@ -43,6 +43,7 @@ mod node;
 pub mod path_serde;
 mod terminal;
 mod tree;
+pub mod units;
 
 pub use config::{ScanConfig, ScanConfigBuilder};
 pub use error::{ScanError, ScanWarning, WarningKind};

@@ -687,7 +687,7 @@ mod tests {
         let buf = render_at(Rect::new(0, 0, 60, 10), &mut state);
         let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
         assert!(
-            rendered.contains("64 KiB"),
+            rendered.contains("65.5 kB"),
             "expected a formatted size in the row: {rendered:?}"
         );
     }

@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parent
+WRAPPERS = Path(__file__).resolve().parent.parent / 'src' / 'shell'
 
 
 @unittest.skipUnless(os.name == 'posix', 'Unix shell wrappers')
@@ -27,7 +27,7 @@ class ShellIntegrationTests(unittest.TestCase):
             binaries = root / 'bin'
             binaries.mkdir()
             marker = root / 'invoked'
-            host = binaries / 'gravityfile'
+            host = binaries / 'grav'
             host.write_text("""#!/usr/bin/env python3
 import os, sys
 from pathlib import Path
@@ -43,7 +43,7 @@ sys.exit(int(os.environ['SHELL_TEST_STATUS']))
                 mktemp.chmod(0o700)
             env = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
                        SHELL_TEST_TARGET=str(target), SHELL_TEST_STATUS=str(status),
-                       SHELL_TEST_MARKER=str(marker), SHELL_TEST_WRAPPER=str(SCRIPTS / ('grav.' + shell)))
+                       SHELL_TEST_MARKER=str(marker), SHELL_TEST_WRAPPER=str(WRAPPERS / ('grav.' + shell)))
             if shell == 'fish':
                 command = 'source "$SHELL_TEST_WRAPPER"; grav; set result $status; printf "%s" "$PWD"; exit $result'
                 arguments = [executable, '--no-config', '-c', command]

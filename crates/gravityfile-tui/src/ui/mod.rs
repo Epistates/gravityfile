@@ -176,9 +176,26 @@ impl AppLayout {
     }
 }
 
-/// Format a byte size in human-readable form.
+/// Whether sizes display in binary units. Chosen once, before the first frame.
+static BINARY_UNITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Choose the units every size is displayed in.
+pub fn set_units(units: gravityfile_core::units::Units) {
+    BINARY_UNITS.store(
+        units == gravityfile_core::units::Units::Binary,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Format a byte size in the chosen units.
 pub fn format_size(bytes: u64) -> String {
-    humansize::format_size(bytes, humansize::BINARY)
+    use gravityfile_core::units::Units;
+    let units = if BINARY_UNITS.load(std::sync::atomic::Ordering::Relaxed) {
+        Units::Binary
+    } else {
+        Units::Si
+    };
+    gravityfile_core::units::format_size(bytes, units)
 }
 
 /// Format a duration in human-readable form.

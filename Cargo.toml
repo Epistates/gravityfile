@@ -35,10 +35,14 @@ ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 crossterm = "0.29"
 
 # CLI
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
+anstream = "1.0"
+anstyle = "1.0"
+indicatif = "0.18"
 
 # Utilities
-humansize = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 strum = { version = "0.28", features = ["derive"] }
 derive_builder = "0.20"
@@ -91,14 +95,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "A state-of-the-art file system analyzer with TUI"
 autobins = false
-include = ["src/**/*.rs", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENSE-MIT"]
+include = ["src/**/*.rs", "src/shell/*", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 [[bin]]
 name = "grav"
-path = "src/grav.rs"
-
-[[bin]]
-name = "gravityfile"
 path = "src/main.rs"
 
 [dependencies]
@@ -108,10 +108,14 @@ gravityfile-analyze.workspace = true
 gravityfile-plugin.workspace = true
 gravityfile-tui.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+anstream.workspace = true
+anstyle.workspace = true
+indicatif.workspace = true
 color-eyre.workspace = true
 tokio-util = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
-humansize.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 tracing-subscriber = { workspace = true }

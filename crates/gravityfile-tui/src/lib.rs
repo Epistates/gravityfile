@@ -70,6 +70,8 @@ pub struct TuiConfig {
     pub print_cwd: bool,
     /// What happens to an item the user chooses to overwrite on paste.
     pub replace_policy: gravityfile_ops::ReplacePolicy,
+    /// How sizes are displayed.
+    pub units: gravityfile_core::units::Units,
 }
 
 impl TuiConfig {
@@ -100,6 +102,12 @@ impl TuiConfig {
         self.print_cwd = print;
         self
     }
+
+    /// Display sizes in `units`.
+    pub fn with_units(mut self, units: gravityfile_core::units::Units) -> Self {
+        self.units = units;
+        self
+    }
 }
 
 /// Data collected at exit for shell integration.
@@ -118,6 +126,8 @@ pub fn run(path: std::path::PathBuf) -> AppResult<()> {
 pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult<()> {
     use crossterm::event::EnableMouseCapture;
     use crossterm::execute;
+
+    ui::set_units(config.units);
 
     // Create tokio runtime for async operations - setup services BEFORE terminal
     let rt = tokio::runtime::Runtime::new()?;

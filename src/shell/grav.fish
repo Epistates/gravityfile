@@ -1,13 +1,11 @@
-# Shell integration for gravityfile (cd on exit)
-# Add this file to your fish functions directory:
-#   cp grav.fish ~/.config/fish/functions/grav.fish
-#
-# Then use `grav` command - when you quit, your shell will cd to your last location.
+# gravityfile shell integration: `grav` changes to the explorer's last
+# directory when it exits. Add to ~/.config/fish/config.fish:
+#   command grav init fish | source
 
 function grav
     set -l tmp (mktemp -t "gravityfile-cwd.XXXXXX")
     or return $status
-    command gravityfile --cwd-file="$tmp" $argv
+    command grav --cwd-file="$tmp" $argv
     set -l exit_code $status
     if test $exit_code -eq 0; and test -f "$tmp"
         set -l cwd

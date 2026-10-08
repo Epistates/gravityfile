@@ -1,12 +1,16 @@
 //! Process signal handling for noninteractive observation commands.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Shutdown {
     cancel: CancellationToken,
     stop: CancellationToken,
+    /// Conventional exit status for the first signal received (128 + signal).
+    signal: Arc<AtomicU8>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -31,6 +35,8 @@ impl Shutdown {
         let stop = CancellationToken::new();
         let work = cancel.clone();
         let done = stop.clone();
+        let signal = Arc::new(AtomicU8::new(130));
+        let received = signal.clone();
         let thread = std::thread::Builder::new()
             .name("gravityfile-signals".into())
             .spawn(move || {
@@ -46,6 +52,7 @@ impl Shutdown {
                             // A second signal deliberately skips graceful cleanup.
                             std::process::exit(code);
                         }
+                        received.store(code as u8, Ordering::Relaxed);
                         work.cancel();
                     }
                 });
@@ -53,12 +60,18 @@ impl Shutdown {
         Ok(Self {
             cancel,
             stop,
+            signal,
             thread: Some(thread),
         })
     }
 
     pub(crate) fn token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Exit status for an interrupted run: 130 for SIGINT, 143 for SIGTERM.
+    pub(crate) fn exit_status(&self) -> u8 {
+        self.signal.load(Ordering::Relaxed)
     }
 }
 

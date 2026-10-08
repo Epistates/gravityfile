@@ -7,6 +7,8 @@ use color_eyre::Result;
 use gravityfile_core::{FileNode, FileTree};
 use serde::Serialize;
 
+use crate::report::ReportEnvelope;
+
 #[derive(Serialize)]
 struct NativePath<'a>(
     #[serde(serialize_with = "gravityfile_core::path_serde::serialize")] &'a Path,
@@ -63,32 +65,26 @@ fn tree(writer: &mut dyn Write, tree: &FileTree) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn write(
-    writer: &mut dyn Write,
-    value: &FileTree,
-    envelope: Option<&super::ReportEnvelope<'_, FileTree>>,
-) -> Result<()> {
-    if let Some(envelope) = envelope {
-        writer.write_all(b"{\"schema_version\":")?;
-        serde_json::to_writer(&mut *writer, &envelope.schema_version)?;
-        field(writer, "tool_version", &envelope.tool_version)?;
-        field(writer, "kind", &envelope.kind)?;
-        field(writer, "root", &NativePath(envelope.root))?;
-        field(writer, "scope", &envelope.scope)?;
-        field(writer, "parameters", &envelope.parameters)?;
-        field(writer, "status", &envelope.status)?;
-        writer.write_all(b",\"data\":")?;
-        tree(writer, value)?;
-        writer.write_all(b"}")?;
-    } else {
-        tree(writer, value)?;
-    }
+/// Write `envelope` with its tree encoded iteratively.
+pub(crate) fn write(writer: &mut dyn Write, envelope: &ReportEnvelope<'_, FileTree>) -> Result<()> {
+    writer.write_all(b"{\"schema_version\":")?;
+    serde_json::to_writer(&mut *writer, &envelope.schema_version)?;
+    field(writer, "tool_version", &envelope.tool_version)?;
+    field(writer, "kind", &envelope.kind)?;
+    field(writer, "root", &NativePath(envelope.root))?;
+    field(writer, "scope", &envelope.scope)?;
+    field(writer, "parameters", &envelope.parameters)?;
+    field(writer, "status", &envelope.status)?;
+    writer.write_all(b",\"data\":")?;
+    tree(writer, envelope.data)?;
+    writer.write_all(b"}")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::{scan_status, write_json_atomic_with, write_json_report_with};
     use gravityfile_core::{GitStatus, NodeKind, Timestamps};
     use tokio_util::sync::CancellationToken;
 
@@ -96,20 +92,23 @@ mod tests {
         serde_json::from_str(include_str!("../tests/fixtures/reports/legacy-scan.json")).unwrap()
     }
 
+    /// Encode `tree` in an envelope with `encode`.
+    fn encoded(
+        tree: &FileTree,
+        encode: impl FnOnce(&mut dyn Write, &ReportEnvelope<'_, FileTree>) -> Result<()>,
+    ) -> Vec<u8> {
+        let status = scan_status(tree);
+        let envelope = ReportEnvelope::new("scan", tree, &status, tree);
+        let mut output = Vec::new();
+        encode(&mut output, &envelope).unwrap();
+        output
+    }
+
     fn compare(tree: &FileTree) {
-        let status = crate::scan_status(tree);
-        let envelope = crate::ReportEnvelope::new("scan", tree, &status, tree);
-        for wrapped in [false, true] {
-            let mut output = Vec::new();
-            write(&mut output, tree, wrapped.then_some(&envelope)).unwrap();
-            let actual: serde_json::Value = serde_json::from_slice(&output).unwrap();
-            let expected = if wrapped {
-                serde_json::to_value(&envelope).unwrap()
-            } else {
-                serde_json::to_value(tree).unwrap()
-            };
-            assert_eq!(actual, expected);
-        }
+        let status = scan_status(tree);
+        let envelope = ReportEnvelope::new("scan", tree, &status, tree);
+        let actual: serde_json::Value = serde_json::from_slice(&encoded(tree, write)).unwrap();
+        assert_eq!(actual, serde_json::to_value(&envelope).unwrap());
     }
 
     #[test]
@@ -160,11 +159,16 @@ mod tests {
                     root = parent;
                 }
                 tree.root = root;
-                let mut output = Vec::new();
-                crate::write_json_report_with(&mut output, &CancellationToken::new(), |writer| {
-                    write(writer, &tree, None)
-                })
-                .unwrap();
+                let output = encoded(&tree, |output, envelope| {
+                    let mut destination = Vec::new();
+                    write_json_report_with(
+                        &mut destination,
+                        &CancellationToken::new(),
+                        |writer| write(writer, envelope),
+                    )?;
+                    output.write_all(&destination)?;
+                    Ok(())
+                });
                 let text = std::str::from_utf8(&output).unwrap();
                 assert_eq!(text.matches("\"children\":[").count(), 10_000);
                 assert!(text.ends_with("}\n"));
@@ -178,22 +182,24 @@ mod tests {
     #[test]
     fn failed_tree_encoding_preserves_stdout_and_existing_export() {
         let tree = fixture();
+        let status = scan_status(&tree);
+        let envelope = ReportEnvelope::new("scan", &tree, &status, &tree);
         let token = CancellationToken::new();
         let encode = |writer: &mut dyn Write| -> Result<()> {
-            write(writer, &tree, None)?;
+            write(writer, &envelope)?;
             token.cancel();
             Ok(())
         };
         let mut output = Vec::new();
-        assert!(crate::write_json_report_with(&mut output, &token, encode).is_err());
+        assert!(write_json_report_with(&mut output, &token, encode).is_err());
         assert!(output.is_empty());
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("report.json");
         std::fs::write(&destination, b"previous").unwrap();
         let token = CancellationToken::new();
         assert!(
-            crate::write_json_atomic_with(&destination, &token, |writer| {
-                write(writer, &tree, None)?;
+            write_json_atomic_with(&destination, &token, |writer| {
+                write(writer, &envelope)?;
                 token.cancel();
                 Ok(())
             })

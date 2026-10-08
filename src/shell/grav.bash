@@ -1,13 +1,11 @@
-# Shell integration for gravityfile (cd on exit)
-# Source this file in your .zshrc:
-#   source /path/to/scripts/grav.zsh
-#
-# Then use `grav` command - when you quit, your shell will cd to your last location.
+# gravityfile shell integration: `grav` changes to the explorer's last
+# directory when it exits. Add to ~/.bashrc:
+#   eval "$(command grav init bash)"
 
 grav() {
     local tmp
     tmp="$(mktemp -t "gravityfile-cwd.XXXXXX")" || return $?
-    command gravityfile --cwd-file="$tmp" "$@"
+    command grav --cwd-file="$tmp" "$@"
     local exit_code=$?
     if [[ $exit_code -eq 0 && -f "$tmp" ]]; then
         # A sentinel prevents command substitution from stripping path newlines.

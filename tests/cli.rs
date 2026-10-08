@@ -1,5 +1,39 @@
 use std::process::{Command, Output};
 
+const GRAV: &str = env!("CARGO_BIN_EXE_grav");
+
+fn grav() -> Command {
+    let mut command = Command::new(GRAV);
+    command.env_remove("NO_COLOR").env_remove("CLICOLOR_FORCE");
+    command
+}
+
+fn run(args: &[&str]) -> Output {
+    grav()
+        .args(args)
+        .output()
+        .expect("CLI process should start")
+}
+
+fn json(output: &Output) -> serde_json::Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// Arguments that emit JSON for `command`.
+fn json_args(command: &str) -> &'static [&'static str] {
+    match command {
+        "export" => &[],
+        "duplicates" => &["-f", "json", "--min-size", "0"],
+        _ => &["-f", "json"],
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn all_report_commands_encode_native_root_and_file_paths() {
@@ -16,55 +50,49 @@ fn all_report_commands_encode_native_root_and_file_paths() {
         )
         .unwrap();
     }
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
-    ] {
-        for command in ["scan", "duplicates", "age"] {
-            let mut process = Command::new(binary);
-            process.arg(command).arg(&root);
-            if command == "duplicates" {
-                process.args(["--min-size", "0"]);
-            }
-            let output = process.output().unwrap();
-            assert!(output.status.success(), "{output:?}");
-            let text = String::from_utf8(output.stdout).unwrap();
-            assert!(text.contains(r"root-\xff"), "{text:?}");
-            assert!(!text.contains('\u{fffd}'), "{text:?}");
-            if command != "age" {
-                assert!(text.contains(r"file-\xfe"), "{text:?}");
-                assert!(text.contains(r"file-\xff"), "{text:?}");
-            }
-            let diagnostic = String::from_utf8(output.stderr).unwrap();
-            assert!(diagnostic.contains(r"root-\xff"), "{diagnostic:?}");
+    for command in ["scan", "duplicates", "age"] {
+        let mut process = grav();
+        process.arg(command).arg(&root);
+        if command == "duplicates" {
+            process.args(["--min-size", "0"]);
         }
-        for command in ["scan", "export", "duplicates", "age"] {
-            let mut process = Command::new(binary);
-            process
-                .arg(command)
-                .arg(&root)
-                .args(["--envelope", "--strict"]);
-            if command == "duplicates" {
-                process.args(["--min-size", "0"]);
-            }
-            let output = process.output().unwrap();
+        let output = process.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(r"root-\xff"), "{text:?}");
+        assert!(!text.contains('\u{fffd}'), "{text:?}");
+        if command != "age" {
+            assert!(text.contains(r"file-\xfe"), "{text:?}");
+            assert!(text.contains(r"file-\xff"), "{text:?}");
+        }
+    }
+    for command in ["scan", "export", "duplicates", "age"] {
+        let output = grav()
+            .arg(command)
+            .arg(&root)
+            .args(json_args(command))
+            .arg("--strict")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{command}: {output:?}");
+        let report = json(&output);
+        let expected = serde_json::json!({"platform":"unix","bytes":root.as_os_str().as_bytes()});
+        assert_eq!(report["root"], expected);
+        assert_eq!(report["scope"]["root"], expected);
+        assert_eq!(report["status"]["state"], "complete");
+        if command == "duplicates" {
+            let paths = report["data"]["groups"][0]["paths"].as_array().unwrap();
+            assert_eq!(paths.len(), 2);
+            assert_ne!(paths[0], paths[1]);
+            assert!(paths.iter().all(|path| path["platform"] == "unix"));
+        }
+        if command == "scan" {
+            let entries = report["data"]["entries"].as_array().unwrap();
             assert!(
-                output.status.success(),
-                "{command}: {}",
-                String::from_utf8_lossy(&output.stderr)
+                entries
+                    .iter()
+                    .all(|entry| entry["path"]["platform"] == "unix")
             );
-            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            let expected =
-                serde_json::json!({"platform":"unix","bytes":root.as_os_str().as_bytes()});
-            assert_eq!(report["root"], expected);
-            assert_eq!(report["scope"]["root"], expected);
-            assert_eq!(report["status"]["state"], "complete");
-            if command == "duplicates" {
-                let paths = report["data"]["groups"][0]["paths"].as_array().unwrap();
-                assert_eq!(paths.len(), 2);
-                assert_ne!(paths[0], paths[1]);
-                assert!(paths.iter().all(|path| path["platform"] == "unix"));
-            }
         }
     }
 }
@@ -78,70 +106,53 @@ fn text_reports_distinguish_literal_escapes_from_control_names() {
     for name in ["file\n", "file\\n"] {
         std::fs::write(root.join(name), b"identical").unwrap();
     }
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
-    ] {
-        for command in ["scan", "duplicates", "age"] {
-            let mut process = Command::new(binary);
-            process.arg(command).arg(&root);
-            if command == "duplicates" {
-                process.args(["--min-size", "0"]);
-            }
-            let output = process.output().unwrap();
-            assert!(output.status.success(), "{output:?}");
-            let text = String::from_utf8(output.stdout).unwrap();
-            let diagnostic = String::from_utf8(output.stderr).unwrap();
-            assert!(text.contains(r"root\\n"), "{text:?}");
-            assert!(diagnostic.contains(r"root\\n"), "{diagnostic:?}");
-            if command != "age" {
-                assert!(text.contains(r"file\n"), "{text:?}");
-                assert!(text.contains(r"file\\n"), "{text:?}");
-            }
+    for command in ["scan", "duplicates", "age"] {
+        let mut process = grav();
+        process.arg(command).arg(&root);
+        if command == "duplicates" {
+            process.args(["--min-size", "0"]);
+        }
+        let output = process.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(r"root\\n"), "{text:?}");
+        if command != "age" {
+            assert!(text.contains(r"file\n"), "{text:?}");
+            assert!(text.contains(r"file\\n"), "{text:?}");
         }
     }
 }
 
 #[test]
-fn scan_entry_limits_apply_to_every_report_command_and_binary() {
+fn scan_entry_limits_apply_to_every_report_command() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("one"), b"same").unwrap();
     std::fs::write(directory.path().join("two"), b"same").unwrap();
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
-    ] {
-        for command in ["scan", "duplicates", "age", "export"] {
-            for limit in ["0", "1", "2"] {
-                let output = run(
-                    binary,
-                    &[
-                        command,
-                        directory.path().to_str().unwrap(),
-                        "--max-entries",
-                        limit,
-                        "--envelope",
-                    ],
-                );
-                if limit == "2" {
-                    assert!(output.status.success(), "{:?}", output);
-                    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-                    assert_eq!(report["scope"]["max_entries"], 2);
-                    assert_eq!(report["status"]["state"], "complete");
-                } else {
-                    assert!(!output.status.success());
-                    assert!(output.stdout.is_empty());
-                    assert!(
-                        String::from_utf8_lossy(&output.stderr)
-                            .contains("Scan entry limit exceeded")
-                    );
-                }
-            }
-            for invalid in ["-1", "18446744073709551616", "many"] {
-                let output = run(binary, &[command, "--max-entries", invalid]);
-                assert_eq!(output.status.code(), Some(2));
+    let path = directory.path().to_str().unwrap();
+    for command in ["scan", "duplicates", "age", "export"] {
+        for limit in ["0", "1", "2"] {
+            let output = grav()
+                .args([command, path, "--max-entries", limit])
+                .args(json_args(command))
+                .output()
+                .unwrap();
+            if limit == "2" {
+                assert!(output.status.success(), "{output:?}");
+                let report = json(&output);
+                assert_eq!(report["scope"]["max_entries"], 2);
+                assert_eq!(report["status"]["state"], "complete");
+            } else {
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
                 assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("Scan entry limit exceeded")
+                );
             }
+        }
+        for invalid in ["-1", "18446744073709551616", "many"] {
+            let output = run(&[command, "--max-entries", invalid]);
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
         }
     }
 }
@@ -152,27 +163,19 @@ fn scan_entry_limit_failure_leaves_existing_export_untouched() {
     let output_dir = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("one"), b"data").unwrap();
     let destination = output_dir.path().join("report.json");
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
-    ] {
-        std::fs::write(&destination, b"previous report").unwrap();
-        let output = run(
-            binary,
-            &[
-                "export",
-                directory.path().to_str().unwrap(),
-                "--max-entries",
-                "0",
-                "--output",
-                destination.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        assert_eq!(std::fs::read(&destination).unwrap(), b"previous report");
-        assert_eq!(std::fs::read_dir(output_dir.path()).unwrap().count(), 1);
-    }
+    std::fs::write(&destination, b"previous report").unwrap();
+    let output = run(&[
+        "export",
+        directory.path().to_str().unwrap(),
+        "--max-entries",
+        "0",
+        "--output",
+        destination.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"previous report");
+    assert_eq!(std::fs::read_dir(output_dir.path()).unwrap().count(), 1);
 }
 
 #[cfg(unix)]
@@ -182,33 +185,30 @@ fn text_reports_escape_hostile_names_while_json_preserves_them() {
     let hostile = "line\n\u{1b}]52;c;payload\u{7}\u{202e}.txt";
     std::fs::write(directory.path().join(hostile), "same contents").unwrap();
     std::fs::write(directory.path().join("ordinary.txt"), "same contents").unwrap();
+    let path = directory.path().to_str().unwrap();
     for command in ["scan", "duplicates"] {
-        let mut args = vec![command, directory.path().to_str().unwrap()];
+        let mut process = grav();
+        process.args([command, path, "--color", "always"]);
         if command == "duplicates" {
-            args.extend(["--min-size", "0"]);
+            process.args(["--min-size", "0"]);
         }
-        let output = run(env!("CARGO_BIN_EXE_grav"), &args);
+        let output = process.output().unwrap();
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(
             text.contains("line\\n\\u{1b}]52;c;payload\\u{7}\\u{202e}.txt"),
             "{text:?}"
         );
-        assert!(!text.contains(['\u{1b}', '\u{7}', '\u{202e}']));
+        // Colour is the only escape sequence that reaches the terminal.
+        assert!(!text.contains(['\u{7}', '\u{202e}']));
+        assert!(!text.contains("\u{1b}]"));
     }
-    let output = run(
-        env!("CARGO_BIN_EXE_grav"),
-        &[
-            "duplicates",
-            directory.path().to_str().unwrap(),
-            "--min-size",
-            "0",
-            "--envelope",
-        ],
-    );
+    let output = run(&["duplicates", path, "--min-size", "0", "-f", "json"]);
     assert!(output.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let paths = json["data"]["groups"][0]["paths"].as_array().unwrap();
+    let paths = json(&output)["data"]["groups"][0]["paths"]
+        .as_array()
+        .unwrap()
+        .clone();
     assert!(paths.iter().any(|path| {
         std::path::Path::new(path.as_str().unwrap())
             .file_name()
@@ -217,73 +217,54 @@ fn text_reports_escape_hostile_names_while_json_preserves_them() {
     }));
 }
 
-fn run(binary: &str, args: &[&str]) -> Output {
-    Command::new(binary)
-        .args(args)
-        .output()
-        .expect("CLI process should start")
-}
-
 #[test]
-fn both_binary_names_report_the_same_version() {
-    let grav = run(env!("CARGO_BIN_EXE_grav"), &["--version"]);
-    let gravityfile = run(env!("CARGO_BIN_EXE_gravityfile"), &["--version"]);
-
-    assert!(grav.status.success());
-    assert!(gravityfile.status.success());
-    assert_eq!(grav.stdout, gravityfile.stdout);
-    assert!(
-        String::from_utf8_lossy(&grav.stdout).contains(env!("CARGO_PKG_VERSION")),
-        "version output should contain the package version"
+fn version_names_the_single_binary() {
+    let output = run(&["--version"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("grav {}", env!("CARGO_PKG_VERSION"))
     );
 }
 
 #[test]
-fn scan_subcommand_runs_end_to_end() {
+fn scan_lists_entries_with_units_and_bounds() {
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("file.txt"), "content").unwrap();
+    std::fs::write(directory.path().join("small.txt"), "content").unwrap();
+    std::fs::write(directory.path().join("large.bin"), vec![0u8; 3000]).unwrap();
+    let path = directory.path().to_str().unwrap();
 
-    let output = run(
-        env!("CARGO_BIN_EXE_grav"),
-        &[
-            "scan",
-            directory.path().to_str().unwrap(),
-            "--max-depth",
-            "1",
-            "--top",
-            "1",
-        ],
-    );
-
-    assert!(
-        output.status.success(),
-        "scan failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = run(&["scan", path, "-A", "-n", "1"]);
+    assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("1 files"), "unexpected output: {stdout}");
-    assert!(stdout.contains("file.txt"), "unexpected output: {stdout}");
+    assert!(stdout.contains("2 files, 0 directories"), "{stdout}");
+    assert!(
+        stdout.contains("3.00 kB") && stdout.contains("large.bin"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("… 1 more, 7 B"), "{stdout}");
+    assert!(!stdout.contains("small.txt"), "{stdout}");
+
+    let output = run(&["scan", path, "-A", "--binary"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2.93 KiB"), "{stdout}");
 }
 
 #[test]
-fn invalid_numeric_arguments_fail_without_panicking() {
+fn invalid_arguments_fail_with_usage_status_and_a_reason() {
     let directory = tempfile::tempdir().unwrap();
-    let output = run(
-        env!("CARGO_BIN_EXE_gravityfile"),
-        &[
-            "duplicates",
-            directory.path().to_str().unwrap(),
-            "--min-size=-1",
-        ],
-    );
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Invalid size") || stderr.contains("negative"),
-        "unexpected error: {stderr}"
-    );
-    assert!(!stderr.contains("panicked at"), "CLI panicked: {stderr}");
+    let path = directory.path().to_str().unwrap();
+    for (args, reason) in [
+        (vec!["duplicates", path, "--min-size=-1"], "is not a size"),
+        (vec!["age", path, "--stale", "6m"], "ambiguous"),
+        (vec!["scan", path, "-j", "0"], "--threads"),
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(reason), "{args:?}: {stderr}");
+        assert!(!stderr.contains("panicked at"), "CLI panicked: {stderr}");
+    }
 }
 
 #[test]
@@ -291,22 +272,15 @@ fn versioned_reports_identify_scope_kind_and_completeness() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("a"), b"same content").unwrap();
     std::fs::write(directory.path().join("b"), b"same content").unwrap();
+    let path = directory.path().to_str().unwrap();
     for command in ["scan", "duplicates", "age", "export"] {
-        let output = run(
-            env!("CARGO_BIN_EXE_grav"),
-            &[
-                command,
-                directory.path().to_str().unwrap(),
-                "--envelope",
-                "--strict",
-            ],
-        );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut args = vec![command, path, "--strict"];
+        if command != "export" {
+            args.extend(["-f", "json"]);
+        }
+        let output = run(&args);
+        assert!(output.status.success(), "{output:?}");
+        let report = json(&output);
         assert_eq!(report["schema_version"], 2);
         assert_eq!(
             report["kind"],
@@ -315,37 +289,48 @@ fn versioned_reports_identify_scope_kind_and_completeness() {
         assert_eq!(report["status"]["state"], "complete");
         assert!(report["scope"].is_object());
         assert!(report["data"].is_object());
-        if command == "duplicates" {
-            assert_eq!(report["parameters"]["min_size"], 1_048_576);
-            assert_eq!(report["parameters"]["max_groups"], 20);
-        } else if command == "age" {
-            assert!(report["parameters"]["reference_time"].is_object());
-        } else {
-            assert!(report["parameters"].is_null());
+        match command {
+            "duplicates" => {
+                assert_eq!(report["parameters"]["min_size"], 1_000_000);
+                assert_eq!(report["parameters"]["max_groups"], 20);
+            }
+            "age" => assert!(report["parameters"]["reference_time"].is_object()),
+            "scan" => {
+                assert_eq!(report["parameters"]["depth"], 1);
+                assert_eq!(report["parameters"]["limit"], 20);
+            }
+            _ => assert!(report["parameters"].is_null()),
         }
     }
 }
 
 #[cfg(unix)]
 #[test]
-fn strict_mode_emits_partial_json_and_fails_on_scan_warnings() {
+fn strict_mode_emits_partial_json_and_exits_with_status_three() {
     let directory = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink("missing", directory.path().join("broken")).unwrap();
+    let path = directory.path().to_str().unwrap();
     for command in ["scan", "duplicates", "age", "export"] {
-        let output = run(
-            env!("CARGO_BIN_EXE_grav"),
-            &[
-                command,
-                directory.path().to_str().unwrap(),
-                "--strict",
-                "--envelope",
-            ],
-        );
-        assert!(!output.status.success());
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let output = grav()
+            .args([command, path, "--strict"])
+            .args(json_args(command))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{command}: {output:?}");
+        let report = json(&output);
         assert_eq!(report["status"]["state"], "partial");
         assert_eq!(report["status"]["scan_warning_count"], 1);
-        assert!(String::from_utf8_lossy(&output.stderr).contains("incomplete report"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("1 entry could not be read"), "{stderr}");
+
+        // Without --strict the same report succeeds, still with the warning.
+        let output = grav()
+            .args([command, path])
+            .args(json_args(command))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{command}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("warning:"));
     }
 }
 
@@ -357,37 +342,22 @@ fn every_report_preserves_warning_totals_after_detail_omission() {
         std::os::unix::fs::symlink("missing", directory.path().join(format!("broken-{index}")))
             .unwrap();
     }
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
-    ] {
-        for command in ["scan", "duplicates", "age", "export"] {
-            let output = run(
-                binary,
-                &[
-                    command,
-                    directory.path().to_str().unwrap(),
-                    "--strict",
-                    "--envelope",
-                ],
-            );
-            assert!(!output.status.success(), "{binary} {command}");
-            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(report["status"]["state"], "partial", "{binary} {command}");
-            assert_eq!(
-                report["status"]["scan_warning_count"], 1100,
-                "{binary} {command}"
-            );
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("1100 scan warning(s)"),
-                "{binary} {command}: {stderr}"
-            );
-            assert!(
-                stderr.contains("incomplete report"),
-                "{binary} {command}: {stderr}"
-            );
-        }
+    let path = directory.path().to_str().unwrap();
+    for command in ["scan", "duplicates", "age", "export"] {
+        let output = grav()
+            .args([command, path, "--strict"])
+            .args(json_args(command))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        let report = json(&output);
+        assert_eq!(report["status"]["state"], "partial", "{command}");
+        assert_eq!(report["status"]["scan_warning_count"], 1100, "{command}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("1,100 entries could not be read"),
+            "{command}: {stderr}"
+        );
     }
 }
 
@@ -396,7 +366,7 @@ fn closed_stdout_does_not_panic() {
     use std::process::Stdio;
     let directory = tempfile::tempdir().unwrap();
     for command in ["scan", "export"] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_grav"))
+        let mut child = grav()
             .args([command, directory.path().to_str().unwrap()])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -429,7 +399,7 @@ fn strict_mode_does_not_report_success_when_stdout_is_closed() {
     };
     #[cfg(not(unix))]
     let stdout = Stdio::piped();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_grav"))
+    let mut child = grav()
         .args(["export", directory.path().to_str().unwrap(), "--strict"])
         .stdout(stdout)
         .stderr(Stdio::piped())
@@ -437,26 +407,23 @@ fn strict_mode_does_not_report_success_when_stdout_is_closed() {
         .unwrap();
     drop(child.stdout.take());
     let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
 }
 
 #[test]
-fn legacy_analysis_json_has_unknown_completeness() {
+fn reports_without_status_have_unknown_completeness() {
     let directory = tempfile::tempdir().unwrap();
-    let output = run(
-        env!("CARGO_BIN_EXE_grav"),
-        &[
-            "duplicates",
-            directory.path().to_str().unwrap(),
-            "--format",
-            "json",
-        ],
-    );
+    let output = run(&[
+        "duplicates",
+        directory.path().to_str().unwrap(),
+        "-f",
+        "json",
+    ]);
     assert!(output.status.success());
-    let mut value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    value.as_object_mut().unwrap().remove("status");
-    let legacy: gravityfile_analyze::DuplicateReport = serde_json::from_value(value).unwrap();
+    let mut data = json(&output)["data"].take();
+    data.as_object_mut().unwrap().remove("status");
+    let legacy: gravityfile_analyze::DuplicateReport = serde_json::from_value(data).unwrap();
     assert!(!legacy.status.is_complete());
     assert_eq!(
         legacy.status.state,
@@ -466,58 +433,88 @@ fn legacy_analysis_json_has_unknown_completeness() {
 
 #[test]
 fn executable_failures_escape_third_party_error_messages() {
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
-    ] {
-        let output = run(
-            binary,
-            &["__plugin-worker", "bad\n\u{1b}]52;c;payload\u{7}\u{202e}"],
-        );
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(
-            stderr.contains(r"bad\n\u{1b}]52;c;payload\u{7}\u{202e}"),
-            "{stderr:?}"
-        );
-        assert_eq!(stderr.matches('\n').count(), 1);
-        assert!(!stderr.contains(['\u{1b}', '\u{7}', '\u{202e}']));
-    }
+    let output = run(&["__plugin-worker", "bad\n\u{1b}]52;c;payload\u{7}\u{202e}"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("error: "), "{stderr:?}");
+    assert!(
+        stderr.contains(r"bad\n\u{1b}]52;c;payload\u{7}\u{202e}"),
+        "{stderr:?}"
+    );
+    assert_eq!(stderr.matches('\n').count(), 1);
+    assert!(!stderr.contains(['\u{1b}', '\u{7}', '\u{202e}']));
 }
 
 #[test]
 fn parser_errors_escape_control_arguments_and_keep_exit_status() {
-    for binary in [
-        env!("CARGO_BIN_EXE_grav"),
-        env!("CARGO_BIN_EXE_gravityfile"),
+    for args in [
+        vec!["--bad\n\u{202e}"],
+        vec!["scan", "--max-entries", "bad\n\u{202e}"],
     ] {
-        for args in [
-            vec!["--bad\n\u{202e}"],
-            vec!["scan", "--max-entries", "bad\n\u{202e}"],
-        ] {
-            let output = run(binary, &args);
-            assert_eq!(output.status.code(), Some(2));
-            assert!(output.stdout.is_empty());
-            let text = String::from_utf8(output.stderr).unwrap();
-            assert_eq!(text.matches('\n').count(), 1, "{text:?}");
-            assert!(!text.contains(['\u{1b}', '\u{202e}']));
-            assert!(text.contains(r"\n"));
-        }
-        for flag in ["--help", "--version"] {
-            let output = run(binary, &[flag]);
-            assert!(output.status.success());
-            assert!(output.stderr.is_empty());
-            assert!(!output.stdout.is_empty());
-        }
-        let output = run(binary, &["--ordinary-invalid"]);
+        let output = run(&args);
         assert_eq!(output.status.code(), Some(2));
-        assert!(
-            String::from_utf8(output.stderr)
-                .unwrap()
-                .contains("\nUsage:")
-        );
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(text.matches('\n').count(), 1, "{text:?}");
+        assert!(!text.contains(['\u{1b}', '\u{202e}']));
+        assert!(text.contains(r"\n"));
     }
+    for flag in ["--help", "--version"] {
+        let output = run(&[flag]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.is_empty());
+    }
+    let output = run(&["--ordinary-invalid"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("\nUsage:")
+    );
+}
+
+#[test]
+fn colour_follows_the_flag_and_no_color() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("sub")).unwrap();
+    let path = directory.path().to_str().unwrap();
+    let has_escape = |output: &Output| output.stdout.contains(&0x1b);
+    assert!(!has_escape(&run(&["scan", path])), "not a terminal");
+    assert!(has_escape(&run(&["scan", path, "--color", "always"])));
+    assert!(!has_escape(&run(&["scan", path, "--color", "never"])));
+    let output = grav()
+        .args(["scan", path])
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    assert!(has_escape(&output));
+    let output = grav()
+        .args(["scan", path])
+        .env("CLICOLOR_FORCE", "1")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!has_escape(&output));
+}
+
+#[test]
+fn init_and_completions_print_scripts() {
+    for shell in ["bash", "zsh", "fish"] {
+        let output = run(&["init", shell]);
+        assert!(output.status.success());
+        let script = String::from_utf8(output.stdout).unwrap();
+        assert!(script.contains("command grav --cwd-file="), "{shell}");
+    }
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let output = run(&["completions", shell]);
+        assert!(output.status.success(), "{shell}");
+        assert!(!output.stdout.is_empty(), "{shell}");
+    }
+    let output = run(&["man"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(".TH grav"));
 }
 
 #[test]
@@ -526,7 +523,7 @@ fn logging_is_opt_in() {
     std::fs::write(fixture.path().join("file"), b"data").unwrap();
     let temp = tempfile::tempdir().unwrap();
     let run = |extra: &[&std::ffi::OsStr]| {
-        Command::new(env!("CARGO_BIN_EXE_grav"))
+        grav()
             .arg("scan")
             .arg(fixture.path())
             .args(extra)
@@ -550,6 +547,6 @@ fn logging_is_opt_in() {
     assert!(
         std::fs::read_to_string(&log)
             .unwrap()
-            .contains("Starting gravityfile")
+            .contains(concat!("gravityfile v", env!("CARGO_PKG_VERSION")))
     );
 }
