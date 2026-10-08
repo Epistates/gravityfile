@@ -1058,8 +1058,21 @@ impl Widget for BulkRenameConfirmModal<'_> {
         let max_visible = (inner.height as usize).saturating_sub(6);
         let max_name_len = ((inner.width as usize).saturating_sub(8)) / 2;
         let arrow = " -> ";
+        // Scroll so the selected rename is always on screen; every rename
+        // must be reviewable before confirming.
+        let total = self.state.entries.len();
+        let start = (self.state.selected + 1)
+            .saturating_sub(max_visible)
+            .min(total.saturating_sub(max_visible));
 
-        for (i, entry) in self.state.entries.iter().enumerate().take(max_visible) {
+        for (i, entry) in self
+            .state
+            .entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(max_visible)
+        {
             let is_selected = i == self.state.selected;
 
             // Truncate names if needed
@@ -1088,9 +1101,10 @@ impl Widget for BulkRenameConfirmModal<'_> {
             ]));
         }
 
-        if self.state.entries.len() > max_visible {
+        if total > max_visible {
+            let end = (start + max_visible).min(total);
             lines.push(Line::styled(
-                format!("  ... and {} more", self.state.entries.len() - max_visible),
+                format!("  {}-{end} of {total}; j/k to scroll", start + 1),
                 Style::default().fg(self.theme.muted),
             ));
         }
@@ -1117,5 +1131,34 @@ impl Widget for BulkRenameConfirmModal<'_> {
         }
 
         Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::BulkRenameState;
+
+    fn rendered(state: &BulkRenameState) -> String {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        BulkRenameConfirmModal::new(&Theme::dark(), state).render(area, &mut buf);
+        buf.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn the_bulk_rename_list_scrolls_to_the_selection() {
+        let originals = (0..50)
+            .map(|index| PathBuf::from(format!("/r/old-{index:02}")))
+            .collect();
+        let names = (0..50).map(|index| format!("new-{index:02}")).collect();
+        let mut state = BulkRenameState::new(originals, names);
+        assert!(rendered(&state).contains("old-00"));
+
+        state.selected = 49;
+        let screen = rendered(&state);
+        assert!(screen.contains("old-49"), "{screen}");
+        assert!(!screen.contains("old-00"), "{screen}");
+        assert!(screen.contains("of 50"), "{screen}");
     }
 }
