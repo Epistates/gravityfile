@@ -314,6 +314,27 @@ async fn creating_a_file_adds_it_in_place() {
 }
 
 #[tokio::test]
+async fn an_invalid_name_keeps_the_prompt_open_with_the_reason() {
+    let mut harness = Harness::scanned().await;
+    harness.press("a").await;
+    harness.type_text("a/b").await;
+    harness.press("<enter>").await;
+    assert_eq!(harness.app.mode, AppMode::CreatingFile);
+    assert!(
+        harness.screen().contains("Name cannot contain '/'"),
+        "{}",
+        harness.screen()
+    );
+    // Fixing the name in the same prompt creates the file.
+    harness.press("<bs><bs><bs>").await;
+    harness.type_text("back\\slash").await;
+    harness.press("<enter>").await;
+    assert_eq!(harness.app.mode, AppMode::Normal);
+    #[cfg(unix)]
+    assert!(harness.path("back\\slash").is_file());
+}
+
+#[tokio::test]
 async fn rescanning_a_subdirectory_keeps_the_rest_of_the_scan() {
     let mut harness = Harness::scanned().await;
     let root = harness.root().to_path_buf();

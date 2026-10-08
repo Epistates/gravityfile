@@ -102,6 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every entry of each Miller column. A frame now builds only the rows on screen:
   under 3 ms at any scroll position, with or without marks.
 - The Miller parent column scrolls to keep the current directory in view.
+- An invalid name in the rename or create prompt keeps the prompt open with
+  the reason, instead of closing it and losing what was typed. Rename and
+  create now apply the same name rules, so a backslash is accepted on Unix.
 - The treemap dims cut items and italicises copied ones, as the tree does.
 - Text previews show how many lines the file has, so a truncated preview says
   so.

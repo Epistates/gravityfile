@@ -2716,6 +2716,14 @@ impl App {
                     self.mode = AppMode::Normal;
                 }
                 InputResult::Submit(value) => {
+                    // An invalid name keeps the prompt open with the reason,
+                    // instead of closing it and losing what was typed.
+                    if current_mode != AppMode::GoingTo
+                        && let Err(error) = input.validate_filename()
+                    {
+                        input.set_error(error);
+                        return;
+                    }
                     let context_path = input.context_path.clone();
                     self.input_state = None;
                     self.mode = AppMode::Normal;
@@ -2758,9 +2766,7 @@ impl App {
     fn execute_rename(&mut self, source: std::path::PathBuf, new_name: String) {
         use gravityfile_ops::start_rename;
 
-        // Validate name
-        if new_name.is_empty() || new_name.contains('/') || new_name.contains('\\') {
-            self.operation_message = Some((false, "Invalid file name".to_string()));
+        if !self.accept_name(&new_name) {
             return;
         }
 
@@ -2828,13 +2834,23 @@ impl App {
         adapted_rx
     }
 
+    /// Whether `name` is usable for a new or renamed entry. Reports the reason
+    /// when it is not.
+    fn accept_name(&mut self, name: &str) -> bool {
+        match gravityfile_ops::validate_filename(name) {
+            Ok(()) => true,
+            Err(error) => {
+                self.operation_message = Some((false, error));
+                false
+            }
+        }
+    }
+
     /// Execute create file operation.
     fn execute_create_file(&mut self, parent: std::path::PathBuf, name: String) {
         use gravityfile_ops::start_create_file;
 
-        // Validate name
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            self.operation_message = Some((false, "Invalid file name".to_string()));
+        if !self.accept_name(&name) {
             return;
         }
 
@@ -2853,9 +2869,7 @@ impl App {
     fn execute_create_directory(&mut self, parent: std::path::PathBuf, name: String) {
         use gravityfile_ops::start_create_directory;
 
-        // Validate name
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            self.operation_message = Some((false, "Invalid directory name".to_string()));
+        if !self.accept_name(&name) {
             return;
         }
 
@@ -2876,12 +2890,7 @@ impl App {
             self.operation_message = Some((false, "Create-and-enter is still in progress".into()));
             return;
         }
-        if name.contains('/') || name.contains('\\') {
-            self.operation_message = Some((false, "Invalid directory name".into()));
-            return;
-        }
-        if let Err(error) = gravityfile_ops::validate_filename(&name) {
-            self.operation_message = Some((false, error));
+        if !self.accept_name(&name) {
             return;
         }
         let path = parent.join(&name);
