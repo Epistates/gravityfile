@@ -103,12 +103,9 @@ enum Background {
 pub struct App {
     /// Path being analyzed (scan root).
     path: PathBuf,
-    /// Current view root for drill-down navigation (can be different from scan root).
-    view_root: PathBuf,
-    /// Navigation history stack for going back up (path, selected_index, expanded_set).
-    view_history: Vec<(PathBuf, usize, HashSet<PathBuf>)>,
-    /// Forward navigation history stack (for returning after going back).
-    forward_history: Vec<(PathBuf, usize, HashSet<PathBuf>)>,
+    /// The active tab's directory, selection and history. Inactive tabs'
+    /// navigation is kept by `tab_manager`.
+    nav: state::Navigation,
     /// Current mode.
     mode: AppMode,
     /// Current view (normal mode).
@@ -138,8 +135,6 @@ pub struct App {
     /// navigation cache. Mutation goes through `Arc::make_mut`, which only
     /// copies when a background task still holds a reference.
     tree: Option<Arc<FileTree>>,
-    /// Tree view state.
-    tree_state: TreeState,
     /// Cached count of visible tree items (to avoid flatten on every nav).
     cached_tree_len: usize,
     /// Duplicate analysis report.
@@ -171,8 +166,6 @@ pub struct App {
     delete_mode: gravityfile_ops::DeleteMode,
     /// Layout mode (tree vs miller).
     layout_mode: LayoutMode,
-    /// Miller columns state.
-    miller_state: crate::ui::MillerState,
     /// Cached count of entries in current directory for Miller view.
     cached_miller_len: usize,
     /// Input state for rename/create modes.
@@ -254,8 +247,6 @@ pub struct App {
     /// Bulk rename state for the confirmation modal.
     bulk_rename_state: Option<state::BulkRenameState>,
     bulk_rename_edit: Option<bulk_edit::BulkRenameEdit>,
-    /// Treemap view state.
-    treemap_state: crate::ui::TreemapState,
     /// Cached count of treemap rectangles for navigation.
     cached_treemap_len: usize,
     /// Visual selection mode state.
@@ -337,9 +328,7 @@ impl App {
 
         let mut app = Self {
             path: path.clone(),
-            view_root: path.clone(),
-            view_history: Vec::new(),
-            forward_history: Vec::new(),
+            nav: state::Navigation::new(path.clone()),
             mode: AppMode::default(),
             view: View::default(),
             theme: Theme::dark(),
@@ -348,7 +337,6 @@ impl App {
             rendered_offsets: std::cell::Cell::new((0, 0)),
             clicks: crate::event::ClickTracker::default(),
             tree: quick_tree.map(Arc::new),
-            tree_state: TreeState::new(path.clone()),
             cached_tree_len: 0,
             duplicates: None,
             duplicate_filter: duplicate_filter::DuplicateFilter::default(),
@@ -368,7 +356,6 @@ impl App {
             replace_policy: config.replace_policy,
             delete_mode: config.delete_mode,
             layout_mode: user_settings.default_layout,
-            miller_state: crate::ui::MillerState::new(),
             cached_miller_len: 0,
             input_state: None,
             operation_progress: None,
@@ -391,7 +378,7 @@ impl App {
             command_input: CommandInput::new(),
             sort_mode: SortMode::default(),
             search_state: SearchState::new(),
-            tab_manager: TabManager::with_initial_tab(path, 10),
+            tab_manager: TabManager::new(10),
             preview_state: PreviewState::new(),
             preview_rx: None,
             pending_preview: None,
@@ -409,7 +396,6 @@ impl App {
             scanned_cache: Some(HashMap::new()),
             bulk_rename_state: None,
             bulk_rename_edit: None,
-            treemap_state: crate::ui::TreemapState::new(),
             cached_treemap_len: 0,
             visual_state: None,
             plugin_manager: Some(plugin_manager),
@@ -459,7 +445,7 @@ impl App {
 
         let mut ctx = gravityfile_plugin::HookContext::new()
             .with_cwd(self.path.clone())
-            .with_view_root(self.view_root.clone())
+            .with_view_root(self.nav.view_root.clone())
             .with_theme(theme_name);
 
         if let Some(node) = self.get_current_node() {
@@ -498,10 +484,10 @@ impl App {
 
     /// Check for navigation and dispatch hook if needed.
     async fn check_navigation(&self, old_root: &std::path::Path) {
-        if old_root != self.view_root {
+        if old_root != self.nav.view_root {
             self.dispatch_hook(gravityfile_plugin::Hook::OnNavigate {
                 from: old_root.to_path_buf(),
-                to: self.view_root.clone(),
+                to: self.nav.view_root.clone(),
             })
             .await;
         }
@@ -554,7 +540,7 @@ impl App {
                 self.needs_redraw = false;
             }
 
-            let old_view_root = self.view_root.clone();
+            let old_view_root = self.nav.view_root.clone();
 
             // Keep Tokio's randomized polling order: fixed input priority can
             // starve completions even when each input drain is bounded.
@@ -672,7 +658,7 @@ impl App {
         });
 
         Ok(crate::ExitData {
-            last_cwd: self.view_root,
+            last_cwd: self.nav.view_root,
         })
     }
 
@@ -803,7 +789,7 @@ impl App {
     fn refresh_view(&mut self) {
         self.marked.clear();
         if self.tree.is_some() {
-            self.refresh_paths(vec![self.view_root.clone()]);
+            self.refresh_paths(vec![self.nav.view_root.clone()]);
         } else {
             self.start_scan();
         }
@@ -862,20 +848,19 @@ impl App {
         let Some(tree) = &self.tree else {
             return;
         };
-        let mut view = self.view_root.clone();
+        let mut view = self.nav.view_root.clone();
         while !tree.find(&view).is_some_and(|node| node.is_dir()) {
             if !view.pop() || !view.starts_with(&tree.root_path) {
                 view = tree.root_path.clone();
                 break;
             }
         }
-        if view != self.view_root {
-            self.view_root = view;
-            self.tree_state.selected = 0;
-            self.tree_state.offset = 0;
-            self.tree_state.expand(&self.view_root);
-            self.miller_state.reset();
-            self.sync_to_active_tab();
+        if view != self.nav.view_root {
+            self.nav.view_root = view;
+            self.nav.tree_state.selected = 0;
+            self.nav.tree_state.offset = 0;
+            self.nav.tree_state.expand(&self.nav.view_root);
+            self.nav.miller_state.reset();
         }
     }
 
@@ -1021,7 +1006,7 @@ impl App {
                 .to_string(),
         );
         // Whatever it changed, show what is there now.
-        self.refresh_paths(vec![self.view_root.clone()]);
+        self.refresh_paths(vec![self.nav.view_root.clone()]);
         self.needs_redraw = true;
     }
 
@@ -1032,7 +1017,7 @@ impl App {
                 self.op_rx = None;
                 // After a failure, rollback may have left any of the viewed
                 // directory's entries renamed.
-                let mut touched = vec![self.view_root.clone()];
+                let mut touched = vec![self.nav.view_root.clone()];
                 self.operation_message = Some(match result {
                     Ok(renames) => {
                         self.marked.clear();
@@ -1065,17 +1050,18 @@ impl App {
 
                 // Preserve tree state (selection, expanded) across rescans
                 // Only reset if this is a different root path
-                if self.tree_state.expanded.is_empty()
+                if self.nav.tree_state.expanded.is_empty()
                     || !self
+                        .nav
                         .tree_state
                         .expanded
                         .iter()
                         .any(|p| p.starts_with(&root_path))
                 {
-                    self.tree_state = TreeState::new(root_path);
+                    self.nav.tree_state = TreeState::new(root_path);
                 } else {
                     // Just ensure root is expanded
-                    self.tree_state.expand(&root_path);
+                    self.nav.tree_state.expand(&root_path);
                 }
                 self.update_cached_tree_len();
                 self.update_cached_miller_len();
@@ -1085,8 +1071,9 @@ impl App {
                 self.update_cached_parent();
 
                 // Clamp selection to valid range
-                if self.tree_state.selected >= self.cached_tree_len && self.cached_tree_len > 0 {
-                    self.tree_state.selected = self.cached_tree_len - 1;
+                if self.nav.tree_state.selected >= self.cached_tree_len && self.cached_tree_len > 0
+                {
+                    self.nav.tree_state.selected = self.cached_tree_len - 1;
                 }
                 self.scan_progress = None;
                 self.has_full_scan = true;
@@ -1099,7 +1086,7 @@ impl App {
 
                 // Dispatch scan complete hook (extract only the stats we need)
                 if let Some(pm) = self.plugin_manager.clone() {
-                    let view_root = self.view_root.clone();
+                    let view_root = self.nav.view_root.clone();
                     tokio::spawn(async move {
                         let ctx = gravityfile_plugin::HookContext::new().with_view_root(view_root);
 
@@ -1306,7 +1293,7 @@ impl App {
             // Use flatten_count to avoid allocating a full Vec just for the length.
             self.cached_tree_len =
                 TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                    .flatten_count(&self.tree_state);
+                    .flatten_count(&self.nav.tree_state);
         } else {
             self.cached_tree_len = 0;
         }
@@ -1338,7 +1325,7 @@ impl App {
         let mut children: Vec<&FileNode> = node.children.iter().collect();
         children.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.compare_name(b)));
 
-        let child = children.get(self.treemap_state.selected)?;
+        let child = children.get(self.nav.treemap_state.selected)?;
         let path = root_path.join(child.file_name());
         Some((*child, path))
     }
@@ -1352,7 +1339,11 @@ impl App {
             };
 
             if child.is_dir() {
-                Some((path, self.view_root.clone(), self.treemap_state.selected))
+                Some((
+                    path,
+                    self.nav.view_root.clone(),
+                    self.nav.treemap_state.selected,
+                ))
             } else {
                 None
             }
@@ -1360,39 +1351,39 @@ impl App {
 
         if let Some((new_root, old_root, old_selected)) = drill_info {
             // Save current state to history
-            self.view_history
-                .push((old_root, old_selected, HashSet::new()));
-            self.forward_history.clear();
+            self.nav.back.push((old_root, old_selected, HashSet::new()));
+            self.nav.forward.clear();
 
             // Navigate to the new directory
-            self.view_root = new_root;
-            self.treemap_state.reset();
+            self.nav.view_root = new_root;
+            self.nav.treemap_state.reset();
             self.update_cached_treemap_len();
         }
     }
 
     /// Navigate back in treemap view.
     fn navigate_treemap_back(&mut self) {
-        if let Some((prev_root, prev_selected, _)) = self.view_history.pop() {
+        if let Some((prev_root, prev_selected, _)) = self.nav.back.pop() {
             // Save current state to forward history
-            self.forward_history.push((
-                self.view_root.clone(),
-                self.treemap_state.selected,
+            self.nav.forward.push((
+                self.nav.view_root.clone(),
+                self.nav.treemap_state.selected,
                 HashSet::new(),
             ));
 
             // Restore previous state
-            self.view_root = prev_root;
-            self.treemap_state.selected = prev_selected;
+            self.nav.view_root = prev_root;
+            self.nav.treemap_state.selected = prev_selected;
             self.update_cached_treemap_len();
-        } else if self.view_root != self.path {
+        } else if self.nav.view_root != self.path {
             // No history, but we can go to parent
-            if let Some(parent) = self.view_root.parent() {
-                let old_selected = self.treemap_state.selected;
-                self.forward_history
-                    .push((self.view_root.clone(), old_selected, HashSet::new()));
-                self.view_root = parent.to_path_buf();
-                self.treemap_state.reset();
+            if let Some(parent) = self.nav.view_root.parent() {
+                let old_selected = self.nav.treemap_state.selected;
+                self.nav
+                    .forward
+                    .push((self.nav.view_root.clone(), old_selected, HashSet::new()));
+                self.nav.view_root = parent.to_path_buf();
+                self.nav.treemap_state.reset();
                 self.update_cached_treemap_len();
             }
         }
@@ -1408,7 +1399,7 @@ impl App {
             // No view node, just toggle and reset
             self.layout_mode = self.layout_mode.toggle();
             if self.layout_mode == LayoutMode::Miller {
-                self.miller_state.reset();
+                self.nav.miller_state.reset();
                 self.update_cached_miller_len();
                 self.update_preview();
             } else {
@@ -1425,19 +1416,19 @@ impl App {
 
                 // If we need to change view_root to show the selected item
                 if let Some(new_view_root) = data.new_view_root {
-                    self.view_root = new_view_root;
-                    self.tree_state.expand(&self.view_root);
+                    self.nav.view_root = new_view_root;
+                    self.nav.tree_state.expand(&self.nav.view_root);
                 }
 
                 if let Some(miller_idx) = data.miller_index {
-                    self.miller_state.selected = miller_idx;
-                    self.miller_state.offset = 0;
+                    self.nav.miller_state.selected = miller_idx;
+                    self.nav.miller_state.offset = 0;
                     self.update_cached_miller_len();
-                    self.miller_state.ensure_visible(self.viewport_height);
+                    self.nav.miller_state.ensure_visible(self.viewport_height);
                     self.update_preview();
                 } else {
                     // Fallback: reset miller state
-                    self.miller_state.reset();
+                    self.nav.miller_state.reset();
                     self.update_cached_miller_len();
                     self.update_preview();
                 }
@@ -1448,12 +1439,12 @@ impl App {
                 self.clear_preview();
 
                 // Ensure the view_root is expanded in tree
-                self.tree_state.expand(&data.view_path);
+                self.nav.tree_state.expand(&data.view_path);
 
                 if let Some(tree_idx) = data.tree_index {
-                    self.tree_state.selected = tree_idx;
-                    self.tree_state.offset = 0;
-                    self.tree_state.ensure_visible(self.viewport_height);
+                    self.nav.tree_state.selected = tree_idx;
+                    self.nav.tree_state.offset = 0;
+                    self.nav.tree_state.ensure_visible(self.viewport_height);
                 }
                 self.update_cached_tree_len();
             }
@@ -1474,10 +1465,10 @@ impl App {
                     &self.marked,
                     &self.clipboard,
                 )
-                .flatten(&self.tree_state);
+                .flatten(&self.nav.tree_state);
 
                 let selected_path = items
-                    .get(self.tree_state.selected)
+                    .get(self.nav.tree_state.selected)
                     .map(|item| item.path.clone());
 
                 let Some(selected) = selected_path else {
@@ -1491,8 +1482,9 @@ impl App {
 
                 // If we're on the root itself, preserve current miller selection
                 if selected == view_path {
-                    let miller_index = if self.miller_state.selected < view_node.children.len() {
-                        Some(self.miller_state.selected)
+                    let miller_index = if self.nav.miller_state.selected < view_node.children.len()
+                    {
+                        Some(self.nav.miller_state.selected)
                     } else if view_node.children.is_empty() {
                         None
                     } else {
@@ -1551,12 +1543,12 @@ impl App {
                 // Get the target path from miller selection
                 let target_path = view_node
                     .children
-                    .get(self.miller_state.selected)
+                    .get(self.nav.miller_state.selected)
                     .map(|c| view_path.join(c.file_name()));
 
                 // Use existing tree_state expansion to find the index
                 // First ensure view_path is expanded
-                let mut tree_state_for_search = self.tree_state.clone();
+                let mut tree_state_for_search = self.nav.tree_state.clone();
                 tree_state_for_search.expand(&view_path);
 
                 let items = TreeView::new(
@@ -1595,7 +1587,7 @@ impl App {
             return;
         };
 
-        let Some(selected_child) = view_node.children.get(self.miller_state.selected) else {
+        let Some(selected_child) = view_node.children.get(self.nav.miller_state.selected) else {
             self.clear_preview();
             return;
         };
@@ -1608,7 +1600,7 @@ impl App {
         }
 
         // Get the full path to the selected file
-        let file_path = self.view_root.join(selected_child.file_name());
+        let file_path = self.nav.view_root.join(selected_child.file_name());
 
         self.schedule_preview(file_path, false);
     }
@@ -1889,7 +1881,7 @@ impl App {
                 self.view = self.view.next();
                 if self.view == View::Treemap {
                     self.update_cached_treemap_len();
-                    self.treemap_state.reset();
+                    self.nav.treemap_state.reset();
                 }
                 self.maybe_start_analysis_for_view();
             }
@@ -1897,37 +1889,40 @@ impl App {
                 self.view = self.view.prev();
                 if self.view == View::Treemap {
                     self.update_cached_treemap_len();
-                    self.treemap_state.reset();
+                    self.nav.treemap_state.reset();
                 }
                 self.maybe_start_analysis_for_view();
             }
 
             // Directory tabs
             KeyAction::NewDirTab => {
-                // Open new tab with current view_root
-                self.tab_manager.new_tab(self.view_root.clone());
-            }
-            KeyAction::CloseDirTab => {
-                if self.tab_manager.close_active_tab() {
-                    self.sync_from_active_tab();
+                let navigation = state::Navigation::new(self.nav.view_root.clone());
+                if self.tab_manager.open(&mut self.nav, navigation) {
+                    self.after_tab_switch();
                 }
             }
-            KeyAction::NextDirTab if self.tab_manager.len() > 1 => {
-                self.sync_to_active_tab();
-                self.tab_manager.next_tab();
-                self.sync_from_active_tab();
+            KeyAction::CloseDirTab => {
+                if self.tab_manager.close_active(&mut self.nav) {
+                    self.after_tab_switch();
+                }
             }
-            KeyAction::PrevDirTab if self.tab_manager.len() > 1 => {
-                self.sync_to_active_tab();
-                self.tab_manager.prev_tab();
-                self.sync_from_active_tab();
+            KeyAction::NextDirTab => {
+                if self.tab_manager.next(&mut self.nav) {
+                    self.after_tab_switch();
+                }
             }
-            KeyAction::DirTab(n) if self.tab_manager.len() > 1 => {
-                self.sync_to_active_tab();
-                self.tab_manager.switch_to_number(n as usize);
-                self.sync_from_active_tab();
+            KeyAction::PrevDirTab => {
+                if self.tab_manager.prev(&mut self.nav) {
+                    self.after_tab_switch();
+                }
             }
-            KeyAction::NextDirTab | KeyAction::PrevDirTab | KeyAction::DirTab(_) => {}
+            KeyAction::DirTab(number) => {
+                if let Some(index) = (number as usize).checked_sub(1)
+                    && self.tab_manager.switch(&mut self.nav, index)
+                {
+                    self.after_tab_switch();
+                }
+            }
 
             KeyAction::MoveUp => self.move_up(),
             KeyAction::MoveDown => self.move_down(),
@@ -1993,8 +1988,8 @@ impl App {
                 // Enter visual selection mode
                 // Only supported in Explorer view for now
                 let start_index = match self.layout_mode {
-                    LayoutMode::Tree => self.tree_state.selected,
-                    LayoutMode::Miller => self.miller_state.selected,
+                    LayoutMode::Tree => self.nav.tree_state.selected,
+                    LayoutMode::Miller => self.nav.miller_state.selected,
                 };
                 self.visual_state = Some(state::VisualState::new(start_index));
                 self.mode = AppMode::Visual;
@@ -2187,13 +2182,13 @@ impl App {
                                 &self.marked,
                                 &self.clipboard,
                             )
-                            .row(&self.tree_state, self.tree_state.selected);
+                            .row(&self.nav.tree_state, self.nav.tree_state.selected);
                             selected.as_ref().map(|i| i.path.clone())
                         }
                         LayoutMode::Miller => node
                             .children
-                            .get(self.miller_state.selected)
-                            .map(|child| self.view_root.join(child.file_name())),
+                            .get(self.nav.miller_state.selected)
+                            .map(|child| self.nav.view_root.join(child.file_name())),
                     }
                 } else {
                     None
@@ -2207,7 +2202,7 @@ impl App {
                 };
                 let Some(group_index) = self
                     .duplicate_filter
-                    .get(&report, &self.view_root, &self.path)
+                    .get(&report, &self.nav.view_root, &self.path)
                     .groups
                     .get(self.duplicates_state.selected_group)
                     .map(|(index, _)| *index)
@@ -2338,7 +2333,7 @@ impl App {
         };
 
         if !paths.is_empty() {
-            self.clipboard.yank(paths, self.view_root.clone());
+            self.clipboard.yank(paths, self.nav.view_root.clone());
             self.marked.clear();
         }
     }
@@ -2352,7 +2347,7 @@ impl App {
         };
 
         if !paths.is_empty() {
-            self.clipboard.cut(paths, self.view_root.clone());
+            self.clipboard.cut(paths, self.nav.view_root.clone());
             self.marked.clear();
         }
     }
@@ -2428,7 +2423,7 @@ impl App {
             }
         }
         // Default to view_root if nothing selected
-        self.view_root.clone()
+        self.nav.view_root.clone()
     }
 
     /// Adapt a copy or move channel to the ScanResult channel.
@@ -2572,7 +2567,7 @@ impl App {
     /// Start create file operation.
     fn start_create_file(&mut self) {
         let mut input = InputState::new();
-        input.context_path = Some(self.view_root.clone());
+        input.context_path = Some(self.nav.view_root.clone());
         self.input_state = Some(input);
         self.mode = AppMode::CreatingFile;
     }
@@ -2580,7 +2575,7 @@ impl App {
     /// Start create directory operation.
     fn start_create_directory(&mut self) {
         let mut input = InputState::new();
-        input.context_path = Some(self.view_root.clone());
+        input.context_path = Some(self.nav.view_root.clone());
         self.input_state = Some(input);
         self.mode = AppMode::CreatingDirectory;
     }
@@ -2588,7 +2583,7 @@ impl App {
     /// Start take operation (create directory and cd into it).
     fn start_take(&mut self) {
         let mut input = InputState::new();
-        input.context_path = Some(self.view_root.clone());
+        input.context_path = Some(self.nav.view_root.clone());
         self.input_state = Some(input);
         self.mode = AppMode::Taking;
     }
@@ -2596,9 +2591,9 @@ impl App {
     /// Start go to directory operation.
     fn start_goto(&mut self) {
         // Pre-fill with current view root for convenience
-        let current_path = self.view_root.to_string_lossy().to_string();
+        let current_path = self.nav.view_root.to_string_lossy().to_string();
         let mut input = InputState::with_initial(&current_path);
-        input.context_path = Some(self.view_root.clone());
+        input.context_path = Some(self.nav.view_root.clone());
         self.input_state = Some(input);
         self.mode = AppMode::GoingTo;
     }
@@ -2616,7 +2611,7 @@ impl App {
             std::path::PathBuf::from(path_str)
         } else {
             // Relative path from current view root
-            self.view_root.join(path_str)
+            self.nav.view_root.join(path_str)
         };
 
         // Canonicalize to resolve .. and .
@@ -2884,15 +2879,15 @@ impl App {
     /// Start a new history branch using the cursor of the active layout.
     fn record_navigation_origin(&mut self) {
         let selected = match self.layout_mode {
-            LayoutMode::Tree => self.tree_state.selected,
-            LayoutMode::Miller => self.miller_state.selected,
+            LayoutMode::Tree => self.nav.tree_state.selected,
+            LayoutMode::Miller => self.nav.miller_state.selected,
         };
-        self.view_history.push((
-            self.view_root.clone(),
+        self.nav.back.push((
+            self.nav.view_root.clone(),
             selected,
-            self.tree_state.expanded.clone(),
+            self.nav.tree_state.expanded.clone(),
         ));
-        self.forward_history.clear();
+        self.nav.forward.clear();
     }
 
     fn finish_take(&mut self, path: PathBuf, result: Result<bool, String>) {
@@ -2908,7 +2903,7 @@ impl App {
         if created {
             self.undo_log.record_create_directory(path.clone());
         }
-        if path.parent() != Some(self.view_root.as_path()) || self.mode != AppMode::Normal {
+        if path.parent() != Some(self.nav.view_root.as_path()) || self.mode != AppMode::Normal {
             self.operation_message = Some((true, format!("Directory ready: {}", path.display())));
             return;
         }
@@ -2919,22 +2914,21 @@ impl App {
         self.record_navigation_origin();
 
         // Update view root to the new directory
-        self.view_root = path;
+        self.nav.view_root = path;
 
         // Reset state for new directory
         match self.layout_mode {
             LayoutMode::Tree => {
-                self.tree_state.selected = 0;
-                self.tree_state.offset = 0;
-                self.tree_state.expand(&self.view_root);
+                self.nav.tree_state.selected = 0;
+                self.nav.tree_state.offset = 0;
+                self.nav.tree_state.expand(&self.nav.view_root);
             }
             LayoutMode::Miller => {
-                self.miller_state.reset();
+                self.nav.miller_state.reset();
             }
         }
 
-        self.sync_to_active_tab();
-        self.refresh_paths(vec![self.view_root.clone()]);
+        self.refresh_paths(vec![self.nav.view_root.clone()]);
     }
 
     /// Adapt create result receiver to ScanResult.
@@ -3000,9 +2994,9 @@ impl App {
     fn move_up(&mut self) {
         match self.view {
             View::Explorer => match self.layout_mode {
-                LayoutMode::Tree => self.tree_state.move_up(1),
+                LayoutMode::Tree => self.nav.tree_state.move_up(1),
                 LayoutMode::Miller => {
-                    self.miller_state.move_up(1);
+                    self.nav.miller_state.move_up(1);
                     self.update_preview();
                 }
             },
@@ -3028,7 +3022,7 @@ impl App {
                 self.selected_warning = self.selected_warning.saturating_sub(1);
             }
             View::Treemap => {
-                self.treemap_state.move_prev();
+                self.nav.treemap_state.move_prev();
             }
         }
     }
@@ -3037,10 +3031,10 @@ impl App {
         match self.view {
             View::Explorer => match self.layout_mode {
                 LayoutMode::Tree => {
-                    self.tree_state.move_down(1, self.cached_tree_len);
+                    self.nav.tree_state.move_down(1, self.cached_tree_len);
                 }
                 LayoutMode::Miller => {
-                    self.miller_state.move_down(1, self.cached_miller_len);
+                    self.nav.miller_state.move_down(1, self.cached_miller_len);
                     self.update_preview();
                 }
             },
@@ -3070,7 +3064,7 @@ impl App {
                 self.selected_warning = (self.selected_warning + 1).min(max);
             }
             View::Treemap => {
-                self.treemap_state.move_next(self.cached_treemap_len);
+                self.nav.treemap_state.move_next(self.cached_treemap_len);
             }
         }
     }
@@ -3078,9 +3072,9 @@ impl App {
     fn page_up(&mut self) {
         match self.view {
             View::Explorer => match self.layout_mode {
-                LayoutMode::Tree => self.tree_state.move_up(PAGE_SIZE),
+                LayoutMode::Tree => self.nav.tree_state.move_up(PAGE_SIZE),
                 LayoutMode::Miller => {
-                    self.miller_state.move_up(PAGE_SIZE);
+                    self.nav.miller_state.move_up(PAGE_SIZE);
                     self.update_preview();
                 }
             },
@@ -3100,7 +3094,7 @@ impl App {
             View::Treemap => {
                 // Page up in treemap - move selection backward by PAGE_SIZE
                 for _ in 0..PAGE_SIZE {
-                    self.treemap_state.move_prev();
+                    self.nav.treemap_state.move_prev();
                 }
             }
         }
@@ -3110,10 +3104,13 @@ impl App {
         match self.view {
             View::Explorer => match self.layout_mode {
                 LayoutMode::Tree => {
-                    self.tree_state.move_down(PAGE_SIZE, self.cached_tree_len);
+                    self.nav
+                        .tree_state
+                        .move_down(PAGE_SIZE, self.cached_tree_len);
                 }
                 LayoutMode::Miller => {
-                    self.miller_state
+                    self.nav
+                        .miller_state
                         .move_down(PAGE_SIZE, self.cached_miller_len);
                     self.update_preview();
                 }
@@ -3139,7 +3136,7 @@ impl App {
             View::Treemap => {
                 // Page down in treemap - move selection forward by PAGE_SIZE
                 for _ in 0..PAGE_SIZE {
-                    self.treemap_state.move_next(self.cached_treemap_len);
+                    self.nav.treemap_state.move_next(self.cached_treemap_len);
                 }
             }
         }
@@ -3148,16 +3145,16 @@ impl App {
     fn jump_to_top(&mut self) {
         match self.view {
             View::Explorer => match self.layout_mode {
-                LayoutMode::Tree => self.tree_state.jump_to_top(),
+                LayoutMode::Tree => self.nav.tree_state.jump_to_top(),
                 LayoutMode::Miller => {
-                    self.miller_state.jump_to_top();
+                    self.nav.miller_state.jump_to_top();
                     self.update_preview();
                 }
             },
             View::Duplicates => self.duplicates_state.reset(),
             View::Age => self.selected_stale_dir = 0,
             View::Errors => self.selected_warning = 0,
-            View::Treemap => self.treemap_state.reset(),
+            View::Treemap => self.nav.treemap_state.reset(),
         }
     }
 
@@ -3165,10 +3162,10 @@ impl App {
         match self.view {
             View::Explorer => match self.layout_mode {
                 LayoutMode::Tree => {
-                    self.tree_state.jump_to_bottom(self.cached_tree_len);
+                    self.nav.tree_state.jump_to_bottom(self.cached_tree_len);
                 }
                 LayoutMode::Miller => {
-                    self.miller_state.jump_to_bottom(self.cached_miller_len);
+                    self.nav.miller_state.jump_to_bottom(self.cached_miller_len);
                     self.update_preview();
                 }
             },
@@ -3187,7 +3184,7 @@ impl App {
             }
             View::Treemap => {
                 // Jump to last item in treemap
-                self.treemap_state.selected = self.cached_treemap_len.saturating_sub(1);
+                self.nav.treemap_state.selected = self.cached_treemap_len.saturating_sub(1);
             }
         }
     }
@@ -3196,7 +3193,7 @@ impl App {
         if let Some((node, root_path)) = self.get_view_root_node() {
             let selected =
                 TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                    .row(&self.tree_state, self.tree_state.selected);
+                    .row(&self.nav.tree_state, self.nav.tree_state.selected);
             if let Some(item) = selected.as_ref() {
                 // Lazy load directory contents if directory has no children
                 if matches!(item.node.kind, crate::ui::VisibleNodeKind::Directory { .. }) {
@@ -3215,7 +3212,7 @@ impl App {
                         self.lazy_load_directory(&item.path);
                     }
                 }
-                self.tree_state.expand(&item.path);
+                self.nav.tree_state.expand(&item.path);
                 self.update_cached_tree_len();
             }
         }
@@ -3227,7 +3224,7 @@ impl App {
         if let Some((node, root_path)) = self.get_view_root_node() {
             let selected =
                 TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                    .row(&self.tree_state, self.tree_state.selected);
+                    .row(&self.nav.tree_state, self.nav.tree_state.selected);
             if let Some(item) = selected.as_ref() {
                 // Check if this is an expanded directory
                 let is_expanded_dir = matches!(
@@ -3237,7 +3234,7 @@ impl App {
 
                 if is_expanded_dir {
                     // Collapse the directory
-                    self.tree_state.collapse(&item.path);
+                    self.nav.tree_state.collapse(&item.path);
                     self.update_cached_tree_len();
                 } else {
                     // Not expanded or not a directory - navigate back to parent
@@ -3251,9 +3248,9 @@ impl App {
         if let Some((node, root_path)) = self.get_view_root_node() {
             let selected =
                 TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                    .row(&self.tree_state, self.tree_state.selected);
+                    .row(&self.nav.tree_state, self.nav.tree_state.selected);
             if let Some(item) = selected.as_ref() {
-                self.tree_state.toggle_expand(&item.path);
+                self.nav.tree_state.toggle_expand(&item.path);
                 self.update_cached_tree_len();
             }
         }
@@ -3311,16 +3308,16 @@ impl App {
                         &self.marked,
                         &self.clipboard,
                     )
-                    .row(&self.tree_state, self.tree_state.selected)
+                    .row(&self.nav.tree_state, self.nav.tree_state.selected)
                     .map(|item| item.path);
                 }
                 None
             }
             LayoutMode::Miller => {
                 if let Some((view_node, _)) = self.get_view_root_node()
-                    && let Some(child) = view_node.children.get(self.miller_state.selected)
+                    && let Some(child) = view_node.children.get(self.nav.miller_state.selected)
                 {
-                    return Some(self.view_root.join(child.file_name()));
+                    return Some(self.nav.view_root.join(child.file_name()));
                 }
                 None
             }
@@ -3372,7 +3369,7 @@ impl App {
             &self.marked,
             &self.clipboard,
         )
-        .row(&self.tree_state, self.tree_state.selected);
+        .row(&self.nav.tree_state, self.nav.tree_state.selected);
         let Some(item) = selected.as_ref() else {
             return;
         };
@@ -3397,49 +3394,49 @@ impl App {
             self.lazy_load_directory(&item.path);
         }
 
-        if item.path == self.view_root {
-            self.tree_state.expand(&item.path);
+        if item.path == self.nav.view_root {
+            self.nav.tree_state.expand(&item.path);
             self.update_cached_tree_len();
             return;
         }
 
-        let saved_expanded = self.tree_state.expanded.clone();
-        let saved_selected = self.tree_state.selected;
-        self.view_history
-            .push((self.view_root.clone(), saved_selected, saved_expanded));
+        let saved_expanded = self.nav.tree_state.expanded.clone();
+        let saved_selected = self.nav.tree_state.selected;
+        self.nav
+            .back
+            .push((self.nav.view_root.clone(), saved_selected, saved_expanded));
 
         let target_path = item.path.clone();
 
         // Check if forward history has this path - if so, restore that state
         if let Some(forward_idx) = self
-            .forward_history
+            .nav
+            .forward
             .iter()
             .rposition(|(p, _, _)| p == &target_path)
         {
-            let (_, fwd_selected, fwd_expanded) = self.forward_history.remove(forward_idx);
+            let (_, fwd_selected, fwd_expanded) = self.nav.forward.remove(forward_idx);
             // Clear any forward history entries after this one
-            self.forward_history.truncate(forward_idx);
+            self.nav.forward.truncate(forward_idx);
 
-            self.view_root = target_path;
-            self.tree_state.selected = fwd_selected;
-            self.tree_state.offset = 0;
-            self.tree_state.expanded = fwd_expanded;
-            self.tree_state.expand(&self.view_root);
+            self.nav.view_root = target_path;
+            self.nav.tree_state.selected = fwd_selected;
+            self.nav.tree_state.offset = 0;
+            self.nav.tree_state.expanded = fwd_expanded;
+            self.nav.tree_state.expand(&self.nav.view_root);
             self.update_cached_tree_len();
-            self.sync_to_active_tab();
             return;
         }
 
         // Clear forward history - user is navigating to a new location
-        self.forward_history.clear();
+        self.nav.forward.clear();
 
-        self.view_root = target_path;
+        self.nav.view_root = target_path;
 
-        self.tree_state.selected = 0;
-        self.tree_state.offset = 0;
-        self.tree_state.expand(&self.view_root);
+        self.nav.tree_state.selected = 0;
+        self.nav.tree_state.offset = 0;
+        self.nav.tree_state.expand(&self.nav.view_root);
         self.update_cached_tree_len();
-        self.sync_to_active_tab();
     }
 
     /// Drill into the selected directory in Miller columns mode.
@@ -3448,7 +3445,7 @@ impl App {
             return;
         };
 
-        let Some(selected_child) = view_node.children.get(self.miller_state.selected) else {
+        let Some(selected_child) = view_node.children.get(self.nav.miller_state.selected) else {
             return;
         };
 
@@ -3457,7 +3454,7 @@ impl App {
             return;
         }
 
-        let target_path = self.view_root.join(selected_child.file_name());
+        let target_path = self.nav.view_root.join(selected_child.file_name());
 
         // Lazy loading: if directory has no children (from quick_list), load them now
         if selected_child.children.is_empty() {
@@ -3465,41 +3462,41 @@ impl App {
         }
 
         // Save current state to history
-        let saved_expanded = self.tree_state.expanded.clone();
-        let saved_selected = self.miller_state.selected;
-        self.view_history
-            .push((self.view_root.clone(), saved_selected, saved_expanded));
+        let saved_expanded = self.nav.tree_state.expanded.clone();
+        let saved_selected = self.nav.miller_state.selected;
+        self.nav
+            .back
+            .push((self.nav.view_root.clone(), saved_selected, saved_expanded));
 
         // Check if forward history has this path - if so, restore that state
         if let Some(forward_idx) = self
-            .forward_history
+            .nav
+            .forward
             .iter()
             .rposition(|(p, _, _)| p == &target_path)
         {
-            let (_, fwd_selected, fwd_expanded) = self.forward_history.remove(forward_idx);
+            let (_, fwd_selected, fwd_expanded) = self.nav.forward.remove(forward_idx);
             // Clear any forward history entries after this one
-            self.forward_history.truncate(forward_idx);
+            self.nav.forward.truncate(forward_idx);
 
-            self.view_root = target_path;
-            self.miller_state.selected = fwd_selected;
-            self.miller_state.offset = 0;
-            self.tree_state.expanded = fwd_expanded;
+            self.nav.view_root = target_path;
+            self.nav.miller_state.selected = fwd_selected;
+            self.nav.miller_state.offset = 0;
+            self.nav.tree_state.expanded = fwd_expanded;
             self.update_cached_miller_len();
-            self.miller_state.ensure_visible(self.viewport_height);
+            self.nav.miller_state.ensure_visible(self.viewport_height);
             self.update_preview();
-            self.sync_to_active_tab();
             return;
         }
 
         // Clear forward history - user is navigating to a new location
-        self.forward_history.clear();
+        self.nav.forward.clear();
 
         // Update view root
-        self.view_root = target_path;
-        self.miller_state.reset();
+        self.nav.view_root = target_path;
+        self.nav.miller_state.reset();
         self.update_cached_miller_len();
         self.update_preview();
-        self.sync_to_active_tab();
     }
 
     /// Lazy load a directory's children using quick_list.
@@ -3581,18 +3578,17 @@ impl App {
     fn navigate_back(&mut self) {
         // Prepare current state for forward history (will be pushed if navigation succeeds)
         let current_selected = match self.layout_mode {
-            LayoutMode::Tree => self.tree_state.selected,
-            LayoutMode::Miller => self.miller_state.selected,
+            LayoutMode::Tree => self.nav.tree_state.selected,
+            LayoutMode::Miller => self.nav.miller_state.selected,
         };
         let current_state = (
-            self.view_root.clone(),
+            self.nav.view_root.clone(),
             current_selected,
-            self.tree_state.expanded.clone(),
+            self.nav.tree_state.expanded.clone(),
         );
 
         // First, try to use view history if available
-        if let Some((prev_root, saved_selected, saved_expanded)) = self.view_history.last().cloned()
-        {
+        if let Some((prev_root, saved_selected, saved_expanded)) = self.nav.back.last().cloned() {
             let loaded = self.tree.as_ref().is_some_and(|tree| {
                 Self::find_node_at_path(&tree.root, &prev_root, &tree.root_path)
                     .is_some_and(|node| node.is_dir())
@@ -3611,57 +3607,55 @@ impl App {
                 self.has_full_scan = false;
                 self.path.clone()
             };
-            self.view_history.pop();
+            self.nav.back.pop();
             // Destination is usable; only now commit both history stacks.
-            self.forward_history.push(current_state);
-            self.view_root = prev_root;
-            self.tree_state.expanded = saved_expanded;
+            self.nav.forward.push(current_state);
+            self.nav.view_root = prev_root;
+            self.nav.tree_state.expanded = saved_expanded;
 
             // Restore selection based on layout mode
             match self.layout_mode {
                 LayoutMode::Tree => {
-                    self.tree_state.selected = saved_selected;
-                    self.tree_state.offset = 0;
+                    self.nav.tree_state.selected = saved_selected;
+                    self.nav.tree_state.offset = 0;
                     self.update_cached_tree_len();
                 }
                 LayoutMode::Miller => {
-                    self.miller_state.selected = saved_selected;
-                    self.miller_state.offset = 0;
+                    self.nav.miller_state.selected = saved_selected;
+                    self.nav.miller_state.offset = 0;
                     self.update_cached_miller_len();
                 }
             }
-            self.sync_to_active_tab();
             return;
         }
 
         // No history - try to navigate to parent
-        let Some(parent) = self.view_root.parent() else {
+        let Some(parent) = self.nav.view_root.parent() else {
             return; // Already at root
         };
 
         let parent = parent.to_path_buf();
-        let dir_we_came_from = self.view_root.clone();
+        let dir_we_came_from = self.nav.view_root.clone();
 
         // Check if parent is within our current tree
         let parent_in_tree = parent.starts_with(&self.path) || parent == self.path;
 
         if parent_in_tree {
             // Navigate within existing tree
-            self.tree_state.collapse(&dir_we_came_from);
-            self.view_root = parent;
-            self.tree_state.expand(&self.view_root);
+            self.nav.tree_state.collapse(&dir_we_came_from);
+            self.nav.view_root = parent;
+            self.nav.tree_state.expand(&self.nav.view_root);
         } else {
             // Navigate beyond scan root - need to extend our tree
             if self.navigate_to_parent_beyond_scan_root(&parent, &dir_we_came_from) {
-                self.forward_history.push(current_state);
+                self.nav.forward.push(current_state);
             }
             return;
         }
-        self.forward_history.push(current_state);
+        self.nav.forward.push(current_state);
 
         // Select the directory we just came from
         self.select_child_by_name(&dir_we_came_from);
-        self.sync_to_active_tab();
     }
 
     /// Navigate to a parent directory that's outside the current scan root.
@@ -3691,24 +3685,23 @@ impl App {
         self.cancel_scan();
         self.path = parent_tree.root_path.clone();
         self.install_tree(parent_tree);
-        self.view_root = self.path.clone();
+        self.nav.view_root = self.path.clone();
         self.duplicates = None;
         self.age_report = None;
-        self.view_history.clear();
+        self.nav.back.clear();
         // Note: don't clear forward_history here - we want to allow navigating back
 
         // The parent tree is quick-listed, not fully scanned
         self.has_full_scan = false;
 
         // Reset tree state for the new root
-        self.tree_state = TreeState::new(self.path.clone());
+        self.nav.tree_state = TreeState::new(self.path.clone());
 
         // Update cached parent for Miller columns display
         self.update_cached_parent();
 
         // Select the directory we came from
         self.select_child_by_name(dir_we_came_from);
-        self.sync_to_active_tab();
         true
     }
 
@@ -3743,19 +3736,19 @@ impl App {
                 if let Some((node, root_path)) = self.get_view_root_node() {
                     let items =
                         TreeView::new(node, &root_path, &self.theme, &self.marked, &self.clipboard)
-                            .flatten(&self.tree_state);
+                            .flatten(&self.nav.tree_state);
                     if let Some(idx) = items
                         .iter()
                         .position(|item| item.path.file_name() == Some(dir_name))
                     {
-                        self.tree_state.selected = idx;
+                        self.nav.tree_state.selected = idx;
                     } else {
-                        self.tree_state.selected = 0;
+                        self.nav.tree_state.selected = 0;
                     }
                 } else {
-                    self.tree_state.selected = 0;
+                    self.nav.tree_state.selected = 0;
                 }
-                self.tree_state.offset = 0;
+                self.nav.tree_state.offset = 0;
                 self.update_cached_tree_len();
             }
             LayoutMode::Miller => {
@@ -3766,11 +3759,11 @@ impl App {
                         .iter()
                         .position(|c| c.file_name() == dir_name)
                         .unwrap_or(0);
-                    self.miller_state.selected = idx;
+                    self.nav.miller_state.selected = idx;
                 } else {
-                    self.miller_state.selected = 0;
+                    self.nav.miller_state.selected = 0;
                 }
-                self.miller_state.offset = 0;
+                self.nav.miller_state.offset = 0;
                 self.update_cached_miller_len();
             }
         }
@@ -3818,14 +3811,14 @@ impl App {
     /// Get the current view root node.
     fn get_view_root_node(&self) -> Option<(&gravityfile_core::FileNode, PathBuf)> {
         let tree = self.tree.as_ref()?;
-        let node = Self::find_node_at_path(&tree.root, &self.view_root, &tree.root_path)?;
-        Some((node, self.view_root.clone()))
+        let node = Self::find_node_at_path(&tree.root, &self.nav.view_root, &tree.root_path)?;
+        Some((node, self.nav.view_root.clone()))
     }
 
     /// Get the parent node of the current view root (for Miller columns).
     fn get_parent_node(&self) -> Option<&gravityfile_core::FileNode> {
         let tree = self.tree.as_ref()?;
-        let parent_path = self.view_root.parent()?.to_path_buf();
+        let parent_path = self.nav.view_root.parent()?.to_path_buf();
 
         // First, check if parent is within the main tree
         if parent_path.starts_with(&tree.root_path) || parent_path == tree.root_path {
@@ -3833,7 +3826,7 @@ impl App {
         }
 
         // If we're at the tree root and have a cached parent, use that
-        if self.view_root == tree.root_path
+        if self.nav.view_root == tree.root_path
             && let Some(cached) = &self.cached_parent_tree
         {
             return Some(&cached.root);
@@ -3850,8 +3843,8 @@ impl App {
         let Some(tree) = &self.tree else { return };
 
         // Only need to cache parent if we're at or near the tree root
-        if self.view_root == tree.root_path {
-            if let Some(parent_path) = self.view_root.parent() {
+        if self.nav.view_root == tree.root_path {
+            if let Some(parent_path) = self.nav.view_root.parent() {
                 let parent_path_buf = parent_path.to_path_buf();
                 // Load the parent directory
                 if let Ok(mut parent_tree) =
@@ -3871,7 +3864,8 @@ impl App {
 
     /// Get the current directory name for highlighting in parent column.
     fn get_current_dir_name(&self) -> Option<String> {
-        self.view_root
+        self.nav
+            .view_root
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
@@ -3929,7 +3923,7 @@ impl App {
                 self.view = view;
                 if self.view == View::Treemap {
                     self.update_cached_treemap_len();
-                    self.treemap_state.reset();
+                    self.nav.treemap_state.reset();
                 }
                 self.maybe_start_analysis_for_view();
             }
@@ -4006,7 +4000,7 @@ impl App {
             CommandAction::CreateFile(name) => {
                 if let Some(name) = name {
                     // Direct create with provided name
-                    self.execute_create_file(self.view_root.clone(), name);
+                    self.execute_create_file(self.nav.view_root.clone(), name);
                 } else {
                     // Enter create file mode
                     self.start_create_file();
@@ -4015,7 +4009,7 @@ impl App {
             CommandAction::CreateDirectory(name) => {
                 if let Some(name) = name {
                     // Direct create with provided name
-                    self.execute_create_directory(self.view_root.clone(), name);
+                    self.execute_create_directory(self.nav.view_root.clone(), name);
                 } else {
                     // Enter create directory mode
                     self.start_create_directory();
@@ -4024,7 +4018,7 @@ impl App {
             CommandAction::Take(name) => {
                 if let Some(name) = name {
                     // Direct take with provided name
-                    self.execute_take(self.view_root.clone(), name);
+                    self.execute_take(self.nav.view_root.clone(), name);
                 } else {
                     // Enter take mode
                     self.start_take();
@@ -4199,14 +4193,13 @@ impl App {
 
     /// Go to the scan root.
     fn go_to_root(&mut self) {
-        self.view_root = self.path.clone();
-        self.view_history.clear();
-        self.forward_history.clear();
-        self.tree_state.selected = 0;
-        self.tree_state.offset = 0;
-        self.tree_state.expand(&self.view_root);
+        self.nav.view_root = self.path.clone();
+        self.nav.back.clear();
+        self.nav.forward.clear();
+        self.nav.tree_state.selected = 0;
+        self.nav.tree_state.offset = 0;
+        self.nav.tree_state.expand(&self.nav.view_root);
         self.update_cached_tree_len();
-        self.sync_to_active_tab();
     }
 
     /// Change directory within the loaded scan tree. Leading `/` is scan-root relative.
@@ -4226,7 +4219,7 @@ impl App {
         let mut target_path = if target.starts_with('/') {
             self.path.clone()
         } else {
-            self.view_root.clone()
+            self.nav.view_root.clone()
         };
         for component in Path::new(target.trim_start_matches('/')).components() {
             match component {
@@ -4257,18 +4250,17 @@ impl App {
             self.error = Some(format!("Not a directory: {}", target_path.display()));
             return;
         }
-        if target_path == self.view_root {
+        if target_path == self.nav.view_root {
             return;
         }
         self.record_navigation_origin();
-        self.view_root = target_path;
-        self.tree_state.selected = 0;
-        self.tree_state.offset = 0;
-        self.tree_state.expand(&self.view_root);
-        self.miller_state.reset();
+        self.nav.view_root = target_path;
+        self.nav.tree_state.selected = 0;
+        self.nav.tree_state.offset = 0;
+        self.nav.tree_state.expand(&self.nav.view_root);
+        self.nav.miller_state.reset();
         self.update_cached_tree_len();
         self.update_cached_miller_len();
-        self.sync_to_active_tab();
     }
 
     /// Check if a path is marked for deletion.
@@ -4307,7 +4299,7 @@ impl App {
     fn set_bookmark(&mut self, key: char) {
         self.user_settings
             .bookmarks
-            .set(key, self.view_root.clone());
+            .set(key, self.nav.view_root.clone());
         if let Err(error) = self.user_settings.save() {
             self.error = Some(format!("Failed to save bookmarks: {error}"));
         }
@@ -4339,6 +4331,12 @@ impl App {
     /// `path` and scans it if scanning on open is enabled. Marks and the
     /// clipboard are kept.
     fn navigate_to(&mut self, path: PathBuf) {
+        self.show_directory(path, true);
+    }
+
+    /// View `path`, listing it and moving the scan there when it is not in
+    /// the current tree. `record` pushes the current place onto the history.
+    fn show_directory(&mut self, path: PathBuf, record: bool) {
         let loaded = self.tree.as_ref().is_some_and(|tree| {
             Self::find_node_at_path(&tree.root, &path, &tree.root_path)
                 .is_some_and(|node| node.is_dir())
@@ -4356,19 +4354,21 @@ impl App {
         let destination = replacement
             .as_ref()
             .map_or_else(|| path.clone(), |tree| tree.root_path.clone());
-        if loaded && destination == self.view_root {
+        if loaded && destination == self.nav.view_root {
             return;
         }
-        self.record_navigation_origin();
-        self.view_root = destination;
-        self.tree_state.selected = 0;
-        self.tree_state.offset = 0;
-        self.miller_state.reset();
+        if record {
+            self.record_navigation_origin();
+        }
+        self.nav.view_root = destination;
+        self.nav.tree_state.selected = 0;
+        self.nav.tree_state.offset = 0;
+        self.nav.miller_state.reset();
         if let Some(tree) = replacement {
             self.cancel_scan();
             self.path = tree.root_path.clone();
             self.install_tree(tree);
-            self.tree_state = TreeState::new(self.path.clone());
+            self.nav.tree_state = TreeState::new(self.path.clone());
             self.duplicates = None;
             self.age_report = None;
             self.has_full_scan = false;
@@ -4376,10 +4376,9 @@ impl App {
                 self.start_scan();
             }
         }
-        self.tree_state.expand(&self.view_root);
+        self.nav.tree_state.expand(&self.nav.view_root);
         self.update_cached_tree_len();
         self.update_cached_miller_len();
-        self.sync_to_active_tab();
     }
 
     /// Handle input in the bookmark list modal.
@@ -4606,8 +4605,8 @@ impl App {
     fn sync_visual_cursor_to_view(&mut self) {
         if let Some(state) = &self.visual_state {
             match self.layout_mode {
-                LayoutMode::Tree => self.tree_state.selected = state.cursor,
-                LayoutMode::Miller => self.miller_state.selected = state.cursor,
+                LayoutMode::Tree => self.nav.tree_state.selected = state.cursor,
+                LayoutMode::Miller => self.nav.miller_state.selected = state.cursor,
             }
         }
     }
@@ -4632,7 +4631,7 @@ impl App {
                         &self.marked,
                         &self.clipboard,
                     )
-                    .flatten(&self.tree_state);
+                    .flatten(&self.nav.tree_state);
 
                     (start..=end)
                         .filter_map(|i| items.get(i).map(|item| item.path.clone()))
@@ -4648,7 +4647,7 @@ impl App {
                 // on different files than the highlight (e.g. in quick-listed
                 // dirs, which are name-sorted while sort_mode is size-based).
                 if let Some((node, _)) = self.get_view_root_node() {
-                    let view_root = self.view_root.clone();
+                    let view_root = self.nav.view_root.clone();
                     (start..=end)
                         .filter_map(|i| {
                             node.children
@@ -4669,13 +4668,13 @@ impl App {
 
     /// Keep the scroll offsets the last frame actually used.
     fn adopt_rendered_offsets(&mut self) {
-        (self.tree_state.offset, self.miller_state.offset) = self.rendered_offsets.get();
+        (self.nav.tree_state.offset, self.nav.miller_state.offset) = self.rendered_offsets.get();
     }
 
     /// Paths the UI never operates on destructively: the scan root, the
     /// directory being viewed, and any ancestor of either.
     fn is_protected(&self, path: &Path) -> bool {
-        self.path.starts_with(path) || self.view_root.starts_with(path)
+        self.path.starts_with(path) || self.nav.view_root.starts_with(path)
     }
 
     /// Mark `path` unless it is protected. Returns whether it is now marked.
@@ -4730,7 +4729,7 @@ impl App {
                     }
                     View::Treemap => {
                         for _ in 0..3 {
-                            self.treemap_state.move_prev();
+                            self.nav.treemap_state.move_prev();
                         }
                     }
                 }
@@ -4777,7 +4776,7 @@ impl App {
                     }
                     View::Treemap => {
                         for _ in 0..3 {
-                            self.treemap_state.move_next(self.cached_treemap_len);
+                            self.nav.treemap_state.move_next(self.cached_treemap_len);
                         }
                     }
                 }
@@ -4796,17 +4795,17 @@ impl App {
 
                     match self.layout_mode {
                         LayoutMode::Tree => {
-                            let new_selected = self.tree_state.offset + relative_y;
+                            let new_selected = self.nav.tree_state.offset + relative_y;
                             if new_selected < self.cached_tree_len {
-                                self.tree_state.selected = new_selected;
+                                self.nav.tree_state.selected = new_selected;
                             }
                         }
                         LayoutMode::Miller => {
                             // In Miller mode, the middle column starts after the left column
                             // This is a simplified version - we just select by row
-                            let new_selected = self.miller_state.offset + relative_y;
+                            let new_selected = self.nav.miller_state.offset + relative_y;
                             if new_selected < self.cached_miller_len {
-                                self.miller_state.selected = new_selected;
+                                self.nav.miller_state.selected = new_selected;
                                 self.update_preview();
                             }
                         }
@@ -4822,16 +4821,16 @@ impl App {
 
                     match self.layout_mode {
                         LayoutMode::Tree => {
-                            let new_selected = self.tree_state.offset + relative_y;
+                            let new_selected = self.nav.tree_state.offset + relative_y;
                             if new_selected < self.cached_tree_len {
-                                self.tree_state.selected = new_selected;
+                                self.nav.tree_state.selected = new_selected;
                                 self.drill_into_selected();
                             }
                         }
                         LayoutMode::Miller => {
-                            let new_selected = self.miller_state.offset + relative_y;
+                            let new_selected = self.nav.miller_state.offset + relative_y;
                             if new_selected < self.cached_miller_len {
-                                self.miller_state.selected = new_selected;
+                                self.nav.miller_state.selected = new_selected;
                                 self.drill_into_miller_selected();
                             }
                         }
@@ -4847,16 +4846,16 @@ impl App {
 
                     match self.layout_mode {
                         LayoutMode::Tree => {
-                            let new_selected = self.tree_state.offset + relative_y;
+                            let new_selected = self.nav.tree_state.offset + relative_y;
                             if new_selected < self.cached_tree_len {
-                                self.tree_state.selected = new_selected;
+                                self.nav.tree_state.selected = new_selected;
                                 self.toggle_mark();
                             }
                         }
                         LayoutMode::Miller => {
-                            let new_selected = self.miller_state.offset + relative_y;
+                            let new_selected = self.nav.miller_state.offset + relative_y;
                             if new_selected < self.cached_miller_len {
-                                self.miller_state.selected = new_selected;
+                                self.nav.miller_state.selected = new_selected;
                                 self.toggle_mark();
                             }
                         }
@@ -4894,35 +4893,25 @@ impl App {
         self.apply_sort();
     }
 
-    /// Sync current tab state to the active tab.
-    fn sync_to_active_tab(&mut self) {
-        if let Some(tab) = self.tab_manager.active_tab_mut() {
-            tab.view_root = self.view_root.clone();
-            tab.label = self
-                .view_root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| self.view_root.to_string_lossy().to_string());
+    /// Bring everything derived from the view up to date after another tab
+    /// became active. A tab whose directory has since been removed moves to
+    /// its nearest surviving ancestor; one outside the current scan has its
+    /// directory listed and scanned, as going there would.
+    fn after_tab_switch(&mut self) {
+        let outside_scan = self
+            .tree
+            .as_ref()
+            .is_some_and(|tree| !self.nav.view_root.starts_with(&tree.root_path));
+        if outside_scan {
+            self.show_directory(self.nav.view_root.clone(), false);
+        } else {
+            self.leave_vanished_view();
         }
-    }
-
-    /// Sync app state from the active tab.
-    fn sync_from_active_tab(&mut self) {
-        if let Some(tab) = self.tab_manager.active_tab() {
-            // Only sync if view_root is different
-            if tab.view_root != self.view_root {
-                self.view_root = tab.view_root.clone();
-                // Reset tree state for the new view
-                self.tree_state.selected = 0;
-                self.tree_state.offset = 0;
-                self.tree_state.expand(&self.view_root);
-                self.miller_state.reset();
-                match self.layout_mode {
-                    LayoutMode::Tree => self.update_cached_tree_len(),
-                    LayoutMode::Miller => self.update_cached_miller_len(),
-                }
-            }
-        }
+        self.update_cached_tree_len();
+        self.update_cached_miller_len();
+        self.update_cached_treemap_len();
+        self.update_cached_parent();
+        self.update_preview();
     }
 
     /// Start fuzzy search mode.
@@ -4936,7 +4925,7 @@ impl App {
     /// Update search paths from the selected subtree, preserving preorder ranking.
     fn update_search_paths(&mut self) {
         let tree = self.tree.clone();
-        let view_root = self.view_root.clone();
+        let view_root = self.nav.view_root.clone();
         self.search_state.build_paths(move |cancelled| {
             tree.as_ref().map_or_else(Vec::new, |tree| {
                 Self::collect_search_paths(tree, &view_root, cancelled)
@@ -5059,17 +5048,16 @@ impl App {
             self.record_navigation_origin();
 
             // Navigate to directory
-            self.view_root = target.to_path_buf();
-            self.tree_state.selected = 0;
-            self.tree_state.offset = 0;
-            self.tree_state.expand(&self.view_root);
-            self.miller_state.reset();
+            self.nav.view_root = target.to_path_buf();
+            self.nav.tree_state.selected = 0;
+            self.nav.tree_state.offset = 0;
+            self.nav.tree_state.expand(&self.nav.view_root);
+            self.nav.miller_state.reset();
 
             match self.layout_mode {
                 LayoutMode::Tree => self.update_cached_tree_len(),
                 LayoutMode::Miller => self.update_cached_miller_len(),
             }
-            self.sync_to_active_tab();
         } else {
             // It's a file - navigate to parent and select it
             if let Some(parent) = target.parent() {
@@ -5077,29 +5065,29 @@ impl App {
                 self.record_navigation_origin();
 
                 // Navigate to parent
-                self.view_root = parent.to_path_buf();
-                self.tree_state.expand(&self.view_root);
+                self.nav.view_root = parent.to_path_buf();
+                self.nav.tree_state.expand(&self.nav.view_root);
 
                 // Get file name before borrowing for position search
                 let file_name = target.file_name().map(|s| s.to_os_string());
                 match self.layout_mode {
                     LayoutMode::Tree => {
                         // For tree view, we need to find the index in flattened list
-                        self.tree_state.selected = 0;
+                        self.nav.tree_state.selected = 0;
                         self.update_cached_tree_len();
 
                         // Find position in flattened tree
                         if let Some((node, _)) = self.get_view_root_node() {
                             let items = TreeView::new(
                                 node,
-                                &self.view_root,
+                                &self.nav.view_root,
                                 &self.theme,
                                 &self.marked,
                                 &self.clipboard,
                             )
-                            .flatten(&self.tree_state);
+                            .flatten(&self.nav.tree_state);
                             if let Some(pos) = items.iter().position(|i| i.path == target) {
-                                self.tree_state.selected = pos;
+                                self.nav.tree_state.selected = pos;
                             }
                         }
                     }
@@ -5113,12 +5101,11 @@ impl App {
                                 .iter()
                                 .position(|c| c.file_name() == file_name)
                                 .unwrap_or(0);
-                            self.miller_state.selected = idx;
+                            self.nav.miller_state.selected = idx;
                         }
                         self.update_cached_miller_len();
                     }
                 }
-                self.sync_to_active_tab();
             }
         }
     }
@@ -5240,7 +5227,7 @@ impl App {
         let report = self.duplicates.as_ref()?;
         let cached = self
             .duplicate_filter
-            .get(report, &self.view_root, &self.path);
+            .get(report, &self.nav.view_root, &self.path);
         Some((
             cached
                 .groups
@@ -5256,7 +5243,7 @@ impl App {
             return 0;
         };
         self.duplicate_filter
-            .get(report, &self.view_root, &self.path)
+            .get(report, &self.nav.view_root, &self.path)
             .groups
             .get(index)
             .map_or(0, |(_, count)| *count)
@@ -5266,14 +5253,14 @@ impl App {
     fn get_filtered_stale_dirs(&self) -> Option<Vec<&gravityfile_analyze::StaleDirectory>> {
         let age = self.age_report.as_ref()?;
 
-        if self.view_root == self.path {
+        if self.nav.view_root == self.path {
             return Some(age.stale_directories.iter().collect());
         }
 
         let filtered: Vec<&gravityfile_analyze::StaleDirectory> = age
             .stale_directories
             .iter()
-            .filter(|d| d.path.starts_with(&self.view_root))
+            .filter(|d| d.path.starts_with(&self.nav.view_root))
             .collect();
 
         Some(filtered)
@@ -5387,9 +5374,9 @@ mod tests {
         .calculate_rects(Rect::new(0, 0, 80, 24));
         assert_eq!(rects.len(), 2);
         for (index, expected) in [low, high].iter().enumerate() {
-            app.treemap_state.selected = index;
+            app.nav.treemap_state.selected = index;
             let (_, selected) = app.get_selected_treemap_child().unwrap();
-            assert_eq!(selected, app.view_root.join(expected));
+            assert_eq!(selected, app.nav.view_root.join(expected));
             assert_eq!(rects[index].path, selected);
         }
     }
@@ -5433,8 +5420,8 @@ mod tests {
         }
         app.layout_mode = LayoutMode::Miller;
         for (index, name) in names.iter().enumerate() {
-            app.miller_state.selected = index;
-            let path = app.view_root.join(name);
+            app.nav.miller_state.selected = index;
+            let path = app.nav.view_root.join(name);
             assert_eq!(app.get_selected_path(), Some(path.clone()));
             let tree = app.tree.as_ref().unwrap();
             assert_eq!(
@@ -5444,7 +5431,7 @@ mod tests {
                 name
             );
             app.select_child_by_name(&path);
-            assert_eq!(app.miller_state.selected, index);
+            assert_eq!(app.nav.miller_state.selected, index);
         }
         let displayed = text(&render(&app, Rect::new(0, 0, 200, 30)));
         assert!(displayed.contains(r"bad-\xff"), "{displayed}");
@@ -5701,8 +5688,8 @@ mod tests {
     #[tokio::test]
     async fn delete_and_marks_never_target_the_scan_root() {
         let (_dir, mut app) = scanned_app();
-        app.tree_state.selected = 0;
-        assert_eq!(app.get_selected_path().unwrap(), app.view_root);
+        app.nav.tree_state.selected = 0;
+        assert_eq!(app.get_selected_path().unwrap(), app.nav.view_root);
         app.handle_action(KeyAction::Delete);
         assert!(app.marked.is_empty());
         assert_eq!(app.mode, AppMode::Normal);
@@ -5733,7 +5720,7 @@ mod tests {
         );
 
         app.marked.clear();
-        app.tree_state.selected = tree_row(&app, "copy-a.bin");
+        app.nav.tree_state.selected = tree_row(&app, "copy-a.bin");
         app.handle_action(KeyAction::Delete);
         assert_eq!(app.mode, AppMode::ConfirmDelete);
         app.handle_action(KeyAction::Cancel);
@@ -5776,18 +5763,18 @@ mod tests {
     async fn clicks_hit_the_row_on_screen_after_scrolling() {
         let (_dir, mut app) = scanned_app();
         let src = tree_row(&app, "src");
-        app.tree_state.selected = src;
+        app.nav.tree_state.selected = src;
         app.toggle_selected();
         let area = Rect::new(0, 0, 80, 12);
-        app.tree_state.selected = app.cached_tree_len - 1;
+        app.nav.tree_state.selected = app.cached_tree_len - 1;
         render(&app, area);
         app.adopt_rendered_offsets();
-        let offset = app.tree_state.offset;
+        let offset = app.nav.tree_state.offset;
         assert!(offset > 0, "the selection forced a scroll");
         let top = app.estimated_list_top_row();
         app.handle_mouse_action(MouseAction::Click { x: 5, y: top });
         assert_eq!(
-            app.tree_state.selected, offset,
+            app.nav.tree_state.selected, offset,
             "the first visible row was hit"
         );
     }
@@ -5811,11 +5798,11 @@ mod tests {
             let origin = app.path.clone();
             app.user_settings.bookmarks.set('d', destination);
             app.jump_to_bookmark('d');
-            let current = app.view_root.clone();
+            let current = app.nav.view_root.clone();
             let token = app.scan_token.clone();
             app.navigate_back();
             assert!(token.is_cancelled());
-            assert_eq!(app.view_root, origin);
+            assert_eq!(app.nav.view_root, origin);
             assert_eq!(app.tree.as_ref().unwrap().root_path, origin);
             assert!(
                 app.get_view_root_node()
@@ -5825,18 +5812,18 @@ mod tests {
                     .iter()
                     .any(|node| &*node.name == "original-file")
             );
-            assert!(app.view_history.is_empty());
-            assert_eq!(app.forward_history.last().unwrap().0, current);
+            assert!(app.nav.back.is_empty());
+            assert_eq!(app.nav.forward.last().unwrap().0, current);
             app.jump_to_bookmark('d');
             let before = Arc::clone(app.tree.as_ref().unwrap());
-            let history = app.view_history.clone();
-            let forward = app.forward_history.clone();
+            let history = app.nav.back.clone();
+            let forward = app.nav.forward.clone();
             std::fs::rename(&origin, fixture.path().join("moved-origin")).unwrap();
             app.navigate_back();
-            assert_eq!(app.view_root, current);
+            assert_eq!(app.nav.view_root, current);
             assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &before));
-            assert_eq!(app.view_history, history);
-            assert_eq!(app.forward_history, forward);
+            assert_eq!(app.nav.back, history);
+            assert_eq!(app.nav.forward, forward);
             assert!(app.error.as_ref().unwrap().contains("Cannot list"));
         }
     }
@@ -5851,7 +5838,7 @@ mod tests {
         );
         app.scan_on_startup = false;
         let original = Arc::clone(app.tree.as_ref().unwrap());
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         let file = root.join("bookmark-file");
         std::fs::write(&file, "file").unwrap();
         app.user_settings.bookmarks.set('f', file);
@@ -5859,9 +5846,9 @@ mod tests {
         for key in ['z', 'f', 'm'] {
             app.jump_to_bookmark(key);
             assert!(app.error.is_some());
-            assert_eq!(app.view_root, root);
+            assert_eq!(app.nav.view_root, root);
             assert!(Arc::ptr_eq(app.tree.as_ref().unwrap(), &original));
-            assert!(app.view_history.is_empty());
+            assert!(app.nav.back.is_empty());
         }
         let destination = root.join("new/nested");
         std::fs::create_dir_all(&destination).unwrap();
@@ -5872,7 +5859,7 @@ mod tests {
         let old_token = app.scan_token.clone();
         app.jump_to_bookmark('n');
         assert!(old_token.is_cancelled());
-        assert_eq!(app.view_root, destination);
+        assert_eq!(app.nav.view_root, destination);
         assert_eq!(app.path, destination);
         assert_eq!(app.tree.as_ref().unwrap().root_path, destination);
         assert!(
@@ -5883,17 +5870,17 @@ mod tests {
                 .iter()
                 .any(|child| &*child.name == "needle")
         );
-        assert_eq!(app.view_history.len(), 1);
+        assert_eq!(app.nav.back.len(), 1);
         app.jump_to_bookmark('n');
-        assert_eq!(app.view_history.len(), 1);
+        assert_eq!(app.nav.back.len(), 1);
         #[cfg(unix)]
         {
             let alias = root.join("alias");
             std::os::unix::fs::symlink(&destination, &alias).unwrap();
             app.user_settings.bookmarks.set('a', alias);
             app.jump_to_bookmark('a');
-            assert_eq!(app.view_root, destination);
-            assert_eq!(app.view_history.len(), 1);
+            assert_eq!(app.nav.view_root, destination);
+            assert_eq!(app.nav.back.len(), 1);
         }
     }
 
@@ -5916,12 +5903,12 @@ mod tests {
             ],
         );
         app.cd_to_path("./first");
-        assert_eq!(app.view_root, root.join("first"));
+        assert_eq!(app.nav.view_root, root.join("first"));
         app.cd_to_path("../two  日本/.");
-        assert_eq!(app.view_root, root.join("two  日本"));
-        let history_len = app.view_history.len();
+        assert_eq!(app.nav.view_root, root.join("two  日本"));
+        let history_len = app.nav.back.len();
         app.cd_to_path(".");
-        assert_eq!(app.view_history.len(), history_len);
+        assert_eq!(app.nav.back.len(), history_len);
         for (target, message) in [
             ("/missing", "not in the loaded tree"),
             ("/file.txt", "Not a directory"),
@@ -5929,16 +5916,16 @@ mod tests {
         ] {
             app.cd_to_path(target);
             assert!(app.error.as_ref().unwrap().contains(message));
-            assert_eq!(app.view_root, root.join("two  日本"));
-            assert_eq!(app.view_history.len(), history_len);
+            assert_eq!(app.nav.view_root, root.join("two  日本"));
+            assert_eq!(app.nav.back.len(), history_len);
         }
         app.cd_to_path("/first/../two  日本");
-        assert_eq!(app.view_root, root.join("two  日本"));
-        assert_eq!(app.view_history.len(), history_len);
+        assert_eq!(app.nav.view_root, root.join("two  日本"));
+        assert_eq!(app.nav.back.len(), history_len);
         app.tree = None;
         app.cd_to_path("first");
         assert!(app.error.as_ref().unwrap().contains("no directory tree"));
-        assert_eq!(app.view_history.len(), history_len);
+        assert_eq!(app.nav.back.len(), history_len);
     }
 
     #[test]
@@ -5983,9 +5970,8 @@ mod tests {
                 Ok(UserSettings::default()),
             );
             assert_eq!(app.path, canonical);
-            assert_eq!(app.view_root, canonical);
+            assert_eq!(app.nav.view_root, canonical);
             assert_eq!(app.tree.as_ref().unwrap().root_path, canonical);
-            assert_eq!(app.tab_manager.active_tab().unwrap().view_root, canonical);
             assert!(app.get_view_root_node().is_some());
             app.search_state.enable_background();
             app.start_search();
@@ -6095,7 +6081,7 @@ mod tests {
                 );
             }
         }
-        app.view_root = scan_root.join("src/nested");
+        app.nav.view_root = scan_root.join("src/nested");
         app.search_state.enable_background();
         app.start_search();
         app.search_state.set_query("deep".into());
@@ -6429,7 +6415,10 @@ mod tests {
             vec!["one.bin".to_string(), "two.bin".to_string()],
         ));
         app.visual_state = Some(state::VisualState::new(1));
-        app.tab_manager.new_tab(root.join("src"));
+        // A second tab, with the first one active.
+        app.tab_manager
+            .open(&mut app.nav, state::Navigation::new(root.join("src")));
+        app.tab_manager.switch(&mut app.nav, 0);
 
         (dir, app)
     }
@@ -6448,7 +6437,7 @@ mod tests {
     fn tree_row(app: &App, name: &str) -> usize {
         let (node, path) = app.get_view_root_node().expect("a view root node");
         TreeView::new(node, &path, &app.theme, &app.marked, &app.clipboard)
-            .flatten(&app.tree_state)
+            .flatten(&app.nav.tree_state)
             .iter()
             .position(|item| item.node.name == name)
             .unwrap_or_else(|| panic!("{name} is not visible"))
@@ -6533,8 +6522,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_app_cancels_archive_work_without_misreporting_publication() {
         let (_directory, mut app) = scanned_app();
-        let destination = app.view_root.join("drop.zip");
-        app.marked.insert(app.view_root.join("copy-a.bin"));
+        let destination = app.nav.view_root.join("drop.zip");
+        app.marked.insert(app.nav.view_root.join("copy-a.bin"));
         app.compress_files("drop.zip");
         let cancel = app.archive_cancel.as_ref().unwrap().0.clone();
         let receiver = app.archive_rx.take().unwrap();
@@ -6646,7 +6635,7 @@ mod tests {
             .unwrap();
         executor.block_on(async {
             let (_directory, mut app) = scanned_app();
-            let source = app.view_root.join("copy-a.bin");
+            let source = app.nav.view_root.join("copy-a.bin");
             app.marked.insert(source.clone());
             app.compress_files("cancelled.zip");
             app.handle_action(KeyAction::Cancel);
@@ -6667,7 +6656,7 @@ mod tests {
             app.finish_archive_task(completion);
             assert!(app.archive_cancel.is_none());
             assert!(app.archive_rx.is_none());
-            assert!(!app.view_root.join("cancelled.zip").exists());
+            assert!(!app.nav.view_root.join("cancelled.zip").exists());
             assert!(app.marked.contains(&source));
             assert!(
                 app.error
@@ -6682,7 +6671,7 @@ mod tests {
     async fn lost_archive_worker_refreshes_uncertain_output_and_releases_admission() {
         for active_creation in [false, true] {
             let (_directory, mut app) = scanned_app();
-            let root = app.view_root.clone();
+            let root = app.nav.view_root.clone();
             let source = root.join("copy-a.bin");
             app.marked.insert(source.clone());
             app.operation_message = Some((true, "Creating archive…".into()));
@@ -6744,7 +6733,7 @@ mod tests {
     async fn incomplete_extraction_rollback_refreshes_without_clearing_selection() {
         for active_creation in [false, true] {
             let (_directory, mut app) = scanned_app();
-            let root = app.view_root.clone();
+            let root = app.nav.view_root.clone();
             let source = root.join("copy-a.bin");
             let archive = root.join("result.zip");
             std::fs::write(&archive, b"leftover extraction output").unwrap();
@@ -6805,7 +6794,7 @@ mod tests {
     async fn archive_completion_refresh_waits_for_an_active_creation() {
         for compress in [false, true] {
             let (_directory, mut app) = scanned_app();
-            let root = app.view_root.clone();
+            let root = app.nav.view_root.clone();
             let archived_source = root.join("copy-a.bin");
             let unrelated_mark = root.join("copy-b.bin");
             app.marked.insert(archived_source.clone());
@@ -6899,7 +6888,7 @@ mod tests {
         .await
         .unwrap();
         app.execute_command("cd two  spaces");
-        assert_eq!(app.view_root, destination);
+        assert_eq!(app.nav.view_root, destination);
         app.execute_command("touch note  日本.txt");
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -6915,7 +6904,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_palette_commands_preserve_sort_bookmarks_and_navigation() {
         let (_directory, mut app) = scanned_app();
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         app.user_settings.bookmarks.set('a', root.clone());
         let sort = app.sort_mode;
         for command in ["sort typo", "delmark ab", "go a extra", "unknown"] {
@@ -6923,7 +6912,7 @@ mod tests {
             app.execute_command(command);
             assert!(app.error.is_some());
             assert_eq!(app.sort_mode, sort);
-            assert_eq!(app.view_root, root);
+            assert_eq!(app.nav.view_root, root);
             assert_eq!(app.user_settings.bookmarks.get('a'), Some(&root));
             assert!(app.scan_rx.is_none());
         }
@@ -7037,16 +7026,16 @@ mod tests {
         assert!(last > 0, "the fixture should expand to several rows");
 
         app.jump_to_bottom();
-        assert_eq!(app.tree_state.selected, last);
+        assert_eq!(app.nav.tree_state.selected, last);
         app.move_down();
         app.page_down();
-        assert_eq!(app.tree_state.selected, last);
+        assert_eq!(app.nav.tree_state.selected, last);
 
         app.jump_to_top();
-        assert_eq!(app.tree_state.selected, 0);
+        assert_eq!(app.nav.tree_state.selected, 0);
         app.move_up();
         app.page_up();
-        assert_eq!(app.tree_state.selected, 0);
+        assert_eq!(app.nav.tree_state.selected, 0);
     }
 
     #[tokio::test]
@@ -7055,7 +7044,7 @@ mod tests {
         app.layout_mode = LayoutMode::Tree;
         let collapsed_len = app.cached_tree_len;
 
-        app.tree_state.selected = tree_row(&app, "src");
+        app.nav.tree_state.selected = tree_row(&app, "src");
         app.expand_selected();
         assert!(
             app.cached_tree_len > collapsed_len,
@@ -7070,17 +7059,17 @@ mod tests {
     async fn drilling_into_a_directory_and_back_restores_the_previous_root() {
         let (_dir, mut app) = scanned_app();
         app.layout_mode = LayoutMode::Tree;
-        let original_root = app.view_root.clone();
+        let original_root = app.nav.view_root.clone();
 
         let src_index = tree_row(&app, "src");
-        app.tree_state.selected = src_index;
+        app.nav.tree_state.selected = src_index;
         app.drill_into_selected();
-        assert_eq!(app.view_root, original_root.join("src"));
+        assert_eq!(app.nav.view_root, original_root.join("src"));
 
         app.navigate_back();
-        assert_eq!(app.view_root, original_root);
+        assert_eq!(app.nav.view_root, original_root);
         assert_eq!(
-            app.tree_state.selected, src_index,
+            app.nav.tree_state.selected, src_index,
             "returning restores the row the user drilled from"
         );
     }
@@ -7089,7 +7078,7 @@ mod tests {
     async fn drilling_in_miller_mode_and_back_restores_the_previous_root() {
         let (_dir, mut app) = scanned_app();
         app.layout_mode = LayoutMode::Miller;
-        let original_root = app.view_root.clone();
+        let original_root = app.nav.view_root.clone();
 
         let (node, _) = app.get_view_root_node().unwrap();
         let src_index = node
@@ -7097,39 +7086,42 @@ mod tests {
             .iter()
             .position(|child| child.name.as_str() == "src")
             .expect("src is a child");
-        app.miller_state.selected = src_index;
+        app.nav.miller_state.selected = src_index;
 
         app.drill_into_miller_selected();
-        assert_eq!(app.view_root, original_root.join("src"));
+        assert_eq!(app.nav.view_root, original_root.join("src"));
 
         app.navigate_back();
-        assert_eq!(app.view_root, original_root);
-        assert_eq!(app.miller_state.selected, src_index);
+        assert_eq!(app.nav.view_root, original_root);
+        assert_eq!(app.nav.miller_state.selected, src_index);
     }
 
     #[tokio::test]
     async fn drilling_into_a_file_does_nothing() {
         let (_dir, mut app) = scanned_app();
         app.layout_mode = LayoutMode::Tree;
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
 
-        app.tree_state.selected = tree_row(&app, "empty");
+        app.nav.tree_state.selected = tree_row(&app, "empty");
         app.drill_into_selected();
-        assert_eq!(app.view_root, root, "a file is not a directory to enter");
-        assert!(app.view_history.is_empty(), "no history entry was recorded");
+        assert_eq!(
+            app.nav.view_root, root,
+            "a file is not a directory to enter"
+        );
+        assert!(app.nav.back.is_empty(), "no history entry was recorded");
     }
 
     #[tokio::test]
     async fn navigating_back_from_the_scan_root_walks_up_the_filesystem() {
         let (_dir, mut app) = scanned_app();
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         let parent = root
             .parent()
             .expect("the temp dir has a parent")
             .to_path_buf();
 
         app.navigate_back();
-        assert_eq!(app.view_root, parent);
+        assert_eq!(app.nav.view_root, parent);
     }
 
     #[tokio::test]
@@ -7140,16 +7132,16 @@ mod tests {
         let last = app.cached_treemap_len - 1;
 
         app.jump_to_bottom();
-        assert_eq!(app.treemap_state.selected, last);
+        assert_eq!(app.nav.treemap_state.selected, last);
         app.move_down();
         app.page_down();
-        assert_eq!(app.treemap_state.selected, last);
+        assert_eq!(app.nav.treemap_state.selected, last);
 
         app.jump_to_top();
-        assert_eq!(app.treemap_state.selected, 0);
+        assert_eq!(app.nav.treemap_state.selected, 0);
         app.move_up();
         app.page_up();
-        assert_eq!(app.treemap_state.selected, 0);
+        assert_eq!(app.nav.treemap_state.selected, 0);
     }
 
     #[tokio::test]
@@ -7510,7 +7502,7 @@ mod tests {
     async fn switching_layout_keeps_the_same_item_selected() {
         let (_dir, mut app) = scanned_app();
         app.layout_mode = LayoutMode::Tree;
-        app.tree_state.selected = tree_row(&app, "src");
+        app.nav.tree_state.selected = tree_row(&app, "src");
         let selected_before = app.get_selected_path();
         assert!(selected_before.is_some());
 
@@ -7549,7 +7541,7 @@ mod tests {
     #[tokio::test]
     async fn escape_clears_the_clipboard_before_the_marks_and_never_quits() {
         let (_dir, mut app) = scanned_app();
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         app.marked.insert(root.join("empty"));
         app.clipboard.yank([root.join("copy-a.bin")], root.clone());
 
@@ -7568,7 +7560,7 @@ mod tests {
     async fn delete_requires_confirmation_and_cancelling_drops_the_auto_mark() {
         let (_dir, mut app) = scanned_app();
         assert!(app.marked.is_empty());
-        app.tree_state.selected = tree_row(&app, "copy-a.bin");
+        app.nav.tree_state.selected = tree_row(&app, "copy-a.bin");
 
         app.handle_action(KeyAction::Delete);
         assert_eq!(app.mode, AppMode::ConfirmDelete);
@@ -7589,7 +7581,10 @@ mod tests {
         app.mode = AppMode::Help;
 
         app.handle_action(KeyAction::MoveDown);
-        assert_eq!(app.tree_state.selected, 0, "help must not move the cursor");
+        assert_eq!(
+            app.nav.tree_state.selected, 0,
+            "help must not move the cursor"
+        );
 
         app.handle_action(KeyAction::ToggleHelp);
         assert_eq!(app.mode, AppMode::Normal);
@@ -7709,7 +7704,7 @@ mod tests {
         let mut app = App::with_config(root_path.clone(), crate::TuiConfig::default());
         app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
         app.scan_rx = None;
-        app.tree_state.expand(&root_path.join("dir-000"));
+        app.nav.tree_state.expand(&root_path.join("dir-000"));
         app.update_cached_tree_len();
         let area = Rect::new(0, 0, 160, 50);
         let frame = |app: &App| {
@@ -7730,7 +7725,7 @@ mod tests {
         }
         let marked_ms = frame(&app);
         app.marked.clear();
-        app.tree_state.selected = 150_000;
+        app.nav.tree_state.selected = 150_000;
         let deep_ms = frame(&app);
         let start = std::time::Instant::now();
         app.handle_action(KeyAction::MoveDown);
@@ -7738,9 +7733,9 @@ mod tests {
         app.layout_mode = LayoutMode::Miller;
         app.update_cached_miller_len();
         let miller_ms = frame(&app);
-        app.view_root = root_path.join("dir-000");
+        app.nav.view_root = root_path.join("dir-000");
         app.update_cached_miller_len();
-        app.miller_state.selected = 150_000;
+        app.nav.miller_state.selected = 150_000;
         let miller_large_ms = frame(&app);
         println!(
             "explorer frame (median of 21), 1M files, 200k expanded: tree {tree_ms:.2} ms, \
@@ -7838,7 +7833,7 @@ mod tests {
             // Restore and warm the displayed root after the scope-refresh series.
             drop(app.duplicate_filter.get(
                 app.duplicates.as_ref().unwrap(),
-                &app.view_root,
+                &app.nav.view_root,
                 &app.path,
             ));
             let mut mark_samples = Vec::new();
@@ -7881,12 +7876,13 @@ mod tests {
         for layout in [LayoutMode::Tree, LayoutMode::Miller] {
             for action in ["take", "cd", "search-directory", "search-file", "bookmark"] {
                 let (_directory, mut app) = scanned_app();
-                let root = app.view_root.clone();
+                let root = app.nav.view_root.clone();
                 app.layout_mode = layout;
-                app.tree_state.selected = 1;
-                app.miller_state.selected = 2;
+                app.nav.tree_state.selected = 1;
+                app.nav.miller_state.selected = 2;
                 let expected_cursor = if layout == LayoutMode::Tree { 1 } else { 2 };
-                app.forward_history
+                app.nav
+                    .forward
                     .push((root.join("obsolete"), 0, HashSet::new()));
                 let destination = if action == "search-file" {
                     root.join("src/nested")
@@ -7904,13 +7900,13 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-                assert_eq!(app.view_root, destination, "{action}");
-                assert!(app.forward_history.is_empty(), "{action}");
-                let origin = app.view_history.last().unwrap();
+                assert_eq!(app.nav.view_root, destination, "{action}");
+                assert!(app.nav.forward.is_empty(), "{action}");
+                let origin = app.nav.back.last().unwrap();
                 assert_eq!(origin.0, root, "{action}");
                 assert_eq!(origin.1, expected_cursor, "{action}");
                 if action == "cd" && layout == LayoutMode::Miller {
-                    assert_eq!(app.miller_state.selected, 0);
+                    assert_eq!(app.nav.miller_state.selected, 0);
                     assert_eq!(app.cached_miller_len, 2);
                 }
             }
@@ -7921,13 +7917,16 @@ mod tests {
     async fn create_and_enter_waits_for_success_and_records_only_new_directories() {
         for existing in [false, true] {
             let (_directory, mut app) = scanned_app();
-            let root = app.view_root.clone();
+            let root = app.nav.view_root.clone();
             let destination = root.join("take-target");
             if existing {
                 std::fs::create_dir(&destination).unwrap();
             }
             app.execute_take(root.clone(), "take-target".into());
-            assert_eq!(app.view_root, root, "navigation must wait for completion");
+            assert_eq!(
+                app.nav.view_root, root,
+                "navigation must wait for completion"
+            );
             let mut rx = app.take_rx.take().unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
                 .await
@@ -7937,7 +7936,7 @@ mod tests {
                 matches!(&result, ScanResult::TakeComplete { result: Ok(created), .. } if *created != existing)
             );
             app.handle_scan_result(result);
-            assert_eq!(app.view_root, destination);
+            assert_eq!(app.nav.view_root, destination);
             assert!(destination.is_dir());
             assert_eq!(app.undo_log.len(), usize::from(!existing));
             if let Some(entry) = app.undo_log.pop() {
@@ -7951,11 +7950,11 @@ mod tests {
     #[tokio::test]
     async fn create_and_enter_completion_does_not_override_later_navigation() {
         let (_directory, mut app) = scanned_app();
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         app.execute_take(root.clone(), "created-later".into());
         let mut rx = app.take_rx.take().unwrap();
         let destination = root.join("src");
-        app.view_root = destination.clone();
+        app.nav.view_root = destination.clone();
         app.start_scan();
         let later_scan = app.scan_token.clone();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -7963,7 +7962,7 @@ mod tests {
             .unwrap()
             .unwrap();
         app.handle_scan_result(result);
-        assert_eq!(app.view_root, destination);
+        assert_eq!(app.nav.view_root, destination);
         assert!(root.join("created-later").is_dir());
         assert_eq!(app.undo_log.len(), 1);
         assert!(!later_scan.is_cancelled());
@@ -7973,7 +7972,7 @@ mod tests {
     #[tokio::test]
     async fn take_result_survives_another_operation_and_rejects_overlapping_take() {
         let (_directory, mut app) = scanned_app();
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         app.execute_take(root.clone(), "first".into());
         app.handle_action(KeyAction::Quit);
         assert_eq!(app.mode, AppMode::Normal);
@@ -7997,7 +7996,7 @@ mod tests {
             .unwrap();
         app.handle_scan_result(result);
         assert_eq!(app.mode, AppMode::UpdatingEntry);
-        assert_eq!(app.view_root, root);
+        assert_eq!(app.nav.view_root, root);
         assert!(app.op_rx.is_some());
         assert!(!later_token.is_cancelled());
         assert_eq!(app.undo_log.len(), 1);
@@ -8016,11 +8015,11 @@ mod tests {
     #[tokio::test]
     async fn create_and_enter_preserves_navigation_on_invalid_names_and_conflicts() {
         let (_directory, mut app) = scanned_app();
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         for name in ["..", "bad\nname", "name."] {
             app.execute_take(root.clone(), name.into());
             assert!(app.take_rx.is_none());
-            assert_eq!(app.view_root, root);
+            assert_eq!(app.nav.view_root, root);
             assert!(!app.operation_message.as_ref().unwrap().0);
         }
         #[cfg(unix)]
@@ -8040,7 +8039,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             app.handle_scan_result(result);
-            assert_eq!(app.view_root, root);
+            assert_eq!(app.nav.view_root, root);
             assert!(app.undo_log.is_empty());
             assert!(!app.operation_message.as_ref().unwrap().0);
         }
@@ -8179,8 +8178,8 @@ mod tests {
                 }
                 "paste" => {
                     app.clipboard.yank([root.join("copy-a.bin")], root.clone());
-                    app.view_root = root.join("src");
-                    app.tree_state.selected = 0;
+                    app.nav.view_root = root.join("src");
+                    app.nav.tree_state.selected = 0;
                     app.paste_with_resolution(Some(gravityfile_ops::ConflictResolution::Skip));
                 }
                 _ => unreachable!(),
@@ -8682,7 +8681,7 @@ mod tests {
     ///
     /// Returns the destination path that will collide.
     fn stage_conflicting_paste(app: &mut App) -> PathBuf {
-        let root = app.view_root.clone();
+        let root = app.nav.view_root.clone();
         let source = root.join("src").join("copy-a.bin");
         std::fs::write(&source, b"replacement contents").expect("write the source");
 
@@ -8692,7 +8691,7 @@ mod tests {
         // the paste destination is the scan root — where `copy-a.bin` already
         // exists.
         app.layout_mode = LayoutMode::Tree;
-        app.tree_state.selected = 0;
+        app.nav.tree_state.selected = 0;
 
         root.join("copy-a.bin")
     }

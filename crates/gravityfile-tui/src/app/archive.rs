@@ -47,7 +47,7 @@ impl App {
             );
             // Loss of the reply says nothing about publication, or where.
             // Rescan the viewed directory without replaying work.
-            self.refresh_paths(vec![self.view_root.clone()]);
+            self.refresh_paths(vec![self.nav.view_root.clone()]);
         }
     }
 
@@ -196,11 +196,11 @@ impl App {
                 dest_path
             } else {
                 // Relative to view root
-                self.view_root.join(&dest_path)
+                self.nav.view_root.join(&dest_path)
             }
         } else {
             // Extract to current directory by default
-            self.view_root.clone()
+            self.nav.view_root.clone()
         };
 
         let (tx, rx) = oneshot::channel();
@@ -253,7 +253,7 @@ impl App {
         };
 
         // Determine archive path - relative to view root
-        let archive_path = self.view_root.join(&validated_name);
+        let archive_path = self.nav.view_root.join(&validated_name);
 
         // Determine format from name
         let format = match gravityfile_ops::ArchiveFormat::from_path(&archive_path) {

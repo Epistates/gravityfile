@@ -47,7 +47,7 @@ async fn deleting_inside_a_subdirectory_keeps_the_whole_scan() {
     let root = harness.root().to_path_buf();
     harness.select("src").await;
     harness.press("<enter>").await;
-    assert_eq!(harness.app.view_root, harness.path("src"));
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
     harness.select("modified.rs").await;
     harness.press("dy").await;
     assert!(!harness.path("src/modified.rs").exists());
@@ -57,7 +57,7 @@ async fn deleting_inside_a_subdirectory_keeps_the_whole_scan() {
     let tree = harness.app.tree.as_ref().expect("a tree");
     assert_eq!(tree.root_path, root);
     harness.press("<bs>").await;
-    assert_eq!(harness.app.view_root, root);
+    assert_eq!(harness.app.nav.view_root, root);
     let screen = harness.screen();
     let copy = screen
         .lines()
@@ -144,14 +144,62 @@ async fn going_to_an_ancestor_of_the_scan_root_lists_it() {
     harness.press("<c-g><c-u>").await;
     harness.type_text(&parent.to_string_lossy()).await;
     harness.press("<enter>").await;
-    assert_eq!(harness.app.view_root, parent);
+    assert_eq!(harness.app.nav.view_root, parent);
     // The parent is shared with other tests, so the row may be off-screen.
     let tree = harness.app.tree.as_ref().expect("a listing");
     assert_eq!(tree.root_path, parent);
     assert!(tree.root.children.iter().any(|child| child.name == name));
     // Going back returns to the scanned tree's directory.
     harness.press("<bs>").await;
-    assert_eq!(harness.app.view_root, harness.root());
+    assert_eq!(harness.app.nav.view_root, harness.root());
+}
+
+#[tokio::test]
+async fn each_tab_keeps_its_own_place_selection_and_history() {
+    let mut harness = Harness::scanned().await;
+    let root = harness.root().to_path_buf();
+    // Tab 1: into src, selecting modified.rs.
+    harness.select("src").await;
+    harness.press("<enter>").await;
+    harness.select("modified.rs").await;
+    // Tab 2 opens on src too, then goes into nested.
+    harness.press("<c-t>").await;
+    harness.select("nested").await;
+    harness.press("<enter>").await;
+    assert_eq!(harness.app.nav.view_root, harness.path("src/nested"));
+
+    // Back on tab 1, the selection survived and Backspace follows tab 1's
+    // own history, not tab 2's.
+    harness.press("1").await;
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
+    assert_eq!(harness.selected(), Some(harness.path("src/modified.rs")));
+    harness.press("<bs>").await;
+    assert_eq!(harness.app.nav.view_root, root);
+
+    // Tab 2 is still where it was left.
+    harness.press("2").await;
+    assert_eq!(harness.app.nav.view_root, harness.path("src/nested"));
+    harness.press("<bs>").await;
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
+}
+
+#[tokio::test]
+async fn a_tab_whose_directory_was_deleted_elsewhere_moves_to_what_remains() {
+    let mut harness = Harness::scanned().await;
+    let root = harness.root().to_path_buf();
+    harness.press("<c-t>").await;
+    harness.select("src").await;
+    harness.press("<enter>").await;
+    harness.select("nested").await;
+    harness.press("<enter>").await;
+    // Tab 1 deletes src, and tab 2's directory with it.
+    harness.press("1").await;
+    harness.select("src").await;
+    harness.press("dy").await;
+    assert!(!harness.path("src").exists());
+    harness.press("2").await;
+    assert_eq!(harness.app.nav.view_root, root);
+    assert!(harness.tree_shows("copy-a.bin"), "{}", harness.screen());
 }
 
 #[tokio::test]
@@ -162,10 +210,10 @@ async fn closing_a_tab_returns_to_the_other_tabs_directory() {
     assert_eq!(harness.app.tab_manager.len(), 2);
     harness.select("src").await;
     harness.press("<enter>").await;
-    assert_eq!(harness.app.view_root, harness.path("src"));
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
     harness.press("<c-w>").await;
     assert_eq!(harness.app.tab_manager.len(), 1);
-    assert_eq!(harness.app.view_root, root);
+    assert_eq!(harness.app.nav.view_root, root);
     assert!(
         harness.screen().contains("copy-a.bin"),
         "{}",
@@ -202,7 +250,7 @@ async fn double_clicking_a_directory_enters_it() {
     let row = harness.row_of(" src");
     harness.click(10, row).await;
     harness.click(10, row).await;
-    assert_eq!(harness.app.view_root, harness.path("src"));
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
 }
 
 #[tokio::test]

@@ -75,7 +75,7 @@ impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Views that are not drawn this frame keep their current offsets.
         self.rendered_offsets
-            .set((self.tree_state.offset, self.miller_state.offset));
+            .set((self.nav.tree_state.offset, self.nav.miller_state.offset));
         // Fill entire area with theme background color
         let base_style = Style::default()
             .bg(self.theme.background)
@@ -295,7 +295,7 @@ impl App {
             };
 
             let path = if progress.current_path.as_os_str().is_empty() {
-                self.view_root.display().to_string()
+                self.nav.view_root.display().to_string()
             } else {
                 progress.current_path.display().to_string()
             };
@@ -473,25 +473,21 @@ impl App {
     }
 
     fn render_dir_tabs(&self, area: Rect, buf: &mut Buffer) {
-        let tabs = self.tab_manager.tabs();
+        let labels = self.tab_manager.labels(&self.nav);
         let active = self.tab_manager.active_index();
+        let max_tab_width = (area.width as usize / labels.len().max(1)).clamp(8, 20);
 
-        let max_tab_width = if tabs.is_empty() {
-            10
-        } else {
-            (area.width as usize / tabs.len()).clamp(8, 20)
-        };
-
-        let titles: Vec<String> = tabs
+        let titles: Vec<String> = labels
             .iter()
             .enumerate()
-            .map(|(i, tab)| {
+            .map(|(i, label)| {
                 let prefix = if i < 9 {
                     format!("{}:", i + 1)
                 } else {
                     String::new()
                 };
-                let label = tab.short_label(max_tab_width.saturating_sub(prefix.len() + 2));
+                let label =
+                    crate::ui::fit_to_width(label, max_tab_width.saturating_sub(prefix.len() + 2));
                 format!(" {}{} ", prefix, label)
             })
             .collect();
@@ -549,12 +545,13 @@ impl App {
         if let Some((view_node, view_path)) = self.get_view_root_node() {
             match self.layout_mode {
                 LayoutMode::Tree => {
-                    let title = if self.view_root != self.path {
+                    let title = if self.nav.view_root != self.path {
                         let relative = self
+                            .nav
                             .view_root
                             .strip_prefix(&self.path)
                             .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| self.view_root.display().to_string());
+                            .unwrap_or_else(|_| self.nav.view_root.display().to_string());
                         format!(" {} (\u{2190} Backspace) ", relative)
                     } else {
                         format!(" {} ", view_path.display())
@@ -575,7 +572,7 @@ impl App {
                             .title_style(self.theme.title),
                     );
 
-                    let mut tree_state = self.tree_state.clone();
+                    let mut tree_state = self.nav.tree_state.clone();
                     ratatui::widgets::StatefulWidget::render(
                         tree_view,
                         layout.main,
@@ -611,7 +608,7 @@ impl App {
                     .file_preview(&self.preview_state.content)
                     .preview_mode(self.preview_state.mode);
 
-                    let mut miller_state = self.miller_state.clone();
+                    let mut miller_state = self.nav.miller_state.clone();
                     ratatui::widgets::StatefulWidget::render(
                         miller,
                         layout.main,
@@ -657,12 +654,13 @@ impl App {
     }
 
     fn render_duplicates(&self, area: Rect, buf: &mut Buffer) {
-        let title = if self.view_root != self.path {
+        let title = if self.nav.view_root != self.path {
             let relative = self
+                .nav
                 .view_root
                 .strip_prefix(&self.path)
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| self.view_root.display().to_string());
+                .unwrap_or_else(|_| self.nav.view_root.display().to_string());
             format!(" Duplicates in {} ", relative)
         } else {
             " Duplicates ".to_string()
@@ -834,7 +832,7 @@ impl App {
                         let prefix = if *file_idx == 0 { "keep" } else { " dup" };
                         let mark = if *is_marked { "●" } else { " " };
                         let display_path = path
-                            .strip_prefix(&self.view_root)
+                            .strip_prefix(&self.nav.view_root)
                             .unwrap_or(path)
                             .display()
                             .to_string();
@@ -929,12 +927,13 @@ impl App {
     }
 
     fn render_age(&self, area: Rect, buf: &mut Buffer) {
-        let title = if self.view_root != self.path {
+        let title = if self.nav.view_root != self.path {
             let relative = self
+                .nav
                 .view_root
                 .strip_prefix(&self.path)
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| self.view_root.display().to_string());
+                .unwrap_or_else(|_| self.nav.view_root.display().to_string());
             format!(" Age Analysis - {} ", relative)
         } else {
             " Age Analysis ".to_string()
@@ -961,7 +960,7 @@ impl App {
             let max_size = age.buckets.iter().map(|b| b.total_size).max().unwrap_or(1);
             let chart_height = age.buckets.len().min(inner.height as usize / 2);
 
-            let bucket_start_y = if self.view_root != self.path {
+            let bucket_start_y = if self.nav.view_root != self.path {
                 Line::styled(
                     " Distribution (full scan):",
                     Style::default().fg(self.theme.muted),
@@ -1295,7 +1294,7 @@ impl App {
             &self.clipboard,
         )
         .block(block)
-        .selected(self.treemap_state.selected)
+        .selected(self.nav.treemap_state.selected)
         .render(area, buf);
     }
 

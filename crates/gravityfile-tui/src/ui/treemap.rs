@@ -28,11 +28,6 @@ pub struct TreemapState {
 }
 
 impl TreemapState {
-    /// Create new treemap state.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Move selection to next rectangle.
     pub fn move_next(&mut self, count: usize) {
         self.selected = self.selected.saturating_add(1).min(count.saturating_sub(1));
@@ -457,7 +452,7 @@ mod tests {
 
     #[test]
     fn navigation_stays_within_bounds() {
-        let mut state = TreemapState::new();
+        let mut state = TreemapState::default();
         state.move_prev();
         assert_eq!(state.selected, 0);
         state.move_next(4);
@@ -468,7 +463,7 @@ mod tests {
         assert_eq!(state.selected, 3, "clamped to the last rectangle");
 
         // An empty treemap must not underflow.
-        let mut state = TreemapState::new();
+        let mut state = TreemapState::default();
         state.move_next(0);
         assert_eq!(state.selected, 0);
     }

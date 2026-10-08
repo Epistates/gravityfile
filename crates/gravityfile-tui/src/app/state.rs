@@ -1,6 +1,6 @@
 //! Application state types and enums.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,8 @@ use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::FileTree;
 use gravityfile_ops::{ConflictRequest, OperationProgress, OperationType};
 use gravityfile_scan::ScanProgress;
+
+use crate::ui::{MillerState, TreeState, TreemapState};
 
 /// Application mode representing the current UI state.
 /// Note: Scanning is NOT a mode - scanning happens in the background
@@ -520,144 +522,136 @@ impl DuplicatesViewState {
     }
 }
 
-/// A single tab representing an independent directory exploration context.
-#[derive(Debug, Clone)]
-pub struct Tab {
-    /// Display label for the tab (typically the directory name).
-    pub label: String,
-    /// The directory the tab shows.
+/// A place in a tab's back/forward history: the directory viewed, the
+/// selected row and the expanded directories.
+pub type Visit = (PathBuf, usize, HashSet<PathBuf>);
+
+/// What one tab is looking at and how it got there. The active tab's
+/// navigation is owned by the app; [`TabManager`] keeps the others.
+#[derive(Debug, Clone, Default)]
+pub struct Navigation {
+    /// The directory being viewed.
     pub view_root: PathBuf,
+    /// Selection, scroll and expanded directories in the tree layout.
+    pub tree_state: TreeState,
+    /// Selection and scroll in the Miller layout.
+    pub miller_state: MillerState,
+    /// Selection in the treemap.
+    pub treemap_state: TreemapState,
+    /// Earlier places, most recent last.
+    pub back: Vec<Visit>,
+    /// Places left by going back, most recent last.
+    pub forward: Vec<Visit>,
 }
 
-impl Tab {
-    /// Create a new tab for a given path.
-    pub fn new(path: PathBuf) -> Self {
-        let label = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
-
+impl Navigation {
+    /// Start viewing `view_root` with it expanded and no history.
+    pub fn new(view_root: PathBuf) -> Self {
         Self {
-            label,
-            view_root: path,
+            tree_state: TreeState::new(view_root.clone()),
+            view_root,
+            ..Self::default()
         }
     }
 
-    /// Get a label bounded by terminal columns, without splitting UTF-8 bytes.
-    pub fn short_label(&self, max_len: usize) -> String {
-        crate::ui::fit_to_width(&self.label, max_len)
+    /// The tab label: the viewed directory's name.
+    pub fn label(&self) -> String {
+        self.view_root
+            .file_name()
+            .unwrap_or(self.view_root.as_os_str())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
-/// Manager for multiple tabs.
+/// The open directory tabs. The active tab's [`Navigation`] is held by the
+/// app and swapped back in here when another tab becomes active, so each tab
+/// keeps its own place, selection and history.
 #[derive(Debug)]
 pub struct TabManager {
-    /// All open tabs.
-    tabs: Vec<Tab>,
-    /// Index of the currently active tab.
+    /// One entry per tab; the active tab's entry is a placeholder.
+    stashed: Vec<Navigation>,
+    /// Index of the active tab.
     active: usize,
-    /// Maximum number of tabs allowed.
+    /// Maximum number of tabs.
     max_tabs: usize,
 }
 
-impl Default for TabManager {
-    fn default() -> Self {
-        Self::new(10)
-    }
-}
-
 impl TabManager {
-    /// Create a new tab manager with a maximum tab limit.
+    /// One tab, the active one, whose navigation the caller holds.
     pub fn new(max_tabs: usize) -> Self {
         Self {
-            tabs: Vec::new(),
+            stashed: vec![Navigation::default()],
             active: 0,
             max_tabs,
         }
     }
 
-    /// Create a tab manager with an initial tab.
-    pub fn with_initial_tab(path: PathBuf, max_tabs: usize) -> Self {
-        let mut manager = Self::new(max_tabs);
-        manager.new_tab(path);
-        manager
-    }
-
-    /// Get the number of open tabs.
+    /// The number of open tabs.
     pub fn len(&self) -> usize {
-        self.tabs.len()
+        self.stashed.len()
     }
 
-    /// Get the active tab index.
+    /// The active tab's index.
     pub fn active_index(&self) -> usize {
         self.active
     }
 
-    /// Get a reference to the active tab.
-    pub fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.get(self.active)
+    /// Every tab's label, in order, taking the active one from `current`.
+    pub fn labels(&self, current: &Navigation) -> Vec<String> {
+        (0..self.stashed.len())
+            .map(|index| {
+                if index == self.active {
+                    current.label()
+                } else {
+                    self.stashed[index].label()
+                }
+            })
+            .collect()
     }
 
-    /// Get a mutable reference to the active tab.
-    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
-        self.tabs.get_mut(self.active)
-    }
-
-    /// Get all tabs.
-    pub fn tabs(&self) -> &[Tab] {
-        &self.tabs
-    }
-
-    /// Create a new tab with the given path.
-    /// Returns true if the tab was created, false if at max capacity.
-    pub fn new_tab(&mut self, path: PathBuf) -> bool {
-        if self.tabs.len() >= self.max_tabs {
+    /// Open a tab showing `navigation` and make it active. Returns false at
+    /// the tab limit.
+    pub fn open(&mut self, current: &mut Navigation, navigation: Navigation) -> bool {
+        if self.stashed.len() >= self.max_tabs {
             return false;
         }
+        self.stashed.push(navigation);
+        self.switch(current, self.stashed.len() - 1)
+    }
 
-        let tab = Tab::new(path);
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+    /// Close the active tab and activate its neighbour. Returns false for the
+    /// last tab.
+    pub fn close_active(&mut self, current: &mut Navigation) -> bool {
+        if self.stashed.len() <= 1 {
+            return false;
+        }
+        self.stashed.remove(self.active);
+        self.active = self.active.min(self.stashed.len() - 1);
+        std::mem::swap(current, &mut self.stashed[self.active]);
         true
     }
 
-    /// Close the active tab.
-    /// Returns true if a tab was closed, false if it's the last tab.
-    pub fn close_active_tab(&mut self) -> bool {
-        if self.tabs.len() <= 1 {
+    /// Make tab `index` active. Returns whether the active tab changed.
+    pub fn switch(&mut self, current: &mut Navigation, index: usize) -> bool {
+        if index == self.active || index >= self.stashed.len() {
             return false;
         }
-
-        self.tabs.remove(self.active);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        }
+        std::mem::swap(current, &mut self.stashed[self.active]);
+        self.active = index;
+        std::mem::swap(current, &mut self.stashed[self.active]);
         true
     }
 
-    /// Switch to the next tab.
-    pub fn next_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
-        }
+    /// Activate the next tab, wrapping around.
+    pub fn next(&mut self, current: &mut Navigation) -> bool {
+        self.switch(current, (self.active + 1) % self.stashed.len())
     }
 
-    /// Switch to the previous tab.
-    pub fn prev_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = if self.active == 0 {
-                self.tabs.len() - 1
-            } else {
-                self.active - 1
-            };
-        }
-    }
-
-    /// Switch to a tab by number (1-indexed, for Alt+1 through Alt+9).
-    pub fn switch_to_number(&mut self, number: usize) {
-        if number > 0 && number <= self.tabs.len() {
-            self.active = number - 1;
-        }
+    /// Activate the previous tab, wrapping around.
+    pub fn prev(&mut self, current: &mut Navigation) -> bool {
+        let count = self.stashed.len();
+        self.switch(current, (self.active + count - 1) % count)
     }
 }
 
@@ -1141,8 +1135,6 @@ mod tests {
             "👩‍💻🇺🇸1️⃣",
             "e\u{301}e\u{301}",
         ] {
-            let mut tab = super::Tab::new(std::path::PathBuf::from("directory"));
-            tab.label = label.into();
             for width in 0..=32 {
                 for slice in [
                     crate::ui::truncate_to_width(label, width),
@@ -1159,7 +1151,7 @@ mod tests {
                     assert!(boundaries.contains(&(start + slice.len())));
                 }
                 assert!(crate::ui::fit_left_to_width(label, width).width() <= width);
-                let shortened = tab.short_label(width);
+                let shortened = crate::ui::fit_to_width(label, width);
                 assert!(shortened.width() <= width, "{label:?}, width {width}");
                 if label.width() <= width {
                     assert_eq!(shortened, label);

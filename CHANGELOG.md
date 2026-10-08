@@ -93,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Go-to now behaves like jumping to a bookmark: Backspace returns, and marks and
   the clipboard are kept.
 - Closing a directory tab returned to the closed tab's directory.
+- Each directory tab keeps its own selection and back/forward history.
+  Switching tabs used to reset the selection, and every tab shared one
+  history, so Backspace could jump to a place visited in another tab. A tab
+  whose directory was deleted from another tab opens on what remains.
 - The `default_layout` setting was ignored at startup.
 - Directory sizes in the tree were shifted out of their column.
 - Double-click enters a directory, as the help says.

@@ -101,7 +101,7 @@ impl Harness {
     /// person keeps working while a scan or operation runs.
     pub async fn press_unsettled(&mut self, keys: &str) {
         for key in parse_keys(keys) {
-            let old_view_root = self.app.view_root.clone();
+            let old_view_root = self.app.nav.view_root.clone();
             self.app.handle_terminal_event(Event::Key(key));
             self.app.after_input(&old_view_root).await;
             self.draw();
@@ -150,7 +150,7 @@ impl Harness {
 
     /// One event, then exactly what the run loop does after it.
     async fn event(&mut self, event: Event) {
-        let old_view_root = self.app.view_root.clone();
+        let old_view_root = self.app.nav.view_root.clone();
         self.app.handle_terminal_event(event);
         self.app.after_input(&old_view_root).await;
         self.settle().await;
@@ -161,7 +161,7 @@ impl Harness {
     pub async fn settle(&mut self) {
         loop {
             if self.app.has_background() {
-                let old_view_root = self.app.view_root.clone();
+                let old_view_root = self.app.nav.view_root.clone();
                 let background = tokio::time::timeout(STEP_TIMEOUT, self.app.next_background())
                     .await
                     .expect("a background task stopped making progress");

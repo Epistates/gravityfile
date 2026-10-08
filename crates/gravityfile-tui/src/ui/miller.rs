@@ -30,11 +30,6 @@ pub struct MillerState {
 }
 
 impl MillerState {
-    /// Create new Miller state.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Move selection up.
     pub fn move_up(&mut self, count: usize) {
         self.selected = self.selected.saturating_sub(count);
@@ -909,7 +904,7 @@ mod tests {
         let clipboard = ClipboardState::default();
         let area = Rect::new(0, 0, 160, 20);
         let mut buffer = Buffer::empty(area);
-        let mut state = MillerState::new();
+        let mut state = MillerState::default();
         StatefulWidget::render(
             MillerColumns::new(&root, None, name, &root_path, &marked, &clipboard, &theme),
             area,
@@ -958,7 +953,7 @@ mod tests {
 
     #[test]
     fn navigation_stays_within_bounds() {
-        let mut state = MillerState::new();
+        let mut state = MillerState::default();
         state.move_up(10);
         assert_eq!(state.selected, 0);
         state.move_down(100, 7);
@@ -977,8 +972,10 @@ mod tests {
 
     #[test]
     fn ensure_visible_scrolls_the_minimum_distance() {
-        let mut state = MillerState::new();
-        state.selected = 20;
+        let mut state = MillerState {
+            selected: 20,
+            offset: 0,
+        };
         state.ensure_visible(8);
         assert_eq!(state.offset, 13);
 
@@ -1026,7 +1023,7 @@ mod tests {
         // to compute an out-of-bounds rect and abort the app.
         for width in 1u16..=120 {
             for height in [1u16, 2, 3, 10, 40] {
-                let mut state = MillerState::new();
+                let mut state = MillerState::default();
                 let _ = render_at(Rect::new(0, 0, width, height), &mut state, None);
             }
         }
@@ -1111,7 +1108,7 @@ mod tests {
 
     #[test]
     fn a_wide_layout_renders_all_three_column_titles() {
-        let mut state = MillerState::new();
+        let mut state = MillerState::default();
         let buf = render_at(Rect::new(0, 0, 120, 20), &mut state, None);
         let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
         for title in ["Parent", "Current", "Preview"] {
@@ -1146,7 +1143,7 @@ mod tests {
             &clipboard,
             &theme,
         );
-        StatefulWidget::render(miller, area, &mut buf, &mut MillerState::new());
+        StatefulWidget::render(miller, area, &mut buf, &mut MillerState::default());
 
         let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
         assert!(rendered.contains("d-080"), "{rendered}");
@@ -1162,7 +1159,7 @@ mod tests {
         let clipboard = ClipboardState::default();
         let area = Rect::new(0, 0, 120, 20);
         let mut buf = Buffer::empty(area);
-        let mut state = MillerState::new();
+        let mut state = MillerState::default();
 
         let miller = MillerColumns::new(
             &empty, None, "empty", &root_path, &marked, &clipboard, &theme,
