@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two scans, largest changes first per directory. Each side is a snapshot or
   a directory; with one snapshot it is compared with the same place today,
   scanned with the snapshot's scope. Text or JSON.
+- `grav scan --top N` lists the largest files anywhere below the root, and
+  `grav scan --by-type` totals the space by file extension.
 - **Scan history.** Each full scan in the explorer, and `grav scan --record`,
   adds a summary to `history.jsonl` in the data directory. `grav history
   [PATH]` shows a directory's size over time and what changed most;

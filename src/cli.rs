@@ -235,6 +235,20 @@ pub struct ScanCommand {
     #[arg(long)]
     pub record: bool,
 
+    /// List the N largest files anywhere below the root instead of the tree
+    #[arg(
+        long,
+        value_name = "N",
+        conflicts_with = "by_type",
+        help_heading = "Output"
+    )]
+    pub top: Option<usize>,
+
+    /// Total the space by file extension instead of showing the tree; --limit
+    /// sets how many types
+    #[arg(long, help_heading = "Output")]
+    pub by_type: bool,
+
     /// Levels of directories to show below the root
     #[arg(
         short,

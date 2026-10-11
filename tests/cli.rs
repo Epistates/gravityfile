@@ -742,3 +742,42 @@ fn recorded_scans_show_a_directorys_growth() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--record needs a directory"));
 }
+
+#[test]
+fn scan_lists_the_largest_files_and_space_by_type() {
+    let place = tempfile::tempdir().unwrap();
+    let root = place.path();
+    std::fs::create_dir_all(root.join("a/b")).unwrap();
+    std::fs::write(root.join("a/b/movie.MP4"), vec![0u8; 90_000]).unwrap();
+    std::fs::write(root.join("a/log.txt"), vec![0u8; 20_000]).unwrap();
+    std::fs::write(root.join("notes.txt"), vec![0u8; 10_000]).unwrap();
+    std::fs::write(root.join("README"), vec![0u8; 500]).unwrap();
+    let path = root.to_str().unwrap();
+
+    let top = json(&run(&["scan", path, "--top", "2", "-A", "-f", "json"]));
+    assert_eq!(top["kind"], "top");
+    let files: Vec<&str> = top["data"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, ["a/b/movie.MP4", "a/log.txt"]);
+
+    let types = json(&run(&["scan", path, "--by-type", "-A", "-f", "json"]));
+    assert_eq!(types["kind"], "types");
+    let rows = types["data"]["types"].as_array().unwrap();
+    assert_eq!(rows[0]["extension"], "mp4");
+    assert_eq!(rows[1]["extension"], "txt");
+    assert_eq!(rows[1]["files"], 2);
+    assert!(rows[2]["extension"].is_null());
+
+    let text = run(&["scan", path, "--by-type", "-n", "1", "--color", "never"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(".mp4") && text.contains("… 2 more types"),
+        "{text}"
+    );
+    let output = run(&["scan", path, "--top", "1", "--by-type"]);
+    assert_eq!(output.status.code(), Some(2));
+}

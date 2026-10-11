@@ -40,6 +40,8 @@ grav                     # explore the current directory
 grav ~/Downloads --scan  # explore and start a full scan right away
 grav scan ~              # largest entries in your home directory
 grav scan / -d 2 -n 10   # two levels deep, ten entries per directory
+grav scan ~ --top 20      # the twenty largest files anywhere
+grav scan ~ --by-type     # space by file extension
 grav duplicates ~/Photos --min-size 1MB
 grav age ~/work --stale 6mo
 ```

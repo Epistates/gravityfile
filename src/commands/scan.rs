@@ -27,9 +27,55 @@ pub fn run(command: &ScanCommand, context: &Context) -> Result<Completeness> {
     if command.record {
         super::history::record(&tree)?;
     }
-    let view = View::build(&tree, command.depth, command.limit, &context.cancel)?;
     let status = scan_status(&tree);
     let mut stdout = std::io::stdout().lock();
+    let interrupted = || eyre!("operation interrupted");
+    if let Some(count) = command.top {
+        let files = gravityfile_analyze::largest_files(&tree, count, &context.cancel)
+            .ok_or_else(interrupted)?;
+        match command.output.format {
+            Format::Json => {
+                let data = TopView {
+                    total: Totals::of(&tree),
+                    files: &files,
+                };
+                let mut envelope = ReportEnvelope::new("top", &tree, &status, &data);
+                envelope.parameters = serde_json::json!({ "count": count });
+                write_json_report(&envelope, &mut stdout, &context.cancel)?;
+            }
+            Format::Text => write_top(&tree, &files, snapshot, &mut stdout, context)?,
+        }
+        return Ok(completeness(&status, &context.err));
+    }
+    if command.by_type {
+        let mut types =
+            gravityfile_analyze::by_type(&tree, &context.cancel).ok_or_else(interrupted)?;
+        let shown = if command.limit == 0 {
+            types.len()
+        } else {
+            command.limit.min(types.len())
+        };
+        let rest = types.split_off(shown);
+        let omitted = (!rest.is_empty()).then(|| Omitted {
+            entries: rest.len(),
+            size: rest.iter().map(|kind| kind.size).sum(),
+        });
+        match command.output.format {
+            Format::Json => {
+                let data = TypesView {
+                    total: Totals::of(&tree),
+                    types: &types,
+                    omitted,
+                };
+                let mut envelope = ReportEnvelope::new("types", &tree, &status, &data);
+                envelope.parameters = serde_json::json!({ "limit": command.limit });
+                write_json_report(&envelope, &mut stdout, &context.cancel)?;
+            }
+            Format::Text => write_types(&tree, &types, omitted, snapshot, &mut stdout, context)?,
+        }
+        return Ok(completeness(&status, &context.err));
+    }
+    let view = View::build(&tree, command.depth, command.limit, &context.cancel)?;
     match command.output.format {
         Format::Json => {
             let mut envelope = ReportEnvelope::new("scan", &tree, &status, &view);
@@ -61,6 +107,34 @@ pub struct Totals {
     pub files: u64,
     pub directories: u64,
     pub symlinks: u64,
+}
+
+impl Totals {
+    fn of(tree: &FileTree) -> Self {
+        Self {
+            size: tree.root.size,
+            files: tree.stats.total_files,
+            directories: tree.stats.total_dirs.saturating_sub(1),
+            symlinks: tree.stats.total_symlinks,
+        }
+    }
+}
+
+/// `--top`: the largest files anywhere.
+#[derive(Debug, Serialize)]
+struct TopView<'a> {
+    total: Totals,
+    files: &'a [gravityfile_analyze::LargeFile<'a>],
+}
+
+/// `--by-type`: space by file extension.
+#[derive(Debug, Serialize)]
+struct TypesView<'a> {
+    total: Totals,
+    types: &'a [gravityfile_analyze::TypeStats],
+    /// Types beyond the limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted: Option<Omitted>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,12 +199,7 @@ impl<'a> View<'a> {
         };
         let root = &tree.root;
         let mut view = View {
-            total: Totals {
-                size: root.size,
-                files: tree.stats.total_files,
-                directories: tree.stats.total_dirs.saturating_sub(1),
-                symlinks: tree.stats.total_symlinks,
-            },
+            total: Totals::of(tree),
             entries: Vec::new(),
             omitted: None,
         };
@@ -204,24 +273,20 @@ impl<'a> Entry<'a> {
 
 const SIZE_WIDTH: usize = 9;
 
+/// The root and its size, then its counts and when it was scanned.
 /// `snapshot`: the tree was loaded from a saved snapshot, not scanned now.
-fn write_text(
+fn write_heading(
+    out: &mut impl Write,
     tree: &FileTree,
-    view: &View<'_>,
     snapshot: bool,
-    destination: &mut impl Write,
     context: &Context,
-) -> Result<()> {
+) -> std::io::Result<()> {
     let styles = &context.out;
-    let mut out = ReportWriter {
-        output: destination,
-        cancel: &context.cancel,
-    };
     writeln!(
         out,
         "{}  {}",
         paint(styles.heading, escape_filename(tree.root_path.as_os_str())),
-        paint(styles.size, context.size(view.total.size))
+        paint(styles.size, context.size(tree.root.size))
     )?;
     let when = if snapshot {
         let saved: chrono::DateTime<chrono::Local> = tree.scanned_at.into();
@@ -236,11 +301,137 @@ fn write_text(
             styles.dim,
             format!(
                 "{}, {}, {when}",
-                counted(view.total.files, "file", "files"),
-                counted(view.total.directories, "directory", "directories"),
+                counted(tree.stats.total_files, "file", "files"),
+                counted(
+                    tree.stats.total_dirs.saturating_sub(1),
+                    "directory",
+                    "directories"
+                ),
             )
         )
-    )?;
+    )
+}
+
+/// The share of `total` that `size` is, as a percentage.
+fn share(size: u64, total: u64) -> f64 {
+    if total > 0 {
+        size as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// `grav scan --top N`: the largest files anywhere, as a flat list.
+fn write_top(
+    tree: &FileTree,
+    files: &[gravityfile_analyze::LargeFile<'_>],
+    snapshot: bool,
+    destination: &mut impl Write,
+    context: &Context,
+) -> Result<()> {
+    let styles = &context.out;
+    let mut out = ReportWriter {
+        output: destination,
+        cancel: &context.cancel,
+    };
+    write_heading(&mut out, tree, snapshot, context)?;
+    if !files.is_empty() {
+        writeln!(out)?;
+    }
+    for file in files {
+        writeln!(
+            out,
+            "{}  {}  {}",
+            paint(
+                styles.size,
+                format!("{:>SIZE_WIDTH$}", context.size(file.size))
+            ),
+            paint(
+                styles.dim,
+                format!("{:>5.1}%", share(file.size, tree.root.size))
+            ),
+            escape_filename(file.path.as_os_str()),
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// `grav scan --by-type`: space by file extension.
+fn write_types(
+    tree: &FileTree,
+    types: &[gravityfile_analyze::TypeStats],
+    omitted: Option<Omitted>,
+    snapshot: bool,
+    destination: &mut impl Write,
+    context: &Context,
+) -> Result<()> {
+    let styles = &context.out;
+    let mut out = ReportWriter {
+        output: destination,
+        cancel: &context.cancel,
+    };
+    write_heading(&mut out, tree, snapshot, context)?;
+    if !types.is_empty() {
+        writeln!(out)?;
+    }
+    for kind in types {
+        let name = match &kind.extension {
+            Some(extension) => format!(".{}", crate::terminal::escape(extension)),
+            None => paint(styles.dim, "(no extension)"),
+        };
+        writeln!(
+            out,
+            "{}  {}  {name}  {}",
+            paint(
+                styles.size,
+                format!("{:>SIZE_WIDTH$}", context.size(kind.size))
+            ),
+            paint(
+                styles.dim,
+                format!("{:>5.1}%", share(kind.size, tree.root.size))
+            ),
+            paint(styles.dim, counted(kind.files, "file", "files")),
+        )?;
+    }
+    if let Some(omitted) = omitted {
+        writeln!(
+            out,
+            "{:SIZE_WIDTH$}  {:6}  {}",
+            "",
+            "",
+            paint(
+                styles.dim,
+                format!(
+                    "… {} more {}, {}",
+                    format_count(omitted.entries as u64),
+                    if omitted.entries == 1 {
+                        "type"
+                    } else {
+                        "types"
+                    },
+                    context.size(omitted.size)
+                )
+            )
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn write_text(
+    tree: &FileTree,
+    view: &View<'_>,
+    snapshot: bool,
+    destination: &mut impl Write,
+    context: &Context,
+) -> Result<()> {
+    let styles = &context.out;
+    let mut out = ReportWriter {
+        output: destination,
+        cancel: &context.cancel,
+    };
+    write_heading(&mut out, tree, snapshot, context)?;
     if view.entries.is_empty() && view.omitted.is_none() {
         return Ok(());
     }
