@@ -212,6 +212,31 @@ async fn search_uses_smart_case() {
 }
 
 #[tokio::test]
+async fn search_facets_narrow_by_size_type_and_extension() {
+    let mut harness = Harness::scanned().await;
+    let mut search = async |query: &str| {
+        harness.press("/").await;
+        harness.type_text(query).await;
+        let names: Vec<String> = (harness.app.search_state.results.iter())
+            .map(|result| result.display.clone())
+            .collect();
+        harness.press("<esc>").await;
+        names
+    };
+    // Facets alone list matches largest first; directories are excluded by type.
+    let large = search("size>=8kb type:f").await;
+    assert!(
+        large.len() == 2 && large.iter().all(|name| name.starts_with("copy-")),
+        "{large:?}"
+    );
+    // Facets combine with search text.
+    assert_eq!(search("copy ext:bin size>1mb").await, Vec::<String>::new());
+    assert_eq!(search("ext:rs").await, ["src/modified.rs"]);
+    // A malformed facet is just text, which here matches nothing.
+    assert!(search("size>lots").await.is_empty());
+}
+
+#[tokio::test]
 async fn sort_order_survives_a_rescan() {
     let mut harness = Harness::scanned().await;
     while harness.app.sort_mode != SortMode::NameAscending {

@@ -92,6 +92,11 @@ Completions: `grav completions <bash|zsh|fish|elvish|powershell>`.
 
 `?` lists every binding in effect, including your own.
 
+Search (`/`) is fuzzy by default, with fzf syntax (`^start`, `end$`, `!not`,
+`'exact`). Filters narrow it: `size>100mb`, `size<=1kb`, `age>30d`, `age<1w`,
+`type:f,d,l` and `ext:log,tmp`. A query of filters alone lists the largest
+matches, so `size>1gb type:f` finds the biggest files under the view.
+
 ### Key bindings
 
 `keymap.toml` in the config directory adds bindings and replaces existing

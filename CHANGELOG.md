@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Search filters.** Explorer search takes `size>100mb`, `age>30d`,
+  `type:f`, and `ext:log,tmp` alongside the search text; filters alone list
+  the largest matches. Malformed filters are treated as text.
 - **Configurable keys.** `keymap.toml` in the config directory rebinds or
   unbinds explorer keys using names like `<C-u>` and actions like
   `move_down`; the README lists them. The help overlay and footer hints are

@@ -8,10 +8,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
+
+use super::filter::{Filter, SearchEntry};
 
 const MAX_SEARCH_RESULTS: usize = 1000;
 
@@ -60,7 +63,19 @@ pub struct SearchResult {
     pub matched_indices: Vec<usize>,
 }
 
-type SearchPaths = Vec<(PathBuf, String, bool)>;
+impl SearchResult {
+    /// A result for `entry` with nothing highlighted.
+    fn plain(entry: &SearchEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            display: entry.display.clone(),
+            is_dir: entry.is_dir(),
+            matched_indices: Vec::new(),
+        }
+    }
+}
+
+type SearchPaths = Vec<SearchEntry>;
 type IndexBuilder = Box<dyn FnOnce(&AtomicBool) -> SearchPaths + Send>;
 struct IndexWorker {
     cancelled: Arc<AtomicBool>,
@@ -157,7 +172,7 @@ impl SearchState {
     }
 
     /// Update the available paths from the file tree.
-    pub fn update_paths(&mut self, paths: Vec<(PathBuf, String, bool)>) {
+    pub fn update_paths(&mut self, paths: Vec<SearchEntry>) {
         self.cancel_index();
         self.index_error = None;
         self.all_paths = Arc::new(paths);
@@ -504,28 +519,58 @@ impl SearchState {
             return;
         }
 
-        match self.mode {
-            SearchMode::Fuzzy => self.execute_fuzzy_search(),
-            SearchMode::Glob => self.execute_glob_search(),
-            SearchMode::Regex => self.execute_regex_search(),
+        let (filter, text) = Filter::parse(&self.query);
+        let now = SystemTime::now();
+        if text.is_empty() {
+            if !filter.is_empty() {
+                self.execute_filter_only(&filter, now);
+            }
+            return;
         }
+        match self.mode {
+            SearchMode::Fuzzy => self.execute_fuzzy_search(&text, &filter, now),
+            SearchMode::Glob => self.execute_glob_search(&text, &filter, now),
+            SearchMode::Regex => self.execute_regex_search(&text, &filter, now),
+        }
+    }
+
+    /// A query of facets alone lists what passes them, largest first.
+    fn execute_filter_only(&mut self, filter: &Filter, now: SystemTime) {
+        let mut matching: Vec<usize> = Vec::new();
+        for (index, entry) in self.all_paths.iter().enumerate() {
+            if self.cancelled() {
+                return;
+            }
+            if filter.matches(entry, now) {
+                matching.push(index);
+            }
+        }
+        matching.sort_unstable_by_key(|&index| Reverse(self.all_paths[index].size));
+        matching.truncate(MAX_SEARCH_RESULTS);
+        self.results = matching
+            .into_iter()
+            .map(|index| SearchResult::plain(&self.all_paths[index]))
+            .collect();
     }
 
     /// Score every candidate, retaining only bounded lightweight references.
     /// Materialize paths and highlighting for the winners after ranking.
-    fn execute_fuzzy_search(&mut self) {
+    fn execute_fuzzy_search(&mut self, text: &str, filter: &Filter, now: SystemTime) {
         // Smart case: a lowercase query ignores case, any capital makes it
         // exact. Also fzf syntax: space-separated terms, ^prefix, suffix$,
         // !exclusion and 'exact.
-        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+        let pattern = Pattern::parse(text, CaseMatching::Smart, Normalization::Smart);
         let mut haystack_buf = Vec::new();
         let mut best = BinaryHeap::with_capacity(MAX_SEARCH_RESULTS);
-        for (index, (_, display, _)) in self.all_paths.iter().enumerate() {
+        for (index, entry) in self.all_paths.iter().enumerate() {
             if self.cancelled() {
                 return;
             }
+            if !filter.matches(entry, now) {
+                continue;
+            }
             haystack_buf.clear();
-            let haystack = Utf32Str::new(display, &mut haystack_buf);
+            let haystack = Utf32Str::new(&entry.display, &mut haystack_buf);
             if let Some(score) = pattern.score(haystack, &mut self.matcher) {
                 // Largest heap entry is worst: lowest score, then latest input.
                 let candidate = (Reverse(score), index);
@@ -539,30 +584,28 @@ impl SearchState {
         let mut winners = best.into_vec();
         winners.sort_unstable();
         for (_, index) in winners {
-            let (path, display, is_dir) = &self.all_paths[index];
+            let entry = &self.all_paths[index];
             if self.cancelled() {
                 return;
             }
             haystack_buf.clear();
-            let haystack = Utf32Str::new(display, &mut haystack_buf);
+            let haystack = Utf32Str::new(&entry.display, &mut haystack_buf);
             let mut indices = Vec::new();
             pattern.indices(haystack, &mut self.matcher, &mut indices);
             // Several terms can match the same characters.
             indices.sort_unstable();
             indices.dedup();
             self.results.push(SearchResult {
-                path: path.clone(),
-                display: display.clone(),
-                is_dir: *is_dir,
                 matched_indices: indices.into_iter().map(|index| index as usize).collect(),
+                ..SearchResult::plain(entry)
             });
         }
     }
 
     /// Execute glob pattern search.
-    fn execute_glob_search(&mut self) {
+    fn execute_glob_search(&mut self, text: &str, filter: &Filter, now: SystemTime) {
         // Simple glob implementation (supports * and ?)
-        let pattern = match Self::compile_glob(&self.query.to_lowercase()) {
+        let pattern = match Self::compile_glob(&text.to_lowercase()) {
             Ok(pattern) => pattern,
             Err(error) => {
                 self.error = Some(format!("Invalid glob: {error}"));
@@ -570,18 +613,12 @@ impl SearchState {
             }
         };
 
-        for (path, display, is_dir) in self.all_paths.iter() {
+        for entry in self.all_paths.iter() {
             if self.cancelled() {
                 return;
             }
-            let display_lower = display.to_lowercase();
-            if pattern.is_match(&display_lower) {
-                self.results.push(SearchResult {
-                    path: path.clone(),
-                    display: display.clone(),
-                    is_dir: *is_dir,
-                    matched_indices: Vec::new(),
-                });
+            if filter.matches(entry, now) && pattern.is_match(&entry.display.to_lowercase()) {
+                self.results.push(SearchResult::plain(entry));
                 if self.results.len() == MAX_SEARCH_RESULTS {
                     break;
                 }
@@ -590,8 +627,8 @@ impl SearchState {
     }
 
     /// Execute regex search.
-    fn execute_regex_search(&mut self) {
-        let regex = match regex::Regex::new(&self.query) {
+    fn execute_regex_search(&mut self, text: &str, filter: &Filter, now: SystemTime) {
+        let regex = match regex::Regex::new(text) {
             Ok(regex) => regex,
             Err(error) => {
                 self.error = Some(format!("Invalid regex: {error}"));
@@ -599,10 +636,14 @@ impl SearchState {
             }
         };
 
-        for (path, display, is_dir) in self.all_paths.iter() {
+        for entry in self.all_paths.iter() {
             if self.cancelled() {
                 return;
             }
+            if !filter.matches(entry, now) {
+                continue;
+            }
+            let display = &entry.display;
             if let Some(m) = regex.find(display) {
                 // Convert byte offsets to char indices so highlighting (which
                 // enumerates chars) lines up with multi-byte display names.
@@ -610,10 +651,8 @@ impl SearchState {
                 let end_char = display[..m.end()].chars().count();
                 let matched_indices: Vec<usize> = (start_char..end_char).collect();
                 self.results.push(SearchResult {
-                    path: path.clone(),
-                    display: display.clone(),
-                    is_dir: *is_dir,
                     matched_indices,
+                    ..SearchResult::plain(entry)
                 });
                 if self.results.len() == MAX_SEARCH_RESULTS {
                     break;
@@ -691,7 +730,7 @@ mod tests {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::yield_now();
             }
-            vec![("old".into(), "old".into(), false)]
+            vec![SearchEntry::named("old".into(), "old".into(), false)]
         });
         entry
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -700,12 +739,18 @@ mod tests {
         assert!(state.worker.is_none());
         assert!(state.is_searching());
         state.build_paths(|_| panic!("superseded index must never run"));
-        state.build_paths(|_| vec![("new".into(), "new".into(), false)]);
+        state.build_paths(|_| vec![SearchEntry::named("new".into(), "new".into(), false)]);
         state.set_query("new".into());
         settle(&mut state);
         assert_eq!(state.results.len(), 1);
         assert_eq!(state.results[0].path, PathBuf::from("new"));
-        state.build_paths(|_| vec![("discard".into(), "discard".into(), false)]);
+        state.build_paths(|_| {
+            vec![SearchEntry::named(
+                "discard".into(),
+                "discard".into(),
+                false,
+            )]
+        });
         let token = Arc::clone(&state.index_worker.as_ref().unwrap().cancelled);
         state.deactivate();
         assert!(token.load(Ordering::Relaxed));
@@ -731,7 +776,7 @@ mod tests {
         state.set_query("again".into());
         assert!(state.error.is_some());
         assert!(!state.has_background_work());
-        state.build_paths(|_| vec![("again".into(), "again".into(), false)]);
+        state.build_paths(|_| vec![SearchEntry::named("again".into(), "again".into(), false)]);
         settle(&mut state);
         assert!(state.error.is_none());
         assert_eq!(state.results.len(), 1);
@@ -742,7 +787,7 @@ mod tests {
         let mut state = SearchState::new();
         state.activate();
         state.enable_background();
-        state.update_paths(vec![("old".into(), "old".into(), false)]);
+        state.update_paths(vec![SearchEntry::named("old".into(), "old".into(), false)]);
         state.set_query("old".into());
         let old_token = Arc::clone(&state.worker.as_ref().unwrap().cancelled);
         // A result that finishes before the next edit must also be rejected.
@@ -770,7 +815,7 @@ mod tests {
             ));
             assert!(state.results.is_empty());
         }
-        state.update_paths(vec![("new".into(), "new".into(), false)]);
+        state.update_paths(vec![SearchEntry::named("new".into(), "new".into(), false)]);
         assert!(old_token.load(Ordering::Relaxed));
         assert!(state.is_searching());
         settle(&mut state);
@@ -813,7 +858,11 @@ mod tests {
             let mut worker = SearchState::new();
             worker.mode = mode;
             worker.cancellation = Some(Arc::new(AtomicBool::new(true)));
-            worker.update_paths(vec![("match".into(), "match".into(), false)]);
+            worker.update_paths(vec![SearchEntry::named(
+                "match".into(),
+                "match".into(),
+                false,
+            )]);
             worker.set_query("match".into());
             assert!(worker.results.is_empty());
         }
@@ -830,7 +879,7 @@ mod tests {
             let paths = (0..count)
                 .map(|index| {
                     let display = format!("src/module-{}/report-{index:07}.rs", index % 1024);
-                    (PathBuf::from(&display), display, false)
+                    SearchEntry::named(PathBuf::from(&display), display, false)
                 })
                 .collect();
             let mut state = SearchState::new();
@@ -904,7 +953,13 @@ mod tests {
         expected.sort_by_key(|(score, index, _)| (*score, *index));
         expected.truncate(MAX_SEARCH_RESULTS);
         let mut state = SearchState::new();
-        state.update_paths(paths.clone());
+        state.update_paths(
+            paths
+                .iter()
+                .cloned()
+                .map(|(path, display, is_dir)| SearchEntry::named(path, display, is_dir))
+                .collect(),
+        );
         state.set_query("ab".into());
         assert_eq!(state.results.len(), MAX_SEARCH_RESULTS);
         for (actual, (_, index, indices)) in state.results.iter().zip(expected) {

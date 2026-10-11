@@ -1605,11 +1605,16 @@ impl App {
                 .style(Style::default().fg(self.theme.muted))
                 .render(results_area, buf);
         } else if results.is_empty() {
-            if !query.is_empty() {
-                Paragraph::new("No matches found")
-                    .style(Style::default().fg(self.theme.muted))
-                    .render(results_area, buf);
-            }
+            let text = if query.is_empty() {
+                "Narrow with size>100mb size<=1kb age>30d age<1w type:f,d,l ext:log,tmp; \
+                 filters alone list the largest matches."
+            } else {
+                "No matches found"
+            };
+            Paragraph::new(text)
+                .style(Style::default().fg(self.theme.muted))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .render(results_area, buf);
         } else {
             let max_visible = results_area.height as usize;
             let offset = if selected >= max_visible {

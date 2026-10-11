@@ -959,7 +959,7 @@ mod tests {
             assert!(
                 search
                     .iter()
-                    .any(|(path, _, _)| path == &tree.root_path.join(name))
+                    .any(|entry| entry.path == tree.root_path.join(name))
             );
         }
         app.layout_mode = LayoutMode::Miller;
@@ -1619,11 +1619,11 @@ mod tests {
             assert_eq!(
                 paths
                     .iter()
-                    .map(|(_, display, _)| PathBuf::from(display))
+                    .map(|entry| PathBuf::from(&entry.display))
                     .collect::<Vec<_>>(),
                 expected
             );
-            for (path, display, _) in paths {
+            for crate::search::SearchEntry { path, display, .. } in paths {
                 assert!(path.starts_with(&scope));
                 assert_eq!(
                     path,

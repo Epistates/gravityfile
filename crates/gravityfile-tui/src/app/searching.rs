@@ -2,8 +2,11 @@
 
 use std::path::PathBuf;
 
+use gravityfile_core::{FileNode, NodeKind};
+
 use super::App;
 use super::state::AppMode;
+use crate::search::{EntryKind, SearchEntry};
 
 impl App {
     /// Start fuzzy search mode.
@@ -25,11 +28,27 @@ impl App {
         });
     }
 
+    /// The index entry for `node`, found at `path`.
+    fn search_entry(node: &FileNode, path: PathBuf, display: String) -> SearchEntry {
+        SearchEntry {
+            path,
+            display,
+            kind: match node.kind {
+                NodeKind::File { .. } => EntryKind::File,
+                NodeKind::Directory { .. } => EntryKind::Directory,
+                NodeKind::Symlink { .. } => EntryKind::Symlink,
+                NodeKind::Other => EntryKind::Other,
+            },
+            size: node.size,
+            modified: node.timestamps.modified,
+        }
+    }
+
     pub(super) fn collect_search_paths(
         tree: &gravityfile_core::FileTree,
         view_root: &std::path::Path,
         cancelled: &std::sync::atomic::AtomicBool,
-    ) -> Vec<(PathBuf, String, bool)> {
+    ) -> Vec<SearchEntry> {
         let Some(root) =
             Self::find_node_at_path_while(&tree.root, view_root, &tree.root_path, || {
                 !cancelled.load(std::sync::atomic::Ordering::Relaxed)
@@ -39,7 +58,7 @@ impl App {
         };
         let mut paths = Vec::new();
         let mut current_path = view_root.to_path_buf();
-        paths.push((current_path.clone(), ".".into(), root.is_dir()));
+        paths.push(Self::search_entry(root, current_path.clone(), ".".into()));
         // One iterator per depth avoids recursive calls and a width-sized stack
         // of allocated paths for directories with millions of children.
         let mut stack = vec![root.children.iter()];
@@ -56,7 +75,7 @@ impl App {
                         .as_os_str(),
                 )
                 .into_owned();
-                paths.push((current_path.clone(), display, child.is_dir()));
+                paths.push(Self::search_entry(child, current_path.clone(), display));
                 stack.push(child.children.iter());
             } else {
                 stack.pop();
