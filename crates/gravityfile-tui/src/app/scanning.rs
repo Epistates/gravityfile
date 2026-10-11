@@ -22,6 +22,7 @@ use super::state::ScanResult;
 pub fn start_scan(
     path: PathBuf,
     include_hidden: bool,
+    apparent_size: bool,
     max_entries: Option<u64>,
     token: CancellationToken,
 ) -> mpsc::Receiver<ScanResult> {
@@ -30,6 +31,7 @@ pub fn start_scan(
     tokio::spawn(async move {
         let mut config = ScanConfig::new(&path);
         config.include_hidden = include_hidden;
+        config.apparent_size = apparent_size;
         config.max_entries = max_entries;
         config.git_status = true;
         let scanner = JwalkScanner::new();

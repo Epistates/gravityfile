@@ -437,6 +437,31 @@ fn size_on_screen(harness: &Harness, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn b_switches_between_disk_usage_and_apparent_sizes_without_rescanning() {
+    let mut harness = Harness::scanned().await;
+    std::fs::write(harness.path("small.txt"), b"0123456789").unwrap();
+    harness.press("R").await;
+    harness.select("small.txt").await;
+    let on_disk = size_on_screen(&harness, "small.txt");
+    assert_ne!(on_disk, "10 B", "a 10-byte file occupies a whole block");
+
+    harness.press("b").await;
+    assert_eq!(size_on_screen(&harness, "small.txt"), "10 B");
+    assert!(
+        harness.screen().contains(" apparent in "),
+        "{}",
+        harness.screen()
+    );
+    assert_eq!(harness.selected(), Some(harness.path("small.txt")));
+    // A rescan keeps the chosen measure.
+    harness.press("R").await;
+    assert_eq!(size_on_screen(&harness, "small.txt"), "10 B");
+
+    harness.press("b").await;
+    assert_eq!(size_on_screen(&harness, "small.txt"), on_disk);
+}
+
+#[tokio::test]
 async fn pasting_into_a_subdirectory_updates_sizes_in_place() {
     let mut harness = Harness::scanned().await;
     let root = harness.root().to_path_buf();

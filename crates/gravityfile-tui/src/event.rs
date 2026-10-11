@@ -59,6 +59,8 @@ pub enum KeyAction {
     ToggleTheme,
     /// Toggle between tree and miller layout.
     ToggleLayout,
+    /// Switch between disk usage and apparent sizes.
+    ToggleSizeMode,
     /// Cycle preview mode (auto/text/hex/metadata).
     CyclePreviewMode,
     /// Scroll the file preview down.

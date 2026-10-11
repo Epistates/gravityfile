@@ -211,6 +211,7 @@ impl App {
         self.scan_rx = Some(scanning::start_scan(
             self.path.clone(),
             self.user_settings.show_hidden,
+            self.apparent_size,
             self.user_settings.max_scan_entries,
             self.scan_token.clone(),
         ));

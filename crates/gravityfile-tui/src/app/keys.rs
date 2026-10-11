@@ -441,6 +441,7 @@ impl App {
             KeyAction::ToggleLayout => {
                 self.toggle_layout();
             }
+            KeyAction::ToggleSizeMode => self.toggle_size_mode(),
             KeyAction::PreviewDown => self.scroll_preview(constants::PREVIEW_SCROLL_STEP),
             KeyAction::PreviewUp => self.scroll_preview(-constants::PREVIEW_SCROLL_STEP),
             KeyAction::CyclePreviewMode => {

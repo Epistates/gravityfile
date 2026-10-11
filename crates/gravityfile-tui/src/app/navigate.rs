@@ -368,7 +368,7 @@ impl App {
         &mut self,
         path: &Path,
     ) -> Option<gravityfile_core::FileTree> {
-        match quick_list_with_settings(path, &self.user_settings) {
+        match quick_list_with_settings(path, &self.user_settings, self.apparent_size) {
             Ok(tree) => Some(tree),
             Err(error) => {
                 self.error = Some(format!("Cannot list {}: {error}", path.display()));
@@ -431,9 +431,11 @@ impl App {
             if let Some(parent_path) = self.nav.view_root.parent() {
                 let parent_path_buf = parent_path.to_path_buf();
                 // Load the parent directory
-                if let Ok(mut parent_tree) =
-                    quick_list_with_settings(&parent_path_buf, &self.user_settings)
-                {
+                if let Ok(mut parent_tree) = quick_list_with_settings(
+                    &parent_path_buf,
+                    &self.user_settings,
+                    self.apparent_size,
+                ) {
                     // Merge any cached scans into the parent tree's children
                     // This ensures previously scanned directories show their data
                     self.merge_cached_scans_into_tree(&mut parent_tree.root, &parent_path_buf);

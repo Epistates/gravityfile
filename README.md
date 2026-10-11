@@ -45,7 +45,9 @@ grav age ~/work --stale 6mo
 ```
 
 Sizes use decimal units (`1 kB = 1000 B`, like Finder); add `--binary` for
-`KiB`, `MiB`. Every command accepts the same scan options:
+`KiB`, `MiB`. The explorer shows disk usage; `-A` or the `b` key switches to
+file lengths without rescanning. Every report command accepts the same scan
+options:
 
 | Option | Effect |
 |---|---|
@@ -119,9 +121,9 @@ Actions:
 - Selection: `toggle_mark`, `visual`, `clear_marks`
 - Files: `yank`, `cut`, `paste`, `delete`, `rename`, `create_file`,
   `create_directory`, `take`, `undo`
-- View: `next_view`, `prev_view`, `toggle_layout`, `toggle_details`,
-  `cycle_preview`, `preview_down`, `preview_up`, `sort`, `reverse_sort`,
-  `refresh`, `toggle_theme`
+- View: `next_view`, `prev_view`, `toggle_layout`, `toggle_size_mode`,
+  `toggle_details`, `cycle_preview`, `preview_down`, `preview_up`, `sort`,
+  `reverse_sort`, `refresh`, `toggle_theme`
 - Tabs: `new_tab`, `close_tab`, `next_tab`, `prev_tab`, `tab_1` to `tab_9`
 - Bookmarks: `set_bookmark`, `jump_to_bookmark`, `bookmarks`
 - General: `command`, `settings`, `help`, `cancel`, `quit`, `force_quit`

@@ -182,8 +182,13 @@ impl App {
             } else {
                 ""
             };
+            let measure = if tree.config.apparent_size {
+                " apparent"
+            } else {
+                ""
+            };
             format!(
-                " {} in {} files, {} dirs{} ",
+                " {}{measure} in {} files, {} dirs{} ",
                 format_size(tree.stats.total_size),
                 tree.stats.total_files,
                 tree.stats.total_dirs,

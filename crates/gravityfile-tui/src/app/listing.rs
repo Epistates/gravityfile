@@ -156,6 +156,41 @@ impl App {
         }
     }
 
+    /// Switch every size between disk usage and file lengths. The tree keeps
+    /// both measures, so this re-totals it in place without rescanning, and
+    /// later scans and listings use the same measure.
+    pub(super) fn toggle_size_mode(&mut self) {
+        self.apparent_size = !self.apparent_size;
+        let apparent = self.apparent_size;
+        let remeasure = |tree: &mut gravityfile_core::FileTree| {
+            let count_hard_links = tree.config.count_hard_links;
+            tree.remeasure(apparent, count_hard_links);
+        };
+        let selected = self.get_selected_path();
+        if let Some(tree) = &mut self.tree {
+            remeasure(Arc::make_mut(tree));
+        }
+        for tree in self
+            .scanned_cache
+            .iter_mut()
+            .flat_map(|cache| cache.values_mut())
+        {
+            remeasure(Arc::make_mut(tree));
+        }
+        if let Some(parent) = &mut self.cached_parent_tree {
+            remeasure(parent);
+        }
+        self.apply_sort();
+        self.select_entry(selected.as_deref());
+        self.view_changed();
+        let measure = if apparent {
+            "apparent sizes"
+        } else {
+            "disk usage"
+        };
+        self.operation_message = Some((true, format!("Showing {measure}")));
+    }
+
     /// Apply the current sort mode to the file tree.
     pub(super) fn apply_sort(&mut self) {
         if let Some(ref mut tree) = self.tree {

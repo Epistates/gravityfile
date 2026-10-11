@@ -73,8 +73,10 @@ struct PreviewRequest {
 fn quick_list_with_settings(
     path: &Path,
     settings: &UserSettings,
+    apparent_size: bool,
 ) -> Result<FileTree, gravityfile_scan::ScanError> {
     let mut config = gravityfile_scan::ScanConfig::new(path);
+    config.apparent_size = apparent_size;
     config.include_hidden = settings.show_hidden;
     config.max_entries = settings.max_scan_entries;
     gravityfile_scan::quick_list(path, Some(&config))
@@ -95,6 +97,8 @@ enum Background {
 pub struct App {
     /// Key bindings: defaults with the user's `keymap.toml` applied.
     keymap: crate::keymap::Keymap,
+    /// Sizes are file lengths rather than disk usage.
+    apparent_size: bool,
     /// Path being analyzed (scan root).
     path: PathBuf,
     /// The active tab's directory, selection and history. Inactive tabs'
@@ -289,13 +293,14 @@ impl App {
         };
 
         // Load quick tree immediately for instant display.
-        let (quick_tree, listing_error) = match quick_list_with_settings(&path, &user_settings) {
-            Ok(tree) => (Some(tree), None),
-            Err(error) => (
-                None,
-                Some(format!("Cannot list {}: {error}", path.display())),
-            ),
-        };
+        let (quick_tree, listing_error) =
+            match quick_list_with_settings(&path, &user_settings, config.apparent_size) {
+                Ok(tree) => (Some(tree), None),
+                Err(error) => (
+                    None,
+                    Some(format!("Cannot list {}: {error}", path.display())),
+                ),
+            };
 
         // The quick listing resolves relative paths and directory aliases. Use
         // that same identity for every navigation owner; retaining the supplied
@@ -329,6 +334,7 @@ impl App {
 
         let mut app = Self {
             keymap,
+            apparent_size: config.apparent_size,
             path: path.clone(),
             nav: state::Navigation::new(path.clone()),
             mode: AppMode::default(),
@@ -993,7 +999,11 @@ mod tests {
         );
         assert_eq!(app.tree.as_ref().unwrap().config.max_entries, Some(1));
         assert!(matches!(
-            quick_list_with_settings(&fixture.path().join("nested"), &app.user_settings),
+            quick_list_with_settings(
+                &fixture.path().join("nested"),
+                &app.user_settings,
+                app.apparent_size,
+            ),
             Err(gravityfile_scan::ScanError::EntryLimitExceeded { limit: 1 })
         ));
         for _ in 0..2 {

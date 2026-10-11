@@ -76,13 +76,22 @@ fn run(cli: Cli, out: Styles, err: Styles) -> Result<ExitCode> {
     let Cli {
         path,
         scan,
+        apparent_size,
         cwd_file,
         print_cwd,
         global,
         command,
     } = cli;
     let Some(command) = command else {
-        return explore(path, scan, cwd_file, print_cwd, &global, &err);
+        return explore(
+            path,
+            scan,
+            apparent_size,
+            cwd_file,
+            print_cwd,
+            &global,
+            &err,
+        );
     };
     let mut stdout = std::io::stdout().lock();
     match command {
@@ -155,6 +164,7 @@ fn report(command: &Command, global: &GlobalArgs, out: Styles, err: Styles) -> R
 fn explore(
     path: Option<PathBuf>,
     scan: bool,
+    apparent_size: bool,
     cwd_file: Option<PathBuf>,
     print_cwd: bool,
     global: &GlobalArgs,
@@ -185,7 +195,8 @@ fn explore(
         .with_plugin_worker_executable(std::env::current_exe()?)
         .with_cwd_file(cwd_file)
         .with_print_cwd(print_cwd)
-        .with_units(global.units());
+        .with_units(global.units())
+        .with_apparent_size(apparent_size);
     // Without --scan, the saved setting decides.
     if scan {
         config = config.with_scan_on_startup(true);

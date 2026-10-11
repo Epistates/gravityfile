@@ -76,6 +76,8 @@ pub struct TuiConfig {
     pub delete_mode: gravityfile_ops::DeleteMode,
     /// How sizes are displayed.
     pub units: gravityfile_core::units::Units,
+    /// Show file lengths instead of disk usage.
+    pub apparent_size: bool,
 }
 
 impl TuiConfig {
@@ -87,6 +89,12 @@ impl TuiConfig {
     /// Create a new config with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Show file lengths instead of disk usage.
+    pub fn with_apparent_size(mut self, apparent: bool) -> Self {
+        self.apparent_size = apparent;
+        self
     }
 
     /// Enable auto-scan on startup.

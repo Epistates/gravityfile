@@ -30,6 +30,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub scan: bool,
 
+    /// Show file lengths instead of disk usage (toggle with `b`)
+    #[arg(short = 'A', long)]
+    pub apparent_size: bool,
+
     /// Write the explorer's directory at exit to FILE (see `grav init`)
     #[arg(long, value_name = "FILE")]
     pub cwd_file: Option<PathBuf>,

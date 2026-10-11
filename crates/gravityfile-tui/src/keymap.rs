@@ -327,6 +327,12 @@ pub const ACTIONS: &[(&str, KeyAction, Section, &str)] = &[
         "Tree or Miller columns",
     ),
     (
+        "toggle_size_mode",
+        KeyAction::ToggleSizeMode,
+        Section::View,
+        "Disk usage or apparent sizes",
+    ),
+    (
         "toggle_details",
         KeyAction::ToggleDetails,
         Section::View,
@@ -524,6 +530,7 @@ pub const DEFAULT_KEYMAP: &[(&str, KeyAction)] = &[
     ("<Tab>", KeyAction::NextView),
     ("<S-Tab>", KeyAction::PrevView),
     ("v", KeyAction::ToggleLayout),
+    ("b", KeyAction::ToggleSizeMode),
     ("i", KeyAction::ToggleDetails),
     ("P", KeyAction::CyclePreviewMode),
     ("J", KeyAction::PreviewDown),
