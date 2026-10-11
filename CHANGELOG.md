@@ -109,6 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from today. Ages print in the units `--stale` reads them in, so the
   default reads "untouched for over 1 year" rather than "11 months", and
   counts of one are singular.
+- An ncdu dump with a time too large to represent is read, with that time
+  unknown, instead of crashing.
 - Unreadable directories are reported as warnings instead of silently
   producing a smaller total.
 - Delete and marking can no longer target the scan root or the directory being

@@ -37,6 +37,11 @@ msrv:
 snapshots:
     cargo insta test --test snapshots --review
 
+# Fuzz TARGET (snapshot or units) for SECONDS; needs nightly and cargo-fuzz
+fuzz TARGET="snapshot" SECONDS="60":
+    mkdir -p fuzz/corpus/{{TARGET}} fuzz/seeds/{{TARGET}}
+    cd fuzz && cargo +nightly fuzz run {{TARGET}} corpus/{{TARGET}} seeds/{{TARGET}} -- -max_total_time={{SECONDS}}
+
 supply-chain:
     cargo deny check
     cargo machete
