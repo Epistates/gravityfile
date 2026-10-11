@@ -1290,6 +1290,17 @@ mod tests {
         assert_eq!(app.marked, HashSet::from([paths[1].clone()]));
         app.handle_action(KeyAction::ToggleMark);
         assert!(app.marked.is_empty());
+
+        // When only the most wasteful groups were kept, the view says so.
+        let mut truncated = (**app.duplicates.as_ref().unwrap()).clone();
+        truncated.groups_omitted = 5;
+        app.duplicates = Some(Arc::new(truncated));
+        let screen: String = render(&app, Rect::new(0, 0, 140, 30))
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("5 smaller groups not listed"), "{screen}");
     }
 
     #[tokio::test]

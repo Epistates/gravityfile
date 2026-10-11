@@ -156,6 +156,24 @@ async fn a_snapshot_is_browsed_read_only_without_touching_the_filesystem() {
 }
 
 #[tokio::test]
+async fn page_down_moves_by_a_screenful() {
+    let mut harness = Harness::scanned_sized(100, 20).await;
+    for n in 0..60 {
+        std::fs::write(harness.path(&format!("file-{n:02}")), b"x").unwrap();
+    }
+    harness.press("R").await;
+    let page = harness.app.viewport_height - 1;
+    assert!(
+        page > 5,
+        "a 20-row terminal shows more than a handful of rows"
+    );
+    harness.press("<pgdn>").await;
+    assert_eq!(harness.app.nav.tree_state.selected, page);
+    harness.press("<pgdn><pgup>").await;
+    assert_eq!(harness.app.nav.tree_state.selected, page);
+}
+
+#[tokio::test]
 async fn the_whole_help_can_be_scrolled_into_view() {
     let mut harness = Harness::scanned_sized(70, 24).await;
     harness.press("?").await;

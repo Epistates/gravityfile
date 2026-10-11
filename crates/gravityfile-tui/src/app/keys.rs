@@ -815,14 +815,16 @@ impl App {
             }
             // Page navigation
             (KeyCode::Char('u'), KeyModifiers::CONTROL) | (KeyCode::PageUp, _) => {
+                let page = self.page_size();
                 if let Some(state) = &mut self.visual_state {
-                    state.page_up(constants::PAGE_SIZE);
+                    state.page_up(page);
                     self.sync_visual_cursor_to_view();
                 }
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::PageDown, _) => {
+                let page = self.page_size();
                 if let Some(state) = &mut self.visual_state {
-                    state.page_down(constants::PAGE_SIZE, max_count);
+                    state.page_down(page, max_count);
                     self.sync_visual_cursor_to_view();
                 }
             }

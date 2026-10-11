@@ -154,6 +154,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opening a directory before the scan reached it, and the Miller parent
   column at the scan root, no longer freeze the explorer while the
   directory is read; it shows "(loading…)" until the entries arrive.
+- The explorer's duplicates view keeps the 10,000 groups wasting most space,
+  up from 100, and says when smaller groups were left out.
+- Page Up and Page Down move by a screenful rather than ten rows.
 - The file preview scrolls: `J`/`K`, or the mouse wheel over the preview.
   It used to show only the first screenful of a file, listing or archive.
 - An invalid name in the rename or create prompt keeps the prompt open with

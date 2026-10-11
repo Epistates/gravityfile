@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::constants::PAGE_SIZE;
 use super::state::{LayoutMode, View};
 use super::{App, SelectedInfo};
 use crate::ui::TreeView;
@@ -188,31 +187,35 @@ impl App {
         }
     }
 
+    /// Rows a page moves: a screenful, keeping one row of overlap.
+    pub(super) fn page_size(&self) -> usize {
+        self.viewport_height.saturating_sub(1).max(1)
+    }
+
     pub(super) fn page_up(&mut self) {
+        let page = self.page_size();
         match self.view {
             View::Explorer => match self.layout_mode {
-                LayoutMode::Tree => self.nav.tree_state.move_up(PAGE_SIZE),
+                LayoutMode::Tree => self.nav.tree_state.move_up(page),
                 LayoutMode::Miller => {
-                    self.nav.miller_state.move_up(PAGE_SIZE);
+                    self.nav.miller_state.move_up(page);
                     self.update_preview();
                 }
             },
             View::Duplicates => {
                 // Page up - move multiple groups up
-                self.duplicates_state.selected_group = self
-                    .duplicates_state
-                    .selected_group
-                    .saturating_sub(PAGE_SIZE);
+                self.duplicates_state.selected_group =
+                    self.duplicates_state.selected_group.saturating_sub(page);
             }
             View::Age => {
-                self.selected_stale_dir = self.selected_stale_dir.saturating_sub(PAGE_SIZE);
+                self.selected_stale_dir = self.selected_stale_dir.saturating_sub(page);
             }
             View::Errors => {
-                self.selected_warning = self.selected_warning.saturating_sub(PAGE_SIZE);
+                self.selected_warning = self.selected_warning.saturating_sub(page);
             }
             View::Treemap => {
-                // Page up in treemap - move selection backward by PAGE_SIZE
-                for _ in 0..PAGE_SIZE {
+                // Page up in treemap - move selection backward a page
+                for _ in 0..page {
                     self.nav.treemap_state.move_prev();
                 }
             }
@@ -220,17 +223,16 @@ impl App {
     }
 
     pub(super) fn page_down(&mut self) {
+        let page = self.page_size();
         match self.view {
             View::Explorer => match self.layout_mode {
                 LayoutMode::Tree => {
-                    self.nav
-                        .tree_state
-                        .move_down(PAGE_SIZE, self.cached_tree_len);
+                    self.nav.tree_state.move_down(page, self.cached_tree_len);
                 }
                 LayoutMode::Miller => {
                     self.nav
                         .miller_state
-                        .move_down(PAGE_SIZE, self.cached_miller_len);
+                        .move_down(page, self.cached_miller_len);
                     self.update_preview();
                 }
             },
@@ -239,22 +241,22 @@ impl App {
                 if let Some((filtered, _)) = self.get_filtered_duplicates() {
                     let max = filtered.len().saturating_sub(1);
                     self.duplicates_state.selected_group =
-                        (self.duplicates_state.selected_group + PAGE_SIZE).min(max);
+                        (self.duplicates_state.selected_group + page).min(max);
                 }
             }
             View::Age => {
                 if let Some(filtered) = self.get_filtered_stale_dirs() {
                     let max = filtered.len().saturating_sub(1);
-                    self.selected_stale_dir = (self.selected_stale_dir + PAGE_SIZE).min(max);
+                    self.selected_stale_dir = (self.selected_stale_dir + page).min(max);
                 }
             }
             View::Errors => {
                 let max = self.warning_count().saturating_sub(1);
-                self.selected_warning = (self.selected_warning + PAGE_SIZE).min(max);
+                self.selected_warning = (self.selected_warning + page).min(max);
             }
             View::Treemap => {
-                // Page down in treemap - move selection forward by PAGE_SIZE
-                for _ in 0..PAGE_SIZE {
+                // Page down in treemap - move selection forward a page
+                for _ in 0..page {
                     self.nav.treemap_state.move_next(self.cached_treemap_len);
                 }
             }

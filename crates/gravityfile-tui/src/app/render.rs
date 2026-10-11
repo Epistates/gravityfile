@@ -758,6 +758,16 @@ impl App {
                     format_size(total_wasted)
                 )
             };
+            // Only the groups wasting most space are kept; say when some are not.
+            let omitted = self
+                .duplicates
+                .as_ref()
+                .map_or(0, |report| report.groups_omitted);
+            let header = if omitted > 0 {
+                format!("{header} | {omitted} smaller groups not listed")
+            } else {
+                header
+            };
             let header_line = Line::styled(header, self.theme.title);
             let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
             Paragraph::new(header_line).render(header_area, buf);
