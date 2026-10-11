@@ -1,0 +1,81 @@
+---
+source: tests/snapshots.rs
+description: grav export --help
+expression: run(args)
+---
+exit: 0
+--- stdout
+Write a complete scan as a JSON snapshot
+
+Usage: grav export [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]
+          Directory to scan, or a snapshot saved by `grav export` or `ncdu -o`
+          
+          [default: .]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Scanning:
+  -A, --apparent-size
+          Count file lengths instead of disk usage
+
+  -l, --count-links
+          Count every hard link to a file, not only the first
+
+  -L, --follow-symlinks
+          Follow symbolic links
+
+      --cross-fs
+          Descend into other filesystems [default: stay on the scanned one]
+
+      --no-hidden
+          Skip entries whose names start with "."
+
+  -e, --exclude <GLOB>
+          Skip entries matching GLOB, by name or by path from the root (repeatable)
+
+  -j, --threads <N>
+          Scanning threads [default: one per CPU]
+
+      --git
+          Annotate entries with Git status
+
+      --max-entries <N>
+          Fail if the scan reaches more than N entries
+
+Output:
+  -f, --format <FORMAT>
+          Snapshot format
+
+          Possible values:
+          - json: The complete tree in versioned JSON, readable by every grav command
+          - ncdu: An ncdu dump, readable by `ncdu -f` and `gdu -f`
+          
+          [default: json]
+
+  -o, --output <FILE>
+          Write to FILE instead of standard output, replacing it atomically; compressed with zstd if
+          FILE ends in .zst
+
+      --strict
+          Exit with status 3 if anything could not be read
+
+Global options:
+      --color <WHEN>
+          When to use colour
+          
+          [default: auto]
+          [possible values: auto, always, never]
+
+      --binary
+          Show sizes in powers of 1024 (KiB, MiB) instead of 1000 (kB, MB)
+
+      --log-file <FILE>
+          Append diagnostic logs to FILE (filter with RUST_LOG)
+          
+          [env: GRAVITYFILE_LOG_FILE]
+--- stderr

@@ -1,0 +1,14 @@
+[1,2,{"progname":"ncdu","progver":"2.4","timestamp":1710000000},
+[{"name":"/srv/data","asize":4096,"dsize":4096,"mtime":1709000000},
+ [{"name":"photos","asize":4096,"dsize":4096,"mtime":1709000000},
+  {"name":"beach.jpg","asize":4200000,"dsize":4202496,"mtime":1500000000},
+  {"name":"city.jpg","asize":3100000,"dsize":3100672,"mtime":1600000000},
+  {"name":"sunset.jpg","asize":2500000,"dsize":2502656,"mtime":1709000000},
+  {"name":"notes.txt","asize":1200,"dsize":4096,"mtime":1600000000}],
+ [{"name":"code","asize":4096,"dsize":4096,"mtime":1705000000},
+  {"name":"main.rs","asize":30000,"dsize":32768,"mtime":1705000000}],
+ [{"name":"cache","asize":4096,"dsize":4096,"mtime":1709500000},
+  {"name":"blob","asize":5000000,"dsize":5001216,"mtime":1709500000}],
+ {"name":"backup.tar.gz","asize":12000000,"dsize":12001280,"mtime":1400000000},
+ {"name":"README","asize":300,"dsize":4096,"mtime":1690000000}
+]]

@@ -1,0 +1,55 @@
+---
+source: tests/snapshots.rs
+description: grav history --help
+expression: run(args)
+---
+exit: 0
+--- stdout
+Show how a directory's size changed across recorded scans
+
+Usage: grav history [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]
+          Directory whose history to show [default: current directory]
+
+Options:
+      --all
+          List every directory with recorded scans instead
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Output:
+  -n, --limit <N>
+          Most recent scans to show (0 shows all)
+          
+          [default: 20]
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text
+          - json: Versioned JSON (see `schema_version`)
+          
+          [default: text]
+
+      --strict
+          Exit with status 3 if anything could not be read or analyzed
+
+Global options:
+      --color <WHEN>
+          When to use colour
+          
+          [default: auto]
+          [possible values: auto, always, never]
+
+      --binary
+          Show sizes in powers of 1024 (KiB, MiB) instead of 1000 (kB, MB)
+
+      --log-file <FILE>
+          Append diagnostic logs to FILE (filter with RUST_LOG)
+          
+          [env: GRAVITYFILE_LOG_FILE]
+--- stderr

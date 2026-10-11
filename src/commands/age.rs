@@ -94,13 +94,17 @@ pub(crate) fn write_text(
         } else {
             0
         };
+        let bar = if filled > 0 {
+            format!("  {}", paint(styles.directory, "█".repeat(filled)))
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "{:<label_width$}  {:>9}  {:>12}  {}",
+            "{:<label_width$}  {:>9}  {:>12}{bar}",
             crate::terminal::escape(&bucket.name),
             context.size(bucket.total_size),
             counted(bucket.file_count, "file", "files"),
-            paint(styles.directory, "█".repeat(filled))
         )?;
     }
     if report.stale_directory_status != StaleDirectoryStatus::Evaluated {

@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+description: grav scan /nonexistent/gravityfile
+expression: run(args)
+---
+exit: 1
+--- stdout
+--- stderr
+error: cannot open /nonexistent/gravityfile: No such file or directory (os error 2)

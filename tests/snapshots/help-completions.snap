@@ -1,0 +1,23 @@
+---
+source: tests/snapshots.rs
+description: grav completions --help
+expression: run(args)
+---
+exit: 0
+--- stdout
+Print shell completions
+
+Usage: grav completions [OPTIONS] <SHELL>
+
+Arguments:
+  <SHELL>  [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -h, --help  Print help
+
+Global options:
+      --color <WHEN>     When to use colour [default: auto] [possible values: auto, always, never]
+      --binary           Show sizes in powers of 1024 (KiB, MiB) instead of 1000 (kB, MB)
+      --log-file <FILE>  Append diagnostic logs to FILE (filter with RUST_LOG) [env:
+                         GRAVITYFILE_LOG_FILE]
+--- stderr

@@ -1,0 +1,17 @@
+---
+source: tests/snapshots.rs
+description: grav scan --by-type before.json
+expression: run(args)
+---
+exit: 0
+--- stdout
+/srv/data  20.3 MB
+7 files, 2 directories, from a snapshot taken [TIME]
+
+  12.0 MB   59.3%  .gz  1 file
+  7.30 MB   36.1%  .jpg  2 files
+   901 kB    4.4%  .log  1 file
+  28.7 kB    0.1%  .rs  1 file
+  4.10 kB    0.0%  (no extension)  1 file
+  4.10 kB    0.0%  .txt  1 file
+--- stderr

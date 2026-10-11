@@ -50,6 +50,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Args)]
+#[command(next_help_heading = "Global options")]
 pub struct GlobalArgs {
     /// When to use colour
     #[arg(long, global = true, value_enum, default_value_t = ColorWhen::Auto, value_name = "WHEN")]
@@ -132,7 +133,8 @@ pub enum InitShell {
 #[command(next_help_heading = "Scanning")]
 pub struct ScanArgs {
     /// Directory to scan, or a snapshot saved by `grav export` or `ncdu -o`
-    #[arg(default_value = ".")]
+    // Listed with the other arguments, not under "Scanning".
+    #[arg(default_value = ".", help_heading = None::<&str>)]
     pub path: PathBuf,
 
     /// Count file lengths instead of disk usage
@@ -357,11 +359,11 @@ pub struct DiffCommand {
     pub new: Option<PathBuf>,
 
     /// Count file lengths instead of disk usage
-    #[arg(short = 'A', long)]
+    #[arg(short = 'A', long, help_heading = "Scanning")]
     pub apparent_size: bool,
 
     /// Count every hard link to a file, not only the first
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, help_heading = "Scanning")]
     pub count_links: bool,
 
     /// Levels of directories to show below the root

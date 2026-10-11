@@ -33,6 +33,10 @@ doc:
 msrv:
     cargo +{{msrv}} check --workspace --all-targets --all-features --locked
 
+# Review CLI output snapshots after an intended change
+snapshots:
+    cargo insta test --test snapshots --review
+
 supply-chain:
     cargo deny check
     cargo machete

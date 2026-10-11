@@ -1,0 +1,17 @@
+---
+source: tests/snapshots.rs
+description: grav diff after.json before.json
+expression: run(args)
+---
+exit: 0
+--- stdout
+/srv/data  26.9 MB → 20.3 MB  -6.61 MB
+from a snapshot taken [TIME] (8 files) to a snapshot taken [TIME] (7 files)
+
+   -5.01 MB  cache/  removed
+   -2.50 MB  photos/  9.81 MB → 7.31 MB
+   -2.50 MB    sunset.jpg  removed
+    +897 kB  code/  36.9 kB → 934 kB
+    +901 kB    build.log  new
+   -4.10 kB    main.rs  32.8 kB → 28.7 kB
+--- stderr
