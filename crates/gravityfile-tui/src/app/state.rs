@@ -875,10 +875,17 @@ pub struct UserSettings {
     /// the query timeout, so this can be turned off.
     #[serde(default = "default_true")]
     pub image_previews: bool,
+    /// Colour theme: gestalt, latte, nord, dracula or ansi.
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_theme() -> String {
+    crate::theme::Palette::GESTALT.name.to_string()
 }
 
 impl Default for UserSettings {
@@ -892,6 +899,7 @@ impl Default for UserSettings {
             editor: opensesame::EditorConfig::default(),
             bookmarks: Bookmarks::with_defaults(),
             image_previews: true,
+            theme: default_theme(),
         }
     }
 }
@@ -1040,7 +1048,7 @@ impl SettingsState {
 
     /// Number of settings items.
     pub fn item_count(&self) -> usize {
-        3 // scan_on_startup, show_hidden, default_layout
+        4 // scan_on_startup, show_hidden, default_layout, theme
     }
 
     /// Move selection up.
@@ -1071,6 +1079,15 @@ impl SettingsState {
             2 => {
                 // Cycle layout mode
                 self.settings.default_layout = self.settings.default_layout.toggle();
+                self.dirty = true;
+            }
+            3 => {
+                let palettes = crate::theme::Palette::ALL;
+                let next = palettes
+                    .iter()
+                    .position(|palette| palette.name == self.settings.theme)
+                    .map_or(0, |index| (index + 1) % palettes.len());
+                self.settings.theme = palettes[next].name.to_string();
                 self.dirty = true;
             }
             _ => {}

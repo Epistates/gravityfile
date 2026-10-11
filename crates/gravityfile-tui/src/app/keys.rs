@@ -436,7 +436,7 @@ impl App {
                 self.mode = AppMode::Help;
             }
             KeyAction::ToggleTheme => {
-                self.theme = self.theme.toggle();
+                self.theme = self.theme.next();
             }
             KeyAction::ToggleLayout => {
                 self.toggle_layout();

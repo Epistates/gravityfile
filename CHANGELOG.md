@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Themes.** `gestalt`, `latte`, `nord`, `dracula` and `ansi`, shared with
+  carwash, replace the fixed dark and light themes. They keep the
+  terminal's background, fall back to `ansi` without 24-bit colour, and can
+  be chosen in `settings.toml`, the settings screen or with `:theme nord`.
 - **Search filters.** Explorer search takes `size>100mb`, `age>30d`,
   `type:f`, and `ext:log,tmp` alongside the search text; filters alone list
   the largest matches. Malformed filters are treated as text.

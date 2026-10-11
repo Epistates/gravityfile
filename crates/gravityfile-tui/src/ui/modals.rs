@@ -804,6 +804,13 @@ impl Widget for SettingsModal<'_> {
             self.state.selected == 2,
         ));
 
+        // Colour theme
+        lines.push(self.render_choice(
+            "Theme",
+            &self.state.settings.theme,
+            self.state.selected == 3,
+        ));
+
         lines.push(Line::raw(""));
         lines.push(Line::raw(""));
 

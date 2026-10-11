@@ -229,9 +229,7 @@ impl App {
                     self.marked.len(),
                     format_size(total_size)
                 ),
-                Style::default()
-                    .fg(self.theme.background)
-                    .bg(self.theme.info),
+                Style::default().fg(self.theme.ink).bg(self.theme.info),
             )
         } else {
             Span::raw("")
@@ -247,9 +245,7 @@ impl App {
             if !mode_str.is_empty() {
                 Span::styled(
                     format!(" {} {} ", self.clipboard.paths.len(), mode_str),
-                    Style::default()
-                        .fg(self.theme.background)
-                        .bg(self.theme.success),
+                    Style::default().fg(self.theme.ink).bg(self.theme.success),
                 )
             } else {
                 Span::raw("")

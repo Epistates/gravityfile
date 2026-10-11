@@ -201,7 +201,10 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
         (":rename <name>", "Rename current item"),
         (":rename-bulk :brn", "Bulk rename marked items"),
         (":clear", "Clear all marks"),
-        (":theme dark|light", "Set theme"),
+        (
+            ":theme [name]",
+            "Next theme, or gestalt, latte, nord, dracula, ansi",
+        ),
         (":layout tree|miller", "Set layout"),
         (":sort <mode>", "Set sort (size/name/date/count)"),
         (":treemap :map", "Show disk-usage treemap"),

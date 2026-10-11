@@ -317,7 +317,7 @@ impl Widget for TreemapView<'_> {
             // Base style - highlight selected with reversed colors or a distinct style
             let style = if is_selected {
                 Style::default()
-                    .fg(self.theme.background)
+                    .fg(self.theme.ink)
                     .bg(color)
                     .add_modifier(Modifier::BOLD)
             } else if is_marked {

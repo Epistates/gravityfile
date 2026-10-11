@@ -137,9 +137,10 @@ pub enum CommandAction {
 /// Theme command variants.
 #[derive(Debug, Clone, Copy)]
 pub enum ThemeCommand {
-    Dark,
-    Light,
-    Toggle,
+    /// The palette with this name.
+    Named(&'static str),
+    /// The next palette.
+    Next,
 }
 
 /// Layout command variants.
@@ -236,20 +237,17 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "details" | "info" | "i" => CommandAction::ToggleDetails,
 
         // Theme commands
-        "theme" | "t" => {
-            if parts.len() > 1 {
-                match parts[1] {
-                    "dark" => CommandAction::SetTheme(ThemeCommand::Dark),
-                    "light" => CommandAction::SetTheme(ThemeCommand::Light),
-                    "toggle" => CommandAction::SetTheme(ThemeCommand::Toggle),
-                    _ => CommandAction::Invalid("Unknown theme; use dark, light, or toggle"),
-                }
-            } else {
-                CommandAction::SetTheme(ThemeCommand::Toggle)
-            }
-        }
-        "dark" => CommandAction::SetTheme(ThemeCommand::Dark),
-        "light" => CommandAction::SetTheme(ThemeCommand::Light),
+        "theme" | "t" => match parts.get(1) {
+            None | Some(&"next" | &"toggle") => CommandAction::SetTheme(ThemeCommand::Next),
+            Some(name) => match crate::theme::Palette::named(name) {
+                Some(palette) => CommandAction::SetTheme(ThemeCommand::Named(palette.name)),
+                None => CommandAction::Invalid(
+                    "Unknown theme; use gestalt, latte, nord, dracula or ansi (or dark, light)",
+                ),
+            },
+        },
+        "dark" => CommandAction::SetTheme(ThemeCommand::Named("gestalt")),
+        "light" => CommandAction::SetTheme(ThemeCommand::Named("latte")),
 
         // Layout commands
         "layout" | "view" => {
@@ -450,9 +448,12 @@ impl App {
                 self.show_details = !self.show_details;
             }
             CommandAction::SetTheme(theme_cmd) => match theme_cmd {
-                ThemeCommand::Dark => self.theme = Theme::dark(),
-                ThemeCommand::Light => self.theme = Theme::light(),
-                ThemeCommand::Toggle => self.theme = self.theme.toggle(),
+                ThemeCommand::Named(name) => {
+                    if let Some(theme) = Theme::named(name) {
+                        self.theme = theme;
+                    }
+                }
+                ThemeCommand::Next => self.theme = self.theme.next(),
             },
             CommandAction::SetLayout(layout_cmd) => match layout_cmd {
                 LayoutCommand::Tree => {

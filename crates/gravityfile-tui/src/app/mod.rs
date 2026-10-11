@@ -328,6 +328,16 @@ impl App {
         }
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
+        let (theme, theme_error) = match Theme::named(&user_settings.theme) {
+            Some(theme) => (theme, None),
+            None => (
+                Theme::named("gestalt").unwrap_or_default(),
+                Some(format!(
+                    "Unknown theme {:?}; use gestalt, latte, nord, dracula or ansi",
+                    user_settings.theme
+                )),
+            ),
+        };
         let (keymap, keymap_problems) = crate::keymap::Keymap::load();
         let keymap_error = (!keymap_problems.is_empty())
             .then(|| format!("Ignored keymap entries: {}", keymap_problems.join("; ")));
@@ -339,7 +349,7 @@ impl App {
             nav: state::Navigation::new(path.clone()),
             mode: AppMode::default(),
             view: View::default(),
-            theme: Theme::dark(),
+            theme,
             image_picker: None,
             preview_area: std::cell::Cell::new(ratatui::layout::Rect::new(0, 0, 40, 20)),
             rendered_offsets: std::cell::Cell::new((0, 0)),
@@ -354,7 +364,7 @@ impl App {
             duplicates_state: DuplicatesViewState::new(),
             selected_stale_dir: 0,
             show_details: true,
-            error: [settings_error, keymap_error, listing_error]
+            error: [settings_error, theme_error, keymap_error, listing_error]
                 .into_iter()
                 .flatten()
                 .reduce(|first, next| format!("{first}; {next}")),
@@ -448,10 +458,7 @@ impl App {
         &self,
         hook: gravityfile_plugin::Hook,
     ) -> Vec<gravityfile_plugin::HookResult> {
-        let theme_name = match self.theme.variant {
-            crate::theme::ThemeVariant::Dark => "dark",
-            crate::theme::ThemeVariant::Light => "light",
-        };
+        let theme_name = self.theme.name;
 
         let mut ctx = gravityfile_plugin::HookContext::new()
             .with_cwd(self.path.clone())
@@ -756,6 +763,9 @@ impl App {
             }
             self.user_settings = state.settings.clone();
             self.scan_on_startup = self.user_settings.scan_on_startup;
+            if let Some(theme) = Theme::named(&self.user_settings.theme) {
+                self.theme = theme;
+            }
         }
         self.settings_state = None;
         self.mode = AppMode::Normal;

@@ -136,6 +136,12 @@ Actions:
 Bulk rename and the text editor use `VISUAL` or `EDITOR`; GUI editors must wait
 for the file to close (for example `code --wait`).
 
+Themes: `gestalt` (the default), `latte` for light terminals, `nord`,
+`dracula`, and `ansi`, which uses the terminal's own 16 colours and is chosen
+automatically where 24-bit colour is unavailable. `t` cycles through them;
+set one with `theme = "nord"` in `settings.toml` or from the settings screen
+(`,`).
+
 Settings and plugins live in `~/.config/gravityfile` (`%AppData%\gravityfile` on
 Windows), or under `$GRAVITYFILE_HOME/config` when that variable is set.
 
