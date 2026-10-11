@@ -117,6 +117,31 @@ pub fn format_count(count: u64) -> String {
 const MINUTE: u64 = 60;
 const HOUR: u64 = 60 * MINUTE;
 const DAY: u64 = 24 * HOUR;
+const MONTH: u64 = 30 * DAY;
+const YEAR: u64 = 365 * DAY;
+
+/// Format an age in its largest whole unit, `45 minutes`, `3 days`,
+/// `11 months`, or in years to one decimal, `1 year`, `2.5 years`. Months
+/// and years have the lengths [`parse_age`] gives them, so a parsed `1y`
+/// formats as `1 year`.
+pub fn format_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    let whole = |count: u64, unit: &str| {
+        let plural = if count == 1 { "" } else { "s" };
+        format!("{count} {unit}{plural}")
+    };
+    match secs {
+        0..MINUTE => whole(secs, "second"),
+        MINUTE..HOUR => whole(secs / MINUTE, "minute"),
+        HOUR..DAY => whole(secs / HOUR, "hour"),
+        DAY..MONTH => whole(secs / DAY, "day"),
+        MONTH..YEAR => whole(secs / MONTH, "month"),
+        _ => match (secs / YEAR, secs % YEAR * 10 / YEAR) {
+            (years, 0) => whole(years, "year"),
+            (years, tenth) => format!("{years}.{tenth} years"),
+        },
+    }
+}
 
 /// Parse `90min`, `12h`, `30d`, `2w`, `6mo`, `1y`. A bare `m` is rejected as
 /// ambiguous between minutes and months.
@@ -132,8 +157,8 @@ pub fn parse_age(input: &str) -> Result<Duration, String> {
         "h" | "hr" | "hrs" | "hour" | "hours" => HOUR,
         "d" | "day" | "days" => DAY,
         "w" | "wk" | "week" | "weeks" => 7 * DAY,
-        "mo" | "month" | "months" => 30 * DAY,
-        "y" | "yr" | "year" | "years" => 365 * DAY,
+        "mo" | "month" | "months" => MONTH,
+        "y" | "yr" | "year" | "years" => YEAR,
         "m" => {
             return Err(format!(
                 "{input:?} is ambiguous: use \"min\" for minutes or \"mo\" for months"
@@ -213,5 +238,26 @@ mod tests {
         for invalid in ["", "30", "soon", "-1d", "1e400y"] {
             assert!(parse_age(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn formats_ages_in_the_units_they_parse_in() {
+        let secs = Duration::from_secs;
+        assert_eq!(format_age(secs(1)), "1 second");
+        assert_eq!(format_age(secs(30)), "30 seconds");
+        assert_eq!(format_age(secs(2 * MINUTE)), "2 minutes");
+        assert_eq!(format_age(secs(DAY)), "1 day");
+        assert_eq!(format_age(secs(29 * DAY)), "29 days");
+        for (input, expected) in [
+            ("1y", "1 year"),
+            ("6mo", "6 months"),
+            ("1mo", "1 month"),
+            ("2.5y", "2.5 years"),
+            ("2w", "14 days"),
+        ] {
+            assert_eq!(format_age(parse_age(input).unwrap()), expected, "{input}");
+        }
+        assert_eq!(format_age(secs(YEAR - 1)), "12 months");
+        assert_eq!(format_age(Duration::MAX), "584942417355 years");
     }
 }

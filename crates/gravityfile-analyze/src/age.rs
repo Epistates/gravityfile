@@ -17,9 +17,6 @@ use tokio_util::sync::CancellationToken;
 use crate::AnalysisStatus;
 use gravityfile_core::{FileNode, FileTree, NodeKind};
 
-/// Seconds per month, using the astronomically accurate 365.25/12 * 86400 value.
-const SECS_PER_MONTH: u64 = 2_629_800;
-
 /// An age bucket for categorizing files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgeBucket {
@@ -632,25 +629,6 @@ impl BucketCollector {
     }
 }
 
-/// Format a duration as a human-readable string.
-pub fn format_age(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{secs} seconds")
-    } else if secs < 3600 {
-        format!("{} minutes", secs / 60)
-    } else if secs < 86400 {
-        format!("{} hours", secs / 3600)
-    } else if secs < SECS_PER_MONTH {
-        format!("{} days", secs / 86400)
-    } else if secs < 31_557_600 {
-        // 365.25 * 86400
-        format!("{} months", secs / SECS_PER_MONTH)
-    } else {
-        format!("{:.1} years", secs as f64 / 31_557_600.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,26 +664,6 @@ mod tests {
                 ));
             }
         }
-    }
-
-    #[test]
-    fn test_format_age() {
-        assert_eq!(format_age(Duration::from_secs(30)), "30 seconds");
-        assert_eq!(format_age(Duration::from_secs(120)), "2 minutes");
-        assert_eq!(format_age(Duration::from_secs(7200)), "2 hours");
-        assert_eq!(format_age(Duration::from_secs(172800)), "2 days");
-    }
-
-    #[test]
-    fn test_format_age_month_boundary() {
-        // 30 days = 2_592_000 secs; with old constant that was exactly 1 month, but with
-        // SECS_PER_MONTH = 2_629_800 it should still be "days" range.
-        let thirty_days = Duration::from_secs(30 * 86400);
-        let result = format_age(thirty_days);
-        assert!(
-            result.ends_with("days"),
-            "30 days should still be in 'days' range, got: {result}"
-        );
     }
 
     #[test]

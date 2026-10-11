@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Widget};
 use strum::IntoEnumIterator;
 use unicode_width::UnicodeWidthStr;
 
-use gravityfile_analyze::format_age;
+use gravityfile_core::units::format_age;
 
 use crate::app::App;
 use crate::event::KeyAction;

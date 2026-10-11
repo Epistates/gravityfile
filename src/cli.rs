@@ -60,7 +60,13 @@ pub struct GlobalArgs {
     pub binary: bool,
 
     /// Append diagnostic logs to FILE (filter with RUST_LOG)
-    #[arg(long, global = true, value_name = "FILE", env = "GRAVITYFILE_LOG_FILE")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        env = "GRAVITYFILE_LOG_FILE",
+        hide_env_values = true
+    )]
     pub log_file: Option<PathBuf>,
 }
 

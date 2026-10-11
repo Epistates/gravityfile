@@ -4,8 +4,9 @@ use std::io::Write;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context as _, eyre};
-use gravityfile_analyze::{AgeAnalyzer, AgeConfig, AgeReport, StaleDirectoryStatus, format_age};
+use gravityfile_analyze::{AgeAnalyzer, AgeConfig, AgeReport, StaleDirectoryStatus};
 use gravityfile_core::escape_filename;
+use gravityfile_core::units::format_age;
 
 use super::{Context, counted};
 use crate::cli::{AgeCommand, Format};
@@ -14,7 +15,9 @@ use crate::style::paint;
 
 pub fn run(command: &AgeCommand, context: &Context) -> Result<Completeness> {
     let tree = super::scan_tree(&command.scan, context)?;
+    // Ages as of the scan, so a snapshot reads as it did when it was taken.
     let config = AgeConfig::builder()
+        .reference_time(tree.scanned_at)
         .stale_threshold(command.stale)
         .max_stale_dirs(if command.limit == 0 {
             usize::MAX

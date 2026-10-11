@@ -118,7 +118,11 @@ pub fn start_analysis(
                 return None;
             }
 
-            let age_config = AgeConfig::default();
+            // Ages as of the scan, so a snapshot reads as it did when taken.
+            let age_config = AgeConfig {
+                reference_time: tree.scanned_at,
+                ..AgeConfig::default()
+            };
             let analyzer =
                 AgeAnalyzer::with_config(age_config).expect("valid default age configuration");
             let age_report = analyzer.analyze(&tree, token.clone());
