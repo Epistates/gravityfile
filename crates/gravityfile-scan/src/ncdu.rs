@@ -478,7 +478,7 @@ impl<R: BufRead> Parser<R> {
             let key = self.string(256)?;
             self.expect(b':')?;
             if key == b"timestamp" {
-                timestamp = Some(UNIX_EPOCH + Duration::from_secs(self.whole_number()?));
+                timestamp = since_epoch(self.whole_number()?);
             } else {
                 self.skip_value()?;
             }
@@ -539,8 +539,8 @@ impl<R: BufRead> Parser<R> {
             .name
             .as_deref()
             .ok_or_else(|| self.error("entry without a name".into()))?;
-        let timestamps =
-            Timestamps::with_modified(UNIX_EPOCH + Duration::from_secs(info.mtime.unwrap_or(0)));
+        let modified = info.mtime.and_then(since_epoch).unwrap_or(UNIX_EPOCH);
+        let timestamps = Timestamps::with_modified(modified);
         let mut node = if directory {
             FileNode::new_directory("", timestamps)
         } else {
@@ -660,6 +660,12 @@ fn read_error(path: &Path) -> ScanWarning {
         WarningKind::ReadError,
         "could not be read when the dump was made",
     )
+}
+
+/// The time `secs` after the epoch, or `None` past what the platform can
+/// represent: a corrupt timestamp is unknown, not a crash.
+fn since_epoch(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
 #[cfg(unix)]
@@ -837,5 +843,16 @@ mod tests {
             read(SAMPLE.as_bytes(), &limited),
             Err(SnapshotError::EntryLimitExceeded { limit: 2 })
         ));
+    }
+
+    /// Found by fuzzing: a time past what `SystemTime` holds panicked.
+    #[test]
+    fn times_out_of_range_are_unknown() {
+        let max = u64::MAX;
+        let dump = format!(
+            r#"[1,2,{{"timestamp":{max}}},[{{"name":"/r"}},{{"name":"x","mtime":{max}}}]]"#
+        );
+        let tree = import(&dump, true);
+        assert_eq!(tree.root.children[0].timestamps.modified, UNIX_EPOCH);
     }
 }
