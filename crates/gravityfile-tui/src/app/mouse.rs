@@ -11,6 +11,22 @@ impl App {
         // In a real implementation, we would track the rendered areas from the last frame
         // For now, we implement basic scroll wheel and click functionality
 
+        // The wheel over the Miller preview scrolls the preview.
+        if let MouseAction::ScrollUp { x, .. } | MouseAction::ScrollDown { x, .. } = action
+            && self.view == View::Explorer
+            && self.layout_mode == LayoutMode::Miller
+            && x >= self.preview_area.get().x
+        {
+            let step = super::constants::PREVIEW_SCROLL_STEP;
+            let delta = if matches!(action, MouseAction::ScrollUp { .. }) {
+                -step
+            } else {
+                step
+            };
+            self.scroll_preview(delta);
+            return;
+        }
+
         match action {
             MouseAction::ScrollUp { .. } => {
                 // Scroll up - move selection up

@@ -61,6 +61,10 @@ pub enum KeyAction {
     ToggleLayout,
     /// Cycle preview mode (auto/text/hex/metadata).
     CyclePreviewMode,
+    /// Scroll the file preview down.
+    PreviewDown,
+    /// Scroll the file preview up.
+    PreviewUp,
     /// Open settings modal.
     OpenSettings,
 

@@ -116,6 +116,8 @@ pub struct MillerColumns<'a> {
     file_preview: Option<&'a PreviewContent>,
     /// Current preview mode.
     preview_mode: crate::preview::PreviewMode,
+    /// Rows of the file preview scrolled past.
+    preview_scroll: usize,
 }
 
 impl<'a> MillerColumns<'a> {
@@ -139,12 +141,14 @@ impl<'a> MillerColumns<'a> {
             theme,
             file_preview: None,
             preview_mode: crate::preview::PreviewMode::Auto,
+            preview_scroll: 0,
         }
     }
 
-    /// Set the file preview content.
-    pub fn file_preview(mut self, preview: &'a PreviewContent) -> Self {
+    /// Set the file preview content, scrolled down `scroll` rows.
+    pub fn file_preview(mut self, preview: &'a PreviewContent, scroll: usize) -> Self {
         self.file_preview = Some(preview);
+        self.preview_scroll = scroll;
         self
     }
 
@@ -399,7 +403,7 @@ impl<'a> MillerColumns<'a> {
 
                     let mut display_lines = vec![header, Line::raw("")];
                     let max_lines = inner.height.saturating_sub(2) as usize;
-                    for line in lines.iter().take(max_lines) {
+                    for line in lines.iter().skip(self.preview_scroll).take(max_lines) {
                         display_lines.push(line.clone());
                     }
 
@@ -420,7 +424,7 @@ impl<'a> MillerColumns<'a> {
 
                     let mut display_lines = vec![header, Line::raw("")];
                     let max_lines = inner.height.saturating_sub(2) as usize;
-                    for line in lines.iter().take(max_lines) {
+                    for line in lines.iter().skip(self.preview_scroll).take(max_lines) {
                         display_lines.push(line.clone());
                     }
 
@@ -437,18 +441,14 @@ impl<'a> MillerColumns<'a> {
                         ),
                         Span::raw(" "),
                         Span::styled(
-                            format!(
-                                "[{} items; {} shown]",
-                                total_entries,
-                                entries.len().min(inner.height.saturating_sub(2) as usize)
-                            ),
+                            format!("[{} items; {} listed]", total_entries, entries.len()),
                             Style::default().fg(self.theme.muted),
                         ),
                     ]);
 
                     let mut display_lines = vec![header, Line::raw("")];
                     let max_lines = inner.height.saturating_sub(2) as usize;
-                    for (name, is_dir) in entries.iter().take(max_lines) {
+                    for (name, is_dir) in entries.iter().skip(self.preview_scroll).take(max_lines) {
                         let icon = if *is_dir { " " } else { "  " };
                         let style = if *is_dir {
                             self.theme.directory
@@ -560,7 +560,7 @@ impl<'a> MillerColumns<'a> {
                     let mut display_lines = vec![header, summary, Line::raw("")];
                     let max_lines = inner.height.saturating_sub(3) as usize;
 
-                    for archive_entry in entries.iter().take(max_lines) {
+                    for archive_entry in entries.iter().skip(self.preview_scroll).take(max_lines) {
                         // Distinguish symlinks from directories with a
                         // distinct icon so the user can tell them apart.
                         let icon = if archive_entry.is_symlink {
@@ -612,9 +612,10 @@ impl<'a> MillerColumns<'a> {
                         ]));
                     }
 
-                    if entries.len() > max_lines {
+                    let below = entry_count.saturating_sub(self.preview_scroll + max_lines);
+                    if below > 0 {
                         display_lines.push(Line::styled(
-                            format!("... and {} more entries", entry_count - max_lines),
+                            format!("... and {below} more entries"),
                             Style::default().fg(self.theme.muted),
                         ));
                     }
@@ -939,7 +940,7 @@ mod tests {
             &theme,
         );
         if let Some(preview) = preview {
-            miller = miller.file_preview(preview);
+            miller = miller.file_preview(preview, 0);
         }
         StatefulWidget::render(miller, area, &mut buf, state);
         buf

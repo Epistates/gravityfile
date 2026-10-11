@@ -115,7 +115,7 @@ pub struct App {
     ///
     /// Images are encoded to fit this, so it is captured during draw and used
     /// by the next preview load. `Cell` because rendering takes `&self`.
-    preview_area: std::cell::Cell<ratatui::layout::Size>,
+    preview_area: std::cell::Cell<ratatui::layout::Rect>,
     /// Scroll offsets computed by the last render (tree, miller). Rendering
     /// is `&self`, so these are adopted into the view states after each frame;
     /// mouse hit-testing depends on them matching what is on screen.
@@ -335,7 +335,7 @@ impl App {
             view: View::default(),
             theme: Theme::dark(),
             image_picker: None,
-            preview_area: std::cell::Cell::new(ratatui::layout::Size::new(40, 20)),
+            preview_area: std::cell::Cell::new(ratatui::layout::Rect::new(0, 0, 40, 20)),
             rendered_offsets: std::cell::Cell::new((0, 0)),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),

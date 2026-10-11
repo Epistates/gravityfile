@@ -120,7 +120,8 @@ Actions:
 - Files: `yank`, `cut`, `paste`, `delete`, `rename`, `create_file`,
   `create_directory`, `take`, `undo`
 - View: `next_view`, `prev_view`, `toggle_layout`, `toggle_details`,
-  `cycle_preview`, `sort`, `reverse_sort`, `refresh`, `toggle_theme`
+  `cycle_preview`, `preview_down`, `preview_up`, `sort`, `reverse_sort`,
+  `refresh`, `toggle_theme`
 - Tabs: `new_tab`, `close_tab`, `next_tab`, `prev_tab`, `tab_1` to `tab_9`
 - Bookmarks: `set_bookmark`, `jump_to_bookmark`, `bookmarks`
 - General: `command`, `settings`, `help`, `cancel`, `quit`, `force_quit`

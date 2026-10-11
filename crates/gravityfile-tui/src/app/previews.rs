@@ -10,6 +10,13 @@ use super::{App, PreviewLoad, PreviewRequest};
 use crate::preview::{ImageContext, PreviewContent, PreviewLoader};
 
 impl App {
+    /// Scroll the file preview by `delta` rows.
+    pub(super) fn scroll_preview(&mut self, delta: isize) {
+        // The preview pane's rows, less its header line.
+        let visible = self.preview_area.get().height.saturating_sub(1);
+        self.preview_state.scroll_by(delta, usize::from(visible));
+    }
+
     /// Update the file preview for the currently selected item in Miller mode.
     pub(super) fn update_preview(&mut self) {
         // Only update preview in Miller mode for non-directory items
@@ -51,7 +58,7 @@ impl App {
         // rest of the preview work, never inside `terminal.draw`.
         let image_context = self.image_picker.as_ref().map(|picker| ImageContext {
             picker: picker.clone(),
-            area: self.preview_area.get(),
+            area: self.preview_area.get().as_size(),
         });
         let request = PreviewRequest {
             path,

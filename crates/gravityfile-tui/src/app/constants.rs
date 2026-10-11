@@ -17,3 +17,6 @@ pub const ANALYSIS_CHANNEL_SIZE: usize = 10;
 
 /// Event loop tick interval in milliseconds.
 pub const TICK_INTERVAL_MS: u64 = 50;
+
+/// Rows the file preview moves per scroll key or wheel step.
+pub const PREVIEW_SCROLL_STEP: isize = 5;

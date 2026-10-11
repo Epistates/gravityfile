@@ -338,6 +338,18 @@ pub const ACTIONS: &[(&str, KeyAction, Section, &str)] = &[
         Section::View,
         "Preview mode",
     ),
+    (
+        "preview_down",
+        KeyAction::PreviewDown,
+        Section::View,
+        "Scroll the preview down",
+    ),
+    (
+        "preview_up",
+        KeyAction::PreviewUp,
+        Section::View,
+        "Scroll the preview up",
+    ),
     ("sort", KeyAction::Sort, Section::View, "Next sort order"),
     (
         "reverse_sort",
@@ -514,6 +526,8 @@ pub const DEFAULT_KEYMAP: &[(&str, KeyAction)] = &[
     ("v", KeyAction::ToggleLayout),
     ("i", KeyAction::ToggleDetails),
     ("P", KeyAction::CyclePreviewMode),
+    ("J", KeyAction::PreviewDown),
+    ("K", KeyAction::PreviewUp),
     ("s", KeyAction::Sort),
     ("S", KeyAction::ReverseSort),
     ("R", KeyAction::Refresh),

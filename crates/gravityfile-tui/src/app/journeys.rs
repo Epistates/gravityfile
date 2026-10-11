@@ -54,6 +54,59 @@ async fn rebound_keys_take_effect_and_the_delete_dialog_keeps_its_own() {
 }
 
 #[tokio::test]
+async fn the_preview_scrolls_with_keys_and_the_wheel() {
+    let mut harness = Harness::scanned_sized(120, 30).await;
+    let text: String = (1..=200).map(|n| format!("line {n:03}\n")).collect();
+    std::fs::write(harness.path("long.txt"), text).unwrap();
+    harness.press("R").await;
+    harness.press("v").await;
+    harness.select("long.txt").await;
+    assert!(
+        harness.screen().contains("line 001"),
+        "{}",
+        harness.screen()
+    );
+
+    harness.press("JJ").await;
+    let screen = harness.screen();
+    assert!(
+        !screen.contains("line 010") && screen.contains("line 011"),
+        "{screen}"
+    );
+    harness.press("K").await;
+    assert!(
+        harness.screen().contains("line 006"),
+        "{}",
+        harness.screen()
+    );
+
+    // The wheel over the preview scrolls it rather than the selection.
+    harness.scroll_down(110, 15).await;
+    assert!(
+        harness.screen().contains("line 011"),
+        "{}",
+        harness.screen()
+    );
+    assert_eq!(harness.selected(), Some(harness.path("long.txt")));
+
+    // Scrolling stops at the end, and a new selection starts at the top.
+    harness
+        .press("JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ")
+        .await;
+    assert!(
+        harness.screen().contains("line 200"),
+        "{}",
+        harness.screen()
+    );
+    harness.press("kj").await;
+    assert!(
+        harness.screen().contains("line 001"),
+        "{}",
+        harness.screen()
+    );
+}
+
+#[tokio::test]
 async fn the_whole_help_can_be_scrolled_into_view() {
     let mut harness = Harness::scanned_sized(70, 24).await;
     harness.press("?").await;

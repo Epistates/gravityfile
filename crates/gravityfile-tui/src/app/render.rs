@@ -591,7 +591,9 @@ impl App {
                     // Mirrors the 40% third column in `MillerColumns`, less the
                     // block border and the one-line image header.
                     let preview_width = layout.main.width * 40 / 100;
-                    self.preview_area.set(ratatui::layout::Size::new(
+                    self.preview_area.set(Rect::new(
+                        layout.main.right().saturating_sub(preview_width) + 1,
+                        layout.main.y + 2,
                         preview_width.saturating_sub(2).max(1),
                         layout.main.height.saturating_sub(3).max(1),
                     ));
@@ -608,7 +610,7 @@ impl App {
                         &self.clipboard,
                         &self.theme,
                     )
-                    .file_preview(&self.preview_state.content)
+                    .file_preview(&self.preview_state.content, self.preview_state.scroll)
                     .preview_mode(self.preview_state.mode);
 
                     let mut miller_state = self.nav.miller_state.clone();

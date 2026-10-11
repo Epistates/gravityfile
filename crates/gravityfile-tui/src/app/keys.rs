@@ -441,6 +441,8 @@ impl App {
             KeyAction::ToggleLayout => {
                 self.toggle_layout();
             }
+            KeyAction::PreviewDown => self.scroll_preview(constants::PREVIEW_SCROLL_STEP),
+            KeyAction::PreviewUp => self.scroll_preview(-constants::PREVIEW_SCROLL_STEP),
             KeyAction::CyclePreviewMode => {
                 self.preview_state.cycle_mode();
                 if let Some(path) = self.preview_state.path.clone() {

@@ -792,6 +792,8 @@ pub struct PreviewState {
     pub loading: bool,
     /// Current preview mode.
     pub mode: PreviewMode,
+    /// Rows scrolled past at the top of a text, hex or listing preview.
+    pub scroll: usize,
 }
 
 impl PreviewState {
@@ -807,6 +809,7 @@ impl PreviewState {
             return false;
         }
         self.path = Some(path.to_path_buf());
+        self.scroll = 0;
         self.loading = true;
         self.content = PreviewContent::Loading;
         true
@@ -831,7 +834,21 @@ impl PreviewState {
     pub fn clear(&mut self) {
         self.path = None;
         self.content = PreviewContent::Empty;
+        self.scroll = 0;
         self.loading = false;
+    }
+
+    /// Scroll by `delta` rows, keeping the last screenful of `visible` rows
+    /// in view at the bottom.
+    pub fn scroll_by(&mut self, delta: isize, visible: usize) {
+        let rows = match &self.content {
+            PreviewContent::Text { lines, .. } | PreviewContent::Hex { lines, .. } => lines.len(),
+            PreviewContent::Directory { entries, .. } => entries.len(),
+            PreviewContent::Archive { entries, .. } => entries.len(),
+            _ => 0,
+        };
+        let max = rows.saturating_sub(visible);
+        self.scroll = self.scroll.saturating_add_signed(delta).min(max);
     }
 
     /// Cycle to the next preview mode. The application schedules the reload.
