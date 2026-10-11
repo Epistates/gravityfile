@@ -1,23 +1,4 @@
-//! File operations for gravityfile: copy, move, rename, create, delete,
-//! undo and archives.
-//!
-//! Long-running operations run on blocking threads and report through a
-//! channel: best-effort [`OperationProgress`] snapshots, interactive
-//! [`ConflictRequest`]s, and one reliable completion message. Dropping the
-//! receiver cancels the operation.
-//!
-//! # Safety model
-//!
-//! - New content is assembled in a private staging directory beside its
-//!   destination and published with a single no-clobber rename, so a failed
-//!   or cancelled operation never leaves a partial item at a visible path and
-//!   never silently replaces anything.
-//! - Overwrites the user approves move the replaced item to the system Trash
-//!   (or delete it permanently, if configured) only after the replacement is
-//!   complete.
-//! - Copies skip entries they cannot read and report each one instead of
-//!   discarding everything that did copy; cross-filesystem moves keep the
-//!   source unless every entry arrived.
+#![doc = include_str!("../README.md")]
 
 pub mod archive;
 mod batch;

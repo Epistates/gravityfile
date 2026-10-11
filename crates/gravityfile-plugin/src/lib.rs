@@ -1,15 +1,4 @@
-//! Lua plugins for gravityfile.
-//!
-//! Plugins are Lua scripts that subscribe to [`Hook`]s (startup, navigation,
-//! scan completion, deletion, ...). The [`PluginManager`] dispatches hooks to
-//! a [`PluginRuntime`]; in the application that runtime is a
-//! [`ProcessRuntime`], which runs each plugin in its own supervised worker
-//! process with deadlines and bounded IPC, so a misbehaving plugin cannot
-//! block or crash the host. [`lua::LuaRuntime`] is the in-process engine the
-//! worker uses, with a memory limit and an instruction-count deadline.
-//!
-//! A hook result can veto the default action (currently deletion) through
-//! `prevent_default`.
+#![doc = include_str!("../README.md")]
 
 mod config;
 mod hooks;

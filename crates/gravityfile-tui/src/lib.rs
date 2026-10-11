@@ -1,39 +1,4 @@
-//! Terminal user interface for gravityfile.
-//!
-//! This crate provides an interactive TUI for exploring disk usage,
-//! built with ratatui.
-//!
-//! # Overview
-//!
-//! `gravityfile-tui` provides a feature-rich terminal interface:
-//!
-//! - **Explorer view** - Navigate directory trees sorted by size
-//! - **Duplicates view** - Browse duplicate file groups
-//! - **Age view** - Analyze file age distribution
-//! - **Errors view** - Review scan warnings
-//!
-//! # Usage
-//!
-//! ```rust,no_run
-//! use gravityfile_tui::{self, TuiConfig};
-//! use std::path::PathBuf;
-//!
-//! // Run the TUI on a directory
-//! let config = TuiConfig::default();
-//! gravityfile_tui::run_with_config(PathBuf::from("/path/to/explore"), config).unwrap();
-//! ```
-//!
-//! # Keyboard Navigation
-//!
-//! - `j`/`k` - Move down/up
-//! - `h`/`l` - Collapse/expand directories
-//! - `Enter` - Drill into directory
-//! - `Backspace` - Navigate back
-//! - `Tab` - Switch view
-//! - `d` - Mark for deletion
-//! - `:` - Command palette
-//! - `?` - Help
-//! - `q` - Quit
+#![doc = include_str!("../README.md")]
 
 mod app;
 mod config;
