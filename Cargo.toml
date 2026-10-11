@@ -138,5 +138,9 @@ strip = true
 panic = "abort"
 opt-level = 3
 
+# The profile that 'dist' will build with: the release profile, unchanged
+[profile.dist]
+inherits = "release"
+
 [dev-dependencies]
 insta.workspace = true
