@@ -608,17 +608,22 @@ impl App {
                     let parent_node = self.get_parent_node();
                     let current_name = self.get_current_dir_name().unwrap_or_default();
 
-                    let miller = MillerColumns::new(
-                        view_node,
-                        parent_node,
-                        &current_name,
-                        &view_path,
-                        &self.marked,
-                        &self.clipboard,
-                        &self.theme,
-                    )
-                    .file_preview(&self.preview_state.content, self.preview_state.scroll)
-                    .preview_mode(self.preview_state.mode);
+                    let miller =
+                        MillerColumns::new(
+                            view_node,
+                            parent_node,
+                            &current_name,
+                            &view_path,
+                            &self.marked,
+                            &self.clipboard,
+                            &self.theme,
+                        )
+                        .file_preview(&self.preview_state.content, self.preview_state.scroll)
+                        .preview_mode(self.preview_state.mode)
+                        .loading(self.listings.contains(&(
+                            crate::app::state::ListingFor::Children,
+                            view_path.clone(),
+                        )));
 
                     let mut miller_state = self.nav.miller_state.clone();
                     ratatui::widgets::StatefulWidget::render(

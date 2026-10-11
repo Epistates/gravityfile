@@ -23,6 +23,7 @@ impl App {
             || self.preview_rx.is_some()
             || self.archive_rx.is_some()
             || self.refresh_rx.is_some()
+            || !self.listings.is_empty()
     }
 
     /// The next result from a background task. Never completes when
@@ -47,6 +48,7 @@ impl App {
             refreshed = async {
                 self.refresh_rx.as_mut().expect("guarded refresh receiver").await.ok()
             }, if self.refresh_rx.is_some() => Background::Refresh(refreshed),
+            listed = self.listing_rx.recv(), if !self.listings.is_empty() => Background::Listed(listed),
             else => std::future::pending().await,
         }
     }
@@ -72,6 +74,12 @@ impl App {
             Background::Refresh(refreshed) => {
                 self.refresh_rx = None;
                 self.apply_refresh(refreshed.unwrap_or_default());
+            }
+            // The App holds a sender, so the channel never closes.
+            Background::Listed(listed) => {
+                if let Some(listed) = listed {
+                    self.finish_listing(listed);
+                }
             }
         }
         // Changes that waited for this task can be picked up now.

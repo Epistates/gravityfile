@@ -622,6 +622,36 @@ async fn an_invalid_name_keeps_the_prompt_open_with_the_reason() {
 }
 
 #[tokio::test]
+async fn unread_directories_are_listed_in_the_background() {
+    let mut harness = Harness::scanned().await;
+    // A quick listing, as before a scan finishes: subdirectories are unread.
+    let quick = gravityfile_scan::quick_list(harness.root(), None).unwrap();
+    harness.app.install_tree(quick);
+    harness.app.has_full_scan = false;
+    harness.app.view_changed();
+    harness.press("v").await;
+    harness.select("src").await;
+    harness.press_unsettled("<enter>").await;
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
+    assert!(
+        !harness.app.listings.is_empty(),
+        "the listing runs off the UI thread"
+    );
+    assert!(
+        harness.screen().contains("(loading…)"),
+        "{}",
+        harness.screen()
+    );
+    harness.settle().await;
+    assert!(harness.app.listings.is_empty());
+    assert!(
+        harness.screen().contains("modified.rs"),
+        "{}",
+        harness.screen()
+    );
+}
+
+#[tokio::test]
 async fn rescanning_a_subdirectory_keeps_the_rest_of_the_scan() {
     let mut harness = Harness::scanned().await;
     let root = harness.root().to_path_buf();

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use gravityfile_core::FileNode;
 
-use super::state::{LayoutMode, View, Visit};
+use super::state::{LayoutMode, Listed, ListingFor, View, Visit};
 use super::{App, quick_list_with_settings};
 use crate::ui::{TreeState, TreeView};
 
@@ -364,16 +364,85 @@ impl App {
             return;
         }
 
-        // Quick load directory contents for immediate display
-        // When the full scan completes, it will replace this with accurate data
-        if let Some(mut quick_tree) = self.load_directory_listing(path) {
-            // Find the node in our tree and update its children
-            if let Some(tree) = &mut self.tree
-                && let Some(node) =
-                    Self::find_node_mut(&mut Arc::make_mut(tree).root, path, &root_path)
-            {
-                node.children = std::mem::take(&mut quick_tree.root.children);
+        // List it off the UI thread; a slow disk or network mount must not
+        // freeze the explorer. A full scan replaces this with accurate data.
+        self.request_listing(path.to_path_buf(), ListingFor::Children);
+    }
+
+    /// List `dir` on the blocking pool, unless that listing is already
+    /// running; the result arrives through the run loop.
+    pub(super) fn request_listing(&mut self, dir: PathBuf, purpose: ListingFor) {
+        if !self.listings.insert((purpose, dir.clone())) {
+            return;
+        }
+        let settings = self.user_settings.clone();
+        let apparent = self.apparent_size;
+        let list = move || {
+            let result = quick_list_with_settings(&dir, &settings, apparent)
+                .map_err(|error| format!("Cannot list {}: {error}", dir.display()));
+            Listed {
+                dir,
+                purpose,
+                result,
+            }
+        };
+        // Without a runtime there is no loop to report to; list in place.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.finish_listing(list());
+            return;
+        };
+        let sender = self.listing_tx.clone();
+        runtime.spawn_blocking(move || {
+            let _ = sender.send(list());
+        });
+    }
+
+    /// Put a finished listing in place if it still applies: the directory is
+    /// still unread, or the scan root still has that parent. A scan that
+    /// finished meanwhile has newer data, so a stale listing is dropped.
+    pub(super) fn finish_listing(&mut self, listed: Listed) {
+        self.listings.remove(&(listed.purpose, listed.dir.clone()));
+        let mut listing = match listed.result {
+            Ok(listing) => listing,
+            Err(error) => {
+                if listed.purpose == ListingFor::Children {
+                    self.error = Some(error);
+                }
+                return;
+            }
+        };
+        match listed.purpose {
+            ListingFor::Children => {
+                let sort_mode = self.sort_mode;
+                let selected = self.get_selected_path();
+                let Some(tree) = &mut self.tree else {
+                    return;
+                };
+                let root_path = tree.root_path.clone();
+                let tree = Arc::make_mut(tree);
+                let Some(node) = Self::find_node_mut(&mut tree.root, &listed.dir, &root_path)
+                else {
+                    return;
+                };
+                if !node.is_dir() || !node.children.is_empty() {
+                    return;
+                }
+                node.children = std::mem::take(&mut listing.root.children);
                 Self::order_new_subtree(node, sort_mode);
+                // New rows can shift the selection; keep the same entry.
+                self.select_entry(selected.as_deref());
+                self.view_changed();
+            }
+            ListingFor::Parent => {
+                let current = self.tree.as_ref().is_some_and(|tree| {
+                    self.nav.view_root == tree.root_path
+                        && tree.root_path.parent() == Some(listed.dir.as_path())
+                });
+                if current {
+                    self.merge_cached_scans_into_tree(&mut listing.root, &listed.dir);
+                    self.cached_parent_tree = Some(listing);
+                    self.needs_redraw = true;
+                }
             }
         }
     }
@@ -436,33 +505,28 @@ impl App {
     /// Update the cached parent tree for Miller columns display.
     /// Called when navigating to ensure the parent column can be shown.
     pub(super) fn update_cached_parent(&mut self) {
-        // Never retain a previous location's parent when refresh fails.
-        self.cached_parent_tree = None;
-        let Some(tree) = &self.tree else { return };
-        if self.snapshot.is_some() {
+        // Only the scan root needs a parent from outside the tree, and a
+        // snapshot has nothing outside it.
+        let parent = self
+            .tree
+            .as_ref()
+            .filter(|tree| self.snapshot.is_none() && self.nav.view_root == tree.root_path)
+            .and_then(|tree| tree.root_path.parent())
+            .map(Path::to_path_buf);
+        let Some(parent) = parent else {
+            self.cached_parent_tree = None;
             return;
-        }
-
-        // Only need to cache parent if we're at or near the tree root
-        if self.nav.view_root == tree.root_path {
-            if let Some(parent_path) = self.nav.view_root.parent() {
-                let parent_path_buf = parent_path.to_path_buf();
-                // Load the parent directory
-                if let Ok(mut parent_tree) = quick_list_with_settings(
-                    &parent_path_buf,
-                    &self.user_settings,
-                    self.apparent_size,
-                ) {
-                    // Merge any cached scans into the parent tree's children
-                    // This ensures previously scanned directories show their data
-                    self.merge_cached_scans_into_tree(&mut parent_tree.root, &parent_path_buf);
-                    self.cached_parent_tree = Some(parent_tree);
-                }
-            }
-        } else {
-            // Don't need cached parent when navigating within the tree
+        };
+        // Keep showing the same parent while it is listed again, but never a
+        // previous location's.
+        if !self
+            .cached_parent_tree
+            .as_ref()
+            .is_some_and(|cached| cached.root_path == parent)
+        {
             self.cached_parent_tree = None;
         }
+        self.request_listing(parent, ListingFor::Parent);
     }
 
     /// Change directory within the loaded scan tree. Leading `/` is scan-root relative.

@@ -91,6 +91,7 @@ enum Background {
     Preview(Option<PreviewLoad>),
     Archive(Option<ArchiveCompletion>),
     Refresh(Option<Vec<state::Refreshed>>),
+    Listed(Option<state::Listed>),
 }
 
 /// Main application state.
@@ -236,6 +237,11 @@ pub struct App {
     settings_state: Option<SettingsState>,
     /// Bookmark list modal state.
     bookmark_list_state: Option<BookmarkListState>,
+    /// Directory listings run off the UI thread report here.
+    listing_tx: mpsc::UnboundedSender<state::Listed>,
+    listing_rx: mpsc::UnboundedReceiver<state::Listed>,
+    /// Listings in flight, so one directory is not listed twice at once.
+    listings: HashSet<(state::ListingFor, PathBuf)>,
     /// Cached parent tree for Miller columns when at tree root.
     /// This allows showing the parent column even when navigated beyond the original scan root.
     cached_parent_tree: Option<FileTree>,
@@ -337,6 +343,7 @@ impl App {
         }
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
+        let (listing_tx, listing_rx) = mpsc::unbounded_channel();
         let (theme, theme_error) = match Theme::named(&user_settings.theme) {
             Some(theme) => (theme, None),
             None => (
@@ -420,6 +427,9 @@ impl App {
             user_settings,
             settings_state: None,
             bookmark_list_state: None,
+            listing_tx,
+            listing_rx,
+            listings: HashSet::new(),
             cached_parent_tree: None,
             pending_suspend_command: None,
             pending_deletion: None,

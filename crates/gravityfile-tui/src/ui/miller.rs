@@ -118,6 +118,8 @@ pub struct MillerColumns<'a> {
     preview_mode: crate::preview::PreviewMode,
     /// Rows of the file preview scrolled past.
     preview_scroll: usize,
+    /// The current directory is still being listed.
+    loading: bool,
 }
 
 impl<'a> MillerColumns<'a> {
@@ -142,6 +144,7 @@ impl<'a> MillerColumns<'a> {
             file_preview: None,
             preview_mode: crate::preview::PreviewMode::Auto,
             preview_scroll: 0,
+            loading: false,
         }
     }
 
@@ -149,6 +152,12 @@ impl<'a> MillerColumns<'a> {
     pub fn file_preview(mut self, preview: &'a PreviewContent, scroll: usize) -> Self {
         self.file_preview = Some(preview);
         self.preview_scroll = scroll;
+        self
+    }
+
+    /// Mark the current directory as still being listed.
+    pub fn loading(mut self, loading: bool) -> Self {
+        self.loading = loading;
         self
     }
 
@@ -359,7 +368,13 @@ impl<'a> MillerColumns<'a> {
 
         // Show empty message if no entries
         if children.is_empty() {
-            let msg = Line::styled("(empty)", Style::default().fg(self.theme.muted));
+            let still_listing = self.loading && base_path == Some(self.view_root.as_path());
+            let text = if still_listing {
+                "(loading…)"
+            } else {
+                "(empty)"
+            };
+            let msg = Line::styled(text, Style::default().fg(self.theme.muted));
             let msg_area = Rect::new(inner.x, inner.y, inner.width, 1);
             Widget::render(msg, msg_area, buf);
         }

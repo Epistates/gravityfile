@@ -188,7 +188,11 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
     //
     // Failed detection is not an error: image files simply fall back to the
     // ordinary binary preview.
-    let app = App::with_config(path, config);
+    // Inside the runtime, so the app can start background work as it is built.
+    let app = {
+        let _runtime = rt.enter();
+        App::with_config(path, config)
+    };
     let image_picker = if app.image_previews_enabled() {
         match graphics_query::query_picker() {
             Ok(picker) => Some(picker),

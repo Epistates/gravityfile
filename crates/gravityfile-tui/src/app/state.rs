@@ -403,6 +403,22 @@ pub struct Refreshed {
     pub entry: Result<Option<gravityfile_scan::ScannedEntry>, String>,
 }
 
+/// What a directory listing was read for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListingFor {
+    /// The entries of a directory the tree has not read yet.
+    Children,
+    /// The Miller parent column at the scan root.
+    Parent,
+}
+
+/// A directory listed off the UI thread.
+pub struct Listed {
+    pub dir: PathBuf,
+    pub purpose: ListingFor,
+    pub result: Result<FileTree, String>,
+}
+
 /// Information about the currently selected item.
 #[derive(Debug, Clone)]
 pub struct SelectedInfo {

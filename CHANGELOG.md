@@ -130,6 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Miller parent column scrolls to keep the current directory in view.
 - The explorer can show apparent sizes: `grav -A`, or `b` to switch while
   browsing, which re-totals the tree instantly instead of rescanning.
+- Opening a directory before the scan reached it, and the Miller parent
+  column at the scan root, no longer freeze the explorer while the
+  directory is read; it shows "(loading…)" until the entries arrive.
 - The file preview scrolls: `J`/`K`, or the mouse wheel over the preview.
   It used to show only the first screenful of a file, listing or archive.
 - An invalid name in the rename or create prompt keeps the prompt open with
