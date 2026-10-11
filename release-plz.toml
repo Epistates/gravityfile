@@ -21,3 +21,5 @@ pr_labels = ["release"]
 name = "gravityfile"
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
+# The binary: its library has no public API to check.
+semver_check = false

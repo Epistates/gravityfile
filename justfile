@@ -50,7 +50,7 @@ coverage:
     cargo llvm-cov nextest --workspace --all-features --html
 
 semver:
-    cargo semver-checks --workspace
+    cargo semver-checks --workspace --exclude gravityfile
 
 # Unix PTY smoke test of terminal setup and restoration
 smoke: release

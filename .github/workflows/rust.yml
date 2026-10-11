@@ -141,8 +141,9 @@ jobs:
         with:
           tool: cargo-semver-checks
       # Against the latest release on crates.io: a breaking change needs a
-      # version bump that says so.
-      - run: cargo semver-checks --workspace
+      # version bump that says so. The gravityfile package is the binary;
+      # its library only shares code with the tests.
+      - run: cargo semver-checks --workspace --exclude gravityfile
 
   supply-chain:
     name: Advisories, licenses and unused dependencies
