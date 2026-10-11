@@ -175,6 +175,9 @@ impl App {
         if matches!(action, KeyAction::ForceQuit) {
             self.cancel_archive_operation();
         }
+        if action.changes_files() && self.refuse_in_snapshot() {
+            return;
+        }
 
         match action {
             KeyAction::Quit => {

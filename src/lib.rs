@@ -188,15 +188,34 @@ fn explore(
         ),
     }
     let requested = path.unwrap_or_else(|| PathBuf::from("."));
-    let path = requested
-        .canonicalize()
-        .wrap_err_with(|| format!("cannot open {}", escape_filename(requested.as_os_str())))?;
     let mut config = gravityfile_tui::TuiConfig::new()
         .with_plugin_worker_executable(std::env::current_exe()?)
         .with_cwd_file(cwd_file)
         .with_print_cwd(print_cwd)
         .with_units(global.units())
         .with_apparent_size(apparent_size);
+    // A file is a snapshot to browse read-only, as with the report commands.
+    let path = if std::fs::metadata(&requested).is_ok_and(|metadata| metadata.is_file()) {
+        if scan {
+            return Err(eyre!(
+                "--scan cannot be used with a snapshot, which was already scanned"
+            ));
+        }
+        let options = gravityfile_scan::snapshot::ImportOptions {
+            apparent: apparent_size,
+            count_hard_links: false,
+            max_entries: None,
+        };
+        let tree = gravityfile_scan::snapshot::read(&requested, &options)
+            .wrap_err_with(|| format!("cannot load {}", escape_filename(requested.as_os_str())))?;
+        let root = tree.root_path.clone();
+        config = config.with_snapshot(requested, tree);
+        root
+    } else {
+        requested
+            .canonicalize()
+            .wrap_err_with(|| format!("cannot open {}", escape_filename(requested.as_os_str())))?
+    };
     // Without --scan, the saved setting decides.
     if scan {
         config = config.with_scan_on_startup(true);

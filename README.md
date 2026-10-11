@@ -152,12 +152,18 @@ directory also takes a snapshot, and ncdu dumps work too:
 
 ```sh
 grav export / -o root.json.zst          # complete scan, zstd-compressed
-grav scan root.json.zst -d 3            # browse it without rescanning
+grav scan root.json.zst -d 3            # report on it without rescanning
+grav root.json.zst                      # browse it in the explorer, read-only
 grav scan root.json.zst -A              # switch to apparent sizes, instantly
 ssh server 'ncdu -xo- /' > server.json  # a dump from a machine without grav
 grav scan server.json
 grav export ~ -f ncdu -o home.json      # for ncdu -f or gdu -f
 ```
+
+The explorer opens a snapshot read-only: browsing, search, the treemap,
+size toggling and age analysis work from the record, while file
+operations, rescans and duplicate detection, which need the files
+themselves, are turned off.
 
 ## Reports and automation
 

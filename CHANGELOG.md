@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Browse snapshots in the explorer.** `grav root.json.zst` opens a saved
+  scan or ncdu dump read-only, without touching the filesystem: navigation,
+  search, the treemap, size toggling and age analysis work; file operations,
+  rescans and duplicate detection are refused with an explanation.
 - **Themes.** `gestalt`, `latte`, `nord`, `dracula` and `ansi`, shared with
   carwash, replace the fixed dark and light themes. They keep the
   terminal's background, fall back to `ansi` without 24-bit colour, and can

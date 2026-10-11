@@ -107,6 +107,55 @@ async fn the_preview_scrolls_with_keys_and_the_wheel() {
 }
 
 #[tokio::test]
+async fn a_snapshot_is_browsed_read_only_without_touching_the_filesystem() {
+    let mut harness = Harness::snapshot().await;
+    let screen = harness.screen();
+    assert!(screen.contains("snapshot home.json, read-only"), "{screen}");
+    assert!(harness.tree_shows("copy-a.bin"), "{screen}");
+
+    // Browsing works from the record, though none of these paths exist.
+    harness.select("src").await;
+    harness.press("<enter>").await;
+    assert_eq!(harness.app.nav.view_root, harness.path("src"));
+    assert!(harness.tree_shows("modified.rs"), "{}", harness.screen());
+    harness.press("<bs><bs>").await;
+    assert_eq!(harness.app.nav.view_root, harness.root(), "stays inside");
+    assert!(harness.app.error.is_none(), "{:?}", harness.app.error);
+    harness.press("b").await;
+    assert!(harness.screen().contains(" apparent in "));
+
+    // Nothing that would change files or rescan runs.
+    let refused = |harness: &Harness| {
+        harness
+            .app
+            .operation_message
+            .as_ref()
+            .is_some_and(|(ok, message)| !ok && message.contains("snapshot"))
+    };
+    harness.select("copy-a.bin").await;
+    for keys in ["d", "r", "R", "a", "<c-z>"] {
+        harness.app.operation_message = None;
+        harness.press(keys).await;
+        assert_eq!(harness.app.mode, AppMode::Normal, "{keys}");
+        assert!(refused(&harness), "{keys}");
+    }
+    harness.app.operation_message = None;
+    harness.press(":").await;
+    harness.type_text("mkdir new").await;
+    harness.press("<enter>").await;
+    assert!(refused(&harness));
+
+    // Duplicates need file contents; the view says so instead of searching.
+    harness.press("<tab>").await;
+    assert_eq!(harness.app.view, super::View::Duplicates);
+    assert!(
+        harness.screen().contains("compares file contents"),
+        "{}",
+        harness.screen()
+    );
+}
+
+#[tokio::test]
 async fn the_whole_help_can_be_scrolled_into_view() {
     let mut harness = Harness::scanned_sized(70, 24).await;
     harness.press("?").await;

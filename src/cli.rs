@@ -23,7 +23,7 @@ Exit status: 0 success, 1 error, 2 usage error, 3 incomplete results with
     max_term_width = 100
 )]
 pub struct Cli {
-    /// Directory to open in the explorer [default: current directory]
+    /// Directory to open in the explorer, or a snapshot to browse [default: current directory]
     pub path: Option<PathBuf>,
 
     /// Start a full scan as soon as the explorer opens

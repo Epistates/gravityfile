@@ -134,6 +134,27 @@ pub enum CommandAction {
     Compress(String),
 }
 
+impl CommandAction {
+    /// Whether the command changes files or rescans, which a snapshot
+    /// cannot allow.
+    pub fn changes_files(&self) -> bool {
+        matches!(
+            self,
+            Self::Refresh
+                | Self::Paste
+                | Self::Delete
+                | Self::Rename(_)
+                | Self::CreateFile(_)
+                | Self::CreateDirectory(_)
+                | Self::Take(_)
+                | Self::Undo
+                | Self::BulkRename
+                | Self::Extract(_)
+                | Self::Compress(_)
+        )
+    }
+}
+
 /// Theme command variants.
 #[derive(Debug, Clone, Copy)]
 pub enum ThemeCommand {
@@ -401,7 +422,11 @@ pub fn parse_command(cmd: &str) -> CommandAction {
 impl App {
     /// Execute a command from the command palette.
     pub(super) fn execute_command(&mut self, cmd: &str) {
-        match parse_command(cmd) {
+        let action = parse_command(cmd);
+        if action.changes_files() && self.refuse_in_snapshot() {
+            return;
+        }
+        match action {
             CommandAction::None => {}
             CommandAction::Invalid(message) => {
                 self.error = Some(message.to_string());

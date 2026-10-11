@@ -44,6 +44,39 @@ impl Harness {
         Self::scanned_with(width, height, settings).await
     }
 
+    /// The fixture's scan opened as a snapshot rooted at a directory that
+    /// does not exist, so any attempt to read the filesystem would show.
+    pub async fn snapshot() -> Self {
+        let fixture = sample_dir_on_disk();
+        let scanned = fixture.path().canonicalize().expect("canonical fixture");
+        let mut tree = gravityfile_scan::JwalkScanner::new()
+            .scan(
+                &gravityfile_core::ScanConfig::new(&scanned),
+                CancellationToken::new(),
+            )
+            .expect("scan the fixture");
+        let root = PathBuf::from("/gravityfile-test/elsewhere/home");
+        tree.root_path = root.clone();
+        let settings = super::UserSettings {
+            scan_on_startup: false,
+            ..super::UserSettings::default()
+        };
+        let mut app = App::with_loaded_settings(
+            root.clone(),
+            crate::TuiConfig::default().with_snapshot(PathBuf::from("/saved/home.json"), tree),
+            Ok(settings),
+        );
+        app.search_state.enable_background();
+        let mut harness = Self {
+            app,
+            terminal: Terminal::new(TestBackend::new(100, 30)).expect("test terminal"),
+            root,
+            _fixture: fixture,
+        };
+        harness.settle().await;
+        harness
+    }
+
     /// The scanned fixture, opened with saved `settings`.
     pub async fn scanned_with(width: u16, height: u16, settings: super::UserSettings) -> Self {
         let fixture = sample_dir_on_disk();

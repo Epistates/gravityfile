@@ -85,6 +85,9 @@ impl App {
     /// changed, without rescanning anything else: each one still on disk is
     /// scanned again and grafted in place, and the rest are removed.
     pub(super) fn refresh_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.snapshot.is_some() {
+            return;
+        }
         self.queued_refresh.extend(paths);
         // Wait for a running refresh, and for an operation or scan in
         // progress: one could still be changing these paths, and a full scan
@@ -190,6 +193,9 @@ impl App {
     /// The UI will detect scanning state via `scan_progress.is_some()`.
     /// If we have a quick tree, it remains visible during scanning.
     pub(super) fn start_scan(&mut self) {
+        if self.refuse_in_snapshot() {
+            return;
+        }
         // Cancel any existing scan
         self.scan_token.cancel();
         self.scan_token = CancellationToken::new();
@@ -264,7 +270,13 @@ impl App {
         };
 
         self.analyzing = true;
-        self.scan_rx = Some(scanning::start_analysis(tree, self.scan_token.clone()));
+        // A snapshot has no file contents to compare, so only ages are analysed.
+        let compare_contents = self.snapshot.is_none();
+        self.scan_rx = Some(scanning::start_analysis(
+            tree,
+            compare_contents,
+            self.scan_token.clone(),
+        ));
     }
 
     /// Merge final warnings without quadratic path scans or loss of distinct

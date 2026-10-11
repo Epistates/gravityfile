@@ -75,6 +75,22 @@ impl App {
         }
     }
 
+    /// When a snapshot is open, say it is read-only and return true.
+    pub(super) fn refuse_in_snapshot(&mut self) -> bool {
+        let Some(source) = &self.snapshot else {
+            return false;
+        };
+        let name = source.file_name().unwrap_or(source.as_os_str());
+        self.operation_message = Some((
+            false,
+            format!(
+                "{} is a snapshot, so it cannot be changed or rescanned",
+                gravityfile_core::escape_filename(name)
+            ),
+        ));
+        true
+    }
+
     /// Answer the delete confirmation. Its keys are fixed rather than taken
     /// from the keymap, so rebinding `y` cannot change what confirms.
     pub(super) fn handle_delete_confirmation(&mut self, event: crossterm::event::KeyEvent) {

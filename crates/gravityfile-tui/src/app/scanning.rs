@@ -90,7 +90,11 @@ async fn forward_progress(
 /// Start background analysis of a scanned tree.
 ///
 /// Returns a receiver that will receive the analysis results.
-pub fn start_analysis(tree: Arc<FileTree>, token: CancellationToken) -> mpsc::Receiver<ScanResult> {
+pub fn start_analysis(
+    tree: Arc<FileTree>,
+    compare_contents: bool,
+    token: CancellationToken,
+) -> mpsc::Receiver<ScanResult> {
     let (tx, rx) = mpsc::channel(ANALYSIS_CHANNEL_SIZE);
 
     tokio::spawn(async move {
@@ -104,7 +108,11 @@ pub fn start_analysis(tree: Arc<FileTree>, token: CancellationToken) -> mpsc::Re
                 .expect("duplicate config uses only defaulted fields");
             let finder = DuplicateFinder::with_config(dup_config)
                 .expect("validated constant duplicate configuration");
-            let duplicates = finder.find_duplicates(&tree, token.clone());
+            let duplicates = if compare_contents {
+                finder.find_duplicates(&tree, token.clone())
+            } else {
+                gravityfile_analyze::DuplicateReport::default()
+            };
 
             if token.is_cancelled() {
                 return None;

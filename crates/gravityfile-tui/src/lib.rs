@@ -78,6 +78,17 @@ pub struct TuiConfig {
     pub units: gravityfile_core::units::Units,
     /// Show file lengths instead of disk usage.
     pub apparent_size: bool,
+    /// A saved scan to browse instead of the filesystem.
+    pub snapshot: Option<Box<Snapshot>>,
+}
+
+/// A saved scan opened read-only in the explorer.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// The file the scan was read from.
+    pub source: std::path::PathBuf,
+    /// The scanned tree.
+    pub tree: gravityfile_core::FileTree,
 }
 
 impl TuiConfig {
@@ -89,6 +100,16 @@ impl TuiConfig {
     /// Create a new config with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Browse `tree`, read from `source`, instead of the filesystem.
+    pub fn with_snapshot(
+        mut self,
+        source: std::path::PathBuf,
+        tree: gravityfile_core::FileTree,
+    ) -> Self {
+        self.snapshot = Some(Box::new(Snapshot { source, tree }));
+        self
     }
 
     /// Show file lengths instead of disk usage.
@@ -125,8 +146,9 @@ impl TuiConfig {
 /// Data collected at exit for shell integration.
 #[derive(Debug, Clone)]
 pub struct ExitData {
-    /// The last working directory when the app exited.
-    pub last_cwd: std::path::PathBuf,
+    /// The directory being viewed at exit, for the shell to change to. None
+    /// for a snapshot, whose paths belong to the machine that scanned them.
+    pub last_cwd: Option<std::path::PathBuf>,
 }
 
 /// Run the TUI application with default configuration.
@@ -203,13 +225,13 @@ pub fn run_with_config(path: std::path::PathBuf, config: TuiConfig) -> AppResult
 
     // Handle exit data for shell integration
     // Write cwd to file if requested.
-    if let Some(cwd_path) = cwd_file {
-        shell_integration::write_cwd_file(&cwd_path, &exit_data.last_cwd)?;
+    if let (Some(cwd_path), Some(last_cwd)) = (cwd_file, &exit_data.last_cwd) {
+        shell_integration::write_cwd_file(&cwd_path, last_cwd)?;
     }
 
     // Print cwd if requested.
-    if print_cwd {
-        shell_integration::print_cwd(&exit_data.last_cwd, &mut std::io::stdout().lock())?;
+    if print_cwd && let Some(last_cwd) = &exit_data.last_cwd {
+        shell_integration::print_cwd(last_cwd, &mut std::io::stdout().lock())?;
     }
 
     Ok(())

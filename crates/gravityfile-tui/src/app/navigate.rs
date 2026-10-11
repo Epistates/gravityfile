@@ -275,6 +275,10 @@ impl App {
     /// Load `dir`'s entries if the tree has it without them, as a quick
     /// listing does for directories it has not opened yet.
     pub(super) fn load_children(&mut self, dir: &Path) {
+        // A snapshot is the whole record; the filesystem is not consulted.
+        if self.snapshot.is_some() {
+            return;
+        }
         let unloaded = self
             .tree
             .as_ref()
@@ -298,6 +302,16 @@ impl App {
             .is_some_and(FileNode::is_dir);
         if loaded {
             return Some(dir.to_path_buf());
+        }
+        if self.snapshot.is_some() {
+            self.operation_message = Some((
+                false,
+                format!(
+                    "{} is outside the snapshot",
+                    gravityfile_core::escape_filename(dir.as_os_str())
+                ),
+            ));
+            return None;
         }
         let mut listing = self.load_directory_listing(dir)?;
         if let Some(tree) = &self.tree
@@ -425,6 +439,9 @@ impl App {
         // Never retain a previous location's parent when refresh fails.
         self.cached_parent_tree = None;
         let Some(tree) = &self.tree else { return };
+        if self.snapshot.is_some() {
+            return;
+        }
 
         // Only need to cache parent if we're at or near the tree root
         if self.nav.view_root == tree.root_path {

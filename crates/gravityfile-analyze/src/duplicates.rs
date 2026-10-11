@@ -120,7 +120,7 @@ impl DuplicateGroup {
 }
 
 /// Results from duplicate analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DuplicateReport {
     /// Completeness and bounded diagnostics. Missing legacy data is unknown.
     #[serde(default)]

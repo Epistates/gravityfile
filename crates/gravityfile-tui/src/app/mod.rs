@@ -99,6 +99,8 @@ pub struct App {
     keymap: crate::keymap::Keymap,
     /// Sizes are file lengths rather than disk usage.
     apparent_size: bool,
+    /// The snapshot file being browsed, read-only, instead of the filesystem.
+    snapshot: Option<PathBuf>,
     /// Path being analyzed (scan root).
     path: PathBuf,
     /// The active tab's directory, selection and history. Inactive tabs'
@@ -276,7 +278,7 @@ impl App {
 
     fn with_loaded_settings(
         path: PathBuf,
-        config: TuiConfig,
+        mut config: TuiConfig,
         loaded: std::io::Result<UserSettings>,
     ) -> Self {
         let (user_settings, settings_error) = match loaded {
@@ -293,14 +295,20 @@ impl App {
         };
 
         // Load quick tree immediately for instant display.
-        let (quick_tree, listing_error) =
-            match quick_list_with_settings(&path, &user_settings, config.apparent_size) {
+        // A snapshot replaces the listing: its tree is the whole explorer.
+        let snapshot = config.snapshot.take();
+        let snapshot_source = snapshot.as_ref().map(|snapshot| snapshot.source.clone());
+        let is_snapshot = snapshot_source.is_some();
+        let (quick_tree, listing_error) = match snapshot {
+            Some(snapshot) => (Some(snapshot.tree), None),
+            None => match quick_list_with_settings(&path, &user_settings, config.apparent_size) {
                 Ok(tree) => (Some(tree), None),
                 Err(error) => (
                     None,
                     Some(format!("Cannot list {}: {error}", path.display())),
                 ),
-            };
+            },
+        };
 
         // The quick listing resolves relative paths and directory aliases. Use
         // that same identity for every navigation owner; retaining the supplied
@@ -310,9 +318,10 @@ impl App {
             .map_or(path, |tree| tree.root_path.clone());
 
         // Determine scan_on_startup: CLI flag (Some) overrides user settings; None defers to settings.
-        let scan_on_startup = config
-            .scan_on_startup
-            .unwrap_or(user_settings.scan_on_startup);
+        let scan_on_startup = !is_snapshot
+            && config
+                .scan_on_startup
+                .unwrap_or(user_settings.scan_on_startup);
 
         // Initialize plugin manager and register runtimes. Scope the plugin
         // filesystem API to the scan root so hook plugins can read scanned files
@@ -345,6 +354,7 @@ impl App {
         let mut app = Self {
             keymap,
             apparent_size: config.apparent_size,
+            snapshot: snapshot_source,
             path: path.clone(),
             nav: state::Navigation::new(path.clone()),
             mode: AppMode::default(),
@@ -393,7 +403,7 @@ impl App {
             operation_warnings: Vec::new(),
             selected_warning: 0,
             analyzing: false,
-            has_full_scan: false,
+            has_full_scan: is_snapshot,
             needs_redraw: true,
             command_input: CommandInput::new(),
             sort_mode: SortMode::default(),
@@ -675,7 +685,7 @@ impl App {
         });
 
         Ok(crate::ExitData {
-            last_cwd: self.nav.view_root,
+            last_cwd: self.snapshot.is_none().then_some(self.nav.view_root),
         })
     }
 

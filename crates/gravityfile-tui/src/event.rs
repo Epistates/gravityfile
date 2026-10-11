@@ -113,6 +113,24 @@ pub enum KeyAction {
     None,
 }
 
+impl KeyAction {
+    /// Whether the action changes files or rescans, which a snapshot cannot
+    /// allow.
+    pub fn changes_files(self) -> bool {
+        matches!(
+            self,
+            Self::Paste
+                | Self::Delete
+                | Self::Rename
+                | Self::CreateFile
+                | Self::CreateDirectory
+                | Self::Take
+                | Self::Undo
+                | Self::Refresh
+        )
+    }
+}
+
 /// Mouse action that can be performed in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {

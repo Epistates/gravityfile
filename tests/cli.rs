@@ -613,6 +613,16 @@ fn snapshot_errors_are_explained() {
         String::from_utf8_lossy(&output.stderr)
             .contains("--exclude, --git cannot be used with a snapshot")
     );
+    // The explorer opens a snapshot read-only, and explains the same errors
+    // before taking over the terminal.
+    let output = run(&[garbage.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot load"));
+    let output = run(&[legacy, "--scan"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--scan cannot be used with a snapshot")
+    );
     // Snapshots written by grav 0.3 still load.
     let output = run(&["scan", legacy, "-f", "json"]);
     assert!(output.status.success(), "{output:?}");

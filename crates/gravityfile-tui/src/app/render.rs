@@ -177,10 +177,16 @@ impl App {
         };
 
         let stats = if let Some(tree) = &self.tree {
-            let suffix = if !self.has_full_scan && self.scan_progress.is_none() {
-                " (quick)"
+            let suffix = if let Some(source) = &self.snapshot {
+                let name = source.file_name().unwrap_or(source.as_os_str());
+                format!(
+                    " (snapshot {}, read-only)",
+                    gravityfile_core::escape_filename(name)
+                )
+            } else if !self.has_full_scan && self.scan_progress.is_none() {
+                " (quick)".to_string()
             } else {
-                ""
+                String::new()
             };
             let measure = if tree.config.apparent_size {
                 " apparent"
@@ -688,6 +694,17 @@ impl App {
 
         let inner = block.inner(area);
         block.render(area, buf);
+
+        if self.snapshot.is_some() {
+            Paragraph::new(
+                "Finding duplicates compares file contents, which a snapshot does not \
+                 record. Open the directory itself to look for duplicates.",
+            )
+            .style(Style::default().fg(self.theme.muted))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .render(inner, buf);
+            return;
+        }
 
         if let Some((filtered_groups, total_wasted)) = self.get_filtered_duplicates() {
             if filtered_groups.is_empty() {
