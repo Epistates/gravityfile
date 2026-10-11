@@ -160,6 +160,18 @@ grav scan server.json
 grav export ~ -f ncdu -o home.json      # for ncdu -f or gdu -f
 ```
 
+`grav diff` shows what changed between two scans, largest changes first:
+
+```sh
+grav diff home.json                     # since the snapshot, against the disk today
+grav diff january.json june.json -d 3   # between two snapshots, three levels deep
+grav diff ~/old-copy ~/proj             # two directories, scanned now
+```
+
+A directory compared with a snapshot is scanned with the snapshot's scope
+(hidden files, excludes, links), so the diff shows changes on disk rather than
+differences in what was counted. Entries are compared by size.
+
 The explorer opens a snapshot read-only: browsing, search, the treemap,
 size toggling and age analysis work from the record, while file
 operations, rescans and duplicate detection, which need the files

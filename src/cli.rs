@@ -89,6 +89,8 @@ pub enum Command {
     Duplicates(DuplicatesCommand),
     /// Break files down by age and find stale directories
     Age(AgeCommand),
+    /// Show what grew, shrank, appeared or went between two scans
+    Diff(DiffCommand),
     /// Write a complete scan as a JSON snapshot
     Export(ExportCommand),
     /// Print shell integration that follows the explorer's directory on exit
@@ -284,6 +286,46 @@ pub struct AgeCommand {
     pub stale: std::time::Duration,
 
     /// Stale directories to show, largest first (0 shows all)
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "N",
+        default_value_t = 10,
+        help_heading = "Output"
+    )]
+    pub limit: usize,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct DiffCommand {
+    /// The earlier side: a snapshot, or a directory scanned now
+    pub old: PathBuf,
+
+    /// The later side: a snapshot or directory [default: OLD's directory, scanned now]
+    pub new: Option<PathBuf>,
+
+    /// Count file lengths instead of disk usage
+    #[arg(short = 'A', long)]
+    pub apparent_size: bool,
+
+    /// Count every hard link to a file, not only the first
+    #[arg(short = 'l', long)]
+    pub count_links: bool,
+
+    /// Levels of directories to show below the root
+    #[arg(
+        short,
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Output"
+    )]
+    pub depth: u32,
+
+    /// Changes to show per directory, largest first (0 shows all)
     #[arg(
         short = 'n',
         long,

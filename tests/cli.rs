@@ -628,3 +628,69 @@ fn snapshot_errors_are_explained() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(json(&output)["data"]["entries"][0]["path"], "a\n.txt");
 }
+
+#[test]
+fn diff_reports_what_changed_since_a_snapshot() {
+    let place = tempfile::tempdir().unwrap();
+    let root = place.path().join("proj");
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::create_dir_all(root.join("old")).unwrap();
+    std::fs::write(root.join("cache/blob"), vec![0u8; 10_000]).unwrap();
+    std::fs::write(root.join("old/data"), vec![0u8; 3_000]).unwrap();
+    std::fs::write(root.join("same"), b"same").unwrap();
+    let saved = place.path().join("before.json");
+    let output = run(&[
+        "export",
+        root.to_str().unwrap(),
+        "-o",
+        saved.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+
+    std::fs::write(root.join("cache/blob"), vec![0u8; 50_000]).unwrap();
+    std::fs::remove_dir_all(root.join("old")).unwrap();
+    std::fs::create_dir(root.join("new")).unwrap();
+    std::fs::write(root.join("new/x"), vec![0u8; 7_000]).unwrap();
+
+    // With one side, the snapshot is compared with the same place today.
+    let output = run(&["diff", saved.to_str().unwrap(), "-A", "-f", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report = json(&output);
+    assert_eq!(report["kind"], "diff");
+    assert_eq!(report["data"]["old"]["snapshot"], true);
+    assert_eq!(report["data"]["new"]["snapshot"], false);
+    let changes: Vec<(String, String)> = report["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap().to_string(),
+                entry["change"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        changes[..4],
+        [
+            ("cache".to_string(), "changed".to_string()),
+            ("cache/blob".to_string(), "changed".to_string()),
+            ("new".to_string(), "added".to_string()),
+            ("old".to_string(), "removed".to_string()),
+        ]
+    );
+    assert!(!changes.iter().any(|(path, _)| path == "same"));
+
+    let text = run(&["diff", saved.to_str().unwrap(), "--color", "never"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("from a snapshot taken"), "{text}");
+    assert!(text.contains("removed") && text.contains("new"), "{text}");
+
+    // Two directories compare directly; one directory alone is an error.
+    let output = run(&["diff", root.to_str().unwrap(), root.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No changes in size"));
+    let output = run(&["diff", root.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("give a second directory"));
+}

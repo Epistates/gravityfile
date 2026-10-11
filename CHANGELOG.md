@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`grav diff OLD [NEW]`** shows what grew, shrank, appeared or went between
+  two scans, largest changes first per directory. Each side is a snapshot or
+  a directory; with one snapshot it is compared with the same place today,
+  scanned with the snapshot's scope. Text or JSON.
 - **Browse snapshots in the explorer.** `grav root.json.zst` opens a saved
   scan or ncdu dump read-only, without touching the filesystem: navigation,
   search, the treemap, size toggling and age analysis work; file operations,

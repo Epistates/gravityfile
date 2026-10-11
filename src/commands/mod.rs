@@ -1,6 +1,7 @@
 //! One module per subcommand.
 
 pub mod age;
+pub mod diff;
 pub mod duplicates;
 pub mod export;
 pub mod scan;

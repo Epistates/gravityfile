@@ -98,7 +98,11 @@ fn run(cli: Cli, out: Styles, err: Styles) -> Result<ExitCode> {
         Command::Init { shell } => commands::shell::init(shell, &mut stdout)?,
         Command::Completions { shell } => commands::shell::completions(shell, &mut stdout)?,
         Command::Man => commands::shell::man(&mut stdout)?,
-        Command::Scan(_) | Command::Duplicates(_) | Command::Age(_) | Command::Export(_) => {
+        Command::Scan(_)
+        | Command::Duplicates(_)
+        | Command::Age(_)
+        | Command::Diff(_)
+        | Command::Export(_) => {
             drop(stdout);
             return report(&command, &global, out, err);
         }
@@ -144,6 +148,10 @@ fn report(command: &Command, global: &GlobalArgs, out: Styles, err: Styles) -> R
             command.output.strict,
         ),
         Command::Age(command) => (commands::age::run(command, &context), command.output.strict),
+        Command::Diff(command) => (
+            commands::diff::run(command, &context),
+            command.output.strict,
+        ),
         Command::Export(command) => (commands::export::run(command, &context), command.strict),
         _ => unreachable!("only report commands reach here"),
     };

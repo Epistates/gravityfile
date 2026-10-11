@@ -55,6 +55,7 @@
 //! ```
 
 pub mod age;
+mod diff;
 mod duplicates;
 mod status;
 
@@ -64,6 +65,7 @@ pub use age::{
     AgeAnalyzer, AgeBucket, AgeBucketStats, AgeConfig, AgeReport, StaleDirectory,
     StaleDirectoryStatus, format_age,
 };
+pub use diff::{Change, DiffEntry, DiffOptions, Omitted as DiffOmitted, TreeDiff, diff};
 pub use duplicates::{
     DuplicateConfig, DuplicateFinder, DuplicateGroup, DuplicateReport, DuplicateTimings,
     HashProgress,
