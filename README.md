@@ -200,10 +200,12 @@ and how unusual file names are encoded.
 
 ## Plugins
 
-Lua plugins can react to scans, navigation and file operations, and veto
-actions. Each runs in its own worker process with deadlines and bounded
-messages; a stuck or crashed plugin is killed without affecting the explorer.
-Plugins are not sandboxed from the filesystem or network. See
+Lua plugins react to scans, navigation, file operations and analysis, show
+messages in the status line, and can refuse a delete. Each runs in its own
+worker process with deadlines and bounded messages, in the background so it
+never holds up the explorer; a stuck or crashed plugin is stopped without
+affecting it. Plugins cannot write files or run programs and read only below
+the scanned directory, but this is not operating-system confinement. See
 [plugins](docs/PLUGINS.md).
 
 ## Development

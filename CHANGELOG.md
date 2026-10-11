@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two scans, largest changes first per directory. Each side is a snapshot or
   a directory; with one snapshot it is compared with the same place today,
   scanned with the snapshot's scope. Text or JSON.
+- **Plugins that work as documented.** Hooks run in the background, so a
+  slow plugin no longer freezes navigation; only `on_delete_start` (which
+  can refuse the delete) and `on_shutdown` are awaited. `gf.notify` now
+  shows its message in the status line, plugin failures are reported
+  instead of only logged, and hooks receive the context (directory, theme,
+  selected entry) as a third argument. Scan start and error, delete, copy,
+  move and rename completion, and analysis hooks now fire. Hooks the
+  explorer never fired and the unrendered `ui` namespace are removed, and
+  the plugin guide and example are rewritten to match.
 - `grav scan --top N` lists the largest files anywhere below the root, and
   `grav scan --by-type` totals the space by file extension.
 - **Scan history.** Each full scan in the explorer, and `grav scan --record`,

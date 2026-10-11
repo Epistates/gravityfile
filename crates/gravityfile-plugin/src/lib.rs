@@ -20,7 +20,7 @@ mod sandbox;
 mod types;
 
 pub use config::{PluginConfig, PluginMetadata};
-pub use hooks::{Hook, HookContext, HookResult};
+pub use hooks::{Hook, HookContext, HookResult, Notice, NoticeLevel};
 pub use process::{ProcessRuntime, run_worker};
 pub use runtime::{IsolatedContext, PluginHandle, PluginManager, PluginRuntime};
 pub use sandbox::{Permission, SandboxConfig};

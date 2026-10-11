@@ -11,7 +11,8 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-const VERSION: u32 = 1;
+// 2: hook responses carry notices.
+const VERSION: u32 = 2;
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub(super) const MAX_LOG_BYTES: usize = 64 * 1024;
 
@@ -137,6 +138,7 @@ pub(super) enum Response {
         stop_propagation: bool,
         value: Option<WireValue>,
         error: Option<String>,
+        notices: Vec<crate::Notice>,
     },
     Value(WireValue),
 }
@@ -327,7 +329,9 @@ mod tests {
             read_frame(&mut &[0, 0, 0, 2, 1][..]).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
-        assert!(decode::<WireValue>(br#"{"version":2,"body":"Null"}"#).is_err());
+        // A frame from another protocol version is refused.
+        let other = format!(r#"{{"version":{},"body":"Null"}}"#, VERSION + 1);
+        assert!(decode::<WireValue>(other.as_bytes()).is_err());
         assert!(encode(WireValue::String("x".repeat(MAX_FRAME))).is_err());
     }
 

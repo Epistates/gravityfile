@@ -15,30 +15,18 @@ use indexmap::IndexMap;
 /// `load_plugin` when collecting the hooks a plugin implements.
 pub(crate) const HOOK_NAMES: &[&str] = &[
     "on_navigate",
-    "on_drill_down",
-    "on_back",
     "on_scan_start",
-    "on_scan_progress",
     "on_scan_complete",
     "on_scan_error",
     "on_delete_start",
     "on_delete_complete",
-    "on_copy_start",
     "on_copy_complete",
-    "on_move_start",
     "on_move_complete",
-    "on_rename_start",
     "on_rename_complete",
     "on_duplicates_found",
     "on_age_analysis_complete",
-    "on_render",
-    "on_action",
-    "on_mode_change",
-    "on_selection_change",
     "on_startup",
     "on_shutdown",
-    "on_plugin_load",
-    "on_plugin_unload",
 ];
 
 use tokio_util::sync::CancellationToken;
@@ -498,14 +486,9 @@ impl PluginManager {
 
             if let Some(runtime) = self.runtimes.get(&plugin.metadata.runtime) {
                 let rh = plugin.runtime_handle;
-                let result = if hook.is_sync() {
-                    runtime.call_hook_sync(rh, hook, ctx)
-                } else {
-                    runtime.call_hook_async(rh, hook, ctx).await
-                };
-
-                match result {
-                    Ok(r) => {
+                match runtime.call_hook_async(rh, hook, ctx).await {
+                    Ok(mut r) => {
+                        r.plugin = Some(plugin.id.clone());
                         let stop = r.stop_propagation;
                         results.push(r);
                         if stop {
@@ -513,12 +496,15 @@ impl PluginManager {
                         }
                     }
                     Err(e) => {
-                        // Log error but continue to other plugins
+                        // Report it to the host, and continue with other plugins.
                         tracing::warn!(
                             plugin_id = %plugin.id,
                             error = %e,
                             "Plugin hook dispatch error"
                         );
+                        let mut failed = HookResult::error(e.to_string());
+                        failed.plugin = Some(plugin.id.clone());
+                        results.push(failed);
                     }
                 }
             }

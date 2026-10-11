@@ -25,6 +25,7 @@ impl App {
             || self.refresh_rx.is_some()
             || !self.listings.is_empty()
             || self.history_rx.is_some()
+            || self.hooks_in_flight > 0
     }
 
     /// The next result from a background task. Never completes when
@@ -53,6 +54,7 @@ impl App {
             previous = async {
                 self.history_rx.as_mut().expect("guarded history receiver").await.ok()
             }, if self.history_rx.is_some() => Background::History(previous),
+            results = self.hook_rx.recv(), if self.hooks_in_flight > 0 => Background::Hooks(results),
             else => std::future::pending().await,
         }
     }
@@ -79,6 +81,7 @@ impl App {
                 self.refresh_rx = None;
                 self.apply_refresh(refreshed.unwrap_or_default());
             }
+            Background::Hooks(results) => self.finish_hook(results.unwrap_or_default()),
             Background::History(previous) => {
                 self.history_rx = None;
                 self.history_baseline = previous.flatten();
@@ -237,6 +240,9 @@ impl App {
             self.user_settings.max_scan_entries,
             self.scan_token.clone(),
         ));
+        self.fire(gravityfile_plugin::Hook::OnScanStart {
+            path: self.path.clone(),
+        });
     }
 
     /// Add the finished scan to the history, and learn the latest earlier
@@ -358,6 +364,12 @@ impl App {
                     Ok(renames) => {
                         self.marked.clear();
                         let count = renames.len();
+                        for (source, new_path) in renames.clone() {
+                            self.fire(gravityfile_plugin::Hook::OnRenameComplete {
+                                source,
+                                new_path,
+                            });
+                        }
                         touched = renames
                             .iter()
                             .flat_map(|(from, to)| [from.clone(), to.clone()])
@@ -421,26 +433,19 @@ impl App {
                 // the user actually opens an analysis view.
                 self.maybe_start_analysis_for_view();
 
-                // Dispatch scan complete hook (extract only the stats we need)
-                if let Some(pm) = self.plugin_manager.clone() {
-                    let view_root = self.nav.view_root.clone();
-                    tokio::spawn(async move {
-                        let ctx = gravityfile_plugin::HookContext::new().with_view_root(view_root);
-
-                        let hook = gravityfile_plugin::Hook::OnScanComplete {
-                            path: scan_path,
-                            total_files,
-                            total_dirs,
-                            total_size,
-                        };
-
-                        let pm_lock = pm.read().await;
-                        let _ = pm_lock.dispatch_hook(&hook, &ctx).await;
-                    });
-                }
+                self.fire(gravityfile_plugin::Hook::OnScanComplete {
+                    path: scan_path,
+                    total_files,
+                    total_dirs,
+                    total_size,
+                });
             }
             ScanResult::ScanComplete(Err(e)) => {
                 self.error = Some(e.to_string());
+                self.fire(gravityfile_plugin::Hook::OnScanError {
+                    path: self.path.clone(),
+                    error: e.to_string(),
+                });
                 self.scan_progress = None;
                 self.scan_rx = None;
                 self.analyzing = false;
@@ -450,6 +455,17 @@ impl App {
                 age_report,
                 duplicate_scope: (root, counts),
             } => {
+                if self.snapshot.is_none() {
+                    self.fire(gravityfile_plugin::Hook::OnDuplicatesFound {
+                        group_count: duplicates.group_count,
+                        wasted_bytes: duplicates.total_wasted_space,
+                    });
+                }
+                self.fire(gravityfile_plugin::Hook::OnAgeAnalysisComplete {
+                    stale_dirs: age_report.stale_directories.len(),
+                    files: age_report.total_files,
+                    average_age_secs: age_report.average_age.as_secs(),
+                });
                 let duplicates = Arc::new(duplicates);
                 self.duplicate_filter.seed(&duplicates, root, counts);
                 self.duplicates = Some(duplicates);
@@ -483,6 +499,11 @@ impl App {
 
                 let (success, msg) =
                     deletion::format_deletion_result(mode, deleted.len(), failed, bytes_freed);
+                self.fire(gravityfile_plugin::Hook::OnDeleteComplete {
+                    deleted: deleted.len(),
+                    failed,
+                    bytes_freed,
+                });
                 let touched = deleted.clone();
                 if mode == gravityfile_ops::DeleteMode::Trash {
                     self.undo_log.record_trash(deleted);
@@ -529,6 +550,30 @@ impl App {
                     ));
                 }
                 self.set_operation_errors(operation_type, errors);
+                match (operation_type, &undo_info) {
+                    (gravityfile_ops::OperationType::Copy, _) => {
+                        self.fire(gravityfile_plugin::Hook::OnCopyComplete {
+                            succeeded,
+                            failed,
+                            bytes_copied: bytes_processed,
+                        });
+                    }
+                    (gravityfile_ops::OperationType::Move, _) => {
+                        self.fire(gravityfile_plugin::Hook::OnMoveComplete { succeeded, failed });
+                    }
+                    (
+                        gravityfile_ops::OperationType::Rename,
+                        Some(gravityfile_ops::UndoableOperation::FilesRenamed { renames }),
+                    ) => {
+                        for (source, new_path) in renames.clone() {
+                            self.fire(gravityfile_plugin::Hook::OnRenameComplete {
+                                source,
+                                new_path,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
 
                 // Record in undo log if successful
                 if let Some(undo) = undo_info {

@@ -142,10 +142,6 @@ impl LuaIsolatedContext {
             globals.set("fs", fs).ok();
         }
 
-        // Add 'ui' for rendering (safe, no side effects)
-        let ui = bindings::create_ui_api(&lua)?;
-        globals.set("ui", ui).ok();
-
         drop(globals);
 
         Ok(Self {

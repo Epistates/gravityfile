@@ -17,6 +17,7 @@ mod listing;
 mod mouse;
 mod navigate;
 mod operations;
+mod plugins;
 mod previews;
 mod render;
 mod scanning;
@@ -93,6 +94,7 @@ enum Background {
     Refresh(Option<Vec<state::Refreshed>>),
     Listed(Option<state::Listed>),
     History(Option<Option<gravityfile_core::history::Record>>),
+    Hooks(Option<Vec<gravityfile_plugin::HookResult>>),
 }
 
 /// Main application state.
@@ -269,6 +271,13 @@ pub struct App {
     visual_state: Option<state::VisualState>,
     /// Plugin manager.
     plugin_manager: Option<Arc<RwLock<gravityfile_plugin::PluginManager>>>,
+    /// Whether any plugin is loaded; hooks are not fired otherwise.
+    plugins_loaded: bool,
+    /// Fired hooks report their results here.
+    hook_tx: mpsc::UnboundedSender<Vec<gravityfile_plugin::HookResult>>,
+    hook_rx: mpsc::UnboundedReceiver<Vec<gravityfile_plugin::HookResult>>,
+    /// Hooks fired and not yet reported back.
+    hooks_in_flight: usize,
     /// Last known terminal content-area height (rows available for the file list).
     /// Updated on every render; used for scroll/ensure_visible calculations.
     viewport_height: usize,
@@ -350,6 +359,7 @@ impl App {
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
         let (listing_tx, listing_rx) = mpsc::unbounded_channel();
+        let (hook_tx, hook_rx) = mpsc::unbounded_channel();
         // Unit tests must never write to the user's real history.
         let history_file = (!cfg!(test) && !is_snapshot && user_settings.record_history)
             .then(gravityfile_core::paths::Dirs::discover)
@@ -453,6 +463,10 @@ impl App {
             cached_treemap_len: 0,
             visual_state: None,
             plugin_manager: Some(plugin_manager),
+            plugins_loaded: false,
+            hook_tx,
+            hook_rx,
+            hooks_in_flight: 0,
             viewport_height: 40, // reasonable default before first render
         };
 
@@ -464,84 +478,6 @@ impl App {
         app.update_cached_parent();
 
         app
-    }
-
-    /// Initialize plugin runtimes and discover plugins.
-    async fn init_plugins(&self) {
-        if let Some(pm) = &self.plugin_manager {
-            let mut pm = pm.write().await;
-            if let Err(e) = pm.init_runtimes() {
-                tracing::warn!("Plugin runtime init error: {}", e);
-            }
-            if let Err(e) = pm.discover_plugins().await {
-                tracing::warn!("Plugin discovery error: {}", e);
-            }
-        }
-    }
-
-    /// Dispatch a plugin hook, ignoring any results.
-    async fn dispatch_hook(&self, hook: gravityfile_plugin::Hook) {
-        let _ = self.dispatch_hook_collect(hook).await;
-    }
-
-    /// Dispatch a plugin hook and return the per-plugin results.
-    ///
-    /// Callers that gate a host default action on plugins (e.g. deletion) use
-    /// the returned results with [`PluginManager::any_prevent_default`].
-    async fn dispatch_hook_collect(
-        &self,
-        hook: gravityfile_plugin::Hook,
-    ) -> Vec<gravityfile_plugin::HookResult> {
-        let theme_name = self.theme.name;
-
-        let mut ctx = gravityfile_plugin::HookContext::new()
-            .with_cwd(self.path.clone())
-            .with_view_root(self.nav.view_root.clone())
-            .with_theme(theme_name);
-
-        if let Some(node) = self.get_current_node() {
-            // Serialize only the node's own metadata, NOT its children.
-            // Children can be enormous after a full scan and serializing
-            // them causes multi-second stalls on every hook dispatch.
-            let shallow = serde_json::json!({
-                "name": node.name,
-                "kind": node.kind,
-                "size": node.size,
-                "blocks": node.blocks,
-                "timestamps": node.timestamps,
-                "inode": node.inode,
-                "git_status": node.git_status,
-                "child_count": node.children.len(),
-            });
-            if let Ok(plugin_val) = serde_json::from_value::<gravityfile_plugin::Value>(shallow) {
-                ctx.set("selected_node", plugin_val);
-            }
-        }
-
-        if let Some(pm) = &self.plugin_manager {
-            let pm = pm.read().await;
-            pm.dispatch_hook(&hook, &ctx).await
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Get the currently selected node in the current view.
-    fn get_current_node(&self) -> Option<&gravityfile_core::FileNode> {
-        let tree = self.tree.as_ref()?;
-        let path = self.get_selected_path()?;
-        Self::find_node_at_path(&tree.root, &path, &tree.root_path)
-    }
-
-    /// Check for navigation and dispatch hook if needed.
-    async fn check_navigation(&self, old_root: &std::path::Path) {
-        if old_root != self.nav.view_root {
-            self.dispatch_hook(gravityfile_plugin::Hook::OnNavigate {
-                from: old_root.to_path_buf(),
-                to: self.nav.view_root.clone(),
-            })
-            .await;
-        }
     }
 
     pub(crate) fn image_previews_enabled(&self) -> bool {
@@ -569,8 +505,7 @@ impl App {
     ) -> AppResult<crate::ExitData> {
         self.search_state.enable_background();
         self.init_plugins().await;
-        self.dispatch_hook(gravityfile_plugin::Hook::OnStartup)
-            .await;
+        self.fire(gravityfile_plugin::Hook::OnStartup);
 
         // Start scan if configured to do so
         if self.scan_on_startup {
@@ -683,7 +618,7 @@ impl App {
             }
         }
 
-        self.dispatch_hook(gravityfile_plugin::Hook::OnShutdown)
+        self.dispatch_and_wait(gravityfile_plugin::Hook::OnShutdown)
             .await;
 
         self.scan_token.cancel();
@@ -716,7 +651,7 @@ impl App {
     /// Work that follows each turn of the event loop: navigation hooks, then
     /// the plugin veto check for a staged deletion, which starts or aborts it.
     async fn after_input(&mut self, old_view_root: &Path) {
-        self.check_navigation(old_view_root).await;
+        self.check_navigation(old_view_root);
         if let Some(items) = self.pending_deletion.take() {
             self.finalize_deletion(items).await;
             self.needs_redraw = true;
@@ -3932,6 +3867,34 @@ mod tests {
             assert_eq!(app.undo_log.len(), 1);
             app.cancel_scan();
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_notices_and_failures_reach_the_status_line() {
+        use gravityfile_plugin::{HookResult, Notice, NoticeLevel};
+        let (_dir, mut app) = scanned_app();
+        // Without loaded plugins nothing is fired at all.
+        app.fire(gravityfile_plugin::Hook::OnStartup);
+        assert_eq!(app.hooks_in_flight, 0);
+
+        app.hooks_in_flight = 1;
+        let mut said = HookResult::ok();
+        said.plugin = Some("git".into());
+        said.notices = vec![Notice::new(NoticeLevel::Info, "3 untracked files")];
+        app.finish_hook(vec![said]);
+        assert_eq!(app.hooks_in_flight, 0);
+        assert_eq!(
+            app.operation_message,
+            Some((true, "git: 3 untracked files".into()))
+        );
+
+        let mut failed = HookResult::error("attempt to index a nil value");
+        failed.plugin = Some("broken".into());
+        app.finish_hook(vec![failed]);
+        assert_eq!(
+            app.operation_message,
+            Some((false, "broken failed: attempt to index a nil value".into()))
+        );
     }
 
     #[tokio::test]

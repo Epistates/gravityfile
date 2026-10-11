@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gravityfile_plugin::{
-    Hook, HookContext, PluginConfig, PluginRuntime, ProcessRuntime, SandboxConfig, Value,
+    Hook, HookContext, Notice, NoticeLevel, PluginConfig, PluginRuntime, ProcessRuntime,
+    SandboxConfig, Value,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -71,6 +72,11 @@ async fn plugin_state_persists_and_hooks_work_across_ipc() {
         .call_hook_sync(handle, &Hook::OnStartup, &HookContext::new())
         .unwrap();
     assert_eq!(hook.value.unwrap().as_i64(), Some(42));
+    assert_eq!(
+        hook.notices,
+        [Notice::new(NoticeLevel::Info, "worker notification")],
+        "gf.notify crosses the process boundary"
+    );
     runtime.unload_plugin(handle).unwrap();
     assert!(runtime.loaded_plugins().is_empty());
 }
@@ -175,4 +181,74 @@ async fn oversized_results_fail_without_poisoning_other_workers() {
             .as_i64(),
         Some(42)
     );
+}
+
+#[test]
+fn hook_context_reaches_plugins_in_the_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("where.lua");
+    std::fs::write(
+        &source,
+        r#"return {
+        on_navigate = function(self, hook, ctx)
+            gf.notify("now in " .. ctx.view_root, "warn")
+            return { value = ctx.theme }
+        end
+    }"#,
+    )
+    .unwrap();
+    let mut runtime = runtime(2000);
+    let handle = runtime.load_plugin("where", &source).unwrap();
+    let context = HookContext::new()
+        .with_view_root(PathBuf::from("/home/me"))
+        .with_theme("nord");
+    let hook = Hook::OnNavigate {
+        from: PathBuf::from("/home"),
+        to: PathBuf::from("/home/me"),
+    };
+    let result = runtime.call_hook_sync(handle, &hook, &context).unwrap();
+    assert_eq!(result.value, Some(Value::String("nord".into())));
+    assert_eq!(
+        result.notices,
+        [Notice::new(NoticeLevel::Warn, "now in /home/me")]
+    );
+    runtime.unload_plugin(handle).unwrap();
+}
+
+#[test]
+fn the_example_guard_plugin_refuses_to_delete_git_history() {
+    let source = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/plugins/lua/guard.lua"
+    ));
+    let mut runtime = runtime(2000);
+    let handle = runtime.load_plugin("guard", &source).unwrap();
+    let delete = |items: &[&str]| Hook::OnDeleteStart {
+        items: items.iter().map(PathBuf::from).collect(),
+        use_trash: true,
+    };
+    let refused = runtime
+        .call_hook_sync(
+            handle,
+            &delete(&["/work/a.log", "/work/repo/.git"]),
+            &HookContext::new(),
+        )
+        .unwrap();
+    assert!(refused.prevent_default);
+    assert_eq!(refused.notices[0].level, NoticeLevel::Error);
+    let allowed = runtime
+        .call_hook_sync(handle, &delete(&["/work/a.log"]), &HookContext::new())
+        .unwrap();
+    assert!(!allowed.prevent_default && allowed.notices.is_empty());
+    let scanned = Hook::OnScanComplete {
+        path: PathBuf::from("/work"),
+        total_files: 3,
+        total_dirs: 1,
+        total_size: 2_500_000_000,
+    };
+    let summary = runtime
+        .call_hook_sync(handle, &scanned, &HookContext::new())
+        .unwrap();
+    assert_eq!(summary.notices[0].message, "Scanned 3 files, 2.5 GB");
+    runtime.unload_plugin(handle).unwrap();
 }

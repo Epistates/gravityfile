@@ -548,12 +548,15 @@ fn hook_response(response: Response) -> PluginResult<HookResult> {
             stop_propagation,
             value,
             error,
+            notices,
         } => Ok(HookResult {
             handled,
             prevent_default,
             stop_propagation,
             value: value.map(Into::into),
             error,
+            notices,
+            plugin: None,
         }),
         _ => Err(protocol("unexpected hook response")),
     }
@@ -729,6 +732,7 @@ fn execute_request(
                 stop_propagation: result.stop_propagation,
                 value: result.value.map(Into::into),
                 error: result.error,
+                notices: result.notices,
             })
         }
         Request::Method { handle, name, args } => Ok(Response::Value(

@@ -144,7 +144,7 @@ impl App {
     pub(super) async fn finalize_deletion(&mut self, items: Vec<(PathBuf, u64)>) {
         let paths: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
         let results = self
-            .dispatch_hook_collect(gravityfile_plugin::Hook::OnDeleteStart {
+            .dispatch_and_wait(gravityfile_plugin::Hook::OnDeleteStart {
                 items: paths,
                 use_trash: self.delete_mode == gravityfile_ops::DeleteMode::Trash,
             })
