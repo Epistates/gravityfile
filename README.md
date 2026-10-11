@@ -26,12 +26,30 @@ with a scriptable CLI for reports.
 
 ## Install
 
+Prebuilt binaries for macOS, Linux (glibc and static musl) and Windows are
+attached to each [GitHub release](https://github.com/epistates/gravityfile/releases),
+with installers:
+
+```sh
+# macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/epistates/gravityfile/releases/latest/download/gravityfile-installer.sh | sh
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/epistates/gravityfile/releases/latest/download/gravityfile-installer.ps1 | iex"
+```
+
+Every archive carries build provenance; check one with
+`gh attestation verify <archive> --repo epistates/gravityfile`.
+
+Or build it with Cargo, which needs Rust 1.90 or newer:
+
 ```sh
 cargo install --locked gravityfile
 ```
 
-This installs the `grav` binary. Building from a checkout needs Rust 1.90 or
-newer: `cargo install --locked --path .`.
+Either way you get the `grav` binary.
 
 ## Use
 
