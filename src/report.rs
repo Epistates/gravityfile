@@ -24,7 +24,9 @@ pub struct ReportEnvelope<'a, T> {
     pub kind: &'static str,
     #[serde(serialize_with = "gravityfile_core::path_serde::serialize")]
     pub root: &'a Path,
-    pub scope: &'a ScanConfig,
+    /// How the tree was scanned; absent for reports that span several scans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<&'a ScanConfig>,
     pub parameters: serde_json::Value,
     pub status: &'a AnalysisStatus,
     pub data: &'a T,
@@ -42,7 +44,28 @@ impl<'a, T> ReportEnvelope<'a, T> {
             tool_version: env!("CARGO_PKG_VERSION"),
             kind,
             root: &tree.root_path,
-            scope: &tree.config,
+            scope: Some(&tree.config),
+            parameters: serde_json::Value::Null,
+            status,
+            data,
+        }
+    }
+}
+
+impl<'a, T> ReportEnvelope<'a, T> {
+    /// A report about `root` drawn from several scans rather than one tree.
+    pub fn for_root(
+        kind: &'static str,
+        root: &'a Path,
+        status: &'a AnalysisStatus,
+        data: &'a T,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            kind,
+            root,
+            scope: None,
             parameters: serde_json::Value::Null,
             status,
             data,

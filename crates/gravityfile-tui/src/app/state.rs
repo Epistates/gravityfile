@@ -894,6 +894,10 @@ pub struct UserSettings {
     /// Colour theme: gestalt, latte, nord, dracula or ansi.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Record each full scan's totals for `grav history` and the header's
+    /// change since last time.
+    #[serde(default = "default_true")]
+    pub record_history: bool,
 }
 
 fn default_true() -> bool {
@@ -916,6 +920,7 @@ impl Default for UserSettings {
             bookmarks: Bookmarks::with_defaults(),
             image_previews: true,
             theme: default_theme(),
+            record_history: true,
         }
     }
 }

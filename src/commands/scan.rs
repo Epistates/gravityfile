@@ -20,7 +20,13 @@ use crate::style::paint;
 
 pub fn run(command: &ScanCommand, context: &Context) -> Result<Completeness> {
     let snapshot = super::is_snapshot(&command.scan);
+    if command.record && snapshot {
+        return Err(eyre!("--record needs a directory, not a snapshot"));
+    }
     let tree = super::scan_tree(&command.scan, context)?;
+    if command.record {
+        super::history::record(&tree)?;
+    }
     let view = View::build(&tree, command.depth, command.limit, &context.cancel)?;
     let status = scan_status(&tree);
     let mut stdout = std::io::stdout().lock();

@@ -172,6 +172,13 @@ A directory compared with a snapshot is scanned with the snapshot's scope
 (hidden files, excludes, links), so the diff shows changes on disk rather than
 differences in what was counted. Entries are compared by size.
 
+The explorer records each full scan's totals, and `grav scan PATH --record`
+adds one, for example from cron. `grav history PATH` shows the trend, with
+the top-level entry that changed most; `grav history --all` lists every
+recorded directory. The explorer's header shows the change since the last
+scan of the same place. Set `record_history = false` in `settings.toml` to
+stop recording.
+
 The explorer opens a snapshot read-only: browsing, search, the treemap,
 size toggling and age analysis work from the record, while file
 operations, rescans and duplicate detection, which need the files

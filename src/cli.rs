@@ -91,6 +91,8 @@ pub enum Command {
     Age(AgeCommand),
     /// Show what grew, shrank, appeared or went between two scans
     Diff(DiffCommand),
+    /// Show how a directory's size changed across recorded scans
+    History(HistoryCommand),
     /// Write a complete scan as a JSON snapshot
     Export(ExportCommand),
     /// Print shell integration that follows the explorer's directory on exit
@@ -229,6 +231,10 @@ pub struct ScanCommand {
     #[command(flatten)]
     pub scan: ScanArgs,
 
+    /// Add this scan's totals to the history shown by `grav history`
+    #[arg(long)]
+    pub record: bool,
+
     /// Levels of directories to show below the root
     #[arg(
         short,
@@ -291,6 +297,29 @@ pub struct AgeCommand {
         long,
         value_name = "N",
         default_value_t = 10,
+        help_heading = "Output"
+    )]
+    pub limit: usize,
+
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryCommand {
+    /// Directory whose history to show [default: current directory]
+    pub path: Option<PathBuf>,
+
+    /// List every directory with recorded scans instead
+    #[arg(long, conflicts_with = "path")]
+    pub all: bool,
+
+    /// Most recent scans to show (0 shows all)
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "N",
+        default_value_t = 20,
         help_heading = "Output"
     )]
     pub limit: usize,

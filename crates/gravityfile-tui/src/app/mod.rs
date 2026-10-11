@@ -92,6 +92,7 @@ enum Background {
     Archive(Option<ArchiveCompletion>),
     Refresh(Option<Vec<state::Refreshed>>),
     Listed(Option<state::Listed>),
+    History(Option<Option<gravityfile_core::history::Record>>),
 }
 
 /// Main application state.
@@ -242,6 +243,11 @@ pub struct App {
     listing_rx: mpsc::UnboundedReceiver<state::Listed>,
     /// Listings in flight, so one directory is not listed twice at once.
     listings: HashSet<(state::ListingFor, PathBuf)>,
+    /// The scan history to add full scans to; None when not recording.
+    history_file: Option<PathBuf>,
+    history_rx: Option<oneshot::Receiver<Option<gravityfile_core::history::Record>>>,
+    /// The latest earlier scan of this place, for the change shown in the header.
+    history_baseline: Option<gravityfile_core::history::Record>,
     /// Cached parent tree for Miller columns when at tree root.
     /// This allows showing the parent column even when navigated beyond the original scan root.
     cached_parent_tree: Option<FileTree>,
@@ -344,6 +350,11 @@ impl App {
 
         let plugin_manager = Arc::new(RwLock::new(pm_inner));
         let (listing_tx, listing_rx) = mpsc::unbounded_channel();
+        // Unit tests must never write to the user's real history.
+        let history_file = (!cfg!(test) && !is_snapshot && user_settings.record_history)
+            .then(gravityfile_core::paths::Dirs::discover)
+            .flatten()
+            .map(|dirs| dirs.history_file());
         let (theme, theme_error) = match Theme::named(&user_settings.theme) {
             Some(theme) => (theme, None),
             None => (
@@ -427,6 +438,9 @@ impl App {
             user_settings,
             settings_state: None,
             bookmark_list_state: None,
+            history_file,
+            history_rx: None,
+            history_baseline: None,
             listing_tx,
             listing_rx,
             listings: HashSet::new(),
@@ -3882,6 +3896,9 @@ mod tests {
             AppMode::Search,
             AppMode::CreatingFile,
         ] {
+            // The previous round's refresh is still running; the run loop
+            // selects among ready tasks at random, so let it finish first.
+            pump(&mut app, |_| false).await;
             let (tx, rx) = mpsc::channel(1);
             drop(tx);
             app.op_rx = Some(rx);

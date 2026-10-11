@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two scans, largest changes first per directory. Each side is a snapshot or
   a directory; with one snapshot it is compared with the same place today,
   scanned with the snapshot's scope. Text or JSON.
+- **Scan history.** Each full scan in the explorer, and `grav scan --record`,
+  adds a summary to `history.jsonl` in the data directory. `grav history
+  [PATH]` shows a directory's size over time and what changed most;
+  `--all` lists every recorded directory. The explorer's header shows the
+  change since the last scan of the same place. `record_history = false`
+  turns it off.
 - **Browse snapshots in the explorer.** `grav root.json.zst` opens a saved
   scan or ncdu dump read-only, without touching the filesystem: navigation,
   search, the treemap, size toggling and age analysis work; file operations,

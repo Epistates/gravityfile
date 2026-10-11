@@ -67,6 +67,11 @@ impl Dirs {
         self.config.join("keymap.toml")
     }
 
+    /// The history of scan totals.
+    pub fn history_file(&self) -> PathBuf {
+        self.data.join("history.jsonl")
+    }
+
     /// Installed plugins.
     pub fn plugin_dir(&self) -> PathBuf {
         self.config.join("plugins")

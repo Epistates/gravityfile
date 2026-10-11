@@ -4,6 +4,7 @@ pub mod age;
 pub mod diff;
 pub mod duplicates;
 pub mod export;
+pub mod history;
 pub mod scan;
 pub mod shell;
 

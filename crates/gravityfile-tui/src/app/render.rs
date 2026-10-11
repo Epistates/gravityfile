@@ -185,6 +185,19 @@ impl App {
                 )
             } else if !self.has_full_scan && self.scan_progress.is_none() {
                 " (quick)".to_string()
+            } else if let Some(baseline) = self.history_baseline.as_ref().filter(|baseline| {
+                baseline.root == tree.root_path && baseline.apparent == tree.config.apparent_size
+            }) {
+                // Growth since the last recorded scan of this place.
+                let change = i128::from(tree.root.size) - i128::from(baseline.size);
+                let amount = format_size(u64::try_from(change.unsigned_abs()).unwrap_or(u64::MAX));
+                let sign = match change.signum() {
+                    1 => "+",
+                    -1 => "-",
+                    _ => "±",
+                };
+                let since: chrono::DateTime<chrono::Local> = baseline.at.into();
+                format!(", {sign}{amount} since {}", since.format("%Y-%m-%d"))
             } else {
                 String::new()
             };

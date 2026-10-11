@@ -39,6 +39,7 @@
 
 mod config;
 mod error;
+pub mod history;
 mod node;
 pub mod path_serde;
 pub mod paths;

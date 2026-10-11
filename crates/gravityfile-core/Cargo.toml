@@ -14,7 +14,7 @@ compact_str.workspace = true
 derive_builder.workspace = true
 globset.workspace = true
 etcetera.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true

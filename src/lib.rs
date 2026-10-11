@@ -102,6 +102,7 @@ fn run(cli: Cli, out: Styles, err: Styles) -> Result<ExitCode> {
         | Command::Duplicates(_)
         | Command::Age(_)
         | Command::Diff(_)
+        | Command::History(_)
         | Command::Export(_) => {
             drop(stdout);
             return report(&command, &global, out, err);
@@ -150,6 +151,10 @@ fn report(command: &Command, global: &GlobalArgs, out: Styles, err: Styles) -> R
         Command::Age(command) => (commands::age::run(command, &context), command.output.strict),
         Command::Diff(command) => (
             commands::diff::run(command, &context),
+            command.output.strict,
+        ),
+        Command::History(command) => (
+            commands::history::run(command, &context),
             command.output.strict,
         ),
         Command::Export(command) => (commands::export::run(command, &context), command.strict),

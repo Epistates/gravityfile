@@ -24,6 +24,7 @@ impl App {
             || self.archive_rx.is_some()
             || self.refresh_rx.is_some()
             || !self.listings.is_empty()
+            || self.history_rx.is_some()
     }
 
     /// The next result from a background task. Never completes when
@@ -49,6 +50,9 @@ impl App {
                 self.refresh_rx.as_mut().expect("guarded refresh receiver").await.ok()
             }, if self.refresh_rx.is_some() => Background::Refresh(refreshed),
             listed = self.listing_rx.recv(), if !self.listings.is_empty() => Background::Listed(listed),
+            previous = async {
+                self.history_rx.as_mut().expect("guarded history receiver").await.ok()
+            }, if self.history_rx.is_some() => Background::History(previous),
             else => std::future::pending().await,
         }
     }
@@ -74,6 +78,10 @@ impl App {
             Background::Refresh(refreshed) => {
                 self.refresh_rx = None;
                 self.apply_refresh(refreshed.unwrap_or_default());
+            }
+            Background::History(previous) => {
+                self.history_rx = None;
+                self.history_baseline = previous.flatten();
             }
             // The App holds a sender, so the channel never closes.
             Background::Listed(listed) => {
@@ -231,6 +239,32 @@ impl App {
         ));
     }
 
+    /// Add the finished scan to the history, and learn the latest earlier
+    /// scan of the same place measured the same way, on the blocking pool.
+    pub(super) fn record_history(&mut self) {
+        use gravityfile_core::history::{self, Record};
+        let (Some(file), Some(tree)) = (self.history_file.clone(), &self.tree) else {
+            return;
+        };
+        let record = Record::of(tree);
+        self.history_baseline = None;
+        let (sender, receiver) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            // A rescan moments ago is not a useful baseline.
+            let previous = history::read(&file, Some(&record.root))
+                .ok()
+                .and_then(|records| {
+                    history::previous(&records, &record, std::time::Duration::from_secs(60))
+                        .cloned()
+                });
+            if let Err(error) = history::append(&file, &record) {
+                tracing::warn!(%error, file = %file.display(), "Cannot record the scan");
+            }
+            let _ = sender.send(previous);
+        });
+        self.history_rx = Some(receiver);
+    }
+
     /// Stop the running scan or analysis, whose tree is being replaced.
     pub(super) fn cancel_scan(&mut self) {
         self.scan_token.cancel();
@@ -349,6 +383,7 @@ impl App {
                 self.merge_scan_warnings(&tree.warnings);
 
                 self.install_tree(tree);
+                self.record_history();
 
                 // Preserve tree state (selection, expanded) across rescans
                 // Only reset if this is a different root path

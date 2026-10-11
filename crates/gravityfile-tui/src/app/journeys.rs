@@ -652,6 +652,29 @@ async fn unread_directories_are_listed_in_the_background() {
 }
 
 #[tokio::test]
+async fn full_scans_are_recorded_and_the_header_shows_growth_since_the_last() {
+    use gravityfile_core::history::{self, Record};
+    let mut harness = Harness::scanned().await;
+    let place = tempfile::tempdir().unwrap();
+    let file = place.path().join("history.jsonl");
+    let mut earlier = Record::of(harness.app.tree.as_ref().unwrap());
+    earlier.at -= std::time::Duration::from_secs(86_400);
+    earlier.size -= 1_000;
+    history::append(&file, &earlier).unwrap();
+    harness.app.history_file = Some(file.clone());
+
+    harness.press("R").await;
+    assert!(
+        harness.screen().contains("+1.00 kB since"),
+        "{}",
+        harness.screen()
+    );
+    let records = history::read(&file, Some(harness.root())).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].size, earlier.size + 1_000);
+}
+
+#[tokio::test]
 async fn rescanning_a_subdirectory_keeps_the_rest_of_the_scan() {
     let mut harness = Harness::scanned().await;
     let root = harness.root().to_path_buf();

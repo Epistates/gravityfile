@@ -694,3 +694,51 @@ fn diff_reports_what_changed_since_a_snapshot() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("give a second directory"));
 }
+
+#[test]
+fn recorded_scans_show_a_directorys_growth() {
+    let home = tempfile::tempdir().unwrap();
+    let place = tempfile::tempdir().unwrap();
+    let root = place.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("media")).unwrap();
+    let grav = |args: &[&str]| {
+        grav()
+            .env("GRAVITYFILE_HOME", home.path())
+            .args(args)
+            .output()
+            .expect("CLI process should start")
+    };
+    let path = root.to_str().unwrap();
+    let output = grav(&["history", path, "--color", "never"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No scans recorded yet"));
+
+    assert!(grav(&["scan", path, "--record"]).status.success());
+    std::fs::write(root.join("media/video"), vec![0u8; 50_000]).unwrap();
+    // A plain scan does not record.
+    assert!(grav(&["scan", path]).status.success());
+    assert!(grav(&["scan", path, "--record", "-A"]).status.success());
+    assert!(grav(&["scan", path, "--record"]).status.success());
+
+    let output = grav(&["history", path, "-f", "json"]);
+    assert!(output.status.success(), "{output:?}");
+    let report = json(&output);
+    assert_eq!(report["kind"], "history");
+    let scans = report["data"]["scans"].as_array().unwrap();
+    assert_eq!(scans.len(), 3);
+    // Changes compare scans measured the same way, so the apparent scan has none.
+    assert!(scans[1].get("change").is_none());
+    assert!(scans[2]["change"].as_i64().unwrap() >= 50_000);
+    assert_eq!(scans[2]["largest_change"]["name"], "media");
+
+    let all = grav(&["history", "--all", "--color", "never"]);
+    assert!(String::from_utf8_lossy(&all.stdout).contains("3 scans"));
+    let snapshot = root.join("saved.json");
+    assert!(
+        grav(&["export", path, "-o", snapshot.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let output = grav(&["scan", snapshot.to_str().unwrap(), "--record"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--record needs a directory"));
+}
