@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
+A rewrite of the scanner, the explorer's internals and the command line,
+with release binaries for macOS, Linux and Windows. It is the first release
+on crates.io since 0.2.4: 0.3.0 was released on GitHub only, and 0.3.1 was
+never released, so its changes are listed here. Upgrading from 0.2.4, see
+also the [0.3.0 notes](https://github.com/epistates/gravityfile/releases/tag/v0.3.0).
+Several changes are breaking: the `gravityfile` executable is
+gone (use `grav`), report options and JSON changed (`schema_version` 2),
+plugins are Lua only, and settings moved on macOS.
+
+### Security
+
+- Plugins cannot read past their read-size limit, even when they ask for a
+  larger one, and cannot read special files such as FIFOs, which could block.
+- An archive cannot be created inside the directory being archived, and an
+  interrupted archive leaves nothing behind.
+- Dependencies are updated past the vulnerable `crossbeam-epoch` 0.9.18 and
+  the unsound `git2` 0.20 line; BLAKE3's unused memory-mapping feature, and
+  with it `memmap2`, is gone.
+
 ### Added
 
 - **`grav diff OLD [NEW]`** shows what grew, shrank, appeared or went between
@@ -63,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on Linux, and preserve sparse files, hard links and extended attributes.
 - Archive extraction limits total size, entry count and compression ratio, and
   supports `.tar.zst`.
+- Prebuilt binaries for macOS (Apple silicon and Intel), Linux (arm64 and
+  x86_64, plus a static x86_64 musl build) and Windows, with shell and
+  PowerShell installers and build provenance you can check with
+  `gh attestation verify`.
 
 ### Changed
 
@@ -94,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no-clobber rename.
 - Plugins are Lua only.
 - Logging is off unless `--log-file` or `RUST_LOG` is given.
+- Building needs Rust 1.90 or newer.
 
 ### Removed
 
@@ -175,40 +201,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The treemap dims cut items and italicises copied ones, as the tree does.
 - Text previews show how many lines the file has, so a truncated preview says
   so.
-
-## [0.3.1] - 2026-07-24
-
-### Security
-
-- Updated the lockfile to remove the vulnerable `crossbeam-epoch` 0.9.18 release and upgraded `git2` away from its unsound 0.20 line
-- Removed BLAKE3's unused memory-mapping feature, eliminating the vulnerable `memmap2` dependency path
-- Enforced plugin read-size limits even when Lua callers request a larger limit, and rejected non-regular files to avoid blocking reads from special files
-- Made archive creation transactional and rejected archive destinations inside their own source trees
-
-### Fixed
-
-- Duplicate detection now groups by logical file length instead of scan-time allocated size
-- Copy and move reject self/descendant destinations before creating output and preserve pre-existing destinations on failed overwrites
-- Undo records no longer delete destinations that existed before an overwrite
-- New copies are staged before publication so failures do not leave partial visible outputs
-- Bulk renames now stage the complete set, support swaps and cycles, and roll back on failure without overwriting unrelated paths
-- Archive extraction validates the complete merge and publishes staged entries without replacing existing files
-- Interactive copies now preserve file, directory, and symlink timestamps
-- Preview and archive work no longer blocks the terminal event loop; terminal event errors and end-of-stream are handled explicitly
-- Terminal and mouse state restoration now runs on application errors and external-command failures
-- Scanner hashing and Git annotation settings now perform their documented work
-- Git status cache lookups now normalize equivalent filesystem path aliases
-- Ignore globs match root-relative paths as well as basenames
-- Non-Unix scans no longer assign the same fabricated inode identity to every file
-- CLI size/duration parsers reject negative, non-finite, and overflowing values without panicking
-
-### Changed
-
-- Updated direct dependencies to current stable releases, refreshed the full lockfile, and set the workspace MSRV to Rust 1.88
-- Reworked recursive copy sizing/traversal to use iterative stacks and saturating counters
-- Expanded CI to enforce formatting, strict Clippy, locked all-feature tests, and current GitHub Action major versions
-- Split shared CLI implementation into a library while preserving both `grav` and `gravityfile` binaries
-- Removed unsupported benchmark and plugin-isolation claims from the documentation
+- Duplicates are grouped by file length, not by allocated size, which could
+  differ between identical files.
+- A directory cannot be copied or moved into itself.
+- Undoing an overwrite no longer deletes the item that was there before.
+- Bulk renames can swap names and rename in cycles, and roll back as a whole
+  if any rename fails.
+- Copies keep the timestamps of files, directories and symbolic links.
+- Previews and archive listings no longer block the explorer while they load.
+- The terminal is restored after an error or a failed external command, not
+  only on a clean exit.
+- Git status is found for paths reached through a symlink or other alias.
+- Size and age arguments that are negative, not finite or too large are
+  rejected instead of crashing.
+- On Windows, scanned files no longer all share one made-up file identity.
 
 ## [0.3.0] - 2026-06-14
 
@@ -449,6 +455,9 @@ that release.
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[Unreleased]: https://github.com/epistates/gravityfile/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/epistates/gravityfile/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.6]: https://github.com/epistates/gravityfile/releases/tag/v0.2.6
 [0.2.5]: https://github.com/epistates/gravityfile/releases/tag/v0.2.5
 [0.2.4]: https://github.com/epistates/gravityfile/releases/tag/v0.2.4

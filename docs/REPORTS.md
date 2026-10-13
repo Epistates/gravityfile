@@ -9,7 +9,7 @@ envelope, so a consumer can tell what it is looking at before reading the data.
 ```json
 {
   "schema_version": 2,
-  "tool_version": "0.3.1",
+  "tool_version": "0.4.0",
   "kind": "scan",
   "root": "/data",
   "scope": { "root": "/data", "apparent_size": false, "max_entries": null, "...": "..." },
