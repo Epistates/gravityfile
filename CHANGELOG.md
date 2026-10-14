@@ -137,6 +137,11 @@ plugins are Lua only, and settings moved on macOS.
   counts of one are singular.
 - An ncdu dump with a time too large to represent is read, with that time
   unknown, instead of crashing.
+- A snapshot's sizes and counts are worked out from its entries, as for an
+  ncdu dump, rather than taken from the file, so an edited or damaged
+  snapshot cannot show totals its entries do not add up to or slip past
+  `--max-entries`. One whose files have entries inside them is reported as
+  damaged.
 - Unreadable directories are reported as warnings instead of silently
   producing a smaller total.
 - Delete and marking can no longer target the scan root or the directory being

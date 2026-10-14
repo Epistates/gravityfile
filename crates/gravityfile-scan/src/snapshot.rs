@@ -4,7 +4,7 @@
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use gravityfile_core::FileTree;
+use gravityfile_core::{FileNode, FileTree};
 use serde::Deserialize;
 
 /// Newest snapshot schema this reader understands.
@@ -40,6 +40,9 @@ pub enum SnapshotError {
 
     #[error("unsupported snapshot: {0}")]
     Unsupported(String),
+
+    #[error("damaged snapshot: {0}")]
+    Damaged(String),
 
     #[error("snapshot has more than {limit} entries")]
     EntryLimitExceeded { limit: u64 },
@@ -81,6 +84,12 @@ fn read_plain(mut input: impl BufRead, options: &ImportOptions) -> Result<FileTr
         Format::Ncdu => crate::ncdu::read(input, options),
         Format::Gravityfile => {
             let mut tree = read_gravityfile(input)?;
+            check_structure(&tree.root)?;
+            // Totals are derived from the entries, as for an ncdu dump, never
+            // taken on trust: an edited or damaged file could claim anything.
+            // `grav export` writes complete trees, so nothing is lost.
+            tree.root.update_counts();
+            tree.remeasure(options.apparent, options.count_hard_links);
             if let Some(limit) = options.max_entries {
                 let entries = tree.stats.total_files
                     + tree.stats.total_dirs.saturating_sub(1)
@@ -89,14 +98,25 @@ fn read_plain(mut input: impl BufRead, options: &ImportOptions) -> Result<FileTr
                     return Err(SnapshotError::EntryLimitExceeded { limit });
                 }
             }
-            if tree.config.apparent_size != options.apparent
-                || tree.config.count_hard_links != options.count_hard_links
-            {
-                tree.remeasure(options.apparent, options.count_hard_links);
-            }
             Ok(tree)
         }
     }
+}
+
+/// Only directories have entries. Walks without recursion, as trees can be
+/// as deep as the filesystem.
+fn check_structure(root: &FileNode) -> Result<(), SnapshotError> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if !node.is_dir() && !node.children.is_empty() {
+            return Err(SnapshotError::Damaged(format!(
+                "{} is not a directory but has entries",
+                node.display_name()
+            )));
+        }
+        pending.extend(&node.children);
+    }
+    Ok(())
 }
 
 /// Tell the formats apart by their first significant byte.
@@ -244,6 +264,36 @@ mod tests {
         let read = read_from(envelope(&tree()).as_slice(), &options).unwrap();
         assert_eq!(read.root.size, 1000);
         assert!(read.config.apparent_size);
+    }
+
+    #[test]
+    fn totals_come_from_the_entries_not_the_file() {
+        let mut edited = tree();
+        edited.root.size = 1 << 40;
+        edited.stats.total_files = 1_000_000;
+        let read = read_from(envelope(&edited).as_slice(), &ImportOptions::default()).unwrap();
+        assert_eq!(read.root.size, 4096);
+        assert_eq!(read.stats.total_files, 1);
+        // The entry limit sees the real count, not the claimed one.
+        let limited = ImportOptions {
+            max_entries: Some(1),
+            ..ImportOptions::default()
+        };
+        assert!(read_from(envelope(&edited).as_slice(), &limited).is_ok());
+    }
+
+    /// Found by fuzzing: such a tree read differently after a trip through
+    /// an ncdu dump.
+    #[test]
+    fn a_file_with_entries_is_damage() {
+        let mut damaged = tree();
+        let stray = damaged.root.children[0].clone();
+        damaged.root.children[0].children.push(stray);
+        let error = read_from(envelope(&damaged).as_slice(), &ImportOptions::default());
+        assert!(
+            matches!(&error, Err(SnapshotError::Damaged(message)) if message.contains('f')),
+            "{error:?}"
+        );
     }
 
     #[test]

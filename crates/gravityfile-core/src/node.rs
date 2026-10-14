@@ -520,8 +520,9 @@ impl FileNode {
     /// Iterative, so deep trees cannot exhaust the stack.
     pub fn remeasure(&mut self, apparent: bool, count_hard_links: bool) {
         let mut seen = std::collections::HashSet::new();
+        // Directories cannot be hard links; only other entries count once.
         let mut counted = |node: &FileNode| match node.inode {
-            Some(identity) if !count_hard_links && !seen.insert(identity) => 0,
+            Some(identity) if !count_hard_links && !node.is_dir() && !seen.insert(identity) => 0,
             _ => node.own_size(apparent),
         };
         self.size = counted(self);
