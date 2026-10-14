@@ -50,11 +50,6 @@ opensesame = { version = "0.1", features = ["serde"] }
 # System open command (for non-editor files)
 open = "5"
 
-# PTY buffer flush on quit (unix only)
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
-
 # Archive support for preview
 zip.workspace = true
 tar.workspace = true
@@ -64,3 +59,7 @@ bzip2.workspace = true
 serde_json.workspace = true
 
 tempfile.workspace = true
+
+# PTY buffer flush on quit (unix only)
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
