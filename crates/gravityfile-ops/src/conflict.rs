@@ -107,6 +107,77 @@ impl ConflictResolution {
     }
 }
 
+/// A conflict awaiting an answer from the caller.
+///
+/// The running operation stays alive and blocked on this request, so answering
+/// it resolves exactly one item and lets the rest of the operation continue.
+/// Dropping the request without answering is equivalent to [`ConflictResolution::Skip`].
+#[derive(Debug)]
+pub struct ConflictRequest {
+    conflict: Conflict,
+    responder: tokio::sync::oneshot::Sender<ConflictResolution>,
+}
+
+impl ConflictRequest {
+    pub(crate) fn new(
+        conflict: Conflict,
+        responder: tokio::sync::oneshot::Sender<ConflictResolution>,
+    ) -> Self {
+        Self {
+            conflict,
+            responder,
+        }
+    }
+
+    /// The conflict that needs resolving.
+    pub fn conflict(&self) -> &Conflict {
+        &self.conflict
+    }
+
+    /// The kind of conflict.
+    pub fn kind(&self) -> ConflictKind {
+        self.conflict.kind
+    }
+
+    /// Answer the request, unblocking the operation.
+    pub fn resolve(self, resolution: ConflictResolution) {
+        // A closed receiver means the operation already ended (e.g. it was
+        // cancelled); there is nothing left to answer.
+        let _ = self.responder.send(resolution);
+    }
+}
+
+/// Emit a conflict on `tx` and wait for the caller's answer.
+///
+/// A dropped request skips the item. Cancellation or a closed result channel
+/// aborts, including while delivery is blocked by a full channel.
+pub(crate) async fn request_resolution<T, F>(
+    tx: &tokio::sync::mpsc::Sender<T>,
+    conflict: Conflict,
+    wrap: F,
+    token: &tokio_util::sync::CancellationToken,
+) -> ConflictResolution
+where
+    F: FnOnce(ConflictRequest) -> T,
+{
+    let (responder, reply) = tokio::sync::oneshot::channel();
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => return ConflictResolution::Abort,
+        result = tx.send(wrap(ConflictRequest::new(conflict, responder))) => {
+            if result.is_err() {
+                return ConflictResolution::Abort;
+            }
+        }
+    }
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => ConflictResolution::Abort,
+        _ = tx.closed() => ConflictResolution::Abort,
+        result = reply => result.unwrap_or(ConflictResolution::Skip),
+    }
+}
+
 /// Returns true if nothing exists at `path` (including a dangling symlink).
 ///
 /// Uses `symlink_metadata` rather than `exists()` so a broken symlink at the
@@ -170,6 +241,51 @@ pub fn auto_rename_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_interrupts_unanswered_conflict() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let worker_token = token.clone();
+        let task = tokio::spawn(async move {
+            request_resolution(
+                &tx,
+                Conflict::file_exists("a".into(), "b".into()),
+                |r| r,
+                &worker_token,
+            )
+            .await
+        });
+        // Keep the answer channel alive to reproduce a stalled UI dialog.
+        let request = rx.recv().await.unwrap();
+        token.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, ConflictResolution::Abort);
+        request.resolve(ConflictResolution::Overwrite);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_full_result_channel() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.send(()).await.unwrap();
+        let pending = request_resolution(
+            &tx,
+            Conflict::file_exists("a".into(), "b".into()),
+            |_| (),
+            &token,
+        );
+        token.cancel();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+                .await
+                .unwrap(),
+            ConflictResolution::Abort
+        );
+    }
 
     #[test]
     fn test_auto_rename_path() {

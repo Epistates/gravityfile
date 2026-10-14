@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, StatefulWidget, Widget};
 
 use gravityfile_core::{FileNode, GitStatus, NodeKind};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::state::{ClipboardMode, ClipboardState};
 use crate::theme::Theme;
@@ -24,22 +25,15 @@ pub struct TreeState {
     pub offset: usize,
     /// Set of expanded directory paths.
     pub expanded: HashSet<PathBuf>,
-    /// Current root path.
-    #[allow(dead_code)]
-    root_path: PathBuf,
 }
 
 impl TreeState {
-    /// Create new tree state.
+    /// Create new tree state with the root expanded.
     pub fn new(root_path: PathBuf) -> Self {
-        let mut expanded = HashSet::new();
-        // Expand root by default
-        expanded.insert(root_path.clone());
         Self {
             selected: 0,
             offset: 0,
-            expanded,
-            root_path,
+            expanded: HashSet::from([root_path]),
         }
     }
 
@@ -161,96 +155,133 @@ impl<'a> TreeView<'a> {
         self
     }
 
-    /// Flatten tree to visible items based on expansion state.
+    /// Every visible row, in order.
     pub fn flatten(&self, state: &TreeState) -> Vec<VisibleItem> {
+        self.rows(state, 0..usize::MAX)
+    }
+
+    /// The visible row at `index`.
+    pub fn row(&self, state: &TreeState, index: usize) -> Option<VisibleItem> {
+        self.rows(state, index..index.saturating_add(1)).pop()
+    }
+
+    /// The visible rows whose positions fall in `range`. Rows outside it are
+    /// counted but not built, so a frame costs the rows on screen plus a pass
+    /// over expanded directories, not an allocation per visible entry.
+    pub fn rows(&self, state: &TreeState, range: std::ops::Range<usize>) -> Vec<VisibleItem> {
         let mut items = Vec::new();
-        self.flatten_node(
-            self.root,
-            self.root_path.clone(),
-            0,
-            true,
-            Vec::new(),
-            state,
-            &mut items,
-        );
+        self.walk(state, range, |_, item| items.push(item()));
         items
     }
 
-    /// Count visible items without allocating a Vec.
-    /// Use this when only the count is needed (e.g. updating `cached_tree_len`).
+    /// The number of visible rows.
     pub fn flatten_count(&self, state: &TreeState) -> usize {
-        self.count_node(self.root, &self.root_path.clone(), state)
+        self.walk(state, usize::MAX..usize::MAX, |_, _| {})
     }
 
-    fn count_node(&self, node: &FileNode, path: &PathBuf, state: &TreeState) -> usize {
-        let is_expanded = state.is_expanded(path);
-        let mut count = 1; // this node itself
-        if is_expanded && node.is_dir() {
-            for child in &node.children {
-                let child_path = path.join(&*child.name);
-                count += self.count_node(child, &child_path, state);
-            }
+    /// The row showing `target`, if it is visible.
+    pub fn position(&self, state: &TreeState, target: &Path) -> Option<usize> {
+        if !target.starts_with(self.root_path) {
+            return None;
         }
-        count
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn flatten_node(
-        &self,
-        node: &FileNode,
-        path: PathBuf,
-        depth: usize,
-        is_last: bool,
-        parent_last_siblings: Vec<bool>,
-        state: &TreeState,
-        items: &mut Vec<VisibleItem>,
-    ) {
-        let is_expanded = state.is_expanded(&path);
-
-        let kind = match &node.kind {
-            NodeKind::Directory { .. } => VisibleNodeKind::Directory {
-                expanded: is_expanded,
-            },
-            NodeKind::File { executable } => VisibleNodeKind::File {
-                executable: *executable,
-            },
-            NodeKind::Symlink { broken, .. } => VisibleNodeKind::Symlink { broken: *broken },
-            NodeKind::Other => VisibleNodeKind::Other,
-        };
-
-        items.push(VisibleItem {
-            path: path.clone(),
-            node: VisibleNode {
-                name: node.name.to_string(),
-                size: node.size,
-                kind,
-                git_status: node.git_status,
-            },
-            depth,
-            is_last_sibling: is_last,
-            parent_last_siblings: parent_last_siblings.clone(),
+        let (mut index, mut found) = (0, None);
+        self.walk(state, 0..usize::MAX, |path, _| {
+            if found.is_none() && path == target {
+                found = Some(index);
+            }
+            index += 1;
         });
+        found
+    }
 
-        // If directory is expanded, add children
-        if is_expanded && node.is_dir() {
-            let child_count = node.children.len();
-            for (i, child) in node.children.iter().enumerate() {
-                let child_path = path.join(&*child.name);
-                let child_is_last = i == child_count - 1;
-                let mut child_parent_lasts = parent_last_siblings.clone();
-                child_parent_lasts.push(is_last);
-
-                self.flatten_node(
-                    child,
-                    child_path,
-                    depth + 1,
-                    child_is_last,
-                    child_parent_lasts,
-                    state,
-                    items,
-                );
+    /// Visit the visible rows in `range`, in order, giving `visit` each row's
+    /// path and a way to build it. Rows before the range are only counted.
+    /// Iterative, so deep expanded trees cannot exhaust the stack. Returns
+    /// the number of rows walked.
+    fn walk(
+        &self,
+        state: &TreeState,
+        range: std::ops::Range<usize>,
+        mut visit: impl FnMut(&Path, &dyn Fn() -> VisibleItem),
+    ) -> usize {
+        let stop = range.end;
+        let build =
+            |node: &FileNode, path: &Path, depth, is_last, lasts: &[bool], expanded| VisibleItem {
+                path: path.to_path_buf(),
+                node: VisibleNode {
+                    name: node.display_name().into_owned(),
+                    size: node.size,
+                    kind: match &node.kind {
+                        NodeKind::Directory { .. } => VisibleNodeKind::Directory { expanded },
+                        NodeKind::File { executable } => VisibleNodeKind::File {
+                            executable: *executable,
+                        },
+                        NodeKind::Symlink { broken, .. } => {
+                            VisibleNodeKind::Symlink { broken: *broken }
+                        }
+                        NodeKind::Other => VisibleNodeKind::Other,
+                    },
+                    git_status: node.git_status,
+                },
+                depth,
+                is_last_sibling: is_last,
+                parent_last_siblings: lasts.to_vec(),
+            };
+        if stop == 0 {
+            return 0;
+        }
+        let mut path = self.root_path.clone();
+        let root_expanded = state.is_expanded(&path);
+        if range.contains(&0) {
+            visit(&path, &|| {
+                build(self.root, &path, 0, true, &[], root_expanded)
+            });
+        }
+        let mut index = 1;
+        if !(root_expanded && self.root.is_dir()) {
+            return index;
+        }
+        // Each open directory's remaining children, and whether each
+        // ancestor was its parent's last child (for the guide lines).
+        let mut stack = vec![(
+            self.root.children.iter().enumerate(),
+            self.root.children.len(),
+        )];
+        let mut lasts = vec![true];
+        while let Some((children, count)) = stack.last_mut() {
+            if index >= stop {
+                break;
+            }
+            let count = *count;
+            let Some((position, child)) = children.next() else {
+                stack.pop();
+                lasts.pop();
+                path.pop();
+                continue;
+            };
+            if index < range.start && !child.is_dir() {
+                // Nothing below a file, so it is one row to count.
+                index += 1;
+                continue;
+            }
+            let is_last = position + 1 == count;
+            let depth = stack.len();
+            path.push(child.file_name());
+            let expanded = child.is_dir() && state.is_expanded(&path);
+            if index >= range.start {
+                visit(&path, &|| {
+                    build(child, &path, depth, is_last, &lasts, expanded)
+                });
+            }
+            index += 1;
+            if expanded && !child.children.is_empty() {
+                lasts.push(is_last);
+                stack.push((child.children.iter().enumerate(), child.children.len()));
+            } else {
+                path.pop();
             }
         }
+        index
     }
 }
 
@@ -271,22 +302,24 @@ impl StatefulWidget for TreeView<'_> {
             return;
         }
 
-        let items = self.flatten(state);
         let viewport_height = inner_area.height as usize;
 
         // Ensure selected item is visible
         state.ensure_visible(viewport_height);
 
-        // Calculate visible range
+        // Build only the rows on screen.
         let start = state.offset;
-        let end = (start + viewport_height).min(items.len());
+        let items = self.rows(state, start..start + viewport_height);
+        let end = start + items.len();
 
-        // Size bar width
-        let size_bar_width: u16 = 10;
+        // Size bar width. A column narrower than the bar cannot show it, and in
+        // that case the row text gets the space back instead of being squeezed
+        // into nothing.
+        let size_bar_width: u16 = if inner_area.width >= 10 { 10 } else { 0 };
         let size_text_width: u16 = 10;
 
         for (row_idx, item_idx) in (start..end).enumerate() {
-            let item = &items[item_idx];
+            let item = &items[row_idx];
             let y = inner_area.y + row_idx as u16;
             let is_selected = item_idx == state.selected;
             let is_marked = self.marked.contains(&item.path);
@@ -358,8 +391,9 @@ impl StatefulWidget for TreeView<'_> {
                 base_style
             };
 
-            // Calculate available width for name
-            let prefix_width = prefix.len() + checkbox_width as usize + expand_indicator.len();
+            // Available width for the name, in terminal columns: the guide
+            // lines and indicators are multi-byte but one column per char.
+            let prefix_width = prefix.width() + checkbox_width as usize + expand_indicator.width();
             let available_for_name = inner_area
                 .width
                 .saturating_sub(prefix_width as u16)
@@ -390,14 +424,8 @@ impl StatefulWidget for TreeView<'_> {
 
             // Pad name to fill space (accounting for git indicator)
             // Use display width, not byte length, for correct Unicode padding
-            let git_display_width = {
-                use unicode_width::UnicodeWidthStr;
-                git_indicator.width() as u16
-            };
-            let name_display_width = {
-                use unicode_width::UnicodeWidthStr;
-                name.width() as u16
-            };
+            let git_display_width = git_indicator.width() as u16;
+            let name_display_width = name.width() as u16;
             let name_padding = " ".repeat(
                 available_for_name
                     .saturating_sub(name_display_width)
@@ -440,42 +468,291 @@ impl StatefulWidget for TreeView<'_> {
             let line_area = Rect::new(
                 inner_area.x,
                 y,
-                inner_area.width.saturating_sub(size_bar_width + 1),
+                inner_area
+                    .width
+                    .saturating_sub(size_bar_width)
+                    .saturating_sub(u16::from(size_bar_width > 0)),
                 1,
             );
             Widget::render(line, line_area, buf);
 
-            // Render size bar
-            let ratio = if self.total_size > 0 {
-                item.node.size as f64 / self.total_size as f64
-            } else {
-                0.0
-            };
+            // Render the size bar hugging the right edge, when there is one.
+            if size_bar_width > 0 {
+                let ratio = if self.total_size > 0 {
+                    item.node.size as f64 / self.total_size as f64
+                } else {
+                    0.0
+                };
 
-            let bar_area = Rect::new(
-                inner_area.x + inner_area.width - size_bar_width,
-                y,
-                size_bar_width,
-                1,
-            );
+                let bar_area = Rect::new(
+                    inner_area.x + inner_area.width - size_bar_width,
+                    y,
+                    size_bar_width,
+                    1,
+                );
 
-            let bar = CompactSizeBar::new(ratio).style(self.theme.size_bar_style(ratio));
-
-            if is_selected {
-                // Dim the bar slightly for selected row
-                Widget::render(bar, bar_area, buf);
-            } else {
+                let bar = CompactSizeBar::new(ratio).style(self.theme.size_bar_style(ratio));
                 Widget::render(bar, bar_area, buf);
             }
         }
     }
 }
 
-/// Get the selected item from a tree state and flattened items.
-#[allow(dead_code)]
-pub fn get_selected_item<'a>(
-    state: &TreeState,
-    items: &'a [VisibleItem],
-) -> Option<&'a VisibleItem> {
-    items.get(state.selected)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{sample_node_tree, sample_root_path};
+    use ratatui::buffer::Buffer;
+
+    fn render_at(area: Rect, state: &mut TreeState) -> Buffer {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let mut buf = Buffer::empty(area);
+        let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+        StatefulWidget::render(view, area, &mut buf, state);
+        buf
+    }
+
+    fn expanded_state() -> TreeState {
+        let mut state = TreeState::new(sample_root_path());
+        state.expand(&sample_root_path().join("src"));
+        state
+    }
+
+    #[test]
+    fn flatten_lists_only_expanded_subtrees() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+
+        // Only the root is expanded, so its 7 direct children are visible.
+        let collapsed = TreeState::new(root_path.clone());
+        let names: Vec<_> = view
+            .flatten(&collapsed)
+            .into_iter()
+            .map(|item| item.node.name)
+            .collect();
+        assert_eq!(names.len(), 8, "root plus its direct children: {names:?}");
+        assert!(!names.contains(&"modified.rs".to_string()));
+
+        // Expanding `src` reveals its children but not `nested`'s.
+        let mut state = collapsed.clone();
+        state.expand(&root_path.join("src"));
+        let names: Vec<_> = view
+            .flatten(&state)
+            .into_iter()
+            .map(|item| item.node.name)
+            .collect();
+        assert!(names.contains(&"modified.rs".to_string()));
+        assert!(!names.contains(&"deep.txt".to_string()));
+
+        state.expand(&root_path.join("src").join("nested"));
+        let names: Vec<_> = view
+            .flatten(&state)
+            .into_iter()
+            .map(|item| item.node.name)
+            .collect();
+        assert!(names.contains(&"deep.txt".to_string()));
+    }
+
+    #[test]
+    fn flatten_count_matches_flatten_length() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+
+        // `flatten_count` exists purely to skip the Vec allocation, so the two
+        // must never disagree — the app uses the count to bound navigation
+        // against a list produced by `flatten`.
+        for state in [TreeState::new(root_path.clone()), expanded_state()] {
+            let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+            let counted = view.flatten_count(&state);
+            let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+            assert_eq!(counted, view.flatten(&state).len());
+        }
+    }
+
+    #[test]
+    fn every_window_matches_the_same_slice_of_flatten() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let mut state = expanded_state();
+        state.expand(&root_path.join("src").join("nested"));
+        let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+
+        // Rows before a window are skipped without being built, which must
+        // not shift guide lines, depths or paths of the rows inside it.
+        let items = view.flatten(&state);
+        for (index, item) in items.iter().enumerate() {
+            assert_eq!(view.position(&state, &item.path), Some(index));
+        }
+        assert_eq!(view.position(&state, &root_path.join("missing")), None);
+        let all: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
+        for start in 0..=all.len() {
+            for end in start..=all.len() + 1 {
+                let window: Vec<String> = view
+                    .rows(&state, start..end)
+                    .iter()
+                    .map(|item| format!("{item:?}"))
+                    .collect();
+                assert_eq!(window, all[start..end.min(all.len())], "{start}..{end}");
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_builds_paths_by_joining_names() {
+        let root = sample_node_tree();
+        let root_path = sample_root_path();
+        let theme = Theme::dark();
+        let marked = HashSet::new();
+        let clipboard = ClipboardState::default();
+        let mut state = expanded_state();
+        state.expand(&root_path.join("src").join("nested"));
+
+        let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard);
+        let items = view.flatten(&state);
+        let deep = items
+            .iter()
+            .find(|item| item.node.name == "deep.txt")
+            .expect("deep.txt is visible");
+        assert_eq!(deep.path, root_path.join("src/nested/deep.txt"));
+        assert_eq!(deep.depth, 3);
+    }
+
+    #[test]
+    fn toggle_expand_flips_state() {
+        let mut state = TreeState::new(sample_root_path());
+        let path = sample_root_path().join("src");
+        assert!(!state.is_expanded(&path));
+        state.toggle_expand(&path);
+        assert!(state.is_expanded(&path));
+        state.toggle_expand(&path);
+        assert!(!state.is_expanded(&path));
+    }
+
+    #[test]
+    fn ensure_visible_scrolls_the_minimum_distance() {
+        let mut state = TreeState::new(sample_root_path());
+
+        // Selection below the viewport scrolls just far enough to show it.
+        state.selected = 12;
+        state.ensure_visible(10);
+        assert_eq!(state.offset, 3);
+
+        // Selection above the viewport scrolls up to sit on the first row.
+        state.selected = 1;
+        state.ensure_visible(10);
+        assert_eq!(state.offset, 1);
+
+        // A selection already inside the viewport does not move the offset.
+        state.selected = 5;
+        state.ensure_visible(10);
+        assert_eq!(state.offset, 1);
+    }
+
+    #[test]
+    fn navigation_stays_within_bounds() {
+        let mut state = TreeState::new(sample_root_path());
+        state.move_up(100);
+        assert_eq!(state.selected, 0);
+        state.move_down(100, 8);
+        assert_eq!(state.selected, 7);
+        state.jump_to_top();
+        assert_eq!(state.selected, 0);
+        state.jump_to_bottom(8);
+        assert_eq!(state.selected, 7);
+
+        // An empty tree must not underflow.
+        state.jump_to_bottom(0);
+        assert_eq!(state.selected, 0);
+        state.move_down(1, 0);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn renders_at_every_size_without_panicking() {
+        // The size bar is anchored to the right edge; a column narrower than
+        // the bar used to compute an out-of-bounds rect and abort the app.
+        for width in 1u16..=60 {
+            for height in [1u16, 2, 3, 10, 40] {
+                let mut state = expanded_state();
+                let _ = render_at(Rect::new(0, 0, width, height), &mut state);
+            }
+        }
+    }
+
+    #[test]
+    fn renders_at_every_offset_within_a_block() {
+        // A non-zero origin is what the app actually passes, and it is what
+        // makes right-edge arithmetic easy to get wrong.
+        for x in [0u16, 1, 7] {
+            for y in [0u16, 1, 5] {
+                let area = Rect::new(x, y, 40, 12);
+                let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+                let root = sample_node_tree();
+                let root_path = sample_root_path();
+                let theme = Theme::dark();
+                let marked = HashSet::new();
+                let clipboard = ClipboardState::default();
+                let mut state = expanded_state();
+                let view = TreeView::new(&root, &root_path, &theme, &marked, &clipboard)
+                    .block(Block::default().borders(ratatui::widgets::Borders::ALL));
+                StatefulWidget::render(view, area, &mut buf, &mut state);
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_column_still_renders_rows() {
+        // Below the size-bar width the bar is dropped and the row reclaims its
+        // columns, so the tree structure stays visible. (The name budget is
+        // still spent on the size text first, so names themselves only appear
+        // once the column is wide enough for both.)
+        let mut state = expanded_state();
+        let buf = render_at(Rect::new(0, 0, 9, 10), &mut state);
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            rendered.contains('├') || rendered.contains('└'),
+            "narrow render produced no rows at all: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_column_renders_the_size_bar() {
+        let mut state = expanded_state();
+        let buf = render_at(Rect::new(0, 0, 60, 10), &mut state);
+        let rendered: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            rendered.contains("65.5 kB"),
+            "expected a formatted size in the row: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn exactly_one_row_carries_the_selection_highlight() {
+        let mut state = expanded_state();
+        state.selected = 2;
+        let buf = render_at(Rect::new(0, 0, 60, 10), &mut state);
+        let selected_bg = Theme::dark()
+            .selected
+            .bg
+            .expect("selection has a background");
+
+        let highlighted: Vec<u16> = (0..10u16)
+            .filter(|&y| buf[(0, y)].bg == selected_bg)
+            .collect();
+        assert_eq!(highlighted, vec![2], "only the selected row is highlighted");
+    }
 }

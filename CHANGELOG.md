@@ -5,6 +5,226 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] - 2026-10-13
+
+A rewrite of the scanner, the explorer's internals and the command line,
+with release binaries for macOS, Linux and Windows. It is the first release
+on crates.io since 0.2.4: 0.3.0 was released on GitHub only, and 0.3.1 was
+never released, so its changes are listed here. Upgrading from 0.2.4, see
+also the [0.3.0 notes](https://github.com/epistates/gravityfile/releases/tag/v0.3.0).
+Several changes are breaking: the `gravityfile` executable is
+gone (use `grav`), report options and JSON changed (`schema_version` 2),
+plugins are Lua only, and settings moved on macOS.
+
+### Security
+
+- Plugins cannot read past their read-size limit, even when they ask for a
+  larger one, and cannot read special files such as FIFOs, which could block.
+- An archive cannot be created inside the directory being archived, and an
+  interrupted archive leaves nothing behind.
+- Dependencies are updated past the vulnerable `crossbeam-epoch` 0.9.18 and
+  the unsound `git2` 0.20 line; BLAKE3's unused memory-mapping feature, and
+  with it `memmap2`, is gone.
+
+### Added
+
+- **`grav diff OLD [NEW]`** shows what grew, shrank, appeared or went between
+  two scans, largest changes first per directory. Each side is a snapshot or
+  a directory; with one snapshot it is compared with the same place today,
+  scanned with the snapshot's scope. Text or JSON.
+- **Plugins that work as documented.** Hooks run in the background, so a
+  slow plugin no longer freezes navigation; only `on_delete_start` (which
+  can refuse the delete) and `on_shutdown` are awaited. `gf.notify` now
+  shows its message in the status line, plugin failures are reported
+  instead of only logged, and hooks receive the context (directory, theme,
+  selected entry) as a third argument. Scan start and error, delete, copy,
+  move and rename completion, and analysis hooks now fire. Hooks the
+  explorer never fired and the unrendered `ui` namespace are removed, and
+  the plugin guide and example are rewritten to match.
+- `grav scan --top N` lists the largest files anywhere below the root, and
+  `grav scan --by-type` totals the space by file extension.
+- **Scan history.** Each full scan in the explorer, and `grav scan --record`,
+  adds a summary to `history.jsonl` in the data directory. `grav history
+  [PATH]` shows a directory's size over time and what changed most;
+  `--all` lists every recorded directory. The explorer's header shows the
+  change since the last scan of the same place. `record_history = false`
+  turns it off.
+- **Browse snapshots in the explorer.** `grav root.json.zst` opens a saved
+  scan or ncdu dump read-only, without touching the filesystem: navigation,
+  search, the treemap, size toggling and age analysis work; file operations,
+  rescans and duplicate detection are refused with an explanation.
+- **Themes.** `gestalt`, `latte`, `nord`, `dracula` and `ansi`, shared with
+  carwash, replace the fixed dark and light themes. They keep the
+  terminal's background, fall back to `ansi` without 24-bit colour, and can
+  be chosen in `settings.toml`, the settings screen or with `:theme nord`.
+- **Search filters.** Explorer search takes `size>100mb`, `age>30d`,
+  `type:f`, and `ext:log,tmp` alongside the search text; filters alone list
+  the largest matches. Malformed filters are treated as text.
+- **Configurable keys.** `keymap.toml` in the config directory rebinds or
+  unbinds explorer keys using names like `<C-u>` and actions like
+  `move_down`; the README lists them. The help overlay and footer hints are
+  generated from the bindings in effect, so they always match, and the help
+  now scrolls instead of cutting off what did not fit. Uppercase bindings
+  work whether or not the terminal reports Shift.
+- **Snapshots.** `grav export` saves a complete scan as JSON or, with
+  `-f ncdu`, as an ncdu dump; a `.zst` output is compressed. `scan`, `age`,
+  `duplicates` and `export` accept a snapshot in place of a directory, including
+  dumps from `ncdu -o`, and `-A`/`-l` re-measure it without rescanning.
+- `grav init bash|zsh|fish` prints the shell function that follows the
+  explorer's directory on exit, `grav completions <shell>` prints completions,
+  and `grav man` prints a manual page.
+- Scan options on every report command: `-A/--apparent-size`,
+  `-l/--count-links`, `-L/--follow-symlinks`, `--cross-fs`, `--no-hidden`,
+  `-e/--exclude`, `-j/--threads` and `--git`.
+- `--color auto|always|never` (honouring `NO_COLOR` and `CLICOLOR_FORCE`), a
+  progress spinner while scanning, and `--binary` for KiB/MiB units.
+- Copies use reflinks where the filesystem supports them and `copy_file_range`
+  on Linux, and preserve sparse files, hard links and extended attributes.
+- Archive extraction limits total size, entry count and compression ratio, and
+  supports `.tar.zst`.
+- Prebuilt binaries for macOS (Apple silicon and Intel), Linux (arm64 and
+  x86_64, plus a static x86_64 musl build) and Windows, with shell and
+  PowerShell installers and build provenance you can check with
+  `gh attestation verify`.
+
+### Changed
+
+- **Sizes now match `du`.** Directories include their own allocation, hard
+  links count once in apparent-size mode too (`-l` counts every link), and
+  `max_depth` limits only what is listed, not what is counted. FIFOs, sockets
+  and devices are listed instead of silently skipped.
+- **The scanner is about 2.5× faster and uses less than half the memory.**
+  Metadata is read in parallel and the tree is built in a single pass.
+- **Sizes display in decimal units** (`kB`, `MB`, like Finder). Size arguments
+  accept both: `MB` is 10^6 bytes and `MiB` is 2^20.
+- **One binary, `grav`.** The `gravityfile` executable is gone; the package is
+  still `gravityfile`.
+- **Report commands:** `-f/--format text|json` replaces `--format`/`--envelope`;
+  JSON always uses the versioned envelope, now `schema_version` 2. `grav scan`
+  lists the largest entries with `-d/--depth` (default 1) and `-n/--limit`
+  (default 20) in place of `--max-depth`/`--top`, and its JSON is a flat list of
+  entries. `duplicates` and `age` take `-n/--limit`. Ages need a unit, and a
+  bare `m` is rejected as ambiguous: use `min` or `mo`.
+- **Exit status:** 3 for incomplete results with `--strict`, 130/143 when
+  interrupted (was 1 for both).
+- **Settings and plugins moved to `~/.config/gravityfile` on macOS**, matching
+  Linux, from `~/Library/Application Support/gravityfile`; the old directory is
+  moved automatically on first run. `GRAVITYFILE_HOME` puts all of
+  gravityfile's files under one directory.
+- Git status is computed only when asked for (`--git`; always in the explorer).
+- Overwriting a file on paste moves the old one to the Trash. Copies, moves,
+  renames and archive extraction are staged and published with a single
+  no-clobber rename.
+- Plugins are Lua only.
+- Logging is off unless `--log-file` or `RUST_LOG` is given.
+- Building needs Rust 1.90 or newer.
+
+### Removed
+
+- `grav recover` and the recovery journals: operations are staged and
+  published atomically instead, and replaced files go to the Trash.
+- Rhai plugins.
+- Report JSON node ids, content hashes, and access and creation times, and the
+  scanner's content-hashing option.
+
+### Fixed
+
+- Ages in a snapshot or ncdu dump are measured from when it was taken, not
+  from today. Ages print in the units `--stale` reads them in, so the
+  default reads "untouched for over 1 year" rather than "11 months", and
+  counts of one are singular.
+- An ncdu dump with a time too large to represent is read, with that time
+  unknown, instead of crashing.
+- A snapshot's sizes and counts are worked out from its entries, as for an
+  ncdu dump, rather than taken from the file, so an edited or damaged
+  snapshot cannot show totals its entries do not add up to or slip past
+  `--max-entries`. One whose files have entries inside them is reported as
+  damaged.
+- Unreadable directories are reported as warnings instead of silently
+  producing a smaller total.
+- Delete and marking can no longer target the scan root or the directory being
+  viewed; declining a delete keeps the marks you made yourself; marking a
+  duplicate group keeps one copy.
+- Mouse clicks select the row under the pointer after scrolling.
+- `grav scan`'s total is the full disk usage of the root, not just its files.
+- **Deleting, copying, moving, renaming or creating anything in the explorer
+  no longer throws away the scan.** Each operation used to rescan the directory
+  being viewed and replace the whole tree with it, so a delete inside a
+  subdirectory of a ten-minute scan of `~` left only that subdirectory. Now only
+  the changed entries are scanned again and updated in place, with every
+  parent's size recomputed. `R` likewise rescans just the directory being
+  viewed.
+- Starting a copy, move, delete or other operation cancelled a scan in
+  progress. Operations now run alongside a scan; only duplicate and age
+  analysis, which they would make stale, is cancelled.
+- Explorer search found nothing when the query had a capital letter. It now
+  uses smart case (a capital makes the query case-sensitive) and fzf syntax:
+  space-separated terms, `^prefix`, `suffix$`, `!exclude`, `'exact`.
+- The chosen sort order is kept after a rescan or when moving to a new
+  directory; directory listings no longer briefly appear in name order.
+- Going to an ancestor of the scanned directory (Ctrl-g) showed an empty pane.
+  Go-to now behaves like jumping to a bookmark: Backspace returns, and marks and
+  the clipboard are kept.
+- Closing a directory tab returned to the closed tab's directory.
+- Each directory tab keeps its own selection and back/forward history.
+  Switching tabs used to reset the selection, and every tab shared one
+  history, so Backspace could jump to a place visited in another tab. A tab
+  whose directory was deleted from another tab opens on what remains.
+- Going back selects the entry you left, even after re-sorting, a refresh or
+  switching between the tree and Miller layouts; it used to restore a row
+  number, which could land on a different entry. Backspace now goes back in
+  the treemap too, and the Miller preview and parent column follow every way
+  of moving (`:cd`, going to the root, create-and-enter), not just some.
+- The `default_layout` setting was ignored at startup.
+- Directory sizes in the tree were shifted out of their column.
+- Double-click enters a directory, as the help says.
+- **The explorer stays responsive on huge trees.** Marking files made every
+  frame walk the whole tree once per mark (over two seconds per frame with 100
+  marks in a million-file scan), and every frame rebuilt every visible row and
+  every entry of each Miller column. A frame now builds only the rows on screen:
+  under 3 ms at any scroll position, with or without marks.
+- The Miller parent column scrolls to keep the current directory in view.
+- The explorer can show apparent sizes: `grav -A`, or `b` to switch while
+  browsing, which re-totals the tree instantly instead of rescanning.
+- Opening a directory before the scan reached it, and the Miller parent
+  column at the scan root, no longer freeze the explorer while the
+  directory is read; it shows "(loading…)" until the entries arrive.
+- The explorer's duplicates view keeps the 10,000 groups wasting most space,
+  up from 100, and says when smaller groups were left out.
+- Page Up and Page Down move by a screenful rather than ten rows.
+- The file preview scrolls: `J`/`K`, or the mouse wheel over the preview.
+  It used to show only the first screenful of a file, listing or archive.
+- An invalid name in the rename or create prompt keeps the prompt open with
+  the reason, instead of closing it and losing what was typed. Rename and
+  create now apply the same name rules, so a backslash is accepted on Unix.
+- The bulk rename confirmation scrolls with the selection. It used to show
+  only the renames that fit, so the rest could not be reviewed before
+  confirming.
+- Copy and move report how much data they transferred.
+- The treemap dims cut items and italicises copied ones, as the tree does.
+- Text previews show how many lines the file has, so a truncated preview says
+  so.
+- Duplicates are grouped by file length, not by allocated size, which could
+  differ between identical files.
+- A directory cannot be copied or moved into itself.
+- Undoing an overwrite no longer deletes the item that was there before.
+- Bulk renames can swap names and rename in cycles, and roll back as a whole
+  if any rename fails.
+- Copies keep the timestamps of files, directories and symbolic links.
+- Previews and archive listings no longer block the explorer while they load.
+- The terminal is restored after an error or a failed external command, not
+  only on a clean exit.
+- Git status is found for paths reached through a symlink or other alias.
+- Size and age arguments that are negative, not finite or too large are
+  rejected instead of crashing.
+- On Windows, scanned files no longer all share one made-up file identity.
+- Windows fixes: the explorer builds and runs; Git status appears; paths
+  show single backslashes, not doubled ones; copying or moving onto a
+  different file of the same size no longer takes the two for one file; and
+  items whose path is longer than 260 characters can be copied and moved.
+
 ## [0.3.0] - 2026-06-14
 
 First release since 0.2.4; this entry consolidates all changes shipped since
@@ -244,6 +464,9 @@ that release.
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
+[Unreleased]: https://github.com/epistates/gravityfile/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/epistates/gravityfile/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.6]: https://github.com/epistates/gravityfile/releases/tag/v0.2.6
 [0.2.5]: https://github.com/epistates/gravityfile/releases/tag/v0.2.5
 [0.2.4]: https://github.com/epistates/gravityfile/releases/tag/v0.2.4

@@ -71,7 +71,7 @@ impl Widget for DeleteConfirmModal<'_> {
             .marked_paths
             .iter()
             .filter_map(|p| (self.get_size)(p))
-            .sum();
+            .fold(0u64, u64::saturating_add);
 
         // Build content
         let mut lines = vec![
@@ -285,26 +285,17 @@ impl Widget for CommandPalette<'_> {
                 Style::default().fg(self.theme.muted),
             ));
         } else {
-            // Show input with cursor
-            let cursor_pos = self.cursor.min(self.input.len());
-            let (before, after) = self.input.split_at(cursor_pos);
+            let (before, cursor, after) = crate::ui::visible_input_parts(
+                self.input,
+                self.cursor,
+                area.width.saturating_sub(1) as usize,
+            );
             spans.push(Span::raw(before));
-
-            if !after.is_empty() {
-                // Show cursor under next char
-                let (cursor_char, rest) = after.split_at(1);
-                spans.push(Span::styled(
-                    cursor_char,
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ));
-                spans.push(Span::raw(rest));
-            } else {
-                // Cursor at end - show block cursor
-                spans.push(Span::styled(
-                    " ",
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ));
-            }
+            spans.push(Span::styled(
+                cursor,
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            spans.push(Span::raw(after));
         }
 
         let line = Line::from(spans);
@@ -331,6 +322,7 @@ impl<'a> OperationProgressModal<'a> {
             OperationType::Copy => " Copying... ",
             OperationType::Move => " Moving... ",
             OperationType::Delete => " Deleting... ",
+            OperationType::Restore => " Restoring... ",
             OperationType::Rename => " Renaming... ",
             OperationType::CreateFile => " Creating File... ",
             OperationType::CreateDirectory => " Creating Directory... ",
@@ -342,6 +334,7 @@ impl<'a> OperationProgressModal<'a> {
             OperationType::Copy => "Copied",
             OperationType::Move => "Moved",
             OperationType::Delete => "Deleted",
+            OperationType::Restore => "Restored",
             OperationType::Rename => "Renamed",
             OperationType::CreateFile => "Created",
             OperationType::CreateDirectory => "Created",
@@ -376,16 +369,7 @@ impl Widget for OperationProgressModal<'_> {
 
         let mut lines = vec![];
 
-        // Calculate percentage
-        let pct = if self.progress.bytes_total > 0 {
-            ((self.progress.bytes_processed as f64 / self.progress.bytes_total as f64) * 100.0)
-                as u8
-        } else if self.progress.files_total > 0 {
-            ((self.progress.files_completed as f64 / self.progress.files_total as f64) * 100.0)
-                as u8
-        } else {
-            0
-        };
+        let pct = self.progress.percentage() as u8;
 
         // Progress bar
         let bar_width = (inner.width as usize).saturating_sub(10);
@@ -434,7 +418,7 @@ impl Widget for OperationProgressModal<'_> {
             lines.push(Line::from(vec![
                 Span::styled("  Errors:   ", Style::default().fg(self.theme.error)),
                 Span::styled(
-                    self.progress.errors.len().to_string(),
+                    self.progress.error_count().to_string(),
                     Style::default().fg(self.theme.error),
                 ),
             ]));
@@ -514,63 +498,20 @@ impl Widget for InputModal<'_> {
         // Input field with cursor
         let buffer = self.input.buffer();
         let cursor = self.input.cursor();
-        // Floor at 1 so the `max_visible - 1` math below can't underflow on a
-        // very narrow terminal.
-        let max_visible = (inner.width as usize).saturating_sub(4).max(1);
-
-        // Calculate visible portion
-        let (visible_start, cursor_in_view) = if cursor > max_visible - 1 {
-            (cursor - (max_visible - 1), max_visible - 1)
-        } else {
-            (0, cursor)
-        };
-
-        let visible_end = (visible_start + max_visible).min(buffer.len());
-        let visible_text = if buffer.is_empty() {
-            String::new()
-        } else {
-            buffer
-                .chars()
-                .skip(visible_start)
-                .take(visible_end - visible_start)
-                .collect()
-        };
-
-        let mut input_spans = vec![Span::raw("  ")];
-
-        if visible_text.is_empty() {
-            // Show cursor at empty position
-            input_spans.push(Span::styled(
-                " ",
+        let (before, cursor_text, after) = crate::ui::visible_input_parts(
+            buffer,
+            cursor,
+            (inner.width as usize).saturating_sub(4),
+        );
+        let input_spans = vec![
+            Span::raw("  "),
+            Span::raw(before),
+            Span::styled(
+                cursor_text,
                 Style::default().add_modifier(Modifier::REVERSED),
-            ));
-        } else {
-            // Text before cursor
-            let before: String = visible_text.chars().take(cursor_in_view).collect();
-            if !before.is_empty() {
-                input_spans.push(Span::raw(before));
-            }
-
-            // Cursor character
-            let cursor_char: String = visible_text.chars().skip(cursor_in_view).take(1).collect();
-            if cursor_char.is_empty() {
-                input_spans.push(Span::styled(
-                    " ",
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ));
-            } else {
-                input_spans.push(Span::styled(
-                    cursor_char,
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ));
-            }
-
-            // Text after cursor
-            let after: String = visible_text.chars().skip(cursor_in_view + 1).collect();
-            if !after.is_empty() {
-                input_spans.push(Span::raw(after));
-            }
-        }
+            ),
+            Span::raw(after),
+        ];
 
         lines.push(Line::from(input_spans));
 
@@ -859,8 +800,15 @@ impl Widget for SettingsModal<'_> {
         // Default layout
         lines.push(self.render_choice(
             "Default layout",
-            &self.state.settings.default_layout,
+            self.state.settings.default_layout.name(),
             self.state.selected == 2,
+        ));
+
+        // Colour theme
+        lines.push(self.render_choice(
+            "Theme",
+            &self.state.settings.theme,
+            self.state.selected == 3,
         ));
 
         lines.push(Line::raw(""));
@@ -1117,8 +1065,21 @@ impl Widget for BulkRenameConfirmModal<'_> {
         let max_visible = (inner.height as usize).saturating_sub(6);
         let max_name_len = ((inner.width as usize).saturating_sub(8)) / 2;
         let arrow = " -> ";
+        // Scroll so the selected rename is always on screen; every rename
+        // must be reviewable before confirming.
+        let total = self.state.entries.len();
+        let start = (self.state.selected + 1)
+            .saturating_sub(max_visible)
+            .min(total.saturating_sub(max_visible));
 
-        for (i, entry) in self.state.entries.iter().enumerate().take(max_visible) {
+        for (i, entry) in self
+            .state
+            .entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(max_visible)
+        {
             let is_selected = i == self.state.selected;
 
             // Truncate names if needed
@@ -1147,9 +1108,10 @@ impl Widget for BulkRenameConfirmModal<'_> {
             ]));
         }
 
-        if self.state.entries.len() > max_visible {
+        if total > max_visible {
+            let end = (start + max_visible).min(total);
             lines.push(Line::styled(
-                format!("  ... and {} more", self.state.entries.len() - max_visible),
+                format!("  {}-{end} of {total}; j/k to scroll", start + 1),
                 Style::default().fg(self.theme.muted),
             ));
         }
@@ -1176,5 +1138,34 @@ impl Widget for BulkRenameConfirmModal<'_> {
         }
 
         Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::BulkRenameState;
+
+    fn rendered(state: &BulkRenameState) -> String {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        BulkRenameConfirmModal::new(&Theme::dark(), state).render(area, &mut buf);
+        buf.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn the_bulk_rename_list_scrolls_to_the_selection() {
+        let originals = (0..50)
+            .map(|index| PathBuf::from(format!("/r/old-{index:02}")))
+            .collect();
+        let names = (0..50).map(|index| format!("new-{index:02}")).collect();
+        let mut state = BulkRenameState::new(originals, names);
+        assert!(rendered(&state).contains("old-00"));
+
+        state.selected = 49;
+        let screen = rendered(&state);
+        assert!(screen.contains("old-49"), "{screen}");
+        assert!(!screen.contains("old-00"), "{screen}");
+        assert!(screen.contains("of 50"), "{screen}");
     }
 }

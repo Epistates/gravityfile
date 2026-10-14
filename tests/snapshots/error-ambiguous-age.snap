@@ -1,0 +1,11 @@
+---
+source: tests/snapshots.rs
+description: grav age --stale 6m
+expression: run(args)
+---
+exit: 2
+--- stdout
+--- stderr
+error: invalid value '6m' for '--stale <AGE>': "6m" is ambiguous: use "min" for minutes or "mo" for months
+
+For more information, try '--help'.

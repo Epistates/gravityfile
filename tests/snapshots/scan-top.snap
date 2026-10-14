@@ -1,0 +1,14 @@
+---
+source: tests/snapshots.rs
+description: grav scan --top 3 before.json
+expression: run(args)
+---
+exit: 0
+--- stdout
+/srv/data  20.3 MB
+7 files, 2 directories, from a snapshot taken [TIME]
+
+  12.0 MB   59.3%  backup.tar.gz
+  4.20 MB   20.7%  photos/beach.jpg
+  3.10 MB   15.3%  photos/city.jpg
+--- stderr

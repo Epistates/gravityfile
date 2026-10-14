@@ -102,8 +102,8 @@ impl std::fmt::Display for PluginKind {
 /// A dynamic value that can be passed between Rust and plugin runtimes.
 ///
 /// This is a simplified representation that can be converted to/from
-/// runtime-specific value types (mlua::Value, rhai::Dynamic, etc.).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// runtime-specific value types such as `mlua::Value`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     /// Null/nil value.

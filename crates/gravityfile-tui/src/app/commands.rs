@@ -1,102 +1,51 @@
 //! Command palette handling.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
-use super::state::View;
+use std::path::PathBuf;
 
-/// Command input state.
+use super::App;
+use super::state::{AppMode, BookmarkListState, LayoutMode, SortMode, View};
+use crate::theme::Theme;
+
+/// Command input state, sharing Unicode editing with filename input.
 #[derive(Debug, Clone, Default)]
 pub struct CommandInput {
-    /// Input buffer.
-    buffer: String,
-    /// Cursor position.
-    cursor: usize,
+    input: super::input::InputState,
 }
 
 impl CommandInput {
-    /// Create a new empty command input.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Clear the input buffer.
     pub fn clear(&mut self) {
-        self.buffer.clear();
-        self.cursor = 0;
+        self.input = super::input::InputState::new();
     }
 
-    /// Get the current input buffer.
     pub fn buffer(&self) -> &str {
-        &self.buffer
+        self.input.buffer()
     }
 
-    /// Get the cursor position.
+    /// UTF-8 byte offset at a grapheme boundary.
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.input.cursor()
     }
 
-    /// Handle a key event, returning whether to execute the command.
     pub fn handle_key(&mut self, key: KeyEvent) -> CommandKeyResult {
-        match (key.code, key.modifiers) {
-            // Execute command on Enter
-            (KeyCode::Enter, _) => {
-                let cmd = self.buffer.clone();
+        if key.code == KeyCode::Backspace && self.input.buffer().is_empty() {
+            return CommandKeyResult::Cancel;
+        }
+        match self.input.handle_key(key) {
+            super::input::InputResult::Submit(command) => {
                 self.clear();
-                CommandKeyResult::Execute(cmd)
+                CommandKeyResult::Execute(command)
             }
-            // Cancel on Escape
-            (KeyCode::Esc, _) => {
+            super::input::InputResult::Cancel => {
                 self.clear();
                 CommandKeyResult::Cancel
             }
-            // Delete char before cursor
-            (KeyCode::Backspace, _) => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.buffer.remove(self.cursor);
-                    CommandKeyResult::Continue
-                } else if self.buffer.is_empty() {
-                    CommandKeyResult::Cancel
-                } else {
-                    CommandKeyResult::Continue
-                }
-            }
-            // Delete char at cursor
-            (KeyCode::Delete, _) => {
-                if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
-                }
-                CommandKeyResult::Continue
-            }
-            // Move cursor
-            (KeyCode::Left, _) => {
-                self.cursor = self.cursor.saturating_sub(1);
-                CommandKeyResult::Continue
-            }
-            (KeyCode::Right, _) => {
-                self.cursor = (self.cursor + 1).min(self.buffer.len());
-                CommandKeyResult::Continue
-            }
-            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.cursor = 0;
-                CommandKeyResult::Continue
-            }
-            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                self.cursor = self.buffer.len();
-                CommandKeyResult::Continue
-            }
-            // Clear line
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.clear();
-                CommandKeyResult::Continue
-            }
-            // Type character
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                self.buffer.insert(self.cursor, c);
-                self.cursor += 1;
-                CommandKeyResult::Continue
-            }
-            _ => CommandKeyResult::Continue,
+            super::input::InputResult::Continue => CommandKeyResult::Continue,
         }
     }
 }
@@ -115,8 +64,10 @@ pub enum CommandKeyResult {
 /// Action to perform after executing a command.
 #[derive(Debug, Clone)]
 pub enum CommandAction {
-    /// No action.
+    /// No action (empty input).
     None,
+    /// Invalid input with an actionable explanation.
+    Invalid(&'static str),
     /// Quit the application.
     Quit,
     /// Refresh/rescan.
@@ -183,12 +134,34 @@ pub enum CommandAction {
     Compress(String),
 }
 
+impl CommandAction {
+    /// Whether the command changes files or rescans, which a snapshot
+    /// cannot allow.
+    pub fn changes_files(&self) -> bool {
+        matches!(
+            self,
+            Self::Refresh
+                | Self::Paste
+                | Self::Delete
+                | Self::Rename(_)
+                | Self::CreateFile(_)
+                | Self::CreateDirectory(_)
+                | Self::Take(_)
+                | Self::Undo
+                | Self::BulkRename
+                | Self::Extract(_)
+                | Self::Compress(_)
+        )
+    }
+}
+
 /// Theme command variants.
 #[derive(Debug, Clone, Copy)]
 pub enum ThemeCommand {
-    Dark,
-    Light,
-    Toggle,
+    /// The palette with this name.
+    Named(&'static str),
+    /// The next palette.
+    Next,
 }
 
 /// Layout command variants.
@@ -216,9 +189,31 @@ pub enum SortCommand {
 
 /// Parse and execute a command string.
 pub fn parse_command(cmd: &str) -> CommandAction {
+    let argument = cmd
+        .trim()
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, argument)| argument.trim_start());
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() {
         return CommandAction::None;
+    }
+
+    if matches!(
+        parts[0],
+        "bookmark" | "mark" | "bm" | "delmark" | "delbookmark" | "unbookmark" | "go" | "'"
+    ) && !argument.is_empty()
+    {
+        let mut chars = argument.chars();
+        if !chars
+            .next()
+            .is_some_and(super::state::Bookmarks::is_valid_key)
+            || chars.next().is_some()
+        {
+            return CommandAction::Invalid("Bookmark key must be one ASCII letter or digit");
+        }
+    }
+    if matches!(parts[0], "theme" | "t" | "layout" | "view" | "sort" | "s") && parts.len() > 2 {
+        return CommandAction::Invalid("This command accepts one option; use :help for syntax");
     }
 
     match parts[0] {
@@ -234,7 +229,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Change directory
         "cd" => {
             if parts.len() > 1 {
-                CommandAction::NavigateTo(parts[1..].join(" "))
+                CommandAction::NavigateTo(argument.to_owned())
             } else {
                 CommandAction::GoToRoot
             }
@@ -263,20 +258,17 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "details" | "info" | "i" => CommandAction::ToggleDetails,
 
         // Theme commands
-        "theme" | "t" => {
-            if parts.len() > 1 {
-                match parts[1] {
-                    "dark" => CommandAction::SetTheme(ThemeCommand::Dark),
-                    "light" => CommandAction::SetTheme(ThemeCommand::Light),
-                    "toggle" => CommandAction::SetTheme(ThemeCommand::Toggle),
-                    _ => CommandAction::None,
-                }
-            } else {
-                CommandAction::SetTheme(ThemeCommand::Toggle)
-            }
-        }
-        "dark" => CommandAction::SetTheme(ThemeCommand::Dark),
-        "light" => CommandAction::SetTheme(ThemeCommand::Light),
+        "theme" | "t" => match parts.get(1) {
+            None | Some(&"next" | &"toggle") => CommandAction::SetTheme(ThemeCommand::Next),
+            Some(name) => match crate::theme::Palette::named(name) {
+                Some(palette) => CommandAction::SetTheme(ThemeCommand::Named(palette.name)),
+                None => CommandAction::Invalid(
+                    "Unknown theme; use gestalt, latte, nord, dracula or ansi (or dark, light)",
+                ),
+            },
+        },
+        "dark" => CommandAction::SetTheme(ThemeCommand::Named("gestalt")),
+        "light" => CommandAction::SetTheme(ThemeCommand::Named("latte")),
 
         // Layout commands
         "layout" | "view" => {
@@ -285,7 +277,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                     "tree" => CommandAction::SetLayout(LayoutCommand::Tree),
                     "miller" | "columns" => CommandAction::SetLayout(LayoutCommand::Miller),
                     "toggle" => CommandAction::SetLayout(LayoutCommand::Toggle),
-                    _ => CommandAction::None,
+                    _ => CommandAction::Invalid("Unknown layout; use tree, miller, or toggle"),
                 }
             } else {
                 CommandAction::SetLayout(LayoutCommand::Toggle)
@@ -310,10 +302,10 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                 if let Some(key) = parts[1].chars().next() {
                     CommandAction::DeleteBookmark(key)
                 } else {
-                    CommandAction::None
+                    CommandAction::Invalid("Specify a bookmark key to remove")
                 }
             } else {
-                CommandAction::None
+                CommandAction::Invalid("Specify a bookmark key to remove")
             }
         }
         // Jump to a bookmark: :go h or :' h
@@ -347,7 +339,9 @@ pub fn parse_command(cmd: &str) -> CommandAction {
                     }
                     "count+" | "ct+" | "count-asc" => CommandAction::SetSort(SortCommand::CountAsc),
                     "reverse" | "rev" => CommandAction::SetSort(SortCommand::Reverse),
-                    _ => CommandAction::SetSort(SortCommand::Cycle),
+                    _ => CommandAction::Invalid(
+                        "Unknown sort order; use size, name, date, count, or reverse",
+                    ),
                 }
             } else {
                 CommandAction::SetSort(SortCommand::Cycle)
@@ -363,7 +357,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Rename
         "rename" | "mv" => {
             if parts.len() > 1 {
-                CommandAction::Rename(Some(parts[1..].join(" ")))
+                CommandAction::Rename(Some(argument.to_owned()))
             } else {
                 CommandAction::Rename(None)
             }
@@ -372,7 +366,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Create file
         "touch" | "new" | "create" => {
             if parts.len() > 1 {
-                CommandAction::CreateFile(Some(parts[1..].join(" ")))
+                CommandAction::CreateFile(Some(argument.to_owned()))
             } else {
                 CommandAction::CreateFile(None)
             }
@@ -381,7 +375,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Create directory
         "mkdir" | "md" => {
             if parts.len() > 1 {
-                CommandAction::CreateDirectory(Some(parts[1..].join(" ")))
+                CommandAction::CreateDirectory(Some(argument.to_owned()))
             } else {
                 CommandAction::CreateDirectory(None)
             }
@@ -390,7 +384,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         // Take (create directory and cd into it)
         "take" => {
             if parts.len() > 1 {
-                CommandAction::Take(Some(parts[1..].join(" ")))
+                CommandAction::Take(Some(argument.to_owned()))
             } else {
                 CommandAction::Take(None)
             }
@@ -406,7 +400,7 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "extract" | "unzip" | "untar" | "decompress" => {
             if parts.len() > 1 {
                 // :extract <destination> - extract to specified location
-                CommandAction::Extract(Some(parts[1..].join(" ")))
+                CommandAction::Extract(Some(argument.to_owned()))
             } else {
                 // :extract - extract to current directory
                 CommandAction::Extract(None)
@@ -415,18 +409,358 @@ pub fn parse_command(cmd: &str) -> CommandAction {
         "compress" | "zip" | "archive" => {
             if parts.len() > 1 {
                 // :compress <archive_name> - create archive with name
-                CommandAction::Compress(parts[1..].join(" "))
+                CommandAction::Compress(argument.to_owned())
             } else {
-                CommandAction::None // Name is required
+                CommandAction::Invalid("Specify an archive name, for example :compress backup.zip")
             }
         }
 
-        _ => CommandAction::None,
+        _ => CommandAction::Invalid("Unknown command; use :help to see available commands"),
+    }
+}
+
+impl App {
+    /// Execute a command from the command palette.
+    pub(super) fn execute_command(&mut self, cmd: &str) {
+        let action = parse_command(cmd);
+        if action.changes_files() && self.refuse_in_snapshot() {
+            return;
+        }
+        match action {
+            CommandAction::None => {}
+            CommandAction::Invalid(message) => {
+                self.error = Some(message.to_string());
+            }
+            CommandAction::Quit => {
+                if self.cancel_archive_operation() {
+                    return;
+                }
+                if self.archive_rx.is_some() || self.take_rx.is_some() {
+                    self.error =
+                        Some("Filesystem operation in progress; wait for it to finish".to_string());
+                } else {
+                    self.mode = AppMode::Quit;
+                }
+            }
+            CommandAction::Refresh => self.refresh_view(),
+            CommandAction::Analyze => {
+                self.start_analysis_for_current_tree();
+            }
+            CommandAction::NavigateTo(target) => {
+                self.cd_to_path(&target);
+            }
+            CommandAction::GoToRoot => {
+                self.go_to_root();
+            }
+            CommandAction::NavigateBack => {
+                self.go_back();
+            }
+            CommandAction::ShowHelp => {
+                self.mode = AppMode::Help;
+            }
+            CommandAction::SwitchView(view) => {
+                self.view = view;
+                if self.view == View::Treemap {
+                    self.update_cached_treemap_len();
+                    self.nav.treemap_state.reset();
+                }
+                self.maybe_start_analysis_for_view();
+            }
+            CommandAction::ClearMarks => {
+                self.marked.clear();
+            }
+            CommandAction::ToggleDetails => {
+                self.show_details = !self.show_details;
+            }
+            CommandAction::SetTheme(theme_cmd) => match theme_cmd {
+                ThemeCommand::Named(name) => {
+                    if let Some(theme) = Theme::named(name) {
+                        self.theme = theme;
+                    }
+                }
+                ThemeCommand::Next => self.theme = self.theme.next(),
+            },
+            CommandAction::SetLayout(layout_cmd) => match layout_cmd {
+                LayoutCommand::Tree => {
+                    if self.layout_mode != LayoutMode::Tree {
+                        self.toggle_layout();
+                    }
+                }
+                LayoutCommand::Miller => {
+                    if self.layout_mode != LayoutMode::Miller {
+                        self.toggle_layout();
+                    }
+                }
+                LayoutCommand::Toggle => {
+                    self.toggle_layout();
+                }
+            },
+            CommandAction::SetSort(sort_cmd) => {
+                match sort_cmd {
+                    SortCommand::SizeDesc => self.sort_mode = SortMode::SizeDescending,
+                    SortCommand::SizeAsc => self.sort_mode = SortMode::SizeAscending,
+                    SortCommand::NameAsc => self.sort_mode = SortMode::NameAscending,
+                    SortCommand::NameDesc => self.sort_mode = SortMode::NameDescending,
+                    SortCommand::DateDesc => self.sort_mode = SortMode::ModifiedDescending,
+                    SortCommand::DateAsc => self.sort_mode = SortMode::ModifiedAscending,
+                    SortCommand::CountDesc => self.sort_mode = SortMode::CountDescending,
+                    SortCommand::CountAsc => self.sort_mode = SortMode::CountAscending,
+                    SortCommand::Cycle => self.sort_mode = self.sort_mode.next(),
+                    SortCommand::Reverse => self.sort_mode = self.sort_mode.reverse(),
+                }
+                self.apply_sort();
+            }
+            CommandAction::Yank => {
+                self.yank_selection();
+            }
+            CommandAction::Cut => {
+                self.cut_selection();
+            }
+            CommandAction::Paste => {
+                self.paste_clipboard();
+            }
+            CommandAction::Delete => {
+                if !self.marked.is_empty() {
+                    self.mode = AppMode::ConfirmDelete;
+                }
+            }
+            CommandAction::Rename(name) => {
+                if let Some(name) = name {
+                    // Direct rename with provided name
+                    if let Some(path) = self.get_selected_path() {
+                        self.execute_rename(path, name);
+                    }
+                } else {
+                    // Enter rename mode
+                    self.start_rename();
+                }
+            }
+            CommandAction::CreateFile(name) => {
+                if let Some(name) = name {
+                    // Direct create with provided name
+                    self.execute_create_file(self.nav.view_root.clone(), name);
+                } else {
+                    // Enter create file mode
+                    self.start_create_file();
+                }
+            }
+            CommandAction::CreateDirectory(name) => {
+                if let Some(name) = name {
+                    // Direct create with provided name
+                    self.execute_create_directory(self.nav.view_root.clone(), name);
+                } else {
+                    // Enter create directory mode
+                    self.start_create_directory();
+                }
+            }
+            CommandAction::Take(name) => {
+                if let Some(name) = name {
+                    // Direct take with provided name
+                    self.execute_take(self.nav.view_root.clone(), name);
+                } else {
+                    // Enter take mode
+                    self.start_take();
+                }
+            }
+            CommandAction::Undo => {
+                self.execute_undo();
+            }
+            CommandAction::ShowBookmarks => {
+                self.bookmark_list_state =
+                    Some(BookmarkListState::new(&self.user_settings.bookmarks));
+                self.mode = AppMode::BookmarkList;
+            }
+            CommandAction::SetBookmark(key) => {
+                if let Some(k) = key {
+                    self.set_bookmark(k);
+                } else {
+                    self.mode = AppMode::SettingBookmark;
+                }
+            }
+            CommandAction::JumpToBookmark(key) => {
+                if let Some(k) = key {
+                    self.jump_to_bookmark(k);
+                } else {
+                    self.mode = AppMode::JumpingToBookmark;
+                }
+            }
+            CommandAction::DeleteBookmark(key) => {
+                self.user_settings.bookmarks.remove(key);
+                if let Err(error) = self.user_settings.save() {
+                    self.error = Some(format!("Failed to save bookmarks: {error}"));
+                }
+            }
+            CommandAction::BulkRename => {
+                self.start_bulk_rename();
+            }
+            CommandAction::Extract(destination) => {
+                self.extract_archive(destination);
+            }
+            CommandAction::Compress(archive_name) => {
+                self.compress_files(&archive_name);
+            }
+        }
+    }
+
+    /// Validate a user-provided path for safety.
+    /// Returns error message if path is invalid.
+    pub(super) fn validate_user_path(path_str: &str) -> Result<PathBuf, String> {
+        // Reject empty paths
+        if path_str.is_empty() {
+            return Err("Path cannot be empty".to_string());
+        }
+
+        // Reject paths with null bytes (security)
+        if path_str.contains('\0') {
+            return Err("Invalid characters in path".to_string());
+        }
+
+        let path = PathBuf::from(path_str);
+
+        // Reject paths with parent directory components (prevents escape attempts)
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("Parent directory references (..) not allowed".to_string());
+        }
+
+        // Reject paths starting with ~ (could expand to home directory unexpectedly)
+        if path_str.starts_with('~') {
+            return Err("Tilde expansion not supported, use absolute path".to_string());
+        }
+
+        Ok(path)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_commands_report_errors_instead_of_fallback_actions() {
+        use super::*;
+        for command in [
+            "unknown",
+            "theme blue",
+            "layout sideways",
+            "sort typo",
+            "sort name extra",
+            "compress",
+            "zip",
+            "delmark",
+            "bookmark ab",
+            "go a b",
+            "unbookmark é",
+            "bm !",
+        ] {
+            assert!(
+                matches!(parse_command(command), CommandAction::Invalid(message) if !message.is_empty()),
+                "{command}"
+            );
+        }
+        assert!(matches!(parse_command(" \t "), CommandAction::None));
+        assert!(matches!(
+            parse_command("sort"),
+            CommandAction::SetSort(SortCommand::Cycle)
+        ));
+        assert!(matches!(
+            parse_command("bookmark"),
+            CommandAction::ShowBookmarks
+        ));
+        assert!(matches!(
+            parse_command("go"),
+            CommandAction::JumpToBookmark(None)
+        ));
+        assert!(matches!(
+            parse_command("delmark a"),
+            CommandAction::DeleteBookmark('a')
+        ));
+    }
+
+    #[test]
+    fn path_arguments_preserve_internal_whitespace() {
+        use super::*;
+        for command in [
+            "cd",
+            "rename",
+            "mv",
+            "touch",
+            "new",
+            "create",
+            "mkdir",
+            "md",
+            "take",
+            "extract",
+            "unzip",
+            "untar",
+            "decompress",
+            "compress",
+            "zip",
+            "archive",
+        ] {
+            for argument in [
+                "two  spaces",
+                "café\u{2003}日本",
+                "path\twith\tspacing",
+                "literal 'quotes'",
+            ] {
+                let result = parse_command(&format!("  {command}\t  {argument}  "));
+                let actual = match result {
+                    CommandAction::NavigateTo(path) | CommandAction::Compress(path) => path,
+                    CommandAction::Rename(Some(path))
+                    | CommandAction::CreateFile(Some(path))
+                    | CommandAction::CreateDirectory(Some(path))
+                    | CommandAction::Take(Some(path))
+                    | CommandAction::Extract(Some(path)) => path,
+                    _ => panic!("unexpected command result"),
+                };
+                assert_eq!(actual, argument, "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_commands_edit_render_and_submit_without_byte_splitting() {
+        use super::*;
+        use crossterm::event::KeyModifiers;
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        use unicode_width::UnicodeWidthStr;
+        let mut input = CommandInput::new();
+        let command = "cd café/日本/👩‍💻";
+        for character in command.chars() {
+            input.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(input.buffer(), command);
+        input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(&input.buffer()[input.cursor()..], "👩‍💻");
+        for cursor in 0..=command.len() + 1 {
+            for width in 0..=20 {
+                let (before, current, after) =
+                    crate::ui::visible_input_parts(command, cursor, width);
+                assert!(before.width() + current.width() + after.width() <= width);
+                let area = Rect::new(0, 0, width as u16, 1);
+                let mut buffer = Buffer::empty(area);
+                crate::ui::modals::CommandPalette::new(
+                    &crate::theme::Theme::default(),
+                    command,
+                    cursor,
+                )
+                .render(area, &mut buffer);
+            }
+        }
+        input.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(input.buffer(), "cd café/日本/");
+        assert!(
+            matches!(input.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            CommandKeyResult::Execute(command) if command == "cd café/日本/")
+        );
+        assert!(input.buffer().is_empty());
+        assert_eq!(input.cursor(), 0);
+        assert!(matches!(
+            input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            CommandKeyResult::Cancel
+        ));
+    }
     use super::*;
 
     #[test]

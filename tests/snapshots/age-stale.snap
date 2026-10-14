@@ -1,0 +1,19 @@
+---
+source: tests/snapshots.rs
+description: grav age --stale 30d before.json
+expression: run(args)
+---
+exit: 0
+--- stdout
+/srv/data  20.2 MB
+7 files, average age 3.3 years
+
+Today             0 B       0 files
+This Week         0 B       0 files
+This Month        0 B       0 files
+This Year      934 kB       3 files  █████████
+Older         19.3 MB       4 files  ███████████
+
+Untouched for over 1 month, 20.3 MB in total:
+  20.3 MB  newest   3 months  /srv/data
+--- stderr

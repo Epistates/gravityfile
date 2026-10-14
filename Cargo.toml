@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/gravityfile-*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/gravityfile"
 keywords = ["disk", "usage", "analyzer", "tui", "cli"]
@@ -14,21 +15,20 @@ categories = ["command-line-utilities", "filesystem"]
 # Core
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_stacker = "0.1"
 thiserror = "2"
 color-eyre = "0.6"
-compact_str = { version = "0.9", features = ["serde"] }
+compact_str = { version = "0.10", features = ["serde"] }
 
 # Scanning
-jwalk = "0.8"
+jwalk = "0.9"
 rayon = "1.12"
-dashmap = "6"
 
 # Hashing
-blake3 = { version = "1", features = ["rayon", "mmap"] }
+blake3 = { version = "1", features = ["rayon"] }
 
 # Async (minimal features for smaller binary)
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["full"] }
 
 # TUI
@@ -36,23 +36,32 @@ ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 crossterm = "0.29"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
+anstream = "1.0"
+anstyle = "1.0"
+indicatif = "0.18"
 
 # Utilities
-humansize = "2"
+etcetera = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 strum = { version = "0.28", features = ["derive"] }
-itertools = "0.14"
 derive_builder = "0.20"
 tempfile = "3"
+# canonicalize without Windows verbatim (\\?\) prefixes where they are not needed
+dunce = "1"
+insta ={ version = "1.49", features = ["filters"] }
+libc = "0.2"
+filetime = "0.2"
 
 # Internal crates
-gravityfile-core = { version = "0.3.0", path = "crates/gravityfile-core" }
-gravityfile-scan = { version = "0.3.0", path = "crates/gravityfile-scan" }
-gravityfile-analyze = { version = "0.3.0", path = "crates/gravityfile-analyze" }
-gravityfile-ops = { version = "0.3.0", path = "crates/gravityfile-ops" }
-gravityfile-plugin = { version = "0.3.0", path = "crates/gravityfile-plugin" }
-gravityfile-tui = { version = "0.3.0", path = "crates/gravityfile-tui" }
+gravityfile-core = { version = "0.4.0", path = "crates/gravityfile-core" }
+gravityfile-scan = { version = "0.4.0", path = "crates/gravityfile-scan" }
+gravityfile-analyze = { version = "0.4.0", path = "crates/gravityfile-analyze" }
+gravityfile-ops = { version = "0.4.0", path = "crates/gravityfile-ops" }
+gravityfile-plugin = { version = "0.4.0", path = "crates/gravityfile-plugin" }
+gravityfile-tui = { version = "0.4.0", path = "crates/gravityfile-tui" }
 
 # Logging
 tracing = "0.1"
@@ -65,7 +74,6 @@ indexmap = "2"
 globset = "0.4"
 
 # File operations
-fs_extra = "1.3"
 trash = "5"
 
 # Archive support
@@ -73,43 +81,58 @@ zip = "8"
 tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
+zstd = { version = "0.14", features = ["zstdmt"] }
+reflink-copy = "0.1"
+xattr = "1"
 bzip2 = "0.6"
 
 # Git integration
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21", default-features = false }
 
 [package]
 name = "gravityfile"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "A state-of-the-art file system analyzer with TUI"
 autobins = false
+include = ["src/**/*.rs", "src/shell/*", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 [[bin]]
 name = "grav"
-path = "src/main.rs"
-
-[[bin]]
-name = "gravityfile"
 path = "src/main.rs"
 
 [dependencies]
 gravityfile-core.workspace = true
 gravityfile-scan.workspace = true
 gravityfile-analyze.workspace = true
+gravityfile-plugin.workspace = true
 gravityfile-tui.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+anstream.workspace = true
+anstyle.workspace = true
+indicatif.workspace = true
 color-eyre.workspace = true
-tokio.workspace = true
 tokio-util = { workspace = true }
-humansize.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
+zstd.workspace = true
+chrono.workspace = true
+serde.workspace = true
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
+tempfile.workspace = true
+dunce.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+getrandom = "0.4"
 
 [profile.release]
 lto = true
@@ -117,3 +140,10 @@ codegen-units = 1
 strip = true
 panic = "abort"
 opt-level = 3
+
+# The profile that 'dist' will build with: the release profile, unchanged
+[profile.dist]
+inherits = "release"
+
+[dev-dependencies]
+insta.workspace = true

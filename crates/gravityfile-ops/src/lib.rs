@@ -1,31 +1,32 @@
-//! File operations engine for gravityfile.
-//!
-//! This crate provides async file operations (copy, move, rename, create, delete)
-//! with progress reporting via channels, following the same pattern as the
-//! existing deletion implementation.
+#![doc = include_str!("../README.md")]
 
 pub mod archive;
+mod batch;
 mod conflict;
-mod copy;
 mod create;
-mod executor;
-mod move_op;
-mod operation;
+mod delete;
+mod error;
+mod fs;
 mod progress;
 mod rename;
+mod transfer;
 mod undo;
 
-pub use archive::{ArchiveError, ArchiveFormat, ArchiveResult, create_archive, extract_archive};
-pub use conflict::{Conflict, ConflictKind, ConflictResolution};
-pub use copy::{CopyOptions, CopyResult, start_copy};
+pub use archive::{
+    ArchiveError, ArchiveFormat, ArchiveResult, ExtractLimits, create_archive,
+    create_archive_cancellable, extract_archive, extract_archive_cancellable, extract_archive_with,
+};
+pub use batch::{TransferComplete, TransferOptions, TransferResult, start_copy, start_move};
+pub use conflict::{Conflict, ConflictKind, ConflictRequest, ConflictResolution, auto_rename_path};
 pub use create::{CreateResult, start_create_directory, start_create_file};
-pub use executor::{OperationExecutor, OperationResult, execute_undo};
-pub use move_op::{MoveComplete, MoveOptions, MoveResult, start_move};
-pub use operation::{FileOperation, OperationError};
+pub use delete::{DeleteComplete, DeleteMode, DeleteResult, start_delete};
+pub use error::OperationError;
+pub use fs::STAGING_PREFIX;
 pub use progress::{OperationComplete, OperationProgress, OperationType};
-pub use rename::{RenameResult, start_rename};
+pub use rename::{RenameResult, rename_paths, start_rename, validate_filename};
 pub use tokio_util::sync::CancellationToken;
-pub use undo::{UndoEntry, UndoLog, UndoableOperation};
+pub use transfer::ReplacePolicy;
+pub use undo::{UndoComplete, UndoEntry, UndoLog, UndoResult, UndoableOperation, execute_undo};
 
-/// Default channel buffer size for operation progress updates.
+/// Channel capacity for operation messages.
 pub const OPERATION_CHANNEL_SIZE: usize = 100;

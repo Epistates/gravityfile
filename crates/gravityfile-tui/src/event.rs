@@ -1,6 +1,6 @@
 //! Event handling for the TUI.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 /// Key action that can be performed in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,18 +16,12 @@ pub enum KeyAction {
     PageDown,
 
     // Tree operations
-    #[allow(dead_code)]
-    Expand,
-    #[allow(dead_code)]
-    Collapse,
     ToggleExpand,
 
     // Directory navigation
+    /// Enter a directory, or open a file with the configured opener.
     DrillDown,
     NavigateBack,
-    /// Open file with configured opener (Enter on file).
-    #[allow(dead_code)]
-    OpenFile,
 
     // Selection
     /// Toggle mark on current item (Space).
@@ -65,8 +59,14 @@ pub enum KeyAction {
     ToggleTheme,
     /// Toggle between tree and miller layout.
     ToggleLayout,
+    /// Switch between disk usage and apparent sizes.
+    ToggleSizeMode,
     /// Cycle preview mode (auto/text/hex/metadata).
     CyclePreviewMode,
+    /// Scroll the file preview down.
+    PreviewDown,
+    /// Scroll the file preview up.
+    PreviewUp,
     /// Open settings modal.
     OpenSettings,
 
@@ -79,10 +79,6 @@ pub enum KeyAction {
     /// Go to a specific directory (opens path input).
     GoTo,
 
-    // Confirmation
-    /// Explicit confirmation action (e.g. mapped from 'y' via dedicated confirm logic).
-    #[allow(dead_code)]
-    Confirm,
     Cancel,
 
     // View switching (for View enum: Explorer, Duplicates, Age, Errors)
@@ -117,14 +113,30 @@ pub enum KeyAction {
     None,
 }
 
+impl KeyAction {
+    /// Whether the action changes files or rescans, which a snapshot cannot
+    /// allow.
+    pub fn changes_files(self) -> bool {
+        matches!(
+            self,
+            Self::Paste
+                | Self::Delete
+                | Self::Rename
+                | Self::CreateFile
+                | Self::CreateDirectory
+                | Self::Take
+                | Self::Undo
+                | Self::Refresh
+        )
+    }
+}
+
 /// Mouse action that can be performed in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {
     /// Left click at a position.
     Click { x: u16, y: u16 },
-    /// Double click at a position.
-    /// Reserved for future double-click detection with timing logic.
-    #[allow(dead_code)]
+    /// Second click on the same row in quick succession; see [`ClickTracker`].
     DoubleClick { x: u16, y: u16 },
     /// Right click at a position.
     RightClick { x: u16, y: u16 },
@@ -132,10 +144,6 @@ pub enum MouseAction {
     ScrollUp { x: u16, y: u16 },
     /// Scroll down at a position.
     ScrollDown { x: u16, y: u16 },
-    /// Drag started at a position.
-    /// Reserved for future drag-and-drop support.
-    #[allow(dead_code)]
-    DragStart { x: u16, y: u16 },
     /// Drag continued to a position.
     DragTo { x: u16, y: u16 },
     /// Drag ended.
@@ -162,399 +170,38 @@ impl MouseAction {
     }
 }
 
-impl KeyAction {
-    /// Convert a key event to an action.
-    pub fn from_key_event(event: KeyEvent) -> Self {
-        match (event.code, event.modifiers) {
-            // Quit - only 'q' quits, Esc is for clearing selection/clipboard
-            (KeyCode::Char('q'), KeyModifiers::NONE) => KeyAction::Quit,
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => KeyAction::ForceQuit,
+/// Recognizes double clicks: terminals report each press separately.
+#[derive(Debug, Default)]
+pub struct ClickTracker {
+    last: Option<(std::time::Instant, u16)>,
+}
 
-            // Cancel/Clear - Esc clears selection, clipboard, or closes dialogs
-            (KeyCode::Esc, _) => KeyAction::Cancel,
+impl ClickTracker {
+    /// Longest gap between the two clicks of a double click.
+    pub const WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
-            // Navigation - vim style
-            (KeyCode::Char('j'), KeyModifiers::NONE) => KeyAction::MoveDown,
-            (KeyCode::Char('k'), KeyModifiers::NONE) => KeyAction::MoveUp,
-            (KeyCode::Char('h'), KeyModifiers::NONE) => KeyAction::MoveLeft,
-            (KeyCode::Char('l'), KeyModifiers::NONE) => KeyAction::MoveRight,
-
-            // Navigation - arrow keys (without modifiers; Ctrl+arrows for tabs)
-            (KeyCode::Down, KeyModifiers::NONE) => KeyAction::MoveDown,
-            (KeyCode::Up, KeyModifiers::NONE) => KeyAction::MoveUp,
-            (KeyCode::Left, KeyModifiers::NONE) => KeyAction::MoveLeft,
-            (KeyCode::Right, KeyModifiers::NONE) => KeyAction::MoveRight,
-
-            // Jump
-            (KeyCode::Char('g'), KeyModifiers::NONE) => KeyAction::JumpToTop,
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) => KeyAction::JumpToBottom,
-            (KeyCode::Home, _) => KeyAction::JumpToTop,
-            (KeyCode::End, _) => KeyAction::JumpToBottom,
-
-            // Page navigation
-            (KeyCode::PageUp, _) => KeyAction::PageUp,
-            (KeyCode::PageDown, _) => KeyAction::PageDown,
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => KeyAction::PageUp,
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => KeyAction::PageDown,
-
-            // Selection and marking
-            (KeyCode::Char(' '), KeyModifiers::NONE) => KeyAction::ToggleMark,
-            (KeyCode::Char('V'), KeyModifiers::SHIFT) => KeyAction::EnterVisual,
-            (KeyCode::Char('u'), KeyModifiers::NONE) => KeyAction::ClearMarks,
-
-            // Tree expand/collapse with 'o'
-            (KeyCode::Char('o'), KeyModifiers::NONE) => KeyAction::ToggleExpand,
-
-            // Clipboard operations (vim-style)
-            (KeyCode::Char('y'), KeyModifiers::NONE) => KeyAction::Yank,
-            (KeyCode::Char('x'), KeyModifiers::NONE) => KeyAction::Cut,
-            (KeyCode::Char('p'), KeyModifiers::NONE) => KeyAction::Paste,
-
-            // File operations
-            (KeyCode::Char('d'), KeyModifiers::NONE) => KeyAction::Delete,
-            (KeyCode::Char('D'), KeyModifiers::SHIFT) => KeyAction::Delete,
-            (KeyCode::Delete, _) => KeyAction::Delete,
-            (KeyCode::Char('r'), KeyModifiers::NONE) => KeyAction::Rename,
-            (KeyCode::Char('a'), KeyModifiers::NONE) => KeyAction::CreateFile,
-            (KeyCode::Char('A'), KeyModifiers::SHIFT) => KeyAction::CreateDirectory,
-            (KeyCode::Char('T'), KeyModifiers::SHIFT) => KeyAction::Take,
-
-            // Undo
-            (KeyCode::Char('z'), KeyModifiers::CONTROL) => KeyAction::Undo,
-
-            // UI toggles
-            (KeyCode::Char('i'), KeyModifiers::NONE) => KeyAction::ToggleDetails,
-            (KeyCode::Char('?'), KeyModifiers::NONE) => KeyAction::ToggleHelp,
-            (KeyCode::Char('t'), KeyModifiers::NONE) => KeyAction::ToggleTheme,
-            (KeyCode::Char('P'), KeyModifiers::SHIFT) => KeyAction::CyclePreviewMode,
-            (KeyCode::Char('v'), KeyModifiers::NONE) => KeyAction::ToggleLayout,
-            (KeyCode::Char(','), KeyModifiers::NONE) => KeyAction::OpenSettings,
-
-            // Refresh (Shift-R since r is rename)
-            (KeyCode::Char('R'), KeyModifiers::SHIFT) => KeyAction::Refresh,
-
-            // Search and sort
-            (KeyCode::Char('/'), KeyModifiers::NONE) => KeyAction::Search,
-            (KeyCode::Char('s'), KeyModifiers::NONE) => KeyAction::Sort,
-            (KeyCode::Char('S'), KeyModifiers::SHIFT) => KeyAction::ReverseSort,
-
-            // Directory navigation
-            (KeyCode::Enter, _) => KeyAction::DrillDown,
-            (KeyCode::Backspace, _) => KeyAction::NavigateBack,
-            (KeyCode::Char('-'), KeyModifiers::NONE) => KeyAction::NavigateBack,
-
-            // Command palette
-            (KeyCode::Char(':'), KeyModifiers::NONE) => KeyAction::CommandMode,
-            (KeyCode::Char(':'), KeyModifiers::SHIFT) => KeyAction::CommandMode,
-
-            // Go to directory
-            (KeyCode::Char('g'), KeyModifiers::CONTROL) => KeyAction::GoTo,
-
-            // Bookmarks
-            (KeyCode::Char('m'), KeyModifiers::NONE) => KeyAction::SetBookmark,
-            (KeyCode::Char('\''), KeyModifiers::NONE) => KeyAction::JumpToBookmark,
-            (KeyCode::Char('`'), KeyModifiers::NONE) => KeyAction::JumpToBookmark,
-            (KeyCode::Char('B'), KeyModifiers::SHIFT) => KeyAction::ShowBookmarkList,
-
-            // Confirmation (for dialogs)
-            (KeyCode::Char('n'), KeyModifiers::NONE) => KeyAction::Cancel,
-            // ClearMarks available via Escape when items are marked, or :clear command
-
-            // View switching (Explorer, Duplicates, Age, Errors)
-            (KeyCode::Tab, KeyModifiers::NONE) => KeyAction::NextView,
-            (KeyCode::BackTab, _) => KeyAction::PrevView,
-
-            // Directory tabs
-            (KeyCode::Char('t'), KeyModifiers::CONTROL) => KeyAction::NewDirTab,
-            (KeyCode::Char('w'), KeyModifiers::CONTROL) => KeyAction::CloseDirTab,
-            (KeyCode::Char(']'), KeyModifiers::NONE) => KeyAction::NextDirTab,
-            (KeyCode::Char('['), KeyModifiers::NONE) => KeyAction::PrevDirTab,
-            // Direct tab switching: 1-9 keys (only when multiple tabs exist)
-            (KeyCode::Char('1'), KeyModifiers::NONE) => KeyAction::DirTab(1),
-            (KeyCode::Char('2'), KeyModifiers::NONE) => KeyAction::DirTab(2),
-            (KeyCode::Char('3'), KeyModifiers::NONE) => KeyAction::DirTab(3),
-            (KeyCode::Char('4'), KeyModifiers::NONE) => KeyAction::DirTab(4),
-            (KeyCode::Char('5'), KeyModifiers::NONE) => KeyAction::DirTab(5),
-            (KeyCode::Char('6'), KeyModifiers::NONE) => KeyAction::DirTab(6),
-            (KeyCode::Char('7'), KeyModifiers::NONE) => KeyAction::DirTab(7),
-            (KeyCode::Char('8'), KeyModifiers::NONE) => KeyAction::DirTab(8),
-            (KeyCode::Char('9'), KeyModifiers::NONE) => KeyAction::DirTab(9),
-
-            _ => KeyAction::None,
+    /// `action`, turned into a double click if it is a second left click on
+    /// the same row within [`Self::WINDOW`]. A third click starts over.
+    pub fn classify(&mut self, action: MouseAction, now: std::time::Instant) -> MouseAction {
+        match action {
+            MouseAction::Click { x, y } => {
+                if let Some((at, row)) = self.last.take()
+                    && row == y
+                    && now.saturating_duration_since(at) <= Self::WINDOW
+                {
+                    return MouseAction::DoubleClick { x, y };
+                }
+                self.last = Some((now, y));
+                action
+            }
+            // Releasing the button belongs to the click.
+            MouseAction::DragEnd | MouseAction::None => action,
+            _ => {
+                self.last = None;
+                action
+            }
         }
     }
-}
-
-/// A section of key bindings for the help display.
-pub struct HelpSection {
-    pub title: &'static str,
-    pub bindings: Vec<KeyBinding>,
-}
-
-/// Key binding for display in help.
-pub struct KeyBinding {
-    pub keys: &'static str,
-    pub description: &'static str,
-}
-
-/// Get all key bindings organized by section for help display.
-pub fn get_help_sections() -> Vec<HelpSection> {
-    vec![
-        HelpSection {
-            title: "Navigation",
-            bindings: vec![
-                KeyBinding {
-                    keys: "j/k ↑/↓",
-                    description: "Move up/down",
-                },
-                KeyBinding {
-                    keys: "h/l ←/→",
-                    description: "Collapse/expand",
-                },
-                KeyBinding {
-                    keys: "Enter",
-                    description: "Drill into directory",
-                },
-                KeyBinding {
-                    keys: "Backspace/-",
-                    description: "Navigate back",
-                },
-                KeyBinding {
-                    keys: "g/G",
-                    description: "Jump to top/bottom",
-                },
-                KeyBinding {
-                    keys: "Ctrl-u/d",
-                    description: "Page up/down",
-                },
-                KeyBinding {
-                    keys: "Ctrl-g",
-                    description: "Go to directory",
-                },
-                KeyBinding {
-                    keys: "o",
-                    description: "Toggle expand node",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Selection & Clipboard",
-            bindings: vec![
-                KeyBinding {
-                    keys: "Space",
-                    description: "Mark item for multi-select",
-                },
-                KeyBinding {
-                    keys: "y",
-                    description: "Yank (copy) to clipboard",
-                },
-                KeyBinding {
-                    keys: "x",
-                    description: "Cut to clipboard",
-                },
-                KeyBinding {
-                    keys: "p",
-                    description: "Paste from clipboard",
-                },
-                KeyBinding {
-                    keys: "Esc",
-                    description: "Clear clipboard/marks",
-                },
-            ],
-        },
-        HelpSection {
-            title: "File Operations",
-            bindings: vec![
-                KeyBinding {
-                    keys: "d/Del",
-                    description: "Delete item(s)",
-                },
-                KeyBinding {
-                    keys: "r",
-                    description: "Rename",
-                },
-                KeyBinding {
-                    keys: "a",
-                    description: "Create file (touch)",
-                },
-                KeyBinding {
-                    keys: "A",
-                    description: "Create directory (mkdir)",
-                },
-                KeyBinding {
-                    keys: "T",
-                    description: "Take (mkdir + cd)",
-                },
-                KeyBinding {
-                    keys: "Ctrl-z",
-                    description: "Undo",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Views & Display",
-            bindings: vec![
-                KeyBinding {
-                    keys: "Tab/S-Tab",
-                    description: "Switch view",
-                },
-                KeyBinding {
-                    keys: "v",
-                    description: "Toggle Tree/Miller",
-                },
-                KeyBinding {
-                    keys: "s",
-                    description: "Cycle sort mode",
-                },
-                KeyBinding {
-                    keys: "S",
-                    description: "Reverse sort order",
-                },
-                KeyBinding {
-                    keys: "i",
-                    description: "Toggle details panel",
-                },
-                KeyBinding {
-                    keys: "t",
-                    description: "Toggle dark/light theme",
-                },
-                KeyBinding {
-                    keys: "R",
-                    description: "Full scan/rescan",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Treemap View",
-            bindings: vec![
-                KeyBinding {
-                    keys: "j/k",
-                    description: "Select rectangle",
-                },
-                KeyBinding {
-                    keys: "Enter/l",
-                    description: "Drill into directory",
-                },
-                KeyBinding {
-                    keys: "Backspace/h",
-                    description: "Navigate back",
-                },
-                KeyBinding {
-                    keys: "Space",
-                    description: "Mark selected item",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Duplicates View",
-            bindings: vec![
-                KeyBinding {
-                    keys: "j/k",
-                    description: "Navigate groups/files",
-                },
-                KeyBinding {
-                    keys: "h/l",
-                    description: "Collapse/expand group",
-                },
-                KeyBinding {
-                    keys: "d (on group)",
-                    description: "Mark all duplicates (keeps 1st)",
-                },
-                KeyBinding {
-                    keys: "d (on file)",
-                    description: "Mark single file for deletion",
-                },
-                KeyBinding {
-                    keys: "Space (group)",
-                    description: "Select/deselect all in group",
-                },
-                KeyBinding {
-                    keys: "Space (file)",
-                    description: "Toggle single file selection",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Bookmarks",
-            bindings: vec![
-                KeyBinding {
-                    keys: "m<key>",
-                    description: "Set bookmark",
-                },
-                KeyBinding {
-                    keys: "'<key>",
-                    description: "Jump to bookmark",
-                },
-                KeyBinding {
-                    keys: "B",
-                    description: "Show bookmark list",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Mouse",
-            bindings: vec![
-                KeyBinding {
-                    keys: "Click",
-                    description: "Select item",
-                },
-                KeyBinding {
-                    keys: "Double-click",
-                    description: "Enter directory",
-                },
-                KeyBinding {
-                    keys: "Right-click",
-                    description: "Toggle mark",
-                },
-                KeyBinding {
-                    keys: "Scroll",
-                    description: "Move up/down",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Directory Tabs",
-            bindings: vec![
-                KeyBinding {
-                    keys: "Ctrl-t",
-                    description: "New tab (current dir)",
-                },
-                KeyBinding {
-                    keys: "Ctrl-w",
-                    description: "Close current tab",
-                },
-                KeyBinding {
-                    keys: "]/[",
-                    description: "Next/prev tab",
-                },
-                KeyBinding {
-                    keys: "1-9",
-                    description: "Jump to tab N",
-                },
-            ],
-        },
-        HelpSection {
-            title: "Commands",
-            bindings: vec![
-                KeyBinding {
-                    keys: ":",
-                    description: "Open command palette",
-                },
-                KeyBinding {
-                    keys: ",",
-                    description: "Open settings",
-                },
-                KeyBinding {
-                    keys: "?",
-                    description: "Show this help",
-                },
-                KeyBinding {
-                    keys: "q",
-                    description: "Quit",
-                },
-            ],
-        },
-    ]
 }
 
 /// Get command palette commands for help display.
@@ -572,7 +219,10 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
         (":rename <name>", "Rename current item"),
         (":rename-bulk :brn", "Bulk rename marked items"),
         (":clear", "Clear all marks"),
-        (":theme dark|light", "Set theme"),
+        (
+            ":theme [name]",
+            "Next theme, or gestalt, latte, nord, dracula, ansi",
+        ),
         (":layout tree|miller", "Set layout"),
         (":sort <mode>", "Set sort (size/name/date/count)"),
         (":treemap :map", "Show disk-usage treemap"),
@@ -584,11 +234,90 @@ pub fn get_command_help() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Get all key bindings as a flat list (for backwards compatibility).
-#[allow(dead_code)]
-pub fn get_key_bindings() -> Vec<KeyBinding> {
-    get_help_sections()
-        .into_iter()
-        .flat_map(|s| s.bindings)
-        .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn a_quick_second_click_on_the_same_row_is_a_double_click() {
+        let start = std::time::Instant::now();
+        let at = |millis| start + std::time::Duration::from_millis(millis);
+        let click = |y| MouseAction::Click { x: 3, y };
+        let mut clicks = ClickTracker::default();
+        assert_eq!(clicks.classify(click(5), at(0)), click(5));
+        assert_eq!(
+            clicks.classify(MouseAction::DragEnd, at(50)),
+            MouseAction::DragEnd
+        );
+        assert_eq!(
+            clicks.classify(click(5), at(300)),
+            MouseAction::DoubleClick { x: 3, y: 5 }
+        );
+        // A third click starts over rather than double-clicking again.
+        assert_eq!(clicks.classify(click(5), at(350)), click(5));
+        // Too slow, another row, or something in between: two single clicks.
+        assert_eq!(clicks.classify(click(5), at(900)), click(5));
+        assert_eq!(clicks.classify(click(6), at(950)), click(6));
+        clicks.classify(MouseAction::ScrollDown { x: 3, y: 6 }, at(960));
+        assert_eq!(clicks.classify(click(6), at(970)), click(6));
+    }
+
+    #[test]
+    fn mouse_events_map_to_actions() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let at = |kind| MouseEvent {
+            kind,
+            column: 4,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Down(MouseButton::Left))),
+            MouseAction::Click { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Down(MouseButton::Right))),
+            MouseAction::RightClick { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::ScrollUp)),
+            MouseAction::ScrollUp { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::ScrollDown)),
+            MouseAction::ScrollDown { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Drag(MouseButton::Left))),
+            MouseAction::DragTo { x: 4, y: 7 }
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Up(MouseButton::Left))),
+            MouseAction::DragEnd
+        );
+        assert_eq!(
+            MouseAction::from_mouse_event(at(MouseEventKind::Moved)),
+            MouseAction::None
+        );
+    }
+
+    #[test]
+    fn command_help_lists_each_command_once() {
+        let commands = get_command_help();
+        assert!(!commands.is_empty());
+
+        let mut names: Vec<&str> = commands.iter().map(|(name, _)| *name).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate entries in the command help");
+
+        for (name, description) in &commands {
+            assert!(name.starts_with(':'), "{name} is not a command");
+            assert!(!description.is_empty(), "{name} has no description");
+        }
+    }
 }

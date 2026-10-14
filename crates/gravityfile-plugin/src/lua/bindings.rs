@@ -7,6 +7,74 @@ use mlua::{Lua, Table, Value as LuaValue};
 use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginResult};
 
+/// Whether the sandbox permits reading `path`, checking both the literal path
+/// and its resolved form.
+///
+/// `can_read` alone is not enough for existence probes: a symlink inside an
+/// allowed directory can point outside it, so the target is re-checked once the
+/// path resolves. A path that does not resolve is judged on the literal form.
+fn sandbox_allows_read(sandbox: Option<&SandboxConfig>, path: &std::path::Path) -> bool {
+    let Some(sandbox) = sandbox else {
+        return true;
+    };
+    if !sandbox.can_read(path) {
+        return false;
+    }
+    match dunce::canonicalize(path) {
+        Ok(resolved) => sandbox.can_read(&resolved),
+        Err(_) => true,
+    }
+}
+
+fn open_readable_file(
+    path: &std::path::Path,
+    requested_limit: Option<usize>,
+    sandbox: Option<&SandboxConfig>,
+) -> mlua::Result<Option<(std::fs::File, usize)>> {
+    if let Some(sb) = sandbox
+        && !sb.can_read(path)
+    {
+        return Err(mlua::Error::external("Read denied by sandbox policy"));
+    }
+
+    let real = match dunce::canonicalize(path) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(mlua::Error::external(error)),
+    };
+    if let Some(sb) = sandbox
+        && !sb.can_read(&real)
+    {
+        return Err(mlua::Error::external("Read denied by sandbox policy"));
+    }
+
+    let file = std::fs::File::open(&real).map_err(mlua::Error::external)?;
+    let metadata = file.metadata().map_err(mlua::Error::external)?;
+    if !metadata.is_file() {
+        return Err(mlua::Error::external(
+            "Read denied: path is not a regular file",
+        ));
+    }
+
+    let limit = match sandbox {
+        Some(sb) => {
+            if metadata.len() > sb.max_read_size as u64 {
+                return Err(mlua::Error::external(format!(
+                    "Read denied: file too large ({} bytes > {} limit)",
+                    metadata.len(),
+                    sb.max_read_size
+                )));
+            }
+            requested_limit
+                .unwrap_or(sb.max_read_size)
+                .min(sb.max_read_size)
+        }
+        None => requested_limit.unwrap_or(1024 * 1024),
+    };
+
+    Ok(Some((file, limit)))
+}
+
 /// Create the 'fs' (filesystem) namespace.
 pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<Table> {
     let fs = lua.create_table().map_err(|e| PluginError::LoadError {
@@ -18,39 +86,10 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let sb_clone1 = sandbox.clone();
     let read = lua
         .create_function(move |lua, (path, limit): (String, Option<usize>)| {
-            let limit = limit.unwrap_or_else(|| {
-                sb_clone1
-                    .as_ref()
-                    .map(|sb| sb.max_read_size)
-                    .unwrap_or(1024 * 1024)
-            });
             let path = std::path::Path::new(&path);
-
-            if let Some(sb) = &sb_clone1 {
-                if !sb.can_read(path) {
-                    return Err(mlua::Error::external("Read denied by sandbox policy"));
-                }
-                // Also check total file size if metadata is available
-                if let Ok(meta) = std::fs::metadata(path)
-                    && meta.len() > sb.max_read_size as u64
-                    && limit > sb.max_read_size
-                {
-                    return Err(mlua::Error::external(format!(
-                        "Read denied: file too large ({} bytes > {} limit)",
-                        meta.len(),
-                        sb.max_read_size
-                    )));
-                }
-            }
-
-            if !path.exists() {
+            let Some((f, limit)) = open_readable_file(path, limit, sb_clone1.as_ref())? else {
                 return Ok(LuaValue::Nil);
-            }
-
-            // Open the canonicalized path so a symlink swapped in after the
-            // sandbox check can't redirect the read (TOCTOU mitigation).
-            let real = std::fs::canonicalize(path).map_err(mlua::Error::external)?;
-            let f = std::fs::File::open(&real).map_err(mlua::Error::external)?;
+            };
             let mut content = String::new();
             f.take(limit as u64)
                 .read_to_string(&mut content)
@@ -68,37 +107,10 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let sb_clone2 = sandbox.clone();
     let read_bytes = lua
         .create_function(move |lua, (path, limit): (String, Option<usize>)| {
-            let limit = limit.unwrap_or_else(|| {
-                sb_clone2
-                    .as_ref()
-                    .map(|sb| sb.max_read_size)
-                    .unwrap_or(1024 * 1024)
-            });
             let path = std::path::Path::new(&path);
-
-            if let Some(sb) = &sb_clone2 {
-                if !sb.can_read(path) {
-                    return Err(mlua::Error::external("Read denied by sandbox policy"));
-                }
-                if let Ok(meta) = std::fs::metadata(path)
-                    && meta.len() > sb.max_read_size as u64
-                    && limit > sb.max_read_size
-                {
-                    return Err(mlua::Error::external(format!(
-                        "Read denied: file too large ({} bytes > {} limit)",
-                        meta.len(),
-                        sb.max_read_size
-                    )));
-                }
-            }
-
-            if !path.exists() {
+            let Some((f, limit)) = open_readable_file(path, limit, sb_clone2.as_ref())? else {
                 return Ok(LuaValue::Nil);
-            }
-
-            // Open the canonicalized path (TOCTOU mitigation, see fs.read).
-            let real = std::fs::canonicalize(path).map_err(mlua::Error::external)?;
-            let f = std::fs::File::open(&real).map_err(mlua::Error::external)?;
+            };
             let mut buf = Vec::new();
             f.take(limit as u64)
                 .read_to_end(&mut buf)
@@ -117,9 +129,7 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let exists = lua
         .create_function(move |_, path: String| {
             let path = std::path::Path::new(&path);
-            if let Some(sb) = &sb_clone3
-                && !sb.can_read(path)
-            {
+            if !sandbox_allows_read(sb_clone3.as_ref(), path) {
                 return Ok(false); // Hide existence if not allowed to read
             }
             Ok(path.exists())
@@ -135,9 +145,7 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let is_dir = lua
         .create_function(move |_, path: String| {
             let path = std::path::Path::new(&path);
-            if let Some(sb) = &sb_clone4
-                && !sb.can_read(path)
-            {
+            if !sandbox_allows_read(sb_clone4.as_ref(), path) {
                 return Ok(false);
             }
             Ok(path.is_dir())
@@ -153,9 +161,7 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     let is_file = lua
         .create_function(move |_, path: String| {
             let path = std::path::Path::new(&path);
-            if let Some(sb) = &sb_clone5
-                && !sb.can_read(path)
-            {
+            if !sandbox_allows_read(sb_clone5.as_ref(), path) {
                 return Ok(false);
             }
             Ok(path.is_file())
@@ -172,17 +178,17 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
         .create_function(move |lua, path: String| {
             let path = std::path::Path::new(&path);
 
-            if let Some(sb) = &sb_clone6
-                && !sb.can_read(path)
-            {
+            if !sandbox_allows_read(sb_clone6.as_ref(), path) {
                 return Err(mlua::Error::external("Read denied by sandbox policy"));
             }
 
-            if !path.exists() {
-                return Ok(LuaValue::Nil);
-            }
-
-            let meta = std::fs::metadata(path).map_err(mlua::Error::external)?;
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(LuaValue::Nil);
+                }
+                Err(error) => return Err(mlua::Error::external(error)),
+            };
 
             let table = lua.create_table()?;
             table.set("size", meta.len())?;
@@ -276,111 +282,53 @@ pub fn create_fs_api(lua: &Lua, sandbox: Option<SandboxConfig>) -> PluginResult<
     Ok(fs)
 }
 
-/// Create the 'ui' (user interface) namespace.
-pub fn create_ui_api(lua: &Lua) -> PluginResult<Table> {
-    let ui = lua.create_table().map_err(|e| PluginError::LoadError {
-        name: "lua".into(),
-        message: format!("Failed to create ui table: {}", e),
-    })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // ui.span(text, style?) - Create a styled text span
-    let span = lua
-        .create_function(|lua, (text, style): (String, Option<Table>)| {
-            let table = lua.create_table()?;
-            table.set("type", "span")?;
-            table.set("text", text)?;
+    #[test]
+    fn lua_reads_cannot_override_the_sandbox_size_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.txt");
+        std::fs::write(&path, b"more than four bytes").unwrap();
 
-            if let Some(s) = style {
-                table.set("style", s)?;
-            }
+        let mut sandbox = SandboxConfig::minimal().allow_read(temp.path());
+        sandbox.max_read_size = 4;
+        let lua = Lua::new();
+        let fs = create_fs_api(&lua, Some(sandbox)).unwrap();
+        lua.globals().set("fs", fs).unwrap();
+        lua.globals()
+            .set("path", path.to_string_lossy().as_ref())
+            .unwrap();
 
-            Ok(table)
-        })
-        .map_err(|e| PluginError::LoadError {
-            name: "lua".into(),
-            message: e.to_string(),
-        })?;
-    ui.set("span", span).ok();
-
-    // ui.line(spans) - Create a line from spans
-    let line = lua
-        .create_function(|lua, spans: Table| {
-            let table = lua.create_table()?;
-            table.set("type", "line")?;
-            table.set("spans", spans)?;
-            Ok(table)
-        })
-        .map_err(|e| PluginError::LoadError {
-            name: "lua".into(),
-            message: e.to_string(),
-        })?;
-    ui.set("line", line).ok();
-
-    // ui.paragraph(lines) - Create a paragraph
-    let paragraph = lua
-        .create_function(|lua, lines: Table| {
-            let table = lua.create_table()?;
-            table.set("type", "paragraph")?;
-            table.set("lines", lines)?;
-            Ok(table)
-        })
-        .map_err(|e| PluginError::LoadError {
-            name: "lua".into(),
-            message: e.to_string(),
-        })?;
-    ui.set("paragraph", paragraph).ok();
-
-    // ui.style(opts) - Create a style
-    let style_fn = lua
-        .create_function(|lua, opts: Table| {
-            let table = lua.create_table()?;
-            table.set("type", "style")?;
-
-            // Copy style options
-            for key in ["fg", "bg", "bold", "italic", "underline", "dim"] {
-                if let Ok(val) = opts.get::<LuaValue>(key)
-                    && val != LuaValue::Nil
-                {
-                    table.set(key, val)?;
-                }
-            }
-
-            Ok(table)
-        })
-        .map_err(|e| PluginError::LoadError {
-            name: "lua".into(),
-            message: e.to_string(),
-        })?;
-    ui.set("style", style_fn).ok();
-
-    // Predefined colors
-    let colors = lua.create_table().map_err(|e| PluginError::LoadError {
-        name: "lua".into(),
-        message: e.to_string(),
-    })?;
-
-    for (name, value) in [
-        ("black", "black"),
-        ("red", "red"),
-        ("green", "green"),
-        ("yellow", "yellow"),
-        ("blue", "blue"),
-        ("magenta", "magenta"),
-        ("cyan", "cyan"),
-        ("white", "white"),
-        ("gray", "gray"),
-        ("dark_gray", "dark_gray"),
-        ("light_red", "light_red"),
-        ("light_green", "light_green"),
-        ("light_yellow", "light_yellow"),
-        ("light_blue", "light_blue"),
-        ("light_magenta", "light_magenta"),
-        ("light_cyan", "light_cyan"),
-    ] {
-        colors.set(name, value).ok();
+        let error = lua
+            .load("return fs.read(path, 1000000)")
+            .eval::<String>()
+            .unwrap_err();
+        assert!(error.to_string().contains("file too large"));
     }
 
-    ui.set("colors", colors).ok();
+    #[cfg(unix)]
+    #[test]
+    fn lua_metadata_reports_symbolic_links_without_following_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("target-link");
+        std::fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    Ok(ui)
+        let sandbox = SandboxConfig::minimal().allow_read(temp.path());
+        let lua = Lua::new();
+        let fs = create_fs_api(&lua, Some(sandbox)).unwrap();
+        lua.globals().set("fs", fs).unwrap();
+        lua.globals()
+            .set("path", link.to_string_lossy().as_ref())
+            .unwrap();
+
+        let is_symlink = lua
+            .load("return fs.metadata(path).is_symlink")
+            .eval::<bool>()
+            .unwrap();
+        assert!(is_symlink);
+    }
 }

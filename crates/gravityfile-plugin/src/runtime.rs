@@ -15,30 +15,18 @@ use indexmap::IndexMap;
 /// `load_plugin` when collecting the hooks a plugin implements.
 pub(crate) const HOOK_NAMES: &[&str] = &[
     "on_navigate",
-    "on_drill_down",
-    "on_back",
     "on_scan_start",
-    "on_scan_progress",
     "on_scan_complete",
     "on_scan_error",
     "on_delete_start",
     "on_delete_complete",
-    "on_copy_start",
     "on_copy_complete",
-    "on_move_start",
     "on_move_complete",
-    "on_rename_start",
     "on_rename_complete",
     "on_duplicates_found",
     "on_age_analysis_complete",
-    "on_render",
-    "on_action",
-    "on_mode_change",
-    "on_selection_change",
     "on_startup",
     "on_shutdown",
-    "on_plugin_load",
-    "on_plugin_unload",
 ];
 
 use tokio_util::sync::CancellationToken;
@@ -47,6 +35,47 @@ use crate::config::{PluginConfig, PluginMetadata};
 use crate::hooks::{Hook, HookContext, HookResult};
 use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginKind, PluginResult, Value};
+
+/// Bound source loading independently of VM limits: source strings are allocated
+/// by Rust before either scripting engine can enforce its own memory budget.
+pub(crate) fn read_plugin_source(path: &Path) -> PluginResult<String> {
+    read_regular_utf8(path, 1024 * 1024, "plugin source")
+}
+
+fn read_plugin_manifest(path: &Path) -> PluginResult<PluginMetadata> {
+    let content = read_regular_utf8(path, 64 * 1024, "plugin manifest")?;
+    toml::from_str(&content).map_err(|error| PluginError::ConfigError {
+        message: error.to_string(),
+    })
+}
+
+fn read_regular_utf8(path: &Path, limit: u64, kind: &str) -> PluginResult<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(PluginError::LoadError {
+            name: path.display().to_string(),
+            message: format!("{kind} must be a regular UTF-8 file of at most {limit} bytes"),
+        });
+    }
+    let mut source = String::new();
+    file.take(limit + 1).read_to_string(&mut source)?;
+    if source.len() as u64 > limit {
+        return Err(PluginError::LoadError {
+            name: path.display().to_string(),
+            message: format!("{kind} grew beyond {limit} bytes"),
+        });
+    }
+    Ok(source)
+}
 
 /// A handle to a loaded plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,10 +98,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Trait that all plugin runtime implementations must satisfy.
 ///
-/// This trait abstracts over the specific scripting language (Lua or Rhai)
-/// allowing plugins to be written in any supported language.
+/// Implemented by the in-process Lua engine and by the worker-process
+/// runtime that hosts it.
 pub trait PluginRuntime: Send + Sync {
-    /// Get the name of this runtime (e.g., "lua" or "rhai").
+    /// Get the name of this runtime (e.g. "lua").
     fn name(&self) -> &'static str;
 
     /// Get the file extensions this runtime handles (e.g., [".lua"]).
@@ -125,7 +154,7 @@ pub trait PluginRuntime: Send + Sync {
 
     /// Create an isolated context for running async plugin code.
     ///
-    /// Isolated contexts have limited API access and their own Lua/Rhai state,
+    /// Isolated contexts have limited API access and their own Lua state,
     /// making them safe to run in background tasks.
     fn create_isolated_context(
         &self,
@@ -194,12 +223,6 @@ pub struct LoadedPlugin {
     pub hooks: Vec<String>,
 }
 
-/// Owned request passed through the hook-dispatch Tower service.
-struct HookDispatch {
-    hook: Hook,
-    ctx: HookContext,
-}
-
 /// Manager for all plugin runtimes and loaded plugins.
 pub struct PluginManager {
     /// Available runtimes keyed by name.
@@ -249,6 +272,20 @@ impl PluginManager {
         }
     }
 
+    fn validate_load_policy(&self, name: &str) -> PluginResult<()> {
+        if self.config.is_disabled(name) {
+            return Err(PluginError::ConfigError {
+                message: format!("Plugin '{name}' is disabled"),
+            });
+        }
+        if self.plugins.values().any(|plugin| plugin.id == name) {
+            return Err(PluginError::ConfigError {
+                message: format!("Plugin '{name}' is already loaded"),
+            });
+        }
+        Ok(())
+    }
+
     /// Allocate a fresh manager-global plugin handle.
     fn alloc_handle(&mut self) -> PluginHandle {
         let handle = PluginHandle(self.next_handle);
@@ -259,6 +296,11 @@ impl PluginManager {
     /// Register a plugin runtime.
     pub fn register_runtime(&mut self, runtime: Box<dyn PluginRuntime>) -> PluginResult<()> {
         let name = runtime.name().to_string();
+        if self.runtimes.contains_key(&name) {
+            return Err(PluginError::ConfigError {
+                message: format!("Runtime '{name}' is already registered"),
+            });
+        }
         self.runtimes.insert(name, runtime);
         Ok(())
     }
@@ -290,17 +332,21 @@ impl PluginManager {
         }
 
         let plugin_dir = self.config.plugin_dir.clone();
-        if !plugin_dir.exists() {
-            return Ok(vec![]);
+        match std::fs::metadata(&plugin_dir) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error.into()),
         }
 
         let mut loaded = vec![];
 
         // Read plugin directories
-        let entries = std::fs::read_dir(&plugin_dir).map_err(PluginError::Io)?;
+        let mut paths = std::fs::read_dir(&plugin_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        paths.sort();
 
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             if !path.is_dir() {
                 continue;
             }
@@ -311,109 +357,16 @@ impl PluginManager {
                 continue;
             }
 
-            // Parse metadata. One broken plugin must not abort discovery of the
-            // rest — log and skip it.
-            let metadata: PluginMetadata = match std::fs::read_to_string(&toml_path)
-                .map_err(|e| e.to_string())
-                .and_then(|content| toml::from_str(&content).map_err(|e| e.to_string()))
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %toml_path.display(),
-                        error = %e,
-                        "Skipping plugin with unreadable or invalid plugin.toml"
-                    );
-                    continue;
-                }
-            };
-
-            // Validate plugin name to prevent injection or path-manipulation attacks
-            if let Err(e) = Self::validate_plugin_name(&metadata.name) {
-                tracing::warn!(
+            // Explicit loading is the single policy and publication path.
+            // Discovery differs only in continuing after an individual failure.
+            match self.load_plugin(&path) {
+                Ok(plugin) => loaded.push(plugin),
+                Err(error) => tracing::warn!(
                     path = %path.display(),
-                    error = %e,
-                    "Skipping plugin with invalid name"
-                );
-                continue;
+                    error = %error,
+                    "Skipping plugin that could not be loaded"
+                ),
             }
-
-            // Honour the per-plugin disable list.
-            if self.config.is_disabled(&metadata.name) {
-                tracing::info!(plugin = %metadata.name, "Skipping disabled plugin");
-                continue;
-            }
-
-            // Find the appropriate runtime
-            let runtime_name = &metadata.runtime;
-            let runtime = match self.runtimes.get_mut(runtime_name) {
-                Some(r) => r,
-                None => {
-                    tracing::warn!(
-                        plugin = %metadata.name,
-                        runtime = %runtime_name,
-                        "Skipping plugin: no runtime registered for it"
-                    );
-                    continue;
-                }
-            };
-
-            // Find the entry point file and verify it stays within the plugin dir
-            let entry_file = path.join(&metadata.entry);
-            let canonical_plugin_dir = match std::fs::canonicalize(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let canonical_entry = match std::fs::canonicalize(&entry_file) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            if !canonical_entry.starts_with(&canonical_plugin_dir) {
-                tracing::warn!(
-                    plugin = %metadata.name,
-                    entry = %metadata.entry,
-                    "Skipping plugin: entry point escapes plugin directory"
-                );
-                continue;
-            }
-            if !entry_file.exists() {
-                continue;
-            }
-
-            // Load the plugin (runtime-local handle). A single plugin failing to
-            // load must not abort discovery of the rest.
-            let runtime_handle = match runtime.load_plugin(&metadata.name, &entry_file) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = %metadata.name,
-                        error = %e,
-                        "Failed to load plugin"
-                    );
-                    continue;
-                }
-            };
-
-            // Collect hooks
-            let hooks: Vec<String> = HOOK_NAMES
-                .iter()
-                .filter(|h| runtime.has_hook(runtime_handle, h))
-                .map(|s| s.to_string())
-                .collect();
-
-            // The `runtime` borrow ends above; allocate the global handle now.
-            let handle = self.alloc_handle();
-            let loaded_plugin = LoadedPlugin {
-                handle,
-                runtime_handle,
-                id: metadata.name.clone(),
-                metadata,
-                path: path.clone(),
-                hooks,
-            };
-
-            self.plugins.insert(handle, loaded_plugin.clone());
-            loaded.push(loaded_plugin);
         }
 
         Ok(loaded)
@@ -421,16 +374,18 @@ impl PluginManager {
 
     /// Load a single plugin from a path.
     pub fn load_plugin(&mut self, path: &Path) -> PluginResult<LoadedPlugin> {
+        if !self.config.enabled {
+            return Err(PluginError::ConfigError {
+                message: "Plugin system is disabled".into(),
+            });
+        }
         // Parse metadata
         let toml_path = path.join("plugin.toml");
-        let toml_content = std::fs::read_to_string(&toml_path)?;
-        let metadata: PluginMetadata =
-            toml::from_str(&toml_content).map_err(|e| PluginError::ConfigError {
-                message: e.to_string(),
-            })?;
+        let metadata = read_plugin_manifest(&toml_path)?;
 
         // Validate plugin name
         Self::validate_plugin_name(&metadata.name)?;
+        self.validate_load_policy(&metadata.name)?;
 
         // Find runtime
         let runtime = self.runtimes.get_mut(&metadata.runtime).ok_or_else(|| {
@@ -441,8 +396,8 @@ impl PluginManager {
 
         // Verify entry point stays within the plugin directory (path traversal guard)
         let entry_file = path.join(&metadata.entry);
-        let canonical_plugin_dir = std::fs::canonicalize(path).map_err(PluginError::Io)?;
-        let canonical_entry = std::fs::canonicalize(&entry_file).map_err(PluginError::Io)?;
+        let canonical_plugin_dir = dunce::canonicalize(path).map_err(PluginError::Io)?;
+        let canonical_entry = dunce::canonicalize(&entry_file).map_err(PluginError::Io)?;
         if !canonical_entry.starts_with(&canonical_plugin_dir) {
             return Err(PluginError::ConfigError {
                 message: format!(
@@ -479,25 +434,26 @@ impl PluginManager {
 
     /// Unload a plugin.
     pub fn unload_plugin(&mut self, handle: PluginHandle) -> PluginResult<()> {
-        if let Some(plugin) = self.plugins.shift_remove(&handle)
-            && let Some(runtime) = self.runtimes.get_mut(&plugin.metadata.runtime)
-        {
-            runtime.unload_plugin(plugin.runtime_handle)?;
-        }
+        let Some(plugin) = self.plugins.get(&handle) else {
+            return Ok(());
+        };
+        let runtime = self
+            .runtimes
+            .get_mut(&plugin.metadata.runtime)
+            .ok_or_else(|| PluginError::RuntimeNotAvailable {
+                runtime: plugin.metadata.runtime.clone(),
+            })?;
+        runtime.unload_plugin(plugin.runtime_handle)?;
+        self.plugins.shift_remove(&handle);
         Ok(())
     }
 
     /// Dispatch a hook to all plugins that implement it.
     ///
-    /// The dispatch runs through a small Tower service stack: a wall-clock
-    /// `Timeout` layer bounds the whole dispatch (defense-in-depth alongside the
-    /// in-VM CPU/memory guards in each runtime), and the inner service runs the
-    /// per-plugin loop. Composing it this way means cross-cutting concerns
-    /// (timeout, and future additions like concurrency limiting or load
-    /// shedding) are layers rather than inline code.
+    /// The overall timeout bounds cooperatively yielding hook futures; worker
+    /// deadlines and the runtimes' instruction hooks bound script execution.
     pub async fn dispatch_hook(&self, hook: &Hook, ctx: &HookContext) -> Vec<HookResult> {
         use std::time::Duration;
-        use tower::{ServiceBuilder, ServiceExt, service_fn};
 
         // Overall budget scales with the plugin count so each plugin still gets
         // roughly its per-call timeout even when several are registered.
@@ -506,18 +462,7 @@ impl PluginManager {
         let budget =
             Duration::from_millis(plugin_budget.saturating_mul(active).saturating_add(500));
 
-        let request = HookDispatch {
-            hook: hook.clone(),
-            ctx: ctx.clone(),
-        };
-
-        let inner = service_fn(|req: HookDispatch| async move {
-            Ok::<_, std::convert::Infallible>(self.run_hook_dispatch(&req.hook, &req.ctx).await)
-        });
-
-        let svc = ServiceBuilder::new().timeout(budget).service(inner);
-
-        match svc.oneshot(request).await {
+        match tokio::time::timeout(budget, self.run_hook_dispatch(hook, ctx)).await {
             Ok(results) => results,
             Err(_) => {
                 tracing::warn!(
@@ -529,7 +474,7 @@ impl PluginManager {
         }
     }
 
-    /// The per-plugin dispatch loop (the inner Tower service body).
+    /// The per-plugin dispatch loop.
     async fn run_hook_dispatch(&self, hook: &Hook, ctx: &HookContext) -> Vec<HookResult> {
         let hook_name = hook.name();
         let mut results = vec![];
@@ -541,14 +486,9 @@ impl PluginManager {
 
             if let Some(runtime) = self.runtimes.get(&plugin.metadata.runtime) {
                 let rh = plugin.runtime_handle;
-                let result = if hook.is_sync() {
-                    runtime.call_hook_sync(rh, hook, ctx)
-                } else {
-                    runtime.call_hook_async(rh, hook, ctx).await
-                };
-
-                match result {
-                    Ok(r) => {
+                match runtime.call_hook_async(rh, hook, ctx).await {
+                    Ok(mut r) => {
+                        r.plugin = Some(plugin.id.clone());
                         let stop = r.stop_propagation;
                         results.push(r);
                         if stop {
@@ -556,12 +496,15 @@ impl PluginManager {
                         }
                     }
                     Err(e) => {
-                        // Log error but continue to other plugins
+                        // Report it to the host, and continue with other plugins.
                         tracing::warn!(
                             plugin_id = %plugin.id,
                             error = %e,
                             "Plugin hook dispatch error"
                         );
+                        let mut failed = HookResult::error(e.to_string());
+                        failed.plugin = Some(plugin.id.clone());
+                        results.push(failed);
                     }
                 }
             }
@@ -597,11 +540,21 @@ impl PluginManager {
 
     /// Shutdown all runtimes.
     pub fn shutdown(&mut self) -> PluginResult<()> {
-        for runtime in self.runtimes.values_mut() {
-            runtime.shutdown()?;
+        let mut first_error = None;
+        for (name, runtime) in self.runtimes.iter_mut() {
+            match runtime.shutdown() {
+                Ok(()) => self
+                    .plugins
+                    .retain(|_, plugin| plugin.metadata.runtime != *name),
+                Err(error) => {
+                    tracing::warn!(runtime = %name, error = %error, "Plugin runtime shutdown failed");
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
-        self.plugins.clear();
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -618,15 +571,165 @@ mod tests {
     use crate::hooks::HookResult;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn discovery_order_defines_stable_identity_selection_and_hook_order() {
+        let root = tempfile::tempdir().unwrap();
+        // Deliberately create in a different order than the documented path order.
+        for (directory, name, value) in [
+            ("zeta", "second", 2),
+            ("mirror", "first", 99),
+            ("alpha", "first", 1),
+        ] {
+            let path = root.path().join(directory);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("plugin.toml"), format!("name = '{name}'\n")).unwrap();
+            std::fs::write(path.join("main.lua"), format!("return {{ on_startup = function(self, hook) return {{ handled = true, value = {value} }} end }}")).unwrap();
+        }
+        let mut manager =
+            PluginManager::new(PluginConfig::default().with_plugin_dir(root.path().to_path_buf()));
+        manager
+            .register_runtime(Box::new(crate::lua::LuaRuntime::new().unwrap()))
+            .unwrap();
+        manager.init_runtimes().unwrap();
+        let loaded = manager.discover_plugins().await.unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|plugin| plugin.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(loaded[0].path, root.path().join("alpha"));
+        let results = manager
+            .dispatch_hook(&Hook::OnStartup, &HookContext::new())
+            .await;
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.value.as_ref().and_then(Value::as_i64))
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_manifest_is_rejected_without_blocking_healthy_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let bad = root.path().join("oversized");
+        let good = root.path().join("healthy");
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::create_dir(&good).unwrap();
+        std::fs::File::create(bad.join("plugin.toml"))
+            .unwrap()
+            .set_len(64 * 1024 + 1)
+            .unwrap();
+        std::fs::write(good.join("plugin.toml"), "name = 'healthy'\n").unwrap();
+        std::fs::write(good.join("main.lua"), "return {}").unwrap();
+        let mut manager =
+            PluginManager::new(PluginConfig::default().with_plugin_dir(root.path().to_path_buf()));
+        manager
+            .register_runtime(Box::new(crate::lua::LuaRuntime::new().unwrap()))
+            .unwrap();
+        manager.init_runtimes().unwrap();
+        assert!(manager.load_plugin(&bad).is_err());
+        let loaded = manager.discover_plugins().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "healthy");
+    }
+
+    #[tokio::test]
+    async fn explicit_loading_obeys_disable_policy_before_runtime_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = PluginManager::new(PluginConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(matches!(
+            manager.load_plugin(&root.path().join("absent")),
+            Err(PluginError::ConfigError { .. })
+        ));
+        assert!(manager.discover_plugins().await.unwrap().is_empty());
+        std::fs::write(root.path().join("plugin.toml"), "name = 'blocked'\n").unwrap();
+        let mut manager = PluginManager::new(PluginConfig::default().disable_plugin("blocked"));
+        // No runtime or entry file: policy must reject before either is consulted.
+        let error = manager.load_plugin(root.path()).unwrap_err();
+        assert!(
+            matches!(error, PluginError::ConfigError { message } if message.contains("disabled"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rediscovery_and_explicit_load_do_not_duplicate_plugin_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("one");
+        std::fs::create_dir(&plugin).unwrap();
+        std::fs::write(plugin.join("plugin.toml"), "name = 'one'\n").unwrap();
+        std::fs::write(plugin.join("main.lua"), "return {}").unwrap();
+        let mut manager =
+            PluginManager::new(PluginConfig::default().with_plugin_dir(root.path().to_path_buf()));
+        manager
+            .register_runtime(Box::new(crate::lua::LuaRuntime::new().unwrap()))
+            .unwrap();
+        manager.init_runtimes().unwrap();
+        let first = manager.discover_plugins().await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(manager.discover_plugins().await.unwrap().is_empty());
+        assert!(manager.load_plugin(&plugin).is_err());
+        assert_eq!(manager.plugins.len(), 1);
+        manager.unload_plugin(first[0].handle).unwrap();
+        assert!(manager.load_plugin(&plugin).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_reader_rejects_symlinks_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("actual.toml");
+        std::fs::write(&target, "name = 'healthy'\n").unwrap();
+        let link = root.path().join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_plugin_manifest(&link).is_err());
+        let fifo = root.path().join("pipe.toml");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path is valid for this call, in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        assert!(read_plugin_manifest(&fifo).is_err());
+    }
+
+    #[test]
+    fn source_loading_rejects_oversize_and_nonregular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.lua");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        assert!(read_plugin_source(&path).is_err());
+        assert!(read_plugin_source(root.path()).is_err());
+        std::fs::write(&path, "return {}").unwrap();
+        assert_eq!(read_plugin_source(&path).unwrap(), "return {}");
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link.lua");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(read_plugin_source(&link).is_err());
+        }
+    }
+
     /// A minimal runtime whose async hook sleeps for a configurable delay,
     /// letting us exercise the Tower dispatch timeout budget deterministically.
+    #[derive(Default)]
     struct SleepRuntime {
         delay: Duration,
+        runtime_name: Option<&'static str>,
+        fail_cleanup: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        shutdown_calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl PluginRuntime for SleepRuntime {
         fn name(&self) -> &'static str {
-            "mock"
+            self.runtime_name.unwrap_or("mock")
         }
         fn file_extensions(&self) -> &'static [&'static str] {
             &[".mock"]
@@ -638,6 +741,11 @@ mod tests {
             Ok(PluginHandle(0))
         }
         fn unload_plugin(&mut self, _handle: PluginHandle) -> PluginResult<()> {
+            if self.fail_cleanup.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PluginError::ConfigError {
+                    message: "injected cleanup failure".into(),
+                });
+            }
             Ok(())
         }
         fn get_metadata(&self, _handle: PluginHandle) -> Option<&PluginMetadata> {
@@ -692,7 +800,8 @@ mod tests {
             vec![PluginHandle(0)]
         }
         fn shutdown(&mut self) -> PluginResult<()> {
-            Ok(())
+            self.shutdown_calls.lock().unwrap().push(self.name());
+            self.unload_plugin(PluginHandle(0))
         }
     }
 
@@ -721,8 +830,11 @@ mod tests {
             ..Default::default()
         };
         let mut pm = PluginManager::new(config);
-        pm.register_runtime(Box::new(SleepRuntime { delay }))
-            .unwrap();
+        pm.register_runtime(Box::new(SleepRuntime {
+            delay,
+            ..Default::default()
+        }))
+        .unwrap();
         let handle = pm.alloc_handle();
         pm.plugins.insert(
             handle,
@@ -736,6 +848,64 @@ mod tests {
             },
         );
         pm
+    }
+
+    #[test]
+    fn runtime_registration_cannot_replace_loaded_handle_ownership() {
+        let mut pm = manager_with_sleeping_plugin(100, Duration::ZERO);
+        assert!(pm.register_runtime(Box::<SleepRuntime>::default()).is_err());
+        assert_eq!(pm.plugins.len(), 1);
+        assert_eq!(pm.runtimes.len(), 1);
+        pm.unload_plugin(PluginHandle(0)).unwrap();
+        assert!(pm.plugins.is_empty());
+    }
+
+    #[test]
+    fn failed_unload_preserves_handle_for_retry() {
+        let mut pm = manager_with_sleeping_plugin(100, Duration::ZERO);
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        pm.runtimes.clear();
+        pm.register_runtime(Box::new(SleepRuntime {
+            fail_cleanup: fail.clone(),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(pm.unload_plugin(PluginHandle(0)).is_err());
+        assert!(pm.plugins.contains_key(&PluginHandle(0)));
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        pm.unload_plugin(PluginHandle(0)).unwrap();
+        assert!(pm.plugins.is_empty());
+    }
+
+    #[test]
+    fn shutdown_attempts_every_runtime_and_retains_only_failed_ownership() {
+        let mut pm = manager_with_sleeping_plugin(100, Duration::ZERO);
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        pm.runtimes.clear();
+        pm.register_runtime(Box::new(SleepRuntime {
+            fail_cleanup: fail.clone(),
+            shutdown_calls: calls.clone(),
+            ..Default::default()
+        }))
+        .unwrap();
+        pm.register_runtime(Box::new(SleepRuntime {
+            runtime_name: Some("healthy"),
+            shutdown_calls: calls.clone(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut healthy = pm.plugins[&PluginHandle(0)].clone();
+        healthy.handle = pm.alloc_handle();
+        healthy.metadata.runtime = "healthy".into();
+        pm.plugins.insert(healthy.handle, healthy);
+        assert!(pm.shutdown().is_err());
+        assert_eq!(*calls.lock().unwrap(), ["mock", "healthy"]);
+        assert_eq!(pm.plugins.len(), 1);
+        assert!(pm.plugins.contains_key(&PluginHandle(0)));
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        pm.shutdown().unwrap();
+        assert!(pm.plugins.is_empty());
     }
 
     #[tokio::test]

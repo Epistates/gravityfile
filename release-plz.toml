@@ -1,0 +1,25 @@
+# release-plz opens a pull request that bumps the workspace version; merging
+# it publishes every crate to crates.io and tags the release as `vX.Y.Z`. The
+# tag starts the dist workflow (release.yml), which builds the binaries and
+# creates the GitHub release from CHANGELOG.md.
+#
+# CHANGELOG.md is written by hand: in the release pull request, rename the
+# `[Unreleased]` heading to the new version and date.
+
+[workspace]
+changelog_update = false
+# dist creates the GitHub release, with binaries and installers.
+git_release_enable = false
+# One tag for the whole workspace, on the `gravityfile` package below.
+git_tag_enable = false
+# Breaking API changes in the library crates must bump the version to match.
+semver_check = true
+dependencies_update = false
+pr_labels = ["release"]
+
+[[package]]
+name = "gravityfile"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+# The binary: its library has no public API to check.
+semver_check = false

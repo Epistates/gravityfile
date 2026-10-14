@@ -2,7 +2,9 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 
-use gravityfile_core::{NodeKind, ScanConfig, WarningKind};
+use gravityfile_core::ScanConfig;
+#[cfg(unix)]
+use gravityfile_core::{NodeKind, WarningKind};
 use gravityfile_scan::{JwalkScanner, quick_list};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +15,367 @@ use tokio_util::sync::CancellationToken;
 
 fn scanner() -> JwalkScanner {
     JwalkScanner::new()
+}
+
+/// Size an entry contributes for itself, under the scan's size measure.
+fn own_size(path: &std::path::Path, apparent: bool) -> u64 {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    #[cfg(unix)]
+    if !apparent {
+        use std::os::unix::fs::MetadataExt;
+        return metadata.blocks() * 512;
+    }
+    let _ = apparent;
+    metadata.len()
+}
+
+#[test]
+fn full_and_quick_statistics_choose_same_path_for_tied_extremes() {
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    for names in [["c.txt", "b.txt", "a.txt"], ["a.txt", "c.txt", "b.txt"]] {
+        let tmp = TempDir::new().unwrap();
+        for name in names {
+            let path = tmp.path().join(name);
+            fs::write(&path, b"equal size").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        let config = ScanConfig::new(tmp.path());
+        for tree in [
+            quick_list(tmp.path(), Some(&config)).unwrap(),
+            scanner().scan(&config, CancellationToken::new()).unwrap(),
+        ] {
+            let expected = tree.root_path.join("a.txt");
+            assert_eq!(tree.stats.largest_file.as_ref().unwrap().0, expected);
+            assert_eq!(tree.stats.oldest_file.as_ref().unwrap().0, expected);
+            assert_eq!(tree.stats.newest_file.as_ref().unwrap().0, expected);
+            assert_eq!(tree.stats.total_files, 3);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_filenames_survive_full_and_quick_listing_without_collisions() {
+    use std::os::unix::ffi::OsStringExt;
+    let tmp = TempDir::new().unwrap();
+    let names = [
+        std::ffi::OsString::from_vec(b"bad-\xff".to_vec()),
+        std::ffi::OsString::from_vec(b"bad-\xfe".to_vec()),
+    ];
+    for (index, name) in names.iter().enumerate() {
+        fs::write(tmp.path().join(name), vec![b'x'; index + 1]).unwrap();
+    }
+    let mut config = ScanConfig::new(tmp.path());
+    config.apparent_size = true;
+    for tree in [
+        quick_list(tmp.path(), Some(&config)).unwrap(),
+        scanner().scan(&config, CancellationToken::new()).unwrap(),
+    ] {
+        assert_eq!(tree.root.children.len(), 2);
+        for (index, name) in names.iter().enumerate() {
+            let child = tree
+                .root
+                .children
+                .iter()
+                .find(|n| n.file_name() == name)
+                .unwrap();
+            assert_eq!(child.size, (index + 1) as u64);
+            assert_eq!(
+                fs::read(tree.root_path.join(child.file_name()))
+                    .unwrap()
+                    .len(),
+                index + 1
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn quick_listing_respects_filesystem_boundary_for_followed_directory() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    assert_ne!(
+        fs::metadata(tmp.path()).unwrap().dev(),
+        fs::metadata("/dev").unwrap().dev(),
+        "fixture requires /dev on a separate filesystem"
+    );
+    unix_fs::symlink("/dev", tmp.path().join("device-directory")).unwrap();
+    let mut config = ScanConfig::new(tmp.path());
+    config.follow_symlinks = true;
+    assert!(
+        quick_list(tmp.path(), Some(&config))
+            .unwrap()
+            .root
+            .children
+            .is_empty()
+    );
+    config.cross_filesystems = true;
+    let tree = quick_list(tmp.path(), Some(&config)).unwrap();
+    assert_eq!(tree.root.children.len(), 1);
+    assert!(tree.root.children[0].is_dir());
+    assert!(tree.root.children[0].children.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn quick_listing_honors_symlink_following_and_alias_sizes() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("data");
+    fs::write(&file, vec![1; 8192]).unwrap();
+    fs::create_dir(tmp.path().join("directory")).unwrap();
+    unix_fs::symlink("data", tmp.path().join("file-alias")).unwrap();
+    unix_fs::symlink("directory", tmp.path().join("dir-alias")).unwrap();
+    unix_fs::symlink("missing", tmp.path().join("broken")).unwrap();
+    let mut config = ScanConfig::new(tmp.path());
+    let tree = quick_list(tmp.path(), Some(&config)).unwrap();
+    assert_eq!(tree.stats.total_files, 1);
+    assert_eq!(
+        tree.root
+            .children
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Symlink { .. }))
+            .count(),
+        3
+    );
+    config.follow_symlinks = true;
+    for apparent in [false, true] {
+        config.apparent_size = apparent;
+        let tree = quick_list(tmp.path(), Some(&config)).unwrap();
+        assert!(tree.config.follow_symlinks);
+        assert_eq!(tree.config.max_depth, Some(1));
+        assert_eq!(tree.stats.total_files, 2);
+        assert_eq!(tree.stats.total_dirs, 3); // Root and two paths to the directory.
+        // Each aliased object counts once, in both size modes.
+        let file_size = if apparent {
+            8192
+        } else {
+            fs::metadata(&file).unwrap().blocks() * 512
+        };
+        assert_eq!(
+            tree.root.size,
+            file_size
+                + own_size(tmp.path(), apparent)
+                + own_size(&tmp.path().join("directory"), apparent)
+        );
+        assert!(
+            tree.root
+                .children
+                .iter()
+                .all(|n| !matches!(n.kind, NodeKind::Symlink { .. }))
+        );
+        assert_eq!(tree.warnings.len(), 1);
+        assert_eq!(
+            tree.warnings[0].path,
+            dunce::canonicalize(tmp.path()).unwrap().join("broken")
+        );
+        assert_eq!(tree.warnings[0].kind, WarningKind::MetadataError);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn quick_listing_deduplicates_physical_hardlinks_within_visible_scope() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("original");
+    fs::write(&file, vec![1; 8192]).unwrap();
+    fs::hard_link(&file, tmp.path().join("alias")).unwrap();
+    let physical = fs::metadata(&file).unwrap().blocks() * 512;
+    assert!(physical > 0);
+    let mut config = ScanConfig::new(tmp.path());
+    for apparent in [false, true] {
+        config.apparent_size = apparent;
+        let tree = quick_list(tmp.path(), Some(&config)).unwrap();
+        let expected = if apparent { 8192 } else { physical };
+        assert_eq!(tree.root.size, expected + own_size(tmp.path(), apparent));
+        assert_eq!(tree.stats.total_size, expected);
+        assert_eq!(tree.stats.total_files, 2);
+        assert_eq!(
+            tree.root.children.iter().map(|n| n.size).sum::<u64>(),
+            expected
+        );
+        assert_eq!(tree.root.children[0].inode, tree.root.children[1].inode);
+    }
+    config.apparent_size = false;
+    config.ignore_patterns = vec!["original".into()];
+    let tree = quick_list(tmp.path(), Some(&config)).unwrap();
+    assert_eq!(tree.root.size, physical + own_size(tmp.path(), false));
+    assert_eq!(tree.stats.total_files, 1);
+    assert_eq!(tree.root.children[0].name, "alias");
+}
+
+#[cfg(unix)]
+#[test]
+fn followed_directory_aliases_count_physical_bytes_once() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let file = real.join("data");
+    fs::write(&file, vec![1; 8192]).unwrap();
+    let physical = fs::metadata(&file).unwrap().blocks() * 512;
+    assert!(physical > 0);
+    for name in ["alias-a", "alias-b"] {
+        unix_fs::symlink(&real, tmp.path().join(name)).unwrap();
+    }
+    for hardlink in [false, true] {
+        if hardlink {
+            fs::hard_link(&file, real.join("hardlink")).unwrap();
+        }
+        let mut config = ScanConfig::builder()
+            .root(tmp.path())
+            .follow_symlinks(true)
+            .build()
+            .unwrap();
+        let dirs = |apparent| own_size(tmp.path(), apparent) + own_size(&real, apparent);
+        let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+        assert_eq!(tree.stats.total_files, if hardlink { 6 } else { 3 });
+        assert_eq!(tree.root.size, physical + dirs(false));
+        config.apparent_size = true;
+        let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+        assert_eq!(tree.root.size, 8192 + dirs(true));
+    }
+}
+
+#[test]
+fn entry_budget_enforces_exact_boundary_in_full_and_quick_scans() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = ScanConfig::builder()
+        .root(tmp.path())
+        .max_entries(Some(0))
+        .build()
+        .unwrap();
+    for quick in [false, true] {
+        let tree = if quick {
+            quick_list(tmp.path(), Some(&config))
+        } else {
+            scanner().scan(&config, CancellationToken::new())
+        }
+        .unwrap();
+        assert!(tree.root.children.is_empty());
+    }
+    fs::write(tmp.path().join("one"), b"one").unwrap();
+    fs::write(tmp.path().join("two"), b"two").unwrap();
+    for limit in [0, 1, 2] {
+        config.max_entries = Some(limit);
+        for quick in [false, true] {
+            let result = if quick {
+                quick_list(tmp.path(), Some(&config))
+            } else {
+                scanner().scan(&config, CancellationToken::new())
+            };
+            if limit == 2 {
+                let tree = result.unwrap();
+                assert_eq!(tree.root.children.len(), 2);
+                assert_eq!(tree.config.max_entries, Some(2));
+            } else {
+                assert!(matches!(result,
+                    Err(gravityfile_core::ScanError::EntryLimitExceeded { limit: actual })
+                        if actual == limit));
+            }
+        }
+    }
+}
+
+#[test]
+fn entry_budget_respects_filters_and_counts_nested_descendants() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join("visible")).unwrap();
+    fs::write(tmp.path().join("visible/nested"), b"data").unwrap();
+    fs::write(tmp.path().join(".hidden"), b"hidden").unwrap();
+    fs::create_dir(tmp.path().join("ignored")).unwrap();
+    fs::write(tmp.path().join("ignored/child"), b"ignored").unwrap();
+    let mut config = ScanConfig::builder()
+        .root(tmp.path())
+        .max_entries(Some(1))
+        .include_hidden(false)
+        .ignore_patterns(vec!["ignored".into()])
+        .build()
+        .unwrap();
+    assert_eq!(
+        quick_list(tmp.path(), Some(&config))
+            .unwrap()
+            .root
+            .children
+            .len(),
+        1
+    );
+    assert!(matches!(
+        scanner().scan(&config, CancellationToken::new()),
+        Err(gravityfile_core::ScanError::EntryLimitExceeded { limit: 1 })
+    ));
+    // Depth limits retention, not traversal: deeper entries still count.
+    config.max_depth = Some(1);
+    assert!(matches!(
+        scanner().scan(&config, CancellationToken::new()),
+        Err(gravityfile_core::ScanError::EntryLimitExceeded { limit: 1 })
+    ));
+    config.max_depth = None;
+    config.max_entries = Some(2);
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+    assert_eq!(tree.root.children[0].children.len(), 1);
+    config.max_entries = None;
+    assert!(scanner().scan(&config, CancellationToken::new()).is_ok());
+}
+
+#[test]
+fn scan_assembly_sorts_each_directory_with_name_ties() {
+    let tmp = TempDir::new().unwrap();
+    for directory in ["zdir", "adir"] {
+        let path = tmp.path().join(directory);
+        fs::create_dir(&path).unwrap();
+        for (name, contents) in [("zeta", "x"), ("large", "longer"), ("alpha", "x")] {
+            fs::write(path.join(name), contents).unwrap();
+        }
+    }
+    let config = ScanConfig::builder()
+        .root(tmp.path())
+        .apparent_size(true)
+        .build()
+        .unwrap();
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+    assert_eq!(names(&tree), ["adir", "zdir"]);
+    for directory in &tree.root.children {
+        let names: Vec<_> = directory
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert_eq!(names, ["large", "alpha", "zeta"]);
+        let path = tmp.path().join(directory.name.as_str());
+        assert_eq!(directory.size, 8 + own_size(&path, true));
+        assert_eq!(directory.file_count(), 3);
+    }
+    let children: u64 = tree.root.children.iter().map(|child| child.size).sum();
+    assert_eq!(tree.root.size, children + own_size(tmp.path(), true));
+}
+
+#[cfg(unix)]
+#[test]
+fn full_and_quick_scans_preserve_counts_when_warning_details_overflow() {
+    let tmp = TempDir::new().unwrap();
+    for index in 0..1100 {
+        unix_fs::symlink("missing-target", tmp.path().join(format!("link-{index}"))).unwrap();
+    }
+    let config = ScanConfig::new(tmp.path());
+    let full = scanner().scan(&config, CancellationToken::new()).unwrap();
+    let quick = quick_list(tmp.path(), Some(&config)).unwrap();
+    for tree in [full, quick] {
+        assert_eq!(tree.warning_count(), 1100);
+        assert_eq!(tree.warnings.len(), 1000);
+        assert!(tree.has_warnings());
+        assert_eq!(
+            tree.warnings.last().unwrap().kind,
+            WarningKind::Omitted { count: 101 }
+        );
+    }
 }
 
 fn names(tree: &gravityfile_core::FileTree) -> Vec<&str> {
@@ -59,14 +422,14 @@ fn test_scan_aggregates_size_into_directories() {
     // Root size must be >= the single file we wrote.
     assert!(tree.root.size >= 4096);
 
-    // The sub-directory node should carry the file's size.
+    // The sub-directory node carries the file's size plus its own.
     let sub = tree
         .root
         .children
         .iter()
         .find(|c| c.name == "sub")
         .expect("sub dir must exist");
-    assert_eq!(sub.size, 4096);
+    assert_eq!(sub.size, 4096 + own_size(&root.join("sub"), true));
 }
 
 #[test]
@@ -225,7 +588,7 @@ fn test_scan_counts_hardlink_size_once() {
 
 #[cfg(unix)]
 #[test]
-fn test_scan_apparent_size_counts_all_hardlink_entries() {
+fn test_scan_apparent_size_counts_hardlinks_once_unless_asked() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
@@ -233,19 +596,17 @@ fn test_scan_apparent_size_counts_all_hardlink_entries() {
     fs::write(&original, vec![0u8; 4096]).unwrap();
     fs::hard_link(&original, root.join("link.bin")).unwrap();
 
-    let config = ScanConfig::builder()
+    let mut config = ScanConfig::builder()
         .root(root)
         .apparent_size(true)
         .build()
         .unwrap();
     let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+    assert_eq!(tree.root.size, 4096 + own_size(root, true));
 
-    // In apparent-size mode every directory entry is counted independently.
-    assert_eq!(
-        tree.root.size,
-        4096 * 2,
-        "apparent size must count each hardlink entry"
-    );
+    config.count_hard_links = true;
+    let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+    assert_eq!(tree.root.size, 2 * 4096 + own_size(root, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +706,7 @@ fn test_scan_symlink_node_carries_target_and_broken_flag() {
     match &bad.kind {
         NodeKind::Symlink { broken, target } => {
             assert!(broken, "bad_link must be marked broken");
-            assert_eq!(target.as_str(), "/does/not/exist");
+            assert_eq!(&**target, "/does/not/exist");
         }
         other => panic!("expected Symlink, got {other:?}"),
     }
@@ -593,7 +954,7 @@ fn test_quick_list_broken_symlink_appears_and_warns() {
     match &dead.kind {
         NodeKind::Symlink { broken, target } => {
             assert!(broken);
-            assert_eq!(target.as_str(), "/nowhere");
+            assert_eq!(&**target, "/nowhere");
         }
         other => panic!("expected Symlink, got {other:?}"),
     }
@@ -731,7 +1092,7 @@ fn test_inode_tracker_nlink_zero_treated_as_no_hardlink() {
 }
 
 #[test]
-fn test_inode_tracker_countdown_evicts_after_all_links_seen() {
+fn test_inode_tracker_retains_identity_after_all_links_seen() {
     use gravityfile_core::InodeInfo;
     use gravityfile_scan::InodeTracker;
 
@@ -742,12 +1103,12 @@ fn test_inode_tracker_countdown_evicts_after_all_links_seen() {
     assert!(tracker.track(info, 4)); // first: counted
     assert!(!tracker.track(info, 4)); // dup 1
     assert!(!tracker.track(info, 4)); // dup 2
-    assert!(!tracker.track(info, 4)); // dup 3 – entry evicted here
+    assert!(!tracker.track(info, 4)); // dup 3 – identity remains retained
 
     assert_eq!(
         tracker.pending_count(),
-        0,
-        "entry must be evicted after all duplicate links are seen"
+        1,
+        "identity must remain retained for later aliases"
     );
 }
 
@@ -774,8 +1135,235 @@ fn test_inode_tracker_same_inode_different_devices_are_independent() {
 // synthetic git repo setup.
 #[cfg(feature = "git")]
 mod git_tests {
+    use gravityfile_core::{GitStatus, ScanConfig};
     use gravityfile_scan::GitStatusCache;
-    use std::path::Path;
+    use std::{fs, path::Path};
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use super::scanner;
+
+    /// Git annotation is opt-in.
+    fn git_config(root: impl Into<std::path::PathBuf>) -> ScanConfig {
+        let mut config = ScanConfig::new(root);
+        config.git_status = true;
+        config
+    }
+
+    #[test]
+    fn ignored_directory_cache_does_not_expand_with_generated_descendants() {
+        let temp = TempDir::new().unwrap();
+        git2::Repository::init(temp.path()).unwrap();
+        fs::write(temp.path().join(".gitignore"), b"generated/\n").unwrap();
+        let generated = temp.path().join("generated");
+        fs::create_dir_all(generated.join("nested")).unwrap();
+        for index in 0..200 {
+            fs::write(
+                generated.join("nested").join(index.to_string()),
+                b"generated",
+            )
+            .unwrap();
+        }
+        let mut cache = GitStatusCache::new();
+        assert!(cache.initialize(temp.path()));
+        assert!(cache.initialization_error().is_none());
+        assert!(
+            cache.len() <= 3,
+            "ignored descendants must not each occupy a cache entry: {}",
+            cache.len()
+        );
+        assert_eq!(
+            cache.get_status(&generated.join("nested/199")),
+            Some(GitStatus::Ignored)
+        );
+        assert_eq!(
+            cache.get_status(&temp.path().join("generated-other/file")),
+            None
+        );
+        let canonical = dunce::canonicalize(&generated).unwrap().join("nested/0");
+        fs::remove_file(generated.join("nested/0")).unwrap();
+        // Prefix lookup is observational and does not query file existence.
+        assert_eq!(
+            cache.get_status_canonical(&canonical),
+            Some(GitStatus::Ignored)
+        );
+    }
+
+    #[test]
+    fn ignored_subtree_reports_descendants_without_marking_clean_tracked_files() {
+        let temp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(temp.path()).unwrap();
+        let directory = temp.path().join("ignored");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("tracked"), b"tracked").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("ignored/tracked")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        fs::write(temp.path().join(".gitignore"), b"ignored/\n").unwrap();
+        fs::create_dir(directory.join("nested")).unwrap();
+        let ignored = directory.join("nested/generated");
+        fs::write(&ignored, b"ignored").unwrap();
+        let mut cache = GitStatusCache::new();
+        assert!(cache.initialize(&directory));
+        assert_eq!(cache.get_status(&ignored), Some(GitStatus::Ignored));
+        assert_eq!(cache.get_status(&directory.join("tracked")), None);
+        assert_eq!(cache.get_status(&temp.path().join(".gitignore")), None);
+        let scan = scanner()
+            .scan(&git_config(&directory), CancellationToken::new())
+            .unwrap();
+        let nested = scan
+            .root
+            .children
+            .iter()
+            .find(|node| node.name == "nested")
+            .unwrap();
+        assert_eq!(nested.children[0].git_status, Some(GitStatus::Ignored));
+        assert_eq!(
+            scan.root
+                .children
+                .iter()
+                .find(|node| node.name == "tracked")
+                .unwrap()
+                .git_status,
+            None
+        );
+        assert!(cache.initialize(temp.path()));
+        assert_eq!(cache.get_status(&ignored), Some(GitStatus::Ignored));
+        assert_eq!(cache.get_status(&directory.join("tracked")), None);
+        fs::write(directory.join("tracked"), b"modified tracked contents").unwrap();
+        assert!(cache.initialize(temp.path()));
+        assert_eq!(
+            cache.get_status(&directory.join("tracked")),
+            Some(GitStatus::Modified)
+        );
+    }
+
+    #[test]
+    fn corrupt_git_index_is_reported_as_incomplete_enrichment() {
+        let temp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(temp.path()).unwrap();
+        fs::write(temp.path().join("file"), b"contents").unwrap();
+        let mut previous = scanner()
+            .scan(&git_config(temp.path()), CancellationToken::new())
+            .unwrap();
+        fs::write(repo.path().join("index"), b"not a valid git index").unwrap();
+        let tree = scanner()
+            .scan(&git_config(temp.path()), CancellationToken::new())
+            .unwrap();
+        assert!(
+            tree.warnings
+                .iter()
+                .any(|warning| warning.message.contains("Git status unavailable"))
+        );
+        assert!(tree.has_warnings());
+        assert!(tree.root.children.iter().any(|node| node.name == "file"));
+        gravityfile_scan::apply_git_status(&mut previous);
+        assert!(previous.has_warnings());
+        assert_eq!(
+            previous
+                .root
+                .children
+                .iter()
+                .find(|node| node.name == "file")
+                .unwrap()
+                .git_status,
+            Some(GitStatus::Untracked)
+        );
+        let mut cache = GitStatusCache::new();
+        assert!(cache.initialize(temp.path()));
+        assert!(cache.initialization_error().is_some());
+        fs::remove_file(repo.path().join("index")).unwrap();
+        assert!(cache.initialize(temp.path()));
+        assert!(cache.initialization_error().is_none());
+    }
+
+    #[test]
+    fn refreshing_git_status_clears_annotations_after_commit() {
+        let temp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(temp.path()).unwrap();
+        fs::write(temp.path().join("file"), b"contents").unwrap();
+        let mut tree = scanner()
+            .scan(&git_config(temp.path()), CancellationToken::new())
+            .unwrap();
+        let file_status = |tree: &gravityfile_core::FileTree| {
+            tree.root
+                .children
+                .iter()
+                .find(|node| node.name == "file")
+                .unwrap()
+                .git_status
+        };
+        assert_eq!(file_status(&tree), Some(GitStatus::Untracked));
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("file")).unwrap();
+        index.write().unwrap();
+        gravityfile_scan::apply_git_status(&mut tree);
+        assert_eq!(file_status(&tree), Some(GitStatus::Staged));
+        let tree_id = index.write_tree().unwrap();
+        let git_tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture",
+            &git_tree,
+            &[],
+        )
+        .unwrap();
+        gravityfile_scan::apply_git_status(&mut tree);
+        assert_eq!(file_status(&tree), None);
+    }
+
+    #[test]
+    fn git_subtree_names_are_literal_not_pathspec_patterns() {
+        let temp = TempDir::new().unwrap();
+        git2::Repository::init(temp.path()).unwrap();
+        let selected = temp.path().join("scope[ab]");
+        let outside = temp.path().join("scopea");
+        let same_prefix = temp.path().join("scope[ab]-other");
+        for directory in [&selected, &outside, &same_prefix] {
+            fs::create_dir_all(directory.join("nested")).unwrap();
+            fs::write(directory.join("nested/file"), b"untracked").unwrap();
+        }
+        let mut cache = GitStatusCache::new();
+        assert!(cache.initialize(&selected));
+        assert_eq!(
+            cache.get_status(&selected.join("nested/file")),
+            Some(GitStatus::Untracked)
+        );
+        assert_eq!(cache.get_status(&outside.join("nested/file")), None);
+        assert_eq!(cache.get_status(&same_prefix.join("nested/file")), None);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.initialize(temp.path()));
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_subtree_scope_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = TempDir::new().unwrap();
+        git2::Repository::init(temp.path()).unwrap();
+        let selected = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"scope-\xff".to_vec()));
+        fs::create_dir(&selected).unwrap();
+        let file = selected.join(std::ffi::OsString::from_vec(b"file-\xfe".to_vec()));
+        fs::write(&file, b"untracked").unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"untracked").unwrap();
+        let mut cache = GitStatusCache::new();
+        assert!(cache.initialize(&selected));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get_status(&file), Some(GitStatus::Untracked));
+        assert_eq!(cache.get_status(&outside), None);
+    }
 
     #[test]
     fn test_git_cache_initialize_at_repo_root_succeeds() {
@@ -826,6 +1414,43 @@ mod git_tests {
         }
         // If /tmp happens to be inside a git repo (unusual CI config), just skip.
     }
+
+    #[test]
+    fn test_git_cache_reinitialization_clears_stale_repository_state() {
+        let repository = TempDir::new().unwrap();
+        git2::Repository::init(repository.path()).unwrap();
+        let untracked = repository.path().join("untracked.txt");
+        fs::write(&untracked, "untracked").unwrap();
+
+        let mut cache = GitStatusCache::new();
+        assert!(cache.initialize(repository.path()));
+        assert_eq!(cache.get_status(&untracked), Some(GitStatus::Untracked));
+
+        let outside = TempDir::new().unwrap();
+        assert!(!cache.initialize(outside.path()));
+        assert!(cache.repo_root().is_none());
+        assert!(cache.is_empty());
+        assert_eq!(cache.get_status(&untracked), None);
+    }
+
+    #[test]
+    fn test_full_scan_applies_git_status_to_nodes() {
+        let repository = TempDir::new().unwrap();
+        git2::Repository::init(repository.path()).unwrap();
+        fs::write(repository.path().join("untracked.txt"), "untracked").unwrap();
+
+        let mut config = git_config(repository.path());
+        config.include_hidden = false;
+        let tree = scanner().scan(&config, CancellationToken::new()).unwrap();
+        let untracked = tree
+            .root
+            .children
+            .iter()
+            .find(|node| node.name.as_str() == "untracked.txt")
+            .expect("untracked file should be scanned");
+
+        assert_eq!(untracked.git_status, Some(GitStatus::Untracked));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,4 +1483,37 @@ fn test_scan_progress_events_are_emitted_for_large_file_set() {
         received > 0,
         "at least one progress event must be emitted for 1100 files"
     );
+}
+
+#[test]
+fn invalid_and_mutated_scopes_are_honored_by_both_scan_modes() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.log"), b"a").unwrap();
+    std::fs::write(root.path().join("b.tmp"), b"b").unwrap();
+    let mut config = gravityfile_core::ScanConfig::new(root.path());
+    config.ignore_patterns = vec!["*.log".into()];
+    config.compile_patterns().unwrap();
+    config.ignore_patterns = vec!["*.tmp".into()];
+    let scanner = gravityfile_scan::JwalkScanner::new();
+    for tree in [
+        scanner
+            .scan(&config, tokio_util::sync::CancellationToken::new())
+            .unwrap(),
+        gravityfile_scan::quick_list(root.path(), Some(&config)).unwrap(),
+    ] {
+        assert!(tree.root.children.iter().any(|node| node.name == "a.log"));
+        assert!(!tree.root.children.iter().any(|node| node.name == "b.tmp"));
+    }
+    let quick = gravityfile_scan::quick_list(root.path(), Some(&config)).unwrap();
+    assert_eq!(quick.config.max_depth, Some(1));
+    assert_eq!(quick.config.root, dunce::canonicalize(root.path()).unwrap());
+    config.ignore_patterns = vec!["[".into()];
+    assert!(matches!(
+        scanner.scan(&config, tokio_util::sync::CancellationToken::new()),
+        Err(gravityfile_core::ScanError::InvalidConfig { .. })
+    ));
+    assert!(matches!(
+        gravityfile_scan::quick_list(root.path(), Some(&config)),
+        Err(gravityfile_core::ScanError::InvalidConfig { .. })
+    ));
 }

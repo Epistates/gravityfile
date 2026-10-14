@@ -1,0 +1,96 @@
+---
+source: tests/snapshots.rs
+description: grav scan --help
+expression: run(args)
+---
+exit: 0
+--- stdout
+Show what takes up space, largest first
+
+Usage: grav scan [OPTIONS] [PATH]
+
+Arguments:
+  [PATH]
+          Directory to scan, or a snapshot saved by `grav export` or `ncdu -o`
+          
+          [default: .]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Scanning:
+  -A, --apparent-size
+          Count file lengths instead of disk usage
+
+  -l, --count-links
+          Count every hard link to a file, not only the first
+
+  -L, --follow-symlinks
+          Follow symbolic links
+
+      --cross-fs
+          Descend into other filesystems [default: stay on the scanned one]
+
+      --no-hidden
+          Skip entries whose names start with "."
+
+  -e, --exclude <GLOB>
+          Skip entries matching GLOB, by name or by path from the root (repeatable)
+
+  -j, --threads <N>
+          Scanning threads [default: one per CPU]
+
+      --git
+          Annotate entries with Git status
+
+      --max-entries <N>
+          Fail if the scan reaches more than N entries
+
+      --record
+          Add this scan's totals to the history shown by `grav history`
+
+Output:
+      --top <N>
+          List the N largest files anywhere below the root instead of the tree
+
+      --by-type
+          Total the space by file extension instead of showing the tree; --limit sets how many types
+
+  -d, --depth <N>
+          Levels of directories to show below the root
+          
+          [default: 1]
+
+  -n, --limit <N>
+          Entries to show per directory, largest first (0 shows all)
+          
+          [default: 20]
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text
+          - json: Versioned JSON (see `schema_version`)
+          
+          [default: text]
+
+      --strict
+          Exit with status 3 if anything could not be read or analyzed
+
+Global options:
+      --color <WHEN>
+          When to use colour
+          
+          [default: auto]
+          [possible values: auto, always, never]
+
+      --binary
+          Show sizes in powers of 1024 (KiB, MiB) instead of 1000 (kB, MB)
+
+      --log-file <FILE>
+          Append diagnostic logs to FILE (filter with RUST_LOG)
+          
+          [env: GRAVITYFILE_LOG_FILE]
+--- stderr

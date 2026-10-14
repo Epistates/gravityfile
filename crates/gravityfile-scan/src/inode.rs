@@ -1,82 +1,45 @@
-//! Inode tracking for hardlink deduplication.
-//!
-//! Uses a countdown DashMap: on first sight we record (nlink - 2) remaining
-//! links; each subsequent encounter decrements the counter and removes the
-//! entry when exhausted. This bounds memory to the number of *outstanding*
-//! hard-link duplicates rather than the full inode set.
-
-use std::collections::HashMap;
+//! Scan-lifetime inode tracking for physical-size deduplication.
 
 use gravityfile_core::InodeInfo;
+use std::collections::HashSet;
 
-/// Tracks seen inodes to prevent double-counting hardlinks.
-///
-/// When a file has multiple hardlinks, we only want to count its size once.
-/// This tracker uses a countdown map to track (inode, device) pairs
-/// and automatically evicts entries once all expected hard links have been seen.
-///
-/// Uses a plain `HashMap` since all access occurs from a single thread
-/// (the sequential `for entry_result in walker` loop in `collect_entries`).
+/// Tracks physical identities already counted during one scan.
+/// Hard-link counts are mutable hints, not safe eviction criteria. Retain
+/// observed multi-link identities until the scan ends. Following directory
+/// symlinks also requires tracking single-link files reached through aliases.
 #[derive(Debug, Default)]
 pub struct InodeTracker {
-    seen: HashMap<InodeInfo, u32>,
+    seen: HashSet<InodeInfo>,
+    track_single_links: bool,
 }
 
 impl InodeTracker {
-    /// Create a new inode tracker.
+    /// Track hard-linked identities; ordinary single-link files need no entry.
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track every identity when traversal may revisit a file through aliases.
+    pub(crate) fn with_alias_tracking() -> Self {
         Self {
-            seen: HashMap::new(),
+            track_single_links: true,
+            ..Self::default()
         }
     }
 
-    /// Track an inode. Returns `true` if this is the first time seeing it.
-    ///
-    /// `nlink` is the hard-link count from file metadata. When `nlink <= 1`
-    /// the file cannot have any additional hard links so we return `true`
-    /// immediately without touching the map (no memory allocated).
-    ///
-    /// On the first encounter the entry is inserted with a countdown equal to
-    /// `nlink - 1` — the number of duplicate encounters we still need to
-    /// suppress. Each subsequent encounter decrements the counter; when it
-    /// reaches zero the entry is removed, bounding memory to the number of
-    /// in-flight duplicate hard links.
+    /// Return true only when this identity should contribute physical size.
+    /// A previously seen identity remains suppressed even if its link count
+    /// subsequently falls to one. This is best-effort accounting, not a snapshot
+    /// guarantee against inode reuse or concurrent mutation.
     pub fn track(&mut self, info: InodeInfo, nlink: u64) -> bool {
-        use std::collections::hash_map::Entry;
-
-        if nlink <= 1 {
-            return true;
-        }
-
-        match self.seen.entry(info) {
-            Entry::Vacant(e) => {
-                // First time we see this inode. Record how many duplicate
-                // encounters we still expect to suppress: (nlink - 1) remaining
-                // hard links after this first one.  We saturate at u32::MAX for
-                // pathological cases.
-                let remaining = (nlink - 1).min(u32::MAX as u64) as u32;
-                e.insert(remaining);
-                true
-            }
-            Entry::Occupied(mut e) => {
-                let count = e.get_mut();
-                if *count <= 1 {
-                    e.remove();
-                } else {
-                    *count -= 1;
-                }
-                false
-            }
+        if self.track_single_links || nlink > 1 {
+            self.seen.insert(info)
+        } else {
+            !self.seen.contains(&info)
         }
     }
 
-    /// Returns the number of inodes currently being tracked (in-flight duplicates).
-    ///
-    /// This is the number of entries in the countdown map — i.e. inodes whose
-    /// full set of hard links has not yet been encountered.  It reaches zero
-    /// once every hard-linked inode has been seen the expected number of times.
-    ///
-    /// Not part of the stable public API; exposed for integration tests.
+    /// Number of retained identities. Entries remain until this tracker drops.
     #[doc(hidden)]
     pub fn pending_count(&self) -> usize {
         self.seen.len()
@@ -86,6 +49,19 @@ impl InodeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_link_counts_and_extra_aliases_do_not_recount_seen_identity() {
+        let mut tracker = InodeTracker::new();
+        let info = InodeInfo::new(42, 1);
+        assert!(tracker.track(info, 2));
+        for count in [2, 1, 0, 3, 2] {
+            assert!(!tracker.track(info, count));
+        }
+        let mut aliases = InodeTracker::with_alias_tracking();
+        assert!(aliases.track(info, 1));
+        assert!(!aliases.track(info, 1));
+    }
 
     #[test]
     fn test_track_new_inode_nlink_1() {
@@ -103,8 +79,8 @@ mod tests {
         // Two hard links: first returns true, second returns false
         assert!(tracker.track(info, 2));
         assert!(!tracker.track(info, 2));
-        // Entry should be evicted; next call treats it as fresh again
-        assert_eq!(tracker.pending_count(), 0);
+        // Retain identity so later aliases cannot count this inode again
+        assert_eq!(tracker.pending_count(), 1);
     }
 
     #[test]
@@ -115,7 +91,7 @@ mod tests {
         assert!(tracker.track(info, 3));
         assert!(!tracker.track(info, 3));
         assert!(!tracker.track(info, 3));
-        assert_eq!(tracker.pending_count(), 0);
+        assert_eq!(tracker.pending_count(), 1);
     }
 
     #[test]

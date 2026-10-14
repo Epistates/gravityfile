@@ -4,11 +4,11 @@
 //! hex views for binary files, and directory listings.
 
 mod content;
+mod image;
 mod syntax;
 
-pub use content::{PreviewContent, PreviewMode, PreviewState};
-
-// Re-export for potential future use
-#[allow(unused_imports)]
-pub use content::{ArchiveEntry, PreviewError, PreviewLoader};
-pub use syntax::SyntaxHighlighter;
+#[cfg(test)]
+pub use content::ArchiveEntry;
+pub use content::{
+    ImageContext, PreviewContent, PreviewError, PreviewLoader, PreviewMode, PreviewState,
+};
