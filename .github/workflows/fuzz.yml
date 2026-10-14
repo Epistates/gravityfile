@@ -51,7 +51,10 @@ jobs:
         working-directory: fuzz
         run: |
           mkdir -p corpus/${{ matrix.target }} seeds/${{ matrix.target }}
-          cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
+          # The prebuilt cargo-fuzz is a static musl binary and would build
+          # for musl, where the address sanitizer cannot work.
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo fuzz run --target "$host" ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
             -max_total_time="$SECONDS_TO_RUN" -rss_limit_mb=2048
       - name: Save corpus
         if: github.event_name != 'pull_request'
