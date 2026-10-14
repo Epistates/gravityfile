@@ -6,8 +6,7 @@ use filetime::FileTime;
 use gravityfile_ops::{
     ConflictResolution, CreateResult, OperationComplete, OperationType, RenameResult,
     ReplacePolicy, TransferOptions, TransferResult, UndoComplete, UndoEntry, UndoResult,
-    UndoableOperation, execute_undo, start_copy, start_create_directory, start_create_file,
-    start_move, start_rename,
+    UndoableOperation, execute_undo, start_copy, start_create_directory, start_move, start_rename,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -675,7 +674,7 @@ async fn create_file_rejects_an_existing_broken_symlink() {
     let path = tmp.path().join("broken-link");
     std::os::unix::fs::symlink("missing-target", &path).unwrap();
 
-    let complete = wait_for_create(start_create_file(path.clone())).await;
+    let complete = wait_for_create(gravityfile_ops::start_create_file(path.clone())).await;
 
     assert_eq!((complete.succeeded, complete.failed), (0, 1));
     assert!(
