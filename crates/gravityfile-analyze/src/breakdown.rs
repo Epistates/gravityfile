@@ -178,19 +178,20 @@ mod tests {
     fn the_largest_files_come_from_any_depth_with_ties_by_path() {
         let tree = tree();
         let cancel = CancellationToken::new();
-        let paths = |count| -> Vec<(String, u64)> {
+        // Paths compare by component, so `deep/er` also matches `deep\er`.
+        let paths = |count| -> Vec<(PathBuf, u64)> {
             largest_files(&tree, count, &cancel)
                 .unwrap()
                 .into_iter()
-                .map(|file| (file.path.display().to_string(), file.size))
+                .map(|file| (file.path, file.size))
                 .collect()
         };
         assert_eq!(
             paths(3),
             [
-                ("deep/er/big.mp4".to_string(), 900),
-                ("deep/er/b.log".to_string(), 70),
-                ("notes".to_string(), 70),
+                ("deep/er/big.mp4".into(), 900),
+                ("deep/er/b.log".into(), 70),
+                ("notes".into(), 70),
             ]
         );
         assert_eq!(paths(100).len(), 5);

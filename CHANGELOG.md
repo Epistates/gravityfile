@@ -215,6 +215,10 @@ plugins are Lua only, and settings moved on macOS.
 - Size and age arguments that are negative, not finite or too large are
   rejected instead of crashing.
 - On Windows, scanned files no longer all share one made-up file identity.
+- Windows fixes: the explorer builds and runs; Git status appears; paths
+  show single backslashes, not doubled ones; copying or moving onto a
+  different file of the same size no longer takes the two for one file; and
+  items whose path is longer than 260 characters can be copied and moved.
 
 ## [0.3.0] - 2026-06-14
 

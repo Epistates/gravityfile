@@ -76,12 +76,18 @@ impl GitStatusCache {
             }
         };
 
-        // Get the workdir (root of the working tree)
-        let workdir = match repo.workdir() {
-            Some(dir) => dir.to_path_buf(),
+        // The working tree's root, in the same canonical form as the start
+        // path and every lookup: libgit2 keeps the form it was given, which on
+        // Windows may be a short (8.3) name or use forward slashes.
+        let workdir = match repo.workdir().map(dunce::canonicalize) {
+            Some(Ok(dir)) => dir,
+            Some(Err(error)) => {
+                self.initialization_error = Some(error.to_string());
+                return false;
+            }
             None => return false, // Bare repository
         };
-        let normalized_start = match start_path.canonicalize() {
+        let normalized_start = match dunce::canonicalize(start_path) {
             Ok(path) => path,
             Err(error) => {
                 self.initialization_error = Some(error.to_string());
@@ -228,7 +234,7 @@ impl GitStatusCache {
     /// bulk callers should use [`get_status_canonical`](Self::get_status_canonical).
     pub fn get_status(&self, path: &Path) -> Option<GitStatus> {
         self.get_status_canonical(path).or_else(|| {
-            path.canonicalize()
+            dunce::canonicalize(path)
                 .ok()
                 .and_then(|normalized| self.get_status_canonical(&normalized))
         })
@@ -280,9 +286,7 @@ impl GitStatusCache {
     pub fn is_in_repo(&self, path: &Path) -> bool {
         if let Some(ref root) = self.repo_root {
             path.starts_with(root)
-                || path
-                    .canonicalize()
-                    .is_ok_and(|normalized| normalized.starts_with(root))
+                || dunce::canonicalize(path).is_ok_and(|normalized| normalized.starts_with(root))
         } else {
             false
         }
@@ -351,10 +355,7 @@ fn annotate_git_status(
 
     // Resolve the root once. Every child path is built by joining onto it, so
     // the whole walk can then use the syscall-free canonical lookup.
-    let root = tree
-        .root_path
-        .canonicalize()
-        .unwrap_or_else(|_| tree.root_path.clone());
+    let root = dunce::canonicalize(&tree.root_path).unwrap_or_else(|_| tree.root_path.clone());
 
     apply_status_iterative(&mut tree.root, &root, &cache, &|| token.is_cancelled());
 }

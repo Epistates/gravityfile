@@ -304,10 +304,8 @@ impl JwalkScanner {
             .validate()
             .map_err(|message| ScanError::InvalidConfig { message })?;
         let start = Instant::now();
-        let root_path = config
-            .root
-            .canonicalize()
-            .map_err(|e| ScanError::io(&config.root, e))?;
+        let root_path =
+            dunce::canonicalize(&config.root).map_err(|e| ScanError::io(&config.root, e))?;
         let root_metadata =
             std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
         if !root_metadata.is_dir() {
@@ -601,7 +599,7 @@ pub fn scan_entry(
 /// `None` to use a default config (hidden files included).
 pub fn quick_list(path: &Path, config: Option<&ScanConfig>) -> Result<FileTree, ScanError> {
     let start = Instant::now();
-    let root_path = path.canonicalize().map_err(|e| ScanError::io(path, e))?;
+    let root_path = dunce::canonicalize(path).map_err(|e| ScanError::io(path, e))?;
     let root_metadata = std::fs::metadata(&root_path).map_err(|e| ScanError::io(&root_path, e))?;
     if !root_metadata.is_dir() {
         return Err(ScanError::NotADirectory { path: root_path });
@@ -982,7 +980,7 @@ mod tests {
     #[test]
     fn grafting_scanned_entries_matches_a_fresh_scan() {
         let temp = create_test_tree();
-        let root = temp.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
         let config = ScanConfig::new(&root);
         let mut tree = scan(&config);
         // Change a directory and a file, and delete another file.

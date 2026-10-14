@@ -255,10 +255,11 @@ mod tests {
         diff(old, new, options, &CancellationToken::new()).unwrap()
     }
 
-    fn summary(diff: &TreeDiff) -> Vec<(String, Change, i64)> {
+    /// Paths compare by component, so `cache/a` also matches `cache\a`.
+    fn summary(diff: &TreeDiff) -> Vec<(PathBuf, Change, i64)> {
         diff.entries
             .iter()
-            .map(|entry| (entry.path.display().to_string(), entry.change, entry.delta))
+            .map(|entry| (entry.path.clone(), entry.change, entry.delta))
             .collect()
     }
 

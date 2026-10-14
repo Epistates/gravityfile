@@ -156,14 +156,12 @@ fn validate_batch(renames: &[(PathBuf, PathBuf)]) -> Result<Vec<(PathBuf, PathBu
         let name = path
             .file_name()
             .ok_or_else(|| format!("'{}' has no file name", path.display()))?;
-        let parent = crate::fs::parent_or_current(path)
-            .canonicalize()
-            .map_err(|error| {
-                format!(
-                    "cannot resolve the directory of '{}': {error}",
-                    path.display()
-                )
-            })?;
+        let parent = dunce::canonicalize(crate::fs::parent_or_current(path)).map_err(|error| {
+            format!(
+                "cannot resolve the directory of '{}': {error}",
+                path.display()
+            )
+        })?;
         Ok(parent.join(name))
     };
     let mut resolved = Vec::with_capacity(renames.len());

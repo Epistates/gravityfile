@@ -26,6 +26,7 @@ flate2.workspace = true
 xz2.workspace = true
 bzip2.workspace = true
 zstd.workspace = true
+dunce.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

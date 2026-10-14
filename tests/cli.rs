@@ -659,13 +659,14 @@ fn diff_reports_what_changed_since_a_snapshot() {
     assert_eq!(report["kind"], "diff");
     assert_eq!(report["data"]["old"]["snapshot"], true);
     assert_eq!(report["data"]["new"]["snapshot"], false);
-    let changes: Vec<(String, String)> = report["data"]["entries"]
+    // Paths compare by component, so `cache/blob` also matches `cache\blob`.
+    let changes: Vec<(std::path::PathBuf, String)> = report["data"]["entries"]
         .as_array()
         .unwrap()
         .iter()
         .map(|entry| {
             (
-                entry["path"].as_str().unwrap().to_string(),
+                entry["path"].as_str().unwrap().into(),
                 entry["change"].as_str().unwrap().to_string(),
             )
         })
@@ -673,13 +674,17 @@ fn diff_reports_what_changed_since_a_snapshot() {
     assert_eq!(
         changes[..4],
         [
-            ("cache".to_string(), "changed".to_string()),
-            ("cache/blob".to_string(), "changed".to_string()),
-            ("new".to_string(), "added".to_string()),
-            ("old".to_string(), "removed".to_string()),
+            ("cache".into(), "changed".to_string()),
+            ("cache/blob".into(), "changed".to_string()),
+            ("new".into(), "added".to_string()),
+            ("old".into(), "removed".to_string()),
         ]
     );
-    assert!(!changes.iter().any(|(path, _)| path == "same"));
+    assert!(
+        !changes
+            .iter()
+            .any(|(path, _)| path == std::path::Path::new("same"))
+    );
 
     let text = run(&["diff", saved.to_str().unwrap(), "--color", "never"]);
     let text = String::from_utf8_lossy(&text.stdout);
@@ -699,7 +704,7 @@ fn diff_reports_what_changed_since_a_snapshot() {
 fn recorded_scans_show_a_directorys_growth() {
     let home = tempfile::tempdir().unwrap();
     let place = tempfile::tempdir().unwrap();
-    let root = place.path().canonicalize().unwrap();
+    let root = dunce::canonicalize(place.path()).unwrap();
     std::fs::create_dir(root.join("media")).unwrap();
     let grav = |args: &[&str]| {
         grav()
@@ -756,13 +761,19 @@ fn scan_lists_the_largest_files_and_space_by_type() {
 
     let top = json(&run(&["scan", path, "--top", "2", "-A", "-f", "json"]));
     assert_eq!(top["kind"], "top");
-    let files: Vec<&str> = top["data"]["files"]
+    let files: Vec<&std::path::Path> = top["data"]["files"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|file| file["path"].as_str().unwrap())
+        .map(|file| std::path::Path::new(file["path"].as_str().unwrap()))
         .collect();
-    assert_eq!(files, ["a/b/movie.MP4", "a/log.txt"]);
+    assert_eq!(
+        files,
+        [
+            std::path::Path::new("a/b/movie.MP4"),
+            std::path::Path::new("a/log.txt")
+        ]
+    );
 
     let types = json(&run(&["scan", path, "--by-type", "-A", "-f", "json"]));
     assert_eq!(types["kind"], "types");

@@ -57,8 +57,9 @@ fn path_error(message: &str, path: &Path) -> ArchiveError {
     invalid_data(format!("{message}: {}", path.display()))
 }
 
-/// Reject absolute paths and `..` components.
-fn validate_entry_path(path: &Path) -> ArchiveResult<()> {
+/// Reject absolute paths, paths with a root or drive (`/etc` is not absolute
+/// on Windows, but still escapes) and `..` components.
+pub(super) fn validate_entry_path(path: &Path) -> ArchiveResult<()> {
     if path.is_absolute()
         || path
             .components()
@@ -80,7 +81,7 @@ fn validate_entry_path(path: &Path) -> ArchiveResult<()> {
 fn prepare_parent(outpath: &Path, root: &Path, entry: &Path) -> ArchiveResult<()> {
     if let Some(parent) = outpath.parent() {
         fs::create_dir_all(parent)?;
-        if !parent.canonicalize()?.starts_with(root) {
+        if !dunce::canonicalize(parent)?.starts_with(root) {
             return Err(path_error("Path escapes destination", entry));
         }
     }
@@ -137,7 +138,7 @@ pub(super) fn extract_zip_with_metadata_budget(
     }
     let mut archive = parsed?;
     budget.finish_metadata();
-    let root = destination.canonicalize()?;
+    let root = dunce::canonicalize(destination)?;
 
     if archive.len() as u64 > limits.max_entries {
         return Err(ArchiveError::DecompressionBomb(format!(
@@ -322,9 +323,7 @@ fn validate_symlink_target(target: &Path, outpath: &Path, root: &Path) -> Archiv
         return Err(path_error("Symlink with absolute target rejected", target));
     }
     let parent = outpath.parent().unwrap_or(root);
-    let parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    let parent = dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     if !resolve_path(&parent.join(target)).starts_with(root) {
         return Err(path_error("Symlink escapes destination", target));
     }
@@ -343,7 +342,7 @@ pub(super) fn validate_tar_hardlink_target(target: &Path, root: &Path) -> Archiv
         ));
     }
     let path = root.join(target);
-    if !fs::symlink_metadata(&path)?.is_file() || !path.canonicalize()?.starts_with(root) {
+    if !fs::symlink_metadata(&path)?.is_file() || !dunce::canonicalize(&path)?.starts_with(root) {
         return Err(invalid_data(
             "TAR hard-link target must be an extracted regular file inside the archive root",
         ));
@@ -389,7 +388,7 @@ pub(super) fn extract_tar_with_metadata_budget<R: Read>(
     let mut archive = tar::Archive::new(budget.wrap(reader));
     archive.set_preserve_permissions(false);
     archive.set_unpack_xattrs(false);
-    let root = destination.canonicalize()?;
+    let root = dunce::canonicalize(destination)?;
 
     let mut extracted = Vec::new();
     // Directory modes are applied after every entry is written, so a
@@ -451,7 +450,7 @@ pub(super) fn extract_tar_with_metadata_budget<R: Read>(
 
         if entry_type.is_dir() {
             fs::create_dir_all(&outpath)?;
-            if !outpath.canonicalize()?.starts_with(&root) {
+            if !dunce::canonicalize(&outpath)?.starts_with(&root) {
                 return Err(path_error("Path escapes destination", &entry_path));
             }
             directory_modes.push((

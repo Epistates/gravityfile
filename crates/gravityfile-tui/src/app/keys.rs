@@ -514,7 +514,7 @@ impl App {
         };
 
         // Canonicalize to resolve .. and .
-        let path = path.canonicalize().unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         if path.is_dir() {
             self.go_to(path);
         } else {
@@ -637,7 +637,7 @@ impl App {
             self.error = Some(format!("Bookmark '{key}' is not set"));
             return;
         };
-        let path = match saved_path.canonicalize() {
+        let path = match dunce::canonicalize(&saved_path) {
             Ok(path) => path,
             Err(error) => {
                 self.error = Some(format!("Cannot open bookmark '{key}': {error}"));

@@ -6,6 +6,15 @@ const DUPLICATES: &str = include_str!("fixtures/reports/legacy-duplicates.json")
 const AGE: &str = include_str!("fixtures/reports/legacy-age.json");
 const SCAN: &str = include_str!("fixtures/reports/legacy-scan.json");
 
+/// The nanoseconds a `SystemTime` keeps: Windows counts in 100 ns steps.
+fn system_time_nanos(nanos: u64) -> u64 {
+    if cfg!(windows) {
+        nanos / 100 * 100
+    } else {
+        nanos
+    }
+}
+
 #[test]
 fn fixed_legacy_scan_preserves_tree_precision_warnings_and_defaults() {
     use gravityfile_core::{FileTree, WarningKind};
@@ -55,7 +64,10 @@ fn fixed_legacy_scan_preserves_tree_precision_warnings_and_defaults() {
         match expected {
             serde_json::Value::Object(fields) => {
                 for (key, value) in fields {
-                    if !DROPPED.contains(&key.as_str()) {
+                    if key == "nanos_since_epoch" {
+                        let expected = system_time_nanos(value.as_u64().unwrap());
+                        assert_eq!(Some(expected), actual[key].as_u64());
+                    } else if !DROPPED.contains(&key.as_str()) {
                         assert_preserved(value, &actual[key]);
                     }
                 }
@@ -230,9 +242,10 @@ fn fixed_legacy_age_preserves_time_precision_and_unknown_status() {
         .2
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
+    assert_eq!(timestamp.as_secs(), 1_700_000_000);
     assert_eq!(
-        timestamp,
-        std::time::Duration::new(1_700_000_000, 123_456_789)
+        u64::from(timestamp.subsec_nanos()),
+        system_time_nanos(123_456_789)
     );
     let round_trip: AgeReport =
         serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();

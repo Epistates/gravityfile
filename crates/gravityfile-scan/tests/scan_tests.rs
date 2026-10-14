@@ -173,7 +173,7 @@ fn quick_listing_honors_symlink_following_and_alias_sizes() {
         assert_eq!(tree.warnings.len(), 1);
         assert_eq!(
             tree.warnings[0].path,
-            tmp.path().canonicalize().unwrap().join("broken")
+            dunce::canonicalize(tmp.path()).unwrap().join("broken")
         );
         assert_eq!(tree.warnings[0].kind, WarningKind::MetadataError);
     }
@@ -1180,7 +1180,7 @@ mod git_tests {
             cache.get_status(&temp.path().join("generated-other/file")),
             None
         );
-        let canonical = generated.canonicalize().unwrap().join("nested/0");
+        let canonical = dunce::canonicalize(&generated).unwrap().join("nested/0");
         fs::remove_file(generated.join("nested/0")).unwrap();
         // Prefix lookup is observational and does not query file existence.
         assert_eq!(
@@ -1506,7 +1506,7 @@ fn invalid_and_mutated_scopes_are_honored_by_both_scan_modes() {
     }
     let quick = gravityfile_scan::quick_list(root.path(), Some(&config)).unwrap();
     assert_eq!(quick.config.max_depth, Some(1));
-    assert_eq!(quick.config.root, root.path().canonicalize().unwrap());
+    assert_eq!(quick.config.root, dunce::canonicalize(root.path()).unwrap());
     config.ignore_patterns = vec!["[".into()];
     assert!(matches!(
         scanner.scan(&config, tokio_util::sync::CancellationToken::new()),

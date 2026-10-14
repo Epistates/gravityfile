@@ -59,6 +59,7 @@ bzip2.workspace = true
 serde_json.workspace = true
 
 tempfile.workspace = true
+dunce.workspace = true
 
 # PTY buffer flush on quit (unix only)
 [target.'cfg(unix)'.dependencies]

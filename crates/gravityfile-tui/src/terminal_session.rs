@@ -60,6 +60,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "raw restoration failed");
         let output = String::from_utf8(output).unwrap();
+        // Windows changes mouse capture through the console API instead.
+        #[cfg(unix)]
         assert!(output.contains("\x1b[?1000l"));
         assert!(output.contains("\x1b[?1049l"));
         assert!(output.contains("\x1b[?25h"));
@@ -88,7 +90,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(raw_called);
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(output.0, 3);
+        // On Windows the mouse step uses the console API, not this output, and
+        // its own failure is the one reported.
+        if cfg!(windows) {
+            assert_eq!(output.0, 2);
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(output.0, 3);
+        }
     }
 }

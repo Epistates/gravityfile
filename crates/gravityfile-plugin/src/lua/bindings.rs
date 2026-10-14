@@ -20,7 +20,7 @@ fn sandbox_allows_read(sandbox: Option<&SandboxConfig>, path: &std::path::Path) 
     if !sandbox.can_read(path) {
         return false;
     }
-    match std::fs::canonicalize(path) {
+    match dunce::canonicalize(path) {
         Ok(resolved) => sandbox.can_read(&resolved),
         Err(_) => true,
     }
@@ -37,7 +37,7 @@ fn open_readable_file(
         return Err(mlua::Error::external("Read denied by sandbox policy"));
     }
 
-    let real = match std::fs::canonicalize(path) {
+    let real = match dunce::canonicalize(path) {
         Ok(real) => real,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(mlua::Error::external(error)),

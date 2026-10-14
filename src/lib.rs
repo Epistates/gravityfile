@@ -225,8 +225,7 @@ fn explore(
         config = config.with_snapshot(requested, tree);
         root
     } else {
-        requested
-            .canonicalize()
+        dunce::canonicalize(&requested)
             .wrap_err_with(|| format!("cannot open {}", escape_filename(requested.as_os_str())))?
     };
     // Without --scan, the saved setting decides.

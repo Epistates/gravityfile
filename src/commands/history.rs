@@ -53,8 +53,7 @@ pub fn run(command: &HistoryCommand, context: &Context) -> Result<Completeness> 
     }
     let requested = command.path.clone().unwrap_or_else(|| PathBuf::from("."));
     // A directory that has since gone still has its history.
-    let root = requested
-        .canonicalize()
+    let root = dunce::canonicalize(&requested)
         .or_else(|_| std::path::absolute(&requested))
         .wrap_err_with(|| format!("cannot resolve {}", escape_filename(requested.as_os_str())))?;
     let records = history::read(&file, Some(&root))

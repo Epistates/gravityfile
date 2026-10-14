@@ -249,7 +249,7 @@ fn add_path_to_zip_with_visited<W: Write + std::io::Seek>(
         archive.add_symlink(name, target, *options)?;
     } else if metadata.is_dir() {
         // Detect symlink loops by checking canonical path
-        let canonical = match path.canonicalize() {
+        let canonical = match dunce::canonicalize(path) {
             Ok(c) => c,
             Err(_) => path.to_path_buf(),
         };

@@ -1095,7 +1095,8 @@ fn many_age_buckets_preserve_inclusive_boundaries_and_catch_all() {
         Duration::ZERO,
         Duration::from_secs(1),
         Duration::from_secs(500),
-        Duration::from_secs(500) + Duration::from_nanos(1),
+        // Just past the boundary; Windows times have 100 ns resolution.
+        Duration::from_secs(500) + Duration::from_nanos(100),
         Duration::from_secs(999),
         Duration::from_secs(1000),
         Duration::from_secs(9000),

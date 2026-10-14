@@ -107,8 +107,7 @@ fn load_sides(command: &DiffCommand, context: &Context) -> Result<(Side, Side)> 
         })
     };
     let scan = |path: &Path, scope: Option<&ScanConfig>| -> Result<Side> {
-        let root = path
-            .canonicalize()
+        let root = dunce::canonicalize(path)
             .wrap_err_with(|| format!("cannot open {}", escape_filename(path.as_os_str())))?;
         let mut config = scope.cloned().unwrap_or_else(|| ScanConfig::new(&root));
         config.root = root.clone();

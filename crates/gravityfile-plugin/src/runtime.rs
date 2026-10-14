@@ -396,8 +396,8 @@ impl PluginManager {
 
         // Verify entry point stays within the plugin directory (path traversal guard)
         let entry_file = path.join(&metadata.entry);
-        let canonical_plugin_dir = std::fs::canonicalize(path).map_err(PluginError::Io)?;
-        let canonical_entry = std::fs::canonicalize(&entry_file).map_err(PluginError::Io)?;
+        let canonical_plugin_dir = dunce::canonicalize(path).map_err(PluginError::Io)?;
+        let canonical_entry = dunce::canonicalize(&entry_file).map_err(PluginError::Io)?;
         if !canonical_entry.starts_with(&canonical_plugin_dir) {
             return Err(PluginError::ConfigError {
                 message: format!(

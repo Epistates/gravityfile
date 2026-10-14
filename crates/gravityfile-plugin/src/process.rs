@@ -375,7 +375,7 @@ impl ProcessRuntime {
     /// support the private worker protocol.
     pub fn new(executable: PathBuf) -> PluginResult<Self> {
         Ok(Self {
-            executable: executable.canonicalize()?,
+            executable: dunce::canonicalize(&executable)?,
             language: "lua",
             config: PluginConfig::default(),
             plugins: HashMap::new(),
@@ -414,7 +414,7 @@ impl PluginRuntime for ProcessRuntime {
         Ok(())
     }
     fn load_plugin(&mut self, id: &str, source: &Path) -> PluginResult<PluginHandle> {
-        let source = source.canonicalize()?;
+        let source = dunce::canonicalize(source)?;
         let worker = Worker::spawn(&self.executable, self.language)?;
         worker.request(Request::Init(self.config.clone()), STARTUP_TIMEOUT_MS)?;
         let response = worker.request(

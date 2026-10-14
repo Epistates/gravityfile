@@ -48,7 +48,7 @@ impl Harness {
     /// does not exist, so any attempt to read the filesystem would show.
     pub async fn snapshot() -> Self {
         let fixture = sample_dir_on_disk();
-        let scanned = fixture.path().canonicalize().expect("canonical fixture");
+        let scanned = dunce::canonicalize(fixture.path()).expect("canonical fixture");
         let mut tree = gravityfile_scan::JwalkScanner::new()
             .scan(
                 &gravityfile_core::ScanConfig::new(&scanned),
@@ -82,7 +82,7 @@ impl Harness {
         let fixture = sample_dir_on_disk();
         // The scanner stores a canonical root; on macOS temp dirs sit behind
         // a `/var` symlink.
-        let root = fixture.path().canonicalize().expect("canonical fixture");
+        let root = dunce::canonicalize(fixture.path()).expect("canonical fixture");
         let mut app = App::with_loaded_settings(
             root.clone(),
             crate::TuiConfig {

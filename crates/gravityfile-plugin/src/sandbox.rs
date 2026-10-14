@@ -199,7 +199,7 @@ impl SandboxConfig {
         };
         self.allowed_read_paths
             .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter_map(|p| dunce::canonicalize(p).ok())
             .any(|allowed| normalized.starts_with(&allowed))
     }
 
@@ -220,7 +220,7 @@ impl SandboxConfig {
         };
         self.allowed_write_paths
             .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter_map(|p| dunce::canonicalize(p).ok())
             .any(|allowed| normalized.starts_with(&allowed))
     }
 
@@ -230,14 +230,14 @@ impl SandboxConfig {
     /// the caller to deny access (safe default).
     fn normalize_path(&self, path: &std::path::Path) -> Option<PathBuf> {
         // Try canonicalizing directly first (works for existing paths)
-        if let Ok(c) = std::fs::canonicalize(path) {
+        if let Ok(c) = dunce::canonicalize(path) {
             return Some(c);
         }
 
         // If it doesn't exist, try canonicalizing the parent and joining the
         // final component. This handles writes to new files inside existing dirs.
         if let Some(parent) = path.parent()
-            && let Ok(c) = std::fs::canonicalize(parent)
+            && let Ok(c) = dunce::canonicalize(parent)
             && let Some(name) = path.file_name()
         {
             return Some(c.join(name));

@@ -180,9 +180,50 @@ mod platform {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
+    /// `path` as a NUL-terminated wide string. Like `std::fs`, a long absolute
+    /// path takes the verbatim `\\?\` form so it can exceed `MAX_PATH`.
+    pub(super) fn wide(path: &Path) -> Vec<u16> {
+        use std::ffi::OsString;
+        use std::path::{Component, Prefix};
+        // The limit is 260 including the NUL; directories leave room for an
+        // 8.3 name, hence std's 248.
+        const LONG: usize = 248;
+        let plain = || path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if path.as_os_str().len() < LONG || !path.is_absolute() {
+            return plain();
+        }
+        // Verbatim paths are not normalised by Windows: build one from the
+        // components, with backslashes, and leave `..` to the plain form.
+        let mut verbatim = OsString::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(drive) => {
+                        verbatim.push(format!(r"\\?\{}:", char::from(drive)));
+                    }
+                    Prefix::UNC(server, share) => {
+                        verbatim.push(r"\\?\UNC\");
+                        verbatim.push(server);
+                        verbatim.push(r"\");
+                        verbatim.push(share);
+                    }
+                    Prefix::Verbatim(_)
+                    | Prefix::VerbatimDisk(_)
+                    | Prefix::VerbatimUNC(..)
+                    | Prefix::DeviceNS(_) => return plain(),
+                },
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(name) => {
+                    verbatim.push(r"\");
+                    verbatim.push(name);
+                }
+                Component::ParentDir => return plain(),
+            }
+        }
+        verbatim.encode_wide().chain(Some(0)).collect()
+    }
+
     pub(super) fn rename_noreplace(source: &Path, destination: &Path) -> Option<io::Result<()>> {
-        let wide =
-            |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
         let (source, destination) = (wide(source), wide(destination));
         // SAFETY: NUL-terminated UTF-16 buffers that outlive the call. Zero
         // flags exclude REPLACE_EXISTING and COPY_ALLOWED.
@@ -280,7 +321,7 @@ pub(crate) fn parent_or_current(path: &Path) -> &Path {
 /// Canonicalize the longest existing prefix of `path` and append the rest
 /// lexically, so not-yet-created destinations can be compared with sources.
 pub(crate) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
-    if let Ok(path) = path.canonicalize() {
+    if let Ok(path) = dunce::canonicalize(path) {
         return Some(path);
     }
     let absolute = if path.is_absolute() {
@@ -293,7 +334,7 @@ pub(crate) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     while let Some(name) = existing.file_name() {
         suffix.push(name.to_owned());
         existing = existing.parent()?;
-        if let Ok(mut canonical) = existing.canonicalize() {
+        if let Ok(mut canonical) = dunce::canonicalize(existing) {
             canonical.extend(suffix.iter().rev());
             return Some(canonical);
         }
@@ -316,26 +357,57 @@ pub(crate) fn is_within_directory(source: &Path, destination: &Path) -> bool {
     }
 }
 
-/// Whether two paths name the same filesystem object.
+/// Whether two paths name the same filesystem object. A final symlink is
+/// compared as itself, not as what it points to.
 pub(crate) fn same_object(a: &Path, b: &Path) -> bool {
-    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
-        (Ok(a), Ok(b)) => same_identity(&a, &b),
+    match (file_id(a), file_id(b)) {
+        (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
 }
 
+/// Device and inode.
 #[cfg(unix)]
-pub(crate) fn same_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+fn file_id(path: &Path) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
+    let metadata = fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
-#[cfg(not(unix))]
-pub(crate) fn same_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    a.len() == b.len()
-        && a.modified().ok() == b.modified().ok()
-        && a.created().ok() == b.created().ok()
-        && a.file_type() == b.file_type()
+/// Volume serial number and file index, Windows' device and inode. Comparing
+/// sizes and times instead would take two files written in the same clock
+/// tick for one.
+#[cfg(windows)]
+fn file_id(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    // No access rights are needed to read the identity; backup semantics
+    // allow opening directories, and the reparse flag keeps symlinks unfollowed.
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle stays open for the call and `info` is a valid
+    // out-pointer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_path: &Path) -> io::Result<(u64, u64)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file identity is not available on this platform",
+    ))
 }
 
 /// True when a regular file still matches an earlier observation.
@@ -461,7 +533,7 @@ mod tests {
     #[test]
     fn lenient_canonicalization_appends_missing_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         assert_eq!(
             canonicalize_lenient(&dir.path().join("missing/child")).unwrap(),
             root.join("missing/child")
@@ -475,7 +547,7 @@ mod tests {
     fn chained_symlinks_are_resolved_like_the_kernel() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("root/d")).unwrap();
-        let root = dir.path().join("root").canonicalize().unwrap();
+        let root = dunce::canonicalize(dir.path().join("root")).unwrap();
         std::os::unix::fs::symlink("..", root.join("d/l1")).unwrap();
         // Lexically `d/l1/../..` is `root`, but `l1` resolves to `root`, so
         // the kernel lands on root's parent.

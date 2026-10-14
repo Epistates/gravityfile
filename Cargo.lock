@@ -903,6 +903,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1227,6 +1233,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "color-eyre",
+ "dunce",
  "getrandom 0.4.3",
  "gravityfile-analyze",
  "gravityfile-core",
@@ -1281,6 +1288,7 @@ name = "gravityfile-ops"
 version = "0.4.0"
 dependencies = [
  "bzip2",
+ "dunce",
  "filetime",
  "flate2",
  "libc",
@@ -1305,6 +1313,7 @@ dependencies = [
 name = "gravityfile-plugin"
 version = "0.4.0"
 dependencies = [
+ "dunce",
  "gravityfile-core",
  "indexmap",
  "libc",
@@ -1324,6 +1333,7 @@ dependencies = [
 name = "gravityfile-scan"
 version = "0.4.0"
 dependencies = [
+ "dunce",
  "git2",
  "globset",
  "gravityfile-core",
@@ -1347,6 +1357,7 @@ dependencies = [
  "chrono",
  "color-eyre",
  "crossterm",
+ "dunce",
  "flate2",
  "gravityfile-analyze",
  "gravityfile-core",

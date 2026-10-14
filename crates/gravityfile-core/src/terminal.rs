@@ -4,9 +4,13 @@ use std::borrow::Cow;
 
 /// Visible filename representation that distinguishes invalid encoded bytes
 /// from literal escape text. This is display text, not a portable path format.
+///
+/// Backslashes are escaped so that a literal `\xff` in a Unix name differs
+/// from an escaped byte. On Windows a backslash is the path separator and
+/// cannot occur in a name, so it is left alone.
 pub fn escape_filename(name: &std::ffi::OsStr) -> Cow<'_, str> {
     if let Some(text) = name.to_str()
-        && !text.chars().any(|c| needs_escape(c) || c == '\\')
+        && !text.chars().any(escapes_in_names)
     {
         return Cow::Borrowed(text);
     }
@@ -14,7 +18,7 @@ pub fn escape_filename(name: &std::ffi::OsStr) -> Cow<'_, str> {
     let mut output = String::new();
     for chunk in name.as_encoded_bytes().utf8_chunks() {
         for character in chunk.valid().chars() {
-            if needs_escape(character) || character == '\\' {
+            if escapes_in_names(character) {
                 output.extend(character.escape_default());
             } else {
                 output.push(character);
@@ -25,6 +29,10 @@ pub fn escape_filename(name: &std::ffi::OsStr) -> Cow<'_, str> {
         }
     }
     Cow::Owned(output)
+}
+
+fn escapes_in_names(character: char) -> bool {
+    needs_escape(character) || (character == '\\' && !cfg!(windows))
 }
 
 fn needs_escape(character: char) -> bool {
@@ -75,6 +83,16 @@ mod tests {
             escape_filename(std::ffi::OsStr::new("résumé 日本語")),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_separators_are_not_escaped() {
+        let path = std::ffi::OsStr::new(r"C:\Users\me\file.txt");
+        assert!(
+            matches!(escape_filename(path), Cow::Borrowed(text) if text == r"C:\Users\me\file.txt")
+        );
+        assert_eq!(escape_filename(std::ffi::OsStr::new("a\\b\n")), r"a\b\n");
     }
 
     #[test]

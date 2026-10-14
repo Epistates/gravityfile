@@ -72,9 +72,7 @@ pub fn scan_tree(args: &ScanArgs, context: &Context) -> Result<FileTree> {
         return gravityfile_scan::snapshot::read(&args.path, &options)
             .wrap_err_with(|| format!("cannot load {}", escape_filename(args.path.as_os_str())));
     }
-    let root = args
-        .path
-        .canonicalize()
+    let root = dunce::canonicalize(&args.path)
         .wrap_err_with(|| format!("cannot open {}", escape_filename(args.path.as_os_str())))?;
     let config = args.config(&root);
     crate::progress::scan(&config, &context.cancel, context.units)

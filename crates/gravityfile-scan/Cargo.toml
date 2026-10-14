@@ -19,6 +19,7 @@ serde_json = { workspace = true, features = ["unbounded_depth"] }
 serde_stacker.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
+dunce.workspace = true
 
 [features]
 default = ["git"]

@@ -607,7 +607,7 @@ fn tar_hardlinks_cannot_import_files_from_process_working_directory() {
 fn tar_hardlink_validation_rejects_symlinks_and_parent_traversal() {
     use std::os::unix::fs::symlink;
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
+    let root = dunce::canonicalize(directory.path()).unwrap();
     std::fs::write(root.join("payload"), b"content").unwrap();
     symlink("payload", root.join("link")).unwrap();
     for target in [Path::new("link"), Path::new("../payload"), Path::new(".")] {
@@ -1021,35 +1021,17 @@ fn test_create_and_extract_tar_gz() {
 }
 
 #[test]
-fn test_path_traversal_prevention_absolute_path() {
-    let path = Path::new("/etc/passwd");
-    assert!(path.is_absolute());
-
-    let has_parent_dir = path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    assert!(path.is_absolute() || has_parent_dir);
-}
-
-#[test]
-fn test_path_traversal_prevention_parent_dir() {
-    let path = Path::new("../../../etc/passwd");
-    let has_parent_dir = path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    assert!(has_parent_dir);
-
-    let path2 = Path::new("foo/../../../bar");
-    let has_parent_dir2 = path2
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    assert!(has_parent_dir2);
-
-    let safe_path = Path::new("foo/bar/baz.txt");
-    let has_parent_dir3 = safe_path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    assert!(!has_parent_dir3);
+fn entry_paths_that_escape_the_destination_are_rejected() {
+    let mut escaping = vec!["/etc/passwd", "../outside", "nested/../../outside"];
+    if cfg!(windows) {
+        escaping.extend([r"C:\Windows\evil.dll", r"\\server\share\x", r"\rooted"]);
+    }
+    for path in escaping {
+        assert!(validate_entry_path(Path::new(path)).is_err(), "{path}");
+    }
+    for path in ["file.txt", "nested/dir/file.txt", "./file.txt"] {
+        assert!(validate_entry_path(Path::new(path)).is_ok(), "{path}");
+    }
 }
 
 #[test]
@@ -1115,8 +1097,10 @@ fn zip_source_copy_rejects_growth_and_truncation_during_read() {
         let inspected = std::fs::symlink_metadata(&path).unwrap();
         let mut source = open_zip_source(&path, &inspected).unwrap();
         let mut writer = MutatingWriter {
+            // Windows cannot truncate through an append-only handle.
             source: std::fs::OpenOptions::new()
-                .append(true)
+                .append(append)
+                .write(!append)
                 .open(&path)
                 .unwrap(),
             append,
@@ -1518,7 +1502,13 @@ fn extraction_merges_into_existing_directories_without_replacing() {
     std::fs::create_dir_all(destination.join("tree/sub")).unwrap();
     std::fs::write(destination.join("tree/sub/existing.txt"), "keep").unwrap();
     let extracted = extract_archive(&archive, &destination).unwrap();
-    assert!(extracted.contains(&destination.canonicalize().unwrap().join("tree/sub/new.txt")));
+    assert!(
+        extracted.contains(
+            &dunce::canonicalize(&destination)
+                .unwrap()
+                .join("tree/sub/new.txt")
+        )
+    );
     assert_eq!(
         std::fs::read_to_string(destination.join("tree/sub/existing.txt")).unwrap(),
         "keep"
@@ -1657,22 +1647,4 @@ fn test_symlink_in_tar_archive() {
     let extract_dir = temp_dir.path().join("extracted");
     let result = extract_archive(&archive_path, &extract_dir);
     assert!(result.is_ok(), "extract failed: {:?}", result.err());
-}
-
-#[test]
-fn test_symlink_validation_paths() {
-    let safe_target = Path::new("subdir/file.txt");
-    let has_parent = safe_target
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    assert!(!has_parent);
-
-    let escape_target = Path::new("../../../etc/passwd");
-    let has_parent2 = escape_target
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    assert!(has_parent2);
-
-    let absolute_target = Path::new("/etc/passwd");
-    assert!(absolute_target.is_absolute());
 }

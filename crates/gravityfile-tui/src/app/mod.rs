@@ -1129,7 +1129,7 @@ mod tests {
             let fixture_started = Instant::now();
             let root = sample_dir_on_disk();
             let mut app = App::with_config(
-                root.path().canonicalize().unwrap(),
+                dunce::canonicalize(root.path()).unwrap(),
                 crate::TuiConfig::default(),
             );
             Arc::make_mut(app.tree.as_mut().unwrap()).root = directory(
@@ -1497,7 +1497,7 @@ mod tests {
         let real = fixture.path().join("real");
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("needle.txt"), "contents").unwrap();
-        let canonical = real.canonicalize().unwrap();
+        let canonical = dunce::canonicalize(&real).unwrap();
         let mut inputs = vec![real.clone(), real.join("."), real.join("../real")];
         #[cfg(unix)]
         {
@@ -1681,7 +1681,7 @@ mod tests {
     #[test]
     fn lazy_listing_failure_preserves_tree_and_invalidates_stale_parent_cache() {
         let root = sample_dir_on_disk();
-        let path = root.path().canonicalize().unwrap();
+        let path = dunce::canonicalize(root.path()).unwrap();
         let mut app = App::with_config(path.clone(), crate::TuiConfig::default());
         let original = Arc::clone(app.tree.as_ref().unwrap());
         app.lazy_load_directory(&path.join("missing"));
@@ -1873,7 +1873,7 @@ mod tests {
         // The scanner stores a canonical root, and on macOS a `TempDir` lives
         // under a `/var` symlink — without this the view root never matches a
         // node and the explorer silently renders nothing.
-        let root = dir.path().canonicalize().expect("canonicalize temp dir");
+        let root = dunce::canonicalize(dir.path()).expect("canonicalize temp dir");
 
         // Tests must never move fixtures into the user's real Trash.
         let mut app = App::with_config(
@@ -2112,7 +2112,7 @@ mod tests {
             std::fs::write(&source, b"contents").unwrap();
             let root = temporary.path().join("view");
             std::fs::create_dir(&root).unwrap();
-            let root = root.canonicalize().unwrap();
+            let root = dunce::canonicalize(&root).unwrap();
             let archive = root.join("archive.zip");
             gravityfile_ops::create_archive(
                 &[source],
@@ -3220,7 +3220,7 @@ mod tests {
     async fn explorer_frame_benchmark() {
         use gravityfile_core::{FileNode, FileTree, ScanConfig, Timestamps, TreeStats};
         let directory = tempfile::tempdir().unwrap();
-        let root_path = directory.path().canonicalize().unwrap();
+        let root_path = dunce::canonicalize(directory.path()).unwrap();
         let time = Timestamps::with_modified(std::time::UNIX_EPOCH);
         let mut root = FileNode::new_directory("root", time);
         root.set_file_name(root_path.file_name().unwrap());

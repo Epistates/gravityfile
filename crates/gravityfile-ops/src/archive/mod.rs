@@ -213,9 +213,8 @@ pub fn extract_archive_with(
     }
     let parent = crate::fs::parent_or_current(destination);
     fs::create_dir_all(parent)?;
-    let destination = parent
-        .canonicalize()?
-        .join(destination.file_name().ok_or_else(|| {
+    let destination =
+        dunce::canonicalize(parent)?.join(destination.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "extraction destination has no file name",
@@ -225,7 +224,7 @@ pub fn extract_archive_with(
     let staging = staging_dir(&destination, ".gravityfile-extract-")?;
     let payload = staging.path().join("payload");
     fs::create_dir(&payload)?;
-    let payload = payload.canonicalize()?;
+    let payload = dunce::canonicalize(&payload)?;
 
     let decoded = extract::decode(format, input, &payload, limits, cancel)
         .and_then(|entries| reject_escaping_links(&payload, cancel).map(|()| entries));

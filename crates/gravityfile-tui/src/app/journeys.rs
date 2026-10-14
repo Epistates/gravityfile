@@ -298,7 +298,8 @@ async fn search_facets_narrow_by_size_type_and_extension() {
     );
     // Facets combine with search text.
     assert_eq!(search("copy ext:bin size>1mb").await, Vec::<String>::new());
-    assert_eq!(search("ext:rs").await, ["src/modified.rs"]);
+    let modified = format!("src{}modified.rs", std::path::MAIN_SEPARATOR);
+    assert_eq!(search("ext:rs").await, [modified]);
     // A malformed facet is just text, which here matches nothing.
     assert!(search("size>lots").await.is_empty());
 }
@@ -630,13 +631,18 @@ async fn an_invalid_name_keeps_the_prompt_open_with_the_reason() {
         "{}",
         harness.screen()
     );
-    // Fixing the name in the same prompt creates the file.
+    // Fixing the name in the same prompt creates the file. A backslash is an
+    // ordinary character on Unix and a separator on Windows.
+    let fixed = if cfg!(windows) {
+        "fixed"
+    } else {
+        "back\\slash"
+    };
     harness.press("<bs><bs><bs>").await;
-    harness.type_text("back\\slash").await;
+    harness.type_text(fixed).await;
     harness.press("<enter>").await;
     assert_eq!(harness.app.mode, AppMode::Normal);
-    #[cfg(unix)]
-    assert!(harness.path("back\\slash").is_file());
+    assert!(harness.path(fixed).is_file());
 }
 
 #[tokio::test]
