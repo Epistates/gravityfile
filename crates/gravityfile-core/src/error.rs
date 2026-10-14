@@ -195,7 +195,13 @@ mod tests {
         ] {
             let error = ScanError::io(&path, std::io::Error::new(kind, "bad\n\u{1b}source"));
             let displayed = error.to_string();
-            assert!(displayed.contains(r"line\n\u{1b}\\n"));
+            // On Windows the backslash is a separator and is not escaped.
+            let expected = if cfg!(windows) {
+                r"line\n\u{1b}\n"
+            } else {
+                r"line\n\u{1b}\\n"
+            };
+            assert!(displayed.contains(expected), "{displayed}");
             assert!(displayed.contains(r"bad\n\u{1b}source"));
             assert!(!displayed.contains(['\n', '\u{1b}']));
             assert_eq!(
