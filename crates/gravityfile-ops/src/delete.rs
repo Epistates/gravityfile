@@ -127,6 +127,7 @@ mod tests {
         std::fs::write(tree.join("inner/file"), "x").unwrap();
         let target = dir.path().join("target");
         std::fs::write(&target, "keep").unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut items = vec![(tree.clone(), 1), (dir.path().join("missing"), 0)];
         #[cfg(unix)]
         {

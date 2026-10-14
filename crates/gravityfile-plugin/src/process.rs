@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,7 +27,7 @@ use protocol::{
     Failure, Reply, Request, Response, WorkerLog, decode, decode_reply, encode, read_frame,
     write_frame,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use protocol::{MAX_LOG_BYTES, WireValue};
 
 const STARTUP_TIMEOUT_MS: u64 = 10_000;
@@ -793,7 +793,8 @@ fn execute_request(
     }
 }
 
-#[cfg(test)]
+// The workers these tests drive are shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

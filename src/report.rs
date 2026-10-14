@@ -274,6 +274,7 @@ fn publish_atomic_with_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use color_eyre::eyre::eyre;
 
     #[test]

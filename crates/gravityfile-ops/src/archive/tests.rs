@@ -31,6 +31,7 @@ fn extract_zip(
     )
 }
 
+#[cfg(unix)]
 fn extract_tar(
     file: File,
     destination: &Path,

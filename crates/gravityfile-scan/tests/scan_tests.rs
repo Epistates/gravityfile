@@ -2,7 +2,9 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 
-use gravityfile_core::{NodeKind, ScanConfig, WarningKind};
+use gravityfile_core::ScanConfig;
+#[cfg(unix)]
+use gravityfile_core::{NodeKind, WarningKind};
 use gravityfile_scan::{JwalkScanner, quick_list};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

@@ -825,6 +825,8 @@ fn create_test_tree_with_files(
         let metadata = fs::metadata(path).unwrap();
         let size = metadata.len();
 
+        // Only Unix records the inode below.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut node = FileNode::new_file(
             &file_name,
             size,
@@ -905,6 +907,8 @@ fn create_test_tree_with_nested_files(
         }
 
         // Add the file
+        // Only Unix records the inode below.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut node = FileNode::new_file(
             name.to_string(),
             size,
