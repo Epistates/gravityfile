@@ -173,11 +173,11 @@ pub fn parse_age(input: &str) -> Result<Duration, String> {
     let value: f64 = number
         .parse()
         .map_err(|_| format!("{input:?} is not an age: expected a number such as 30d"))?;
-    let total = value * seconds as f64;
-    if !total.is_finite() || total < 0.0 || total > Duration::MAX.as_secs_f64() {
-        return Err(format!("{input:?} is out of range"));
-    }
-    Ok(Duration::from_secs_f64(total))
+    // `try_from_secs_f64` rejects negatives, NaN, infinity and values past
+    // `Duration::MAX` exactly; comparing with `Duration::MAX.as_secs_f64()`
+    // let 2^64 seconds through, because that bound rounds up to it.
+    Duration::try_from_secs_f64(value * seconds as f64)
+        .map_err(|_| format!("{input:?} is out of range"))
 }
 
 #[cfg(test)]
@@ -235,7 +235,9 @@ mod tests {
         assert_eq!(parse_age("90min"), Ok(Duration::from_secs(90 * MINUTE)));
         assert_eq!(parse_age("1.5h"), Ok(Duration::from_secs(90 * MINUTE)));
         assert!(parse_age("6m").unwrap_err().contains("ambiguous"));
-        for invalid in ["", "30", "soon", "-1d", "1e400y"] {
+        // 18446744073709551616s is 2^64 seconds, just past `Duration::MAX`;
+        // found by fuzzing, it panicked.
+        for invalid in ["", "30", "soon", "-1d", "1e400y", "18446744073709551616s"] {
             assert!(parse_age(invalid).is_err(), "{invalid}");
         }
     }
