@@ -6,7 +6,7 @@
 //! partial output behind.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -31,6 +31,28 @@ const MAX_TAR_ENTRY_METADATA_READ_BYTES: u64 = 1024 * 1024;
 const MAX_XZ_DECODER_MEMORY: u64 = 256 * 1024 * 1024;
 /// ZIP symlink targets are stored as entry content; cap what is read.
 const MAX_SYMLINK_TARGET_BYTES: u64 = 8 * 1024;
+
+/// Open a ZIP archive without reading all of it.
+///
+/// To find an archive that does not start its file, such as a
+/// self-extracting executable, zip scans everything before the central
+/// directory: the whole archive. An archive that starts with a ZIP header,
+/// as nearly all do, is opened at offset 0 instead, which reads only the
+/// central directory. Anything else still gets the scan.
+pub fn open_zip<R: Read + Seek>(mut reader: R) -> zip::result::ZipResult<zip::ZipArchive<R>> {
+    use zip::read::{ArchiveOffset, Config};
+    let mut signature = [0; 4];
+    let at_start = reader.read_exact(&mut signature).is_ok()
+        // A local file header, or the end record of an empty archive.
+        && matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06");
+    reader.seek(SeekFrom::Start(0))?;
+    let archive_offset = if at_start {
+        ArchiveOffset::Known(0)
+    } else {
+        ArchiveOffset::Detect
+    };
+    zip::ZipArchive::with_config(Config { archive_offset }, reader)
+}
 
 /// Resource limits that reject decompression bombs.
 #[derive(Debug, Clone, Copy, PartialEq)]

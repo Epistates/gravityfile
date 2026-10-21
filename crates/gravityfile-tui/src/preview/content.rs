@@ -480,7 +480,7 @@ impl PreviewLoader {
     }
 
     fn inspect_zip(reader: impl Read + Seek) -> Result<PreviewContent, PreviewError> {
-        let mut archive = zip::ZipArchive::new(reader)
+        let mut archive = gravityfile_ops::archive::open_zip(reader)
             .map_err(|e| PreviewError::IoError(format!("Invalid ZIP: {}", e)))?;
 
         let entry_count = archive.len();
@@ -501,8 +501,13 @@ impl PreviewLoader {
                 .checked_add(size)
                 .ok_or_else(|| PreviewError::IoError("Archive size total overflows u64".into()))?;
             if entries.len() < MAX_PREVIEW_LINES {
+                // A name in an encoding zip cannot decode is still listed.
+                let path = entry.name().map_or_else(
+                    |_| String::from_utf8_lossy(entry.name_raw()).into_owned(),
+                    std::borrow::Cow::into_owned,
+                );
                 entries.push(ArchiveEntry {
-                    path: entry.name().to_string(),
+                    path,
                     size,
                     is_dir: entry.is_dir(),
                     is_symlink: entry

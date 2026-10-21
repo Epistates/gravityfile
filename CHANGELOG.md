@@ -24,6 +24,11 @@ plugins are Lua only, and settings moved on macOS.
   larger one, and cannot read special files such as FIFOs, which could block.
 - An archive cannot be created inside the directory being archived, and an
   interrupted archive leaves nothing behind.
+- `zip` is updated to 9.0, past RUSTSEC-2026-0367, -0368 and -0369. Those
+  affect zip's own extraction helpers, which grav never used: its
+  extraction already drops setuid and setgid bits and keeps symlinks inside
+  the destination. Opening a ZIP still reads only its directory, not the
+  whole archive, which zip 9 would otherwise scan.
 - Dependencies are updated past the vulnerable `crossbeam-epoch` 0.9.18 and
   the unsound `git2` 0.20 line; BLAKE3's unused memory-mapping feature, and
   with it `memmap2`, is gone.

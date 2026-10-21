@@ -143,6 +143,48 @@ fn oversized_compressed_tar_metadata_never_publishes_destination() {
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
+/// zip 9 finds an archive by scanning everything before its central
+/// directory; open_zip must not read the payload to list a normal archive.
+#[test]
+fn opening_a_zip_reads_its_directory_not_its_contents() {
+    struct Counting<R> {
+        inner: R,
+        read: u64,
+    }
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            self.read += read as u64;
+            Ok(read)
+        }
+    }
+    impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("big", options).unwrap();
+    writer.write_all(&vec![b'x'; 4 * 1024 * 1024]).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+
+    let mut counting = Counting {
+        inner: std::io::Cursor::new(&bytes),
+        read: 0,
+    };
+    assert_eq!(open_zip(&mut counting).unwrap().len(), 1);
+    assert!(counting.read < 64 * 1024, "read {} bytes", counting.read);
+
+    // Data before the archive, as in a self-extracting executable, is
+    // still found by zip's scan.
+    let mut prefixed = b"MZ not a zip header".to_vec();
+    prefixed.extend_from_slice(&bytes);
+    let mut archive = open_zip(std::io::Cursor::new(prefixed)).unwrap();
+    assert_eq!(archive.by_index(0).unwrap().size(), 4 * 1024 * 1024);
+}
+
 #[test]
 fn zip_metadata_budget_rejects_before_materialization_but_not_payload_reads() {
     let directory = tempfile::tempdir().unwrap();

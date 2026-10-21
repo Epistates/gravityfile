@@ -129,7 +129,7 @@ pub(super) fn extract_zip_with_metadata_budget(
     cancel: &CancellationToken,
 ) -> ArchiveResult<Vec<PathBuf>> {
     let budget = parser_budget::MetadataBudget::new(metadata_read_bytes);
-    let parsed = zip::ZipArchive::new(budget.wrap(ArchiveInput::new(file, cancel)));
+    let parsed = super::open_zip(budget.wrap(ArchiveInput::new(file, cancel)));
     // The parser may retry and report an earlier error; keep the budget diagnosis.
     if budget.exhausted() {
         return Err(ArchiveError::DecompressionBomb(format!(
@@ -154,7 +154,7 @@ pub(super) fn extract_zip_with_metadata_budget(
             entry.compressed_size(),
             entry.size(),
             declared_total,
-            entry.name(),
+            &entry.name()?,
             limits,
         )?;
     }
