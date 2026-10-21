@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "compact_str",
  "derive_builder",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-scan"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dunce",
  "git2",

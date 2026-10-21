@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-13
+## [0.4.1] - 2026-10-20
+
+The release binaries for 0.4.0, which were never published because the
+static Linux build failed. What changed in 0.4.0, a rewrite of the scanner,
+explorer and command line, is in the
+[0.4.0 notes](https://github.com/epistates/gravityfile/blob/main/CHANGELOG.md#040---2026-10-20).
+
+### Fixed
+
+- The static (musl) Linux build links. The no-overwrite rename now makes the
+  `renameat2` system call itself, since musl has no wrapper for it, and CI
+  builds and tests for musl.
+
+## [0.4.0] - 2026-10-20
 
 A rewrite of the scanner, the explorer's internals and the command line,
 with release binaries for macOS, Linux and Windows. It is the first release
@@ -469,7 +482,8 @@ that release.
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
-[Unreleased]: https://github.com/epistates/gravityfile/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/epistates/gravityfile/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/epistates/gravityfile/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/epistates/gravityfile/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
 [0.2.6]: https://github.com/epistates/gravityfile/releases/tag/v0.2.6

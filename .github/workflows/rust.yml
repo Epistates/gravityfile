@@ -76,6 +76,26 @@ jobs:
           cargo build --bins --locked
           python3 scripts/terminal-smoke.py target/debug/grav
 
+  musl:
+    name: Static Linux build (musl)
+    # The image dist builds the static release binary on.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: musl
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      # Linking is what differs: musl lacks some glibc wrappers.
+      - run: cargo build --locked --target x86_64-unknown-linux-musl --bin grav
+      - run: target/x86_64-unknown-linux-musl/debug/grav scan --top 3 .
+      - run: cargo test --locked --target x86_64-unknown-linux-musl -p gravityfile-ops
+
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
