@@ -52,6 +52,14 @@ coverage:
 semver:
     cargo semver-checks --workspace --exclude gravityfile
 
+# Package and build every crate as crates.io will see it.
+#
+# To release: set the workspace version, rename `[Unreleased]` in
+# CHANGELOG.md, merge to main, `cargo publish --workspace` from main, then
+# push the tag `vX.Y.Z`, which builds the binaries and the GitHub release.
+publish-check:
+    cargo publish --workspace --dry-run --locked
+
 # Unix PTY smoke test of terminal setup and restoration
 smoke: release
     python3 scripts/terminal-smoke.py target/release/grav
