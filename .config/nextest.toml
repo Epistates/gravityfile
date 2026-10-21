@@ -1,0 +1,5 @@
+[profile.default]
+# A test's output handles can close a little after it returns on a loaded
+# machine; the 100 ms default reported pure tests as leaky. A real leak, a
+# child process still holding them, outlasts this too.
+leak-timeout = "500ms"

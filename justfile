@@ -1,191 +1,72 @@
-# justfile for gravityfile - File system analyzer with TUI
+set shell := ["bash", "-euo", "pipefail", "-c"]
 
-set shell := ["bash", "-uc"]
+msrv := `sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1`
 
-# Default recipe - show available commands
 default:
     @just --list
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Development
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Build the project in debug mode
-build:
-    cargo build
-
-# Build the project in release mode with optimizations
-release:
-    cargo build --release
-
-# Run the TUI with a path (default: current directory)
+# Run the explorer on PATH
 run PATH=".":
-    cargo run -- {{PATH}}
+    cargo run --bin grav -- {{PATH}}
 
-# Run the release build
-run-release PATH=".":
-    ./target/release/gravityfile {{PATH}}
+build:
+    cargo build --locked
 
-# Run all tests
+release:
+    cargo build --release --locked
+
 test:
-    cargo test --workspace
+    cargo nextest run --workspace --all-features --locked
+    cargo test --workspace --all-features --locked --doc
 
-# Run tests with output shown
-test-verbose:
-    cargo test --workspace -- --nocapture
-
-# Check code without building
-check:
-    cargo check --workspace
-
-# Run clippy for linting
-lint:
-    cargo clippy --workspace -- -D warnings
-
-# Format code with rustfmt
 fmt:
     cargo fmt --all
 
-# Check if code is formatted
-fmt-check:
+lint:
     cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
 
-# Clean build artifacts
-clean:
-    cargo clean
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Installation
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Install the binaries to ~/.cargo/bin
-install:
-    @echo "Installing gravityfile..."
-    cargo install --path . --force
-    @echo "✅ Installation complete! Run 'gravityfile --help' or 'grav --help' to get started."
-
-# Uninstall the binaries
-uninstall:
-    cargo uninstall gravityfile
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CI/CD
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Full CI check: format, lint, test, build
-ci: fmt-check lint test release
-    @echo "✅ All CI checks passed!"
-
-# Package all workspace crates (dry-run)
-package:
-    cargo package --workspace --allow-dirty
-
-# Publish all crates to crates.io (in dependency order)
-# Requires: cargo install cargo-workspaces
-publish:
-    cargo workspaces publish --publish-as-is --no-remove-dev-deps --allow-dirty --publish-interval 30
-
-# Dry-run publish (verify all crates without uploading)
-# Requires: cargo install cargo-workspaces
-publish-dry-run:
-    cargo workspaces publish --dry-run --publish-as-is --no-remove-dev-deps --allow-dirty
-
-# List files that would be included in each crate's package
-publish-list:
-    @echo "Files to be published in each crate:"
-    @for crate in gravityfile-core gravityfile-scan gravityfile-analyze gravityfile-ops gravityfile-plugin gravityfile-tui gravityfile; do \
-        echo "\n=== $crate ===" && cargo package -p $crate --list 2>/dev/null || echo "(requires deps published first)"; \
-    done
-
-# Install cargo-workspaces for publishing
-install-cargo-workspaces:
-    cargo install cargo-workspaces
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Release Management
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Show current version
-version:
-    @grep '^version' Cargo.toml | head -1 | cut -d'"' -f2
-
-# Tag and push a release (usage: just tag v0.2.0)
-tag VERSION:
-    @echo "Creating tag {{VERSION}}..."
-    git tag {{VERSION}}
-    git push origin {{VERSION}}
-    @echo "✅ Tag {{VERSION}} pushed! GitHub Actions will build the release."
-
-# Create a release commit and tag
-release-tag VERSION MESSAGE="Release":
-    git add -A
-    git commit -m "{{MESSAGE}} {{VERSION}}"
-    git tag {{VERSION}}
-    git push origin main --tags
-    @echo "✅ Released {{VERSION}}!"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cross-compilation
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Build for all supported targets (requires cross)
-build-all:
-    @echo "Building for all targets..."
-    cargo build --release --target x86_64-unknown-linux-gnu
-    cargo build --release --target x86_64-apple-darwin
-    cargo build --release --target aarch64-apple-darwin
-    @echo "Note: Use 'cross' for aarch64-unknown-linux-gnu and Windows targets"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Documentation & Info
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Update dependencies
-update:
-    cargo update
-
-# Show outdated dependencies (requires cargo-outdated)
-outdated:
-    cargo outdated -R
-
-# Watch and rebuild on file changes (requires cargo-watch)
-watch:
-    cargo watch -x check -x 'test --workspace'
-
-# Generate and open documentation
 doc:
-    cargo doc --workspace --open
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 
-# Show project statistics
-stats:
-    @echo "Lines of Rust code:"
-    @find crates src -name "*.rs" -exec wc -l {} + | tail -1
-    @echo "\nWorkspace crates:"
-    @cargo metadata --format-version 1 | jq -r '.workspace_members[]' | cut -d' ' -f1
-    @echo "\nDirect dependencies:"
-    @cargo tree --workspace --depth 1
+msrv:
+    cargo +{{msrv}} check --workspace --all-targets --all-features --locked
 
-# Create a release build and show binary size
-release-info: release
-    @echo "Release binaries:"
-    @ls -lh target/release/gravityfile target/release/grav 2>/dev/null | awk '{print $5, $9}'
+# Review CLI output snapshots after an intended change
+snapshots:
+    cargo insta test --test snapshots --review
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI Commands Demo
-# ─────────────────────────────────────────────────────────────────────────────
+# Fuzz TARGET (snapshot or units) for SECONDS; needs nightly and cargo-fuzz
+fuzz TARGET="snapshot" SECONDS="60":
+    mkdir -p fuzz/corpus/{{TARGET}} fuzz/seeds/{{TARGET}}
+    cd fuzz && cargo +nightly fuzz run {{TARGET}} corpus/{{TARGET}} seeds/{{TARGET}} -- -max_total_time={{SECONDS}}
 
-# Run disk usage scan on a path
-scan PATH=".":
-    cargo run -- scan {{PATH}}
+supply-chain:
+    cargo deny check
+    cargo machete
 
-# Find duplicate files
-duplicates PATH=".":
-    cargo run -- duplicates {{PATH}}
+coverage:
+    cargo llvm-cov nextest --workspace --all-features --html
 
-# Analyze file ages
-age PATH=".":
-    cargo run -- age {{PATH}}
+semver:
+    cargo semver-checks --workspace --exclude gravityfile
 
-# Export scan to JSON
-export PATH="." OUTPUT="scan.json":
-    cargo run -- export {{PATH}} -o {{OUTPUT}}
+# Package and build every crate as crates.io will see it.
+#
+# To release: set the workspace version, rename `[Unreleased]` in
+# CHANGELOG.md, merge to main, `cargo publish --workspace` from main, then
+# push the tag `vX.Y.Z`, which builds the binaries and the GitHub release.
+publish-check:
+    cargo publish --workspace --dry-run --locked
+
+# Unix PTY smoke test of terminal setup and restoration
+smoke: release
+    python3 scripts/terminal-smoke.py target/release/grav
+
+# Everything CI runs, locally
+ci: lint test doc msrv supply-chain smoke
+
+# Check ncdu dump compatibility against ncdu itself (needs ncdu and jq)
+ncdu-interop: build
+    scripts/ncdu-interop.sh target/debug/grav

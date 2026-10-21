@@ -1,0 +1,35 @@
+{
+  "root": {
+    "id": 1,
+    "name": "data",
+    "kind": {"Directory": {"file_count": 1, "dir_count": 0}},
+    "size": 9007199254740993,
+    "blocks": 8,
+    "timestamps": {"modified": {"secs_since_epoch": 1700000000, "nanos_since_epoch": 123456789}},
+    "children": [{
+      "id": 2,
+      "name": "a\n.txt",
+      "kind": {"File": {"executable": false}},
+      "size": 9007199254740993,
+      "blocks": 8,
+      "timestamps": {"modified": {"secs_since_epoch": 1700000000, "nanos_since_epoch": 123456789}},
+      "inode": {"inode": 9007199254740995, "device": 7},
+      "children": []
+    }]
+  },
+  "root_path": "data",
+  "scanned_at": {"secs_since_epoch": 1700000001, "nanos_since_epoch": 987654321},
+  "scan_duration": {"secs": 1, "nanos": 42},
+  "config": {"root": "data"},
+  "stats": {
+    "total_size": 9007199254740993,
+    "total_files": 1,
+    "total_dirs": 1,
+    "total_symlinks": 0,
+    "max_depth": 1,
+    "largest_file": ["data/a\n.txt", 9007199254740993],
+    "oldest_file": ["data/a\n.txt", {"secs_since_epoch": 1700000000, "nanos_since_epoch": 123456789}],
+    "newest_file": ["data/a\n.txt", {"secs_since_epoch": 1700000000, "nanos_since_epoch": 123456789}]
+  },
+  "warnings": [{"path": "data/private", "kind": "PermissionDenied", "message": "fixture access denied"}]
+}

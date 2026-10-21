@@ -1,0 +1,67 @@
+---
+source: tests/snapshots.rs
+description: grav diff --help
+expression: run(args)
+---
+exit: 0
+--- stdout
+Show what grew, shrank, appeared or went between two scans
+
+Usage: grav diff [OPTIONS] <OLD> [NEW]
+
+Arguments:
+  <OLD>
+          The earlier side: a snapshot, or a directory scanned now
+
+  [NEW]
+          The later side: a snapshot or directory [default: OLD's directory, scanned now]
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Scanning:
+  -A, --apparent-size
+          Count file lengths instead of disk usage
+
+  -l, --count-links
+          Count every hard link to a file, not only the first
+
+Output:
+  -d, --depth <N>
+          Levels of directories to show below the root
+          
+          [default: 2]
+
+  -n, --limit <N>
+          Changes to show per directory, largest first (0 shows all)
+          
+          [default: 10]
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text
+          - json: Versioned JSON (see `schema_version`)
+          
+          [default: text]
+
+      --strict
+          Exit with status 3 if anything could not be read or analyzed
+
+Global options:
+      --color <WHEN>
+          When to use colour
+          
+          [default: auto]
+          [possible values: auto, always, never]
+
+      --binary
+          Show sizes in powers of 1024 (KiB, MiB) instead of 1000 (kB, MB)
+
+      --log-file <FILE>
+          Append diagnostic logs to FILE (filter with RUST_LOG)
+          
+          [env: GRAVITYFILE_LOG_FILE]
+--- stderr

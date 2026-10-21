@@ -2,6 +2,7 @@
 name = "gravityfile-tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Terminal user interface for gravityfile"
@@ -13,17 +14,15 @@ gravityfile-analyze.workspace = true
 gravityfile-ops.workspace = true
 gravityfile-plugin.workspace = true
 ratatui.workspace = true
-crossterm = { workspace = true, features = ["event-stream"] }
+crossterm.workspace = true
 color-eyre.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }
-humansize.workspace = true
 chrono.workspace = true
 strum.workspace = true
-itertools.workspace = true
-futures = "0.3"
 tracing.workspace = true
 unicode-width = "0.2"
+unicode-segmentation = "1"
 which = "8"
 
 # Fuzzy search
@@ -33,11 +32,16 @@ regex = "1"
 # File preview / syntax highlighting
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
+# Terminal image previews (sixel / kitty / iTerm2, with a halfblocks fallback)
+# Keep image/default codecs disabled; enable only the formats we preview below.
+# Dependency changes must continue to pass the Rust 1.90 and supply-chain gates.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp", "qoi", "pnm", "tga"] }
+
 # Path utilities
-dirs = "6"
 
 # Settings persistence
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 toml = "1"
 
 # File opening in editors
@@ -45,13 +49,6 @@ opensesame = { version = "0.1", features = ["serde"] }
 
 # System open command (for non-editor files)
 open = "5"
-
-# PTY buffer flush on quit (unix only)
-[target.'cfg(unix)'.dependencies]
-libc = "1.0.0-alpha.3"
-
-# Safe deletion (move to trash instead of permanent delete)
-trash.workspace = true
 
 # Archive support for preview
 zip.workspace = true
@@ -61,5 +58,9 @@ xz2.workspace = true
 bzip2.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
 tempfile.workspace = true
+dunce.workspace = true
+
+# PTY buffer flush on quit (unix only)
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

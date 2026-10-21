@@ -2,6 +2,7 @@
 name = "gravityfile-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core types and traits for gravityfile"
@@ -11,4 +12,9 @@ serde.workspace = true
 thiserror.workspace = true
 compact_str.workspace = true
 derive_builder.workspace = true
-globset = "0.4"
+globset.workspace = true
+etcetera.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

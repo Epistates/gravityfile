@@ -1,0 +1,9 @@
+---
+source: tests/snapshots.rs
+description: grav --scan before.json
+expression: run(args)
+---
+exit: 1
+--- stdout
+--- stderr
+error: --scan cannot be used with a snapshot, which was already scanned

@@ -80,3 +80,22 @@ pub(super) fn value_to_lua(lua: &Lua, val: &Value) -> mlua::Result<LuaValue> {
         Value::Bytes(b) => Ok(LuaValue::String(lua.create_string(b)?)),
     }
 }
+
+/// The hook context as a Lua table: `cwd`, `view_root` and `theme`, and every
+/// value the host added, such as `selected_node`.
+pub(super) fn context_to_lua(lua: &Lua, context: &crate::HookContext) -> mlua::Result<mlua::Table> {
+    let table = lua.create_table()?;
+    for (key, value) in &context.data {
+        table.set(key.as_str(), value_to_lua(lua, value)?)?;
+    }
+    let paths = [("cwd", &context.cwd), ("view_root", &context.view_root)];
+    for (key, path) in paths {
+        if let Some(path) = path {
+            table.set(key, path.to_string_lossy().as_ref())?;
+        }
+    }
+    if let Some(theme) = &context.theme {
+        table.set("theme", theme.as_str())?;
+    }
+    Ok(table)
+}

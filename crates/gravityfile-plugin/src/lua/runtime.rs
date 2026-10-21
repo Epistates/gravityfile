@@ -6,13 +6,13 @@ use std::path::Path;
 use mlua::{Function, Lua, MultiValue, Table, Value as LuaValue};
 
 use crate::config::{PluginConfig, PluginMetadata};
-use crate::hooks::{Hook, HookContext, HookResult};
+use crate::hooks::{Hook, HookContext, HookResult, Notice, NoticeLevel};
 use crate::runtime::{BoxFuture, HOOK_NAMES, IsolatedContext, PluginHandle, PluginRuntime};
 use crate::sandbox::SandboxConfig;
 use crate::types::{PluginError, PluginResult, Value};
 
 use super::bindings;
-use super::convert::{lua_to_value, value_to_lua};
+use super::convert::{context_to_lua, lua_to_value, value_to_lua};
 use super::isolate::LuaIsolatedContext;
 
 /// A loaded Lua plugin.
@@ -46,6 +46,9 @@ pub struct LuaRuntime {
 
     /// Sandbox configuration used to gate filesystem API access.
     sandbox: SandboxConfig,
+
+    /// Notices raised with `gf.notify` during the current hook call.
+    notices: std::sync::Arc<std::sync::Mutex<Vec<Notice>>>,
 
     /// Whether the runtime has been initialized.
     initialized: bool,
@@ -118,6 +121,7 @@ impl LuaRuntime {
             next_handle: 0,
             config: None,
             sandbox: SandboxConfig::default(),
+            notices: Default::default(),
             initialized: false,
         })
     }
@@ -179,12 +183,17 @@ impl LuaRuntime {
             })?;
         gf.set("log_error", log_error).ok();
 
-        // Add notify function
+        // gf.notify(message, level): shown by the explorer once the hook
+        // returns. Bounded per call so a plugin cannot flood the screen.
+        let notices = std::sync::Arc::clone(&self.notices);
         let notify = self
             .lua
-            .create_function(|_, (msg, level): (String, Option<String>)| {
-                let level = level.unwrap_or_else(|| "info".to_string());
-                tracing::info!(target: "plugin_notify", level = level, "{}", msg);
+            .create_function(move |_, (message, level): (String, Option<String>)| {
+                let level = NoticeLevel::parse(level.as_deref().unwrap_or("info"));
+                let mut notices = notices.lock().unwrap_or_else(|poison| poison.into_inner());
+                if notices.len() < Notice::MAX_PER_CALL {
+                    notices.push(Notice::new(level, &message));
+                }
                 Ok(())
             })
             .map_err(|e| PluginError::LoadError {
@@ -201,13 +210,6 @@ impl LuaRuntime {
         // Create the 'fs' namespace (filesystem API), gated by the runtime sandbox.
         let fs = bindings::create_fs_api(&self.lua, Some(self.sandbox.clone()))?;
         globals.set("fs", fs).map_err(|e| PluginError::LoadError {
-            name: "lua".into(),
-            message: e.to_string(),
-        })?;
-
-        // Create the 'ui' namespace (UI elements)
-        let ui = bindings::create_ui_api(&self.lua)?;
-        globals.set("ui", ui).map_err(|e| PluginError::LoadError {
             name: "lua".into(),
             message: e.to_string(),
         })?;
@@ -275,7 +277,9 @@ impl LuaRuntime {
             return f();
         }
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(timeout_ms)) else {
+            return f();
+        };
         let _ = self.lua.set_hook(
             mlua::HookTriggers::new().every_nth_instruction(100_000),
             move |_lua, _debug| {
@@ -311,7 +315,7 @@ impl PluginRuntime for LuaRuntime {
         // the filesystem API actually usable (and scoped).
         self.sandbox = SandboxConfig {
             timeout_ms: config.default_timeout_ms,
-            max_memory: config.max_memory_mb * 1024 * 1024,
+            max_memory: config.max_memory_mb.saturating_mul(1024 * 1024),
             allow_network: config.allow_network,
             allowed_read_paths: config.fs_read_roots.clone(),
             ..SandboxConfig::default()
@@ -332,7 +336,7 @@ impl PluginRuntime for LuaRuntime {
 
     fn load_plugin(&mut self, id: &str, source: &Path) -> PluginResult<PluginHandle> {
         // Read the plugin source
-        let code = std::fs::read_to_string(source)?;
+        let code = crate::runtime::read_plugin_source(source)?;
 
         // Load and execute the plugin
         let chunk = self.lua.load(&code).set_name(id);
@@ -405,8 +409,17 @@ impl PluginRuntime for LuaRuntime {
         &self,
         handle: PluginHandle,
         hook: &Hook,
-        _ctx: &HookContext,
+        ctx: &HookContext,
     ) -> PluginResult<HookResult> {
+        let take_notices = || {
+            std::mem::take(
+                &mut *self
+                    .notices
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            )
+        };
+        take_notices();
         let plugin = self
             .plugins
             .get(&handle)
@@ -436,9 +449,15 @@ impl PluginRuntime for LuaRuntime {
                     message: e.to_string(),
                 })?;
 
+        let context_table =
+            context_to_lua(&self.lua, ctx).map_err(|e| PluginError::ExecutionError {
+                name: plugin.name.clone(),
+                message: e.to_string(),
+            })?;
+
         // Call the function under the CPU/time watchdog.
         let result: LuaValue = self.with_deadline(|| {
-            func.call((module.clone(), hook_table))
+            func.call((module.clone(), hook_table, context_table))
                 .map_err(|e| PluginError::ExecutionError {
                     name: plugin.name.clone(),
                     message: e.to_string(),
@@ -447,6 +466,7 @@ impl PluginRuntime for LuaRuntime {
 
         // Convert result
         let mut hook_result = HookResult::ok();
+        hook_result.notices = take_notices();
         if let LuaValue::Table(t) = result {
             if let Ok(prevent) = t.get::<bool>("prevent_default")
                 && prevent
@@ -472,8 +492,9 @@ impl PluginRuntime for LuaRuntime {
         hook: &'a Hook,
         ctx: &'a HookContext,
     ) -> BoxFuture<'a, PluginResult<HookResult>> {
-        // For now, just call sync version
-        // TODO: Implement true async with spawn_blocking
+        // The main Lua state is shared with synchronous render hooks, so calls
+        // remain serialized. `with_deadline` enforces the VM instruction/time
+        // budget even though this future resolves synchronously.
         Box::pin(async move { self.call_hook_sync(handle, hook, ctx) })
     }
 
@@ -554,6 +575,72 @@ mod tests {
     use crate::hooks::{Hook, HookContext};
     use std::io::Write as _;
 
+    fn load(rt: &mut LuaRuntime, source: &str) -> PluginHandle {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(source.as_bytes()).unwrap();
+        rt.load_plugin("test", file.path()).unwrap()
+    }
+
+    #[test]
+    fn notices_return_with_the_hook_result_bounded_and_per_call() {
+        let mut rt = lua_runtime(1000);
+        let handle = load(
+            &mut rt,
+            r#"
+            local M = {}
+            function M.on_startup(self, hook)
+                gf.notify("started", "warn")
+                gf.notify(string.rep("x", 2000))
+                for i = 1, 20 do gf.notify("more " .. i, "error") end
+            end
+            function M.on_shutdown(self, hook) end
+            return M
+            "#,
+        );
+        let started = rt
+            .call_hook_sync(handle, &Hook::OnStartup, &HookContext::new())
+            .unwrap();
+        assert_eq!(started.notices.len(), Notice::MAX_PER_CALL);
+        assert_eq!(
+            started.notices[0],
+            Notice::new(NoticeLevel::Warn, "started")
+        );
+        assert_eq!(started.notices[1].level, NoticeLevel::Info);
+        assert_eq!(started.notices[1].message.len(), Notice::MAX_BYTES);
+        let quiet = rt
+            .call_hook_sync(handle, &Hook::OnShutdown, &HookContext::new())
+            .unwrap();
+        assert!(quiet.notices.is_empty(), "notices do not carry over");
+    }
+
+    #[test]
+    fn hooks_receive_the_context() {
+        let mut rt = lua_runtime(1000);
+        let handle = load(
+            &mut rt,
+            r#"
+            local M = {}
+            function M.on_navigate(self, hook, ctx)
+                return { value = ctx.view_root .. "|" .. ctx.theme .. "|" .. ctx.selected .. "|" .. hook.to }
+            end
+            return M
+            "#,
+        );
+        let mut context = HookContext::new()
+            .with_view_root("/home/me".into())
+            .with_theme("nord");
+        context.set("selected", "notes.txt");
+        let hook = Hook::OnNavigate {
+            from: "/home".into(),
+            to: "/home/me".into(),
+        };
+        let result = rt.call_hook_sync(handle, &hook, &context).unwrap();
+        assert_eq!(
+            result.value,
+            Some(Value::String("/home/me|nord|notes.txt|/home/me".into()))
+        );
+    }
+
     fn lua_runtime(timeout_ms: u64) -> LuaRuntime {
         let mut rt = LuaRuntime::new().unwrap();
         let cfg = PluginConfig {
@@ -569,23 +656,19 @@ mod tests {
         let mut rt = lua_runtime(50);
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        // on_action is a sync hook; the body loops forever and must be aborted
+        // on_startup is a sync hook; the body loops forever and must be aborted
         // by the instruction-count deadline watchdog rather than hanging.
         write!(
             file,
-            "local M = {{}}\nfunction M.on_action(self, hook) while true do end end\nreturn M\n"
+            "local M = {{}}\nfunction M.on_startup(self, hook) while true do end end\nreturn M\n"
         )
         .unwrap();
 
         let handle = rt.load_plugin("loopy", file.path()).unwrap();
-        assert!(rt.has_hook(handle, "on_action"));
+        assert!(rt.has_hook(handle, "on_startup"));
 
         let start = std::time::Instant::now();
-        let res = rt.call_hook_sync(
-            handle,
-            &Hook::OnAction { action: "x".into() },
-            &HookContext::new(),
-        );
+        let res = rt.call_hook_sync(handle, &Hook::OnStartup, &HookContext::new());
 
         assert!(res.is_err(), "runaway hook should abort, got {res:?}");
         assert!(
@@ -602,17 +685,13 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(
             file,
-            "local M = {{}}\nfunction M.on_action(self, hook) return {{ handled = true }} end\nreturn M\n"
+            "local M = {{}}\nfunction M.on_startup(self, hook) return {{ handled = true }} end\nreturn M\n"
         )
         .unwrap();
 
         let handle = rt.load_plugin("calm", file.path()).unwrap();
         let res = rt
-            .call_hook_sync(
-                handle,
-                &Hook::OnAction { action: "x".into() },
-                &HookContext::new(),
-            )
+            .call_hook_sync(handle, &Hook::OnStartup, &HookContext::new())
             .unwrap();
         assert!(res.is_ok());
     }

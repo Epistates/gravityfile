@@ -14,10 +14,8 @@ use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::AnalysisStatus;
 use gravityfile_core::{FileNode, FileTree, NodeKind};
-
-/// Seconds per month, using the astronomically accurate 365.25/12 * 86400 value.
-const SECS_PER_MONTH: u64 = 2_629_800;
 
 /// An age bucket for categorizing files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,8 +37,8 @@ impl AgeBucket {
 }
 
 /// Configuration for age-based analysis.
-#[derive(Debug, Clone, Builder)]
-#[builder(setter(into))]
+#[derive(Debug, Clone, Builder, Serialize)]
+#[builder(setter(into), build_fn(validate = "Self::validate"))]
 pub struct AgeConfig {
     /// Reference time for age calculations (default: now).
     #[builder(default = "SystemTime::now()")]
@@ -68,6 +66,13 @@ pub struct AgeConfig {
 }
 
 impl AgeConfigBuilder {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(buckets) = &self.buckets {
+            validate_buckets(buckets)?;
+        }
+        Ok(())
+    }
+
     fn default_buckets() -> Vec<AgeBucket> {
         vec![
             AgeBucket::new("Today", Duration::from_secs(24 * 60 * 60)),
@@ -93,10 +98,35 @@ impl Default for AgeConfig {
 }
 
 impl AgeConfig {
+    /// Validate that every file age has exactly one unambiguous bucket.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_buckets(&self.buckets)
+    }
+
     /// Create a new config builder.
     pub fn builder() -> AgeConfigBuilder {
         AgeConfigBuilder::default()
     }
+}
+
+fn validate_buckets(buckets: &[AgeBucket]) -> Result<(), String> {
+    if buckets.is_empty() {
+        return Err("Age analysis requires at least one bucket".into());
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut boundaries = std::collections::HashSet::new();
+    for bucket in buckets {
+        if bucket.name.trim().is_empty() || !names.insert(bucket.name.as_str()) {
+            return Err("Age bucket names must be nonempty and unique".into());
+        }
+        if !boundaries.insert(bucket.max_age) {
+            return Err("Age bucket boundaries must be unique".into());
+        }
+    }
+    if !boundaries.contains(&Duration::MAX) {
+        return Err("Age buckets require a Duration::MAX catch-all bucket".into());
+    }
+    Ok(())
 }
 
 /// Statistics for an age bucket.
@@ -111,6 +141,7 @@ pub struct AgeBucketStats {
     /// Total size of files in this bucket.
     pub total_size: u64,
     /// Largest files in this bucket.
+    #[serde(with = "gravityfile_core::path_serde::triples")]
     pub largest_files: Vec<(PathBuf, u64, SystemTime)>,
 }
 
@@ -118,6 +149,7 @@ pub struct AgeBucketStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaleDirectory {
     /// Path to the directory.
+    #[serde(with = "gravityfile_core::path_serde")]
     pub path: PathBuf,
     /// Total size of the directory.
     pub size: u64,
@@ -127,9 +159,41 @@ pub struct StaleDirectory {
     pub file_count: u64,
 }
 
+/// Availability of stale-directory recommendations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleDirectoryStatus {
+    /// Legacy reports did not record whether recommendations were evaluated.
+    #[default]
+    Unknown,
+    /// Recommendations were evaluated within the observed filesystem scope.
+    Evaluated,
+    /// Scan warnings or cancellation prevent reliable recommendations.
+    SuppressedIncompleteScan,
+    /// Depth, hidden-file, or ignore filters may hide recent descendants.
+    SuppressedFilteredScan,
+}
+
+impl std::fmt::Display for StaleDirectoryStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unknown => "unknown (legacy report)",
+            Self::Evaluated => "evaluated",
+            Self::SuppressedIncompleteScan => "unavailable: incomplete scan",
+            Self::SuppressedFilteredScan => "unavailable: filtered scan",
+        })
+    }
+}
+
 /// Results from age analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgeReport {
+    /// Completeness inherited from scan warnings and cancellation.
+    #[serde(default)]
+    pub status: AnalysisStatus,
+    /// Whether stale-directory recommendations were evaluated.
+    #[serde(default)]
+    pub stale_directory_status: StaleDirectoryStatus,
     /// Statistics for each age bucket.
     pub buckets: Vec<AgeBucketStats>,
     /// Directories identified as stale.
@@ -150,9 +214,12 @@ impl AgeReport {
         !self.stale_directories.is_empty()
     }
 
-    /// Get total size of stale directories.
+    /// Get total size of stale directories, saturating at the byte counter limit.
     pub fn total_stale_size(&self) -> u64 {
-        self.stale_directories.iter().map(|d| d.size).sum()
+        self.stale_directories
+            .iter()
+            .map(|d| d.size)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Get the bucket containing most files.
@@ -182,14 +249,10 @@ impl AgeAnalyzer {
     /// Create a new analyzer with custom config.
     ///
     /// Buckets are sorted by max_age ascending so the first bucket that fits is selected.
-    pub fn with_config(mut config: AgeConfig) -> Self {
-        // Sort buckets by max_age ascending so the find-first logic in the DFS is correct
-        config.buckets.sort_by(|a, b| {
-            a.max_age
-                .partial_cmp(&b.max_age)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Self { config }
+    pub fn with_config(mut config: AgeConfig) -> Result<Self, String> {
+        config.validate()?;
+        config.buckets.sort_by_key(|bucket| bucket.max_age);
+        Ok(Self { config })
     }
 
     /// Analyze file ages in a tree.
@@ -201,10 +264,10 @@ impl AgeAnalyzer {
             .map(|b| BucketCollector::new(b.clone(), self.config.top_files_per_bucket))
             .collect();
 
-        let mut stale_candidates: Vec<StaleDirectory> = Vec::new();
+        let mut stale_candidates = StaleCollector::new(self.config.max_stale_dirs);
         let mut total_files: u64 = 0;
         let mut total_size: u64 = 0;
-        let mut total_age_secs: u64 = 0;
+        let mut total_age = AgeSum::default();
 
         // Single DFS pass: collect bucket stats and stale directory candidates together
         self.dfs(
@@ -214,19 +277,14 @@ impl AgeAnalyzer {
             &mut stale_candidates,
             &mut total_files,
             &mut total_size,
-            &mut total_age_secs,
+            &mut total_age,
             &token,
         );
 
-        // Sort stale directories by size descending and apply limit
-        stale_candidates.sort_by_key(|candidate| Reverse(candidate.size));
-        stale_candidates.truncate(self.config.max_stale_dirs);
+        let mut stale_candidates = stale_candidates.finish();
 
         // Calculate average age
-        let average_age = total_age_secs
-            .checked_div(total_files)
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::ZERO);
+        let average_age = total_age.mean(total_files);
 
         // Find median bucket (bucket containing the cumulative 50th-percentile file).
         //
@@ -234,24 +292,14 @@ impl AgeAnalyzer {
         // This avoids the half_files = total_files / 2 = 0 trap when total_files == 1,
         // which would cause cumulative >= 0 to fire immediately on the first (possibly
         // empty) bucket rather than on the bucket that actually holds the file.
-        let median_age_bucket = if total_files == 0 || token.is_cancelled() {
+        let median_age_bucket = if token.is_cancelled() {
             None
         } else {
-            let median_rank = total_files.div_ceil(2);
-            let mut cumulative = 0u64;
-            let mut found: Option<String> = None;
-            for c in &bucket_collectors {
-                if token.is_cancelled() {
-                    break;
-                }
-                cumulative += c.file_count;
-                if cumulative >= median_rank {
-                    found = Some(c.bucket.name.clone());
-                    break;
-                }
-            }
-            // Fall back to the last bucket if somehow nothing was selected
-            found.or_else(|| bucket_collectors.last().map(|c| c.bucket.name.clone()))
+            let counts: Vec<(&str, u64)> = bucket_collectors
+                .iter()
+                .map(|c| (c.bucket.name.as_str(), c.file_count))
+                .collect();
+            median_bucket_name(&counts, total_files).map(str::to_owned)
         };
 
         // Convert collectors to stats
@@ -269,7 +317,8 @@ impl AgeAnalyzer {
                     .into_iter()
                     .map(|(Reverse(size), path, modified)| (path, size, modified))
                     .collect();
-                largest_files.sort_by_key(|file| Reverse(file.1));
+                largest_files
+                    .sort_by(|a, b| (Reverse(a.1), &a.0, a.2).cmp(&(Reverse(b.1), &b.0, b.2)));
                 AgeBucketStats {
                     name: bucket.name,
                     max_age: bucket.max_age,
@@ -280,7 +329,25 @@ impl AgeAnalyzer {
             })
             .collect();
 
+        let status = AnalysisStatus::from_scan(tree, token.is_cancelled());
+        // An unreadable or unvisited descendant may be recent. Never label its
+        // ancestor stale based on only the old files we happened to observe.
+        let stale_directory_status = if !status.is_complete() {
+            StaleDirectoryStatus::SuppressedIncompleteScan
+        } else if tree.config.max_depth.is_some()
+            || !tree.config.include_hidden
+            || !tree.config.ignore_patterns.is_empty()
+        {
+            StaleDirectoryStatus::SuppressedFilteredScan
+        } else {
+            StaleDirectoryStatus::Evaluated
+        };
+        if stale_directory_status != StaleDirectoryStatus::Evaluated {
+            stale_candidates.clear();
+        }
         AgeReport {
+            status,
+            stale_directory_status,
             buckets,
             stale_directories: stale_candidates,
             total_files,
@@ -301,90 +368,200 @@ impl AgeAnalyzer {
         &self,
         node: &FileNode,
         current_path: &Path,
-        bucket_collectors: &mut Vec<BucketCollector>,
-        stale_dirs: &mut Vec<StaleDirectory>,
+        bucket_collectors: &mut [BucketCollector],
+        stale_dirs: &mut StaleCollector,
         total_files: &mut u64,
         total_size: &mut u64,
-        total_age_secs: &mut u64,
+        total_age: &mut AgeSum,
         token: &CancellationToken,
     ) -> Option<SystemTime> {
-        if token.is_cancelled() {
-            return None;
-        }
-        match &node.kind {
-            NodeKind::File { .. } => {
-                // current_path is already the full file path — the Directory branch
-                // pre-joins the child name before recursing.
-                let file_path = current_path.to_path_buf();
-                let modified = node.timestamps.modified;
-                let age = self
-                    .config
-                    .reference_time
-                    .duration_since(modified)
-                    .unwrap_or(Duration::ZERO);
-
-                *total_files += 1;
-                // Use saturating arithmetic to prevent u64 overflow on pathological inputs
-                *total_size = total_size.saturating_add(node.size);
-                *total_age_secs = total_age_secs.saturating_add(age.as_secs());
-
-                // Place into the first bucket whose max_age >= file age
-                for collector in bucket_collectors.iter_mut() {
-                    if age <= collector.bucket.max_age {
-                        collector.add_file(file_path, node.size, modified);
-                        break;
-                    }
-                }
-
-                Some(modified)
+        // Frames preserve post-order aggregation without consuming the call
+        // stack. Each frame also holds stale descendants that may yet be
+        // absorbed by a stale ancestor: only the outermost stale directory of
+        // a stale subtree is reported, so no bytes are counted twice.
+        let mut stack = vec![(
+            node,
+            current_path.to_path_buf(),
+            0usize,
+            None::<SystemTime>,
+            Vec::<StaleCandidate>::new(),
+        )];
+        while let Some((node, path, next_child, newest, stale_below)) = stack.last_mut() {
+            if token.is_cancelled() {
+                return None;
             }
-            NodeKind::Directory { file_count, .. } => {
-                let mut newest_in_subtree: Option<SystemTime> = None;
-
-                for child in &node.children {
-                    let child_path = current_path.join(&*child.name);
-                    let child_newest = self.dfs(
-                        child,
-                        &child_path,
-                        bucket_collectors,
-                        stale_dirs,
-                        total_files,
-                        total_size,
-                        total_age_secs,
-                        token,
-                    );
-                    newest_in_subtree = match (newest_in_subtree, child_newest) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, b) => b,
-                    };
-                }
-
-                // Stale directory detection: only report this directory as stale if it meets
-                // the size threshold and all its contents are old.
-                if node.size >= self.config.min_stale_size
-                    && let Some(newest) = newest_in_subtree
-                {
+            let mut stale_up = Vec::new();
+            let completed = match &node.kind {
+                NodeKind::File { .. } => {
+                    let modified = node.timestamps.modified;
                     let age = self
                         .config
                         .reference_time
-                        .duration_since(newest)
+                        .duration_since(modified)
                         .unwrap_or(Duration::ZERO);
-                    if age >= self.config.stale_threshold {
-                        stale_dirs.push(StaleDirectory {
-                            path: current_path.to_path_buf(),
-                            size: node.size,
-                            newest_file_age: age,
-                            file_count: *file_count,
-                        });
-                    }
+                    *total_files += 1;
+                    *total_size = total_size.saturating_add(node.size);
+                    total_age.add(age);
+                    // Config validation guarantees sorted, unique boundaries and
+                    // a Duration::MAX catch-all. Find the first inclusive bound.
+                    let bucket = bucket_collectors
+                        .partition_point(|collector| collector.bucket.max_age < age);
+                    bucket_collectors[bucket].add_file(&*path, node.size, modified);
+                    Some(modified)
                 }
-
-                newest_in_subtree
+                NodeKind::Directory { file_count, .. } => {
+                    if let Some(child) = node.children.get(*next_child) {
+                        *next_child += 1;
+                        let child_path = path.join(child.file_name());
+                        stack.push((child, child_path, 0, None, Vec::new()));
+                        continue;
+                    }
+                    let below = std::mem::take(stale_below);
+                    let age = newest.map(|modified| {
+                        self.config
+                            .reference_time
+                            .duration_since(modified)
+                            .unwrap_or(Duration::ZERO)
+                    });
+                    match age {
+                        Some(age) if age >= self.config.stale_threshold => {
+                            if node.size >= self.config.min_stale_size {
+                                // This directory subsumes every stale one below it.
+                                stale_up.push((path.clone(), node.size, age, *file_count));
+                            } else {
+                                stale_up = below;
+                            }
+                        }
+                        // A recent file here means no ancestor can be stale,
+                        // so the candidates below are final.
+                        Some(_) => {
+                            for (path, size, age, files) in below {
+                                stale_dirs.add(&path, size, age, files);
+                            }
+                        }
+                        None => stale_up = below,
+                    }
+                    *newest
+                }
+                _ => None,
+            };
+            stack.pop();
+            if let Some((_, _, _, parent_newest, parent_stale)) = stack.last_mut() {
+                *parent_newest = (*parent_newest).max(completed);
+                parent_stale.append(&mut stale_up);
+            } else {
+                for (path, size, age, files) in stale_up {
+                    stale_dirs.add(&path, size, age, files);
+                }
+                return completed;
             }
-            _ => None,
+        }
+        None
+    }
+}
+
+/// `(path, size, newest file age, file count)` of a stale directory.
+type StaleCandidate = (PathBuf, u64, Duration, u64);
+
+/// Retain only the requested largest stale directories. The heap root is the
+/// worst retained result: smallest size, then lexically greatest path.
+struct StaleCollector {
+    limit: usize,
+    heap: BinaryHeap<(Reverse<u64>, PathBuf, Duration, u64)>,
+}
+
+impl StaleCollector {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::new(),
         }
     }
+
+    fn add(&mut self, path: &Path, size: u64, age: Duration, files: u64) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.heap.len() == self.limit {
+            let (Reverse(worst_size), worst_path, _, _) =
+                self.heap.peek().expect("nonempty bounded heap");
+            if size < *worst_size || (size == *worst_size && path >= worst_path.as_path()) {
+                return;
+            }
+            self.heap.pop();
+        }
+        self.heap
+            .push((Reverse(size), path.to_path_buf(), age, files));
+    }
+
+    fn finish(self) -> Vec<StaleDirectory> {
+        let mut result: Vec<_> = self
+            .heap
+            .into_iter()
+            .map(
+                |(Reverse(size), path, newest_file_age, file_count)| StaleDirectory {
+                    path,
+                    size,
+                    newest_file_age,
+                    file_count,
+                },
+            )
+            .collect();
+        result.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+        result
+    }
+}
+
+/// Separate components avoid overflowing even for u64::MAX durations. A u128
+/// nanosecond total alone cannot represent u64::MAX copies of Duration::MAX.
+#[derive(Default)]
+struct AgeSum {
+    seconds: u128,
+    nanos: u128,
+}
+
+impl AgeSum {
+    fn add(&mut self, age: Duration) {
+        self.seconds += u128::from(age.as_secs());
+        self.nanos += u128::from(age.subsec_nanos());
+    }
+
+    fn mean(&self, count: u64) -> Duration {
+        if count == 0 {
+            return Duration::ZERO;
+        }
+        let count = u128::from(count);
+        let seconds = self.seconds / count;
+        let nanos = ((self.seconds % count) * 1_000_000_000 + self.nanos) / count;
+        // The average cannot exceed the largest input Duration. Duration::new
+        // carries any whole second accumulated by the fractional components.
+        Duration::new(seconds as u64, nanos as u32)
+    }
+}
+
+/// Pick the bucket holding the median file.
+///
+/// Uses the 1-based rank of the lower median, `(total + 1) / 2`. A plain
+/// `total / 2` is 0 when there is a single file, which makes the running total
+/// satisfy `cumulative >= 0` on the first (possibly empty) bucket rather than
+/// the one actually holding it.
+///
+/// `buckets` must be ordered by ascending `max_age`, which
+/// [`AgeAnalyzer::with_config`] guarantees.
+fn median_bucket_name<'a>(buckets: &[(&'a str, u64)], total_files: u64) -> Option<&'a str> {
+    if total_files == 0 {
+        return None;
+    }
+    let median_rank = total_files.div_ceil(2);
+    let mut cumulative = 0u64;
+    for (name, count) in buckets {
+        cumulative += count;
+        if cumulative >= median_rank {
+            return Some(name);
+        }
+    }
+    // Fall back to the last bucket if rounding ever leaves nothing selected.
+    buckets.last().map(|(name, _)| *name)
 }
 
 impl Default for AgeAnalyzer {
@@ -412,12 +589,12 @@ impl BucketCollector {
             bucket,
             file_count: 0,
             total_size: 0,
-            heap: BinaryHeap::with_capacity(max_files + 1),
+            heap: BinaryHeap::new(),
             max_files,
         }
     }
 
-    fn add_file(&mut self, path: PathBuf, size: u64, modified: SystemTime) {
+    fn add_file(&mut self, path: impl AsRef<Path>, size: u64, modified: SystemTime) {
         self.file_count += 1;
         self.total_size = self.total_size.saturating_add(size);
 
@@ -425,13 +602,17 @@ impl BucketCollector {
             return;
         }
 
-        // Always push; then pop the smallest if we exceed capacity
-        self.heap.push((Reverse(size), path, modified));
-        if self.heap.len() > self.max_files {
-            // pop removes the maximum of BinaryHeap; since we wrap size in Reverse, the
-            // maximum Reverse(size) corresponds to the *minimum* actual size — exactly what
-            // we want to evict.
-            self.heap.pop();
+        let path = path.as_ref();
+        if self.heap.len() == self.max_files {
+            let mut worst = self.heap.peek_mut().expect("nonzero full heap");
+            // Preserve the existing tuple ordering, including path/time ties.
+            // Borrow the candidate path until it is known to belong in the heap.
+            if (Reverse(size), path, modified) < (worst.0, worst.1.as_path(), worst.2) {
+                *worst = (Reverse(size), path.to_path_buf(), modified);
+            }
+        } else {
+            self.heap
+                .push((Reverse(size), path.to_path_buf(), modified));
         }
     }
 
@@ -443,27 +624,8 @@ impl BucketCollector {
             .into_iter()
             .map(|(Reverse(size), path, modified)| (path, size, modified))
             .collect();
-        v.sort_by_key(|item| Reverse(item.1));
+        v.sort_by(|a, b| (Reverse(a.1), &a.0, a.2).cmp(&(Reverse(b.1), &b.0, b.2)));
         v
-    }
-}
-
-/// Format a duration as a human-readable string.
-pub fn format_age(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    if secs < 60 {
-        format!("{secs} seconds")
-    } else if secs < 3600 {
-        format!("{} minutes", secs / 60)
-    } else if secs < 86400 {
-        format!("{} hours", secs / 3600)
-    } else if secs < SECS_PER_MONTH {
-        format!("{} days", secs / 86400)
-    } else if secs < 31_557_600 {
-        // 365.25 * 86400
-        format!("{} months", secs / SECS_PER_MONTH)
-    } else {
-        format!("{:.1} years", secs as f64 / 31_557_600.0)
     }
 }
 
@@ -472,23 +634,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_age() {
-        assert_eq!(format_age(Duration::from_secs(30)), "30 seconds");
-        assert_eq!(format_age(Duration::from_secs(120)), "2 minutes");
-        assert_eq!(format_age(Duration::from_secs(7200)), "2 hours");
-        assert_eq!(format_age(Duration::from_secs(172800)), "2 days");
-    }
-
-    #[test]
-    fn test_format_age_month_boundary() {
-        // 30 days = 2_592_000 secs; with old constant that was exactly 1 month, but with
-        // SECS_PER_MONTH = 2_629_800 it should still be "days" range.
-        let thirty_days = Duration::from_secs(30 * 86400);
-        let result = format_age(thirty_days);
-        assert!(
-            result.ends_with("days"),
-            "30 days should still be in 'days' range, got: {result}"
-        );
+    fn stale_selection_is_bounded_and_matches_full_sort_in_both_orders() {
+        let candidates: Vec<_> = (0..10_000)
+            .map(|i| (PathBuf::from(format!("directory-{i:05}")), (i % 17) as u64))
+            .collect();
+        let mut expected = candidates.clone();
+        expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for limit in [0, 1, 37, 10_001] {
+            for reverse in [false, true] {
+                let mut collector = StaleCollector::new(limit);
+                for index in 0..candidates.len() {
+                    let index = if reverse {
+                        candidates.len() - index - 1
+                    } else {
+                        index
+                    };
+                    let (path, size) = &candidates[index];
+                    collector.add(path, *size, Duration::from_secs(7), 3);
+                    assert!(collector.heap.len() <= limit);
+                }
+                let actual = collector.finish();
+                let actual_pairs: Vec<_> = actual
+                    .iter()
+                    .map(|dir| (dir.path.clone(), dir.size))
+                    .collect();
+                assert_eq!(actual_pairs, expected[..limit.min(expected.len())]);
+                assert!(actual.iter().all(
+                    |dir| dir.file_count == 3 && dir.newest_file_age == Duration::from_secs(7)
+                ));
+            }
+        }
     }
 
     #[test]
@@ -517,7 +692,7 @@ mod tests {
             ],
             ..AgeConfig::default()
         };
-        let analyzer = AgeAnalyzer::with_config(config);
+        let analyzer = AgeAnalyzer::with_config(config).unwrap();
         let names: Vec<&str> = analyzer
             .config
             .buckets
@@ -531,53 +706,10 @@ mod tests {
     // Median algorithm correctness
     // ---------------------------------------------------------------------------
 
+    /// Drives the real `median_bucket_name`, so a change to it is caught here.
     fn run_median(bucket_counts: &[(&str, u64)]) -> Option<String> {
-        // Build a minimal AgeConfig whose buckets match the provided counts, then
-        // drive the same logic that AgeAnalyzer::analyze() uses so that any future
-        // refactor of that code path is automatically exercised here too.
-        let mut buckets_cfg: Vec<AgeBucket> = bucket_counts
-            .iter()
-            .map(|(name, _)| AgeBucket::new(*name, Duration::MAX))
-            .collect();
-        // Give each bucket a distinct max_age so sorting doesn't scramble the order.
-        for (i, b) in buckets_cfg.iter_mut().enumerate() {
-            b.max_age = Duration::from_secs((i as u64 + 1) * 86400);
-        }
-        // Last bucket must be a catch-all.
-        if let Some(last) = buckets_cfg.last_mut() {
-            last.max_age = Duration::MAX;
-        }
-
-        // Build collectors manually, mirroring what analyze() does, and feed exactly
-        // the right number of files into each bucket using a synthetic modified time
-        // that falls inside that bucket's max_age window.
-        let top_n = 0; // irrelevant for median test
-        let mut collectors: Vec<BucketCollector> = buckets_cfg
-            .iter()
-            .map(|b| BucketCollector::new(b.clone(), top_n))
-            .collect();
-
-        let total_files: u64 = bucket_counts.iter().map(|(_, c)| c).sum();
-        for (i, (_, count)) in bucket_counts.iter().enumerate() {
-            collectors[i].file_count = *count;
-            collectors[i].total_size = 0;
-        }
-
-        // Re-implement just the median selection so we test the actual function body.
-        if total_files == 0 {
-            return None;
-        }
-        let median_rank = total_files.div_ceil(2);
-        let mut cumulative = 0u64;
-        let mut found: Option<String> = None;
-        for c in &collectors {
-            cumulative += c.file_count;
-            if cumulative >= median_rank {
-                found = Some(c.bucket.name.clone());
-                break;
-            }
-        }
-        found.or_else(|| collectors.last().map(|c| c.bucket.name.clone()))
+        let total_files: u64 = bucket_counts.iter().map(|(_, count)| count).sum();
+        median_bucket_name(bucket_counts, total_files).map(str::to_owned)
     }
 
     #[test]
@@ -635,6 +767,44 @@ mod tests {
     // ---------------------------------------------------------------------------
     // BinaryHeap top-N eviction correctness
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn bucket_extreme_limit_grows_only_with_observed_files() {
+        let mut collector = BucketCollector::new(AgeBucket::new("all", Duration::MAX), usize::MAX);
+        collector.add_file(Path::new("one"), 7, SystemTime::UNIX_EPOCH);
+        assert_eq!(collector.file_count, 1);
+        assert_eq!(collector.into_sorted_vec().len(), 1);
+    }
+
+    #[test]
+    fn bucket_selection_matches_full_sort_with_path_and_time_ties() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        let values = [
+            (PathBuf::from("z"), 10, epoch),
+            (PathBuf::from("a"), 10, epoch + Duration::from_secs(1)),
+            (PathBuf::from("a"), 10, epoch),
+            (PathBuf::from("large"), 20, epoch),
+            (PathBuf::from("small"), 1, epoch),
+        ];
+        for limit in 0..=values.len() + 1 {
+            for reverse in [false, true] {
+                let mut input = values.to_vec();
+                if reverse {
+                    input.reverse();
+                }
+                let mut collector =
+                    BucketCollector::new(AgeBucket::new("all", Duration::MAX), limit);
+                for (path, size, time) in &input {
+                    collector.add_file(path, *size, *time);
+                }
+                let actual = collector.into_sorted_vec();
+                let mut expected = values.to_vec();
+                expected.sort_by(|a, b| (Reverse(a.1), &a.0, a.2).cmp(&(Reverse(b.1), &b.0, b.2)));
+                expected.truncate(limit);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 
     #[test]
     fn test_bucket_collector_top_n_evicts_smallest() {
@@ -711,12 +881,21 @@ mod tests {
     }
 
     #[test]
-    fn test_saturating_add_accumulation() {
-        // total_age_secs uses saturating_add; verify it caps at u64::MAX without panic.
-        let mut acc: u64 = u64::MAX - 5;
-        for _ in 0..10 {
-            acc = acc.saturating_add(u64::MAX / 2);
-        }
-        assert_eq!(acc, u64::MAX);
+    fn age_mean_preserves_large_and_fractional_durations() {
+        let mut sum = AgeSum::default();
+        sum.add(Duration::MAX);
+        sum.add(Duration::MAX);
+        assert_eq!(sum.mean(2), Duration::MAX);
+        let mut sum = AgeSum::default();
+        sum.add(Duration::new(1, 900_000_000));
+        sum.add(Duration::new(2, 900_000_000));
+        assert_eq!(sum.mean(2), Duration::new(2, 400_000_000));
+        assert_eq!(AgeSum::default().mean(0), Duration::ZERO);
+        let count = u128::from(u64::MAX);
+        let sum = AgeSum {
+            seconds: count * u128::from(u64::MAX),
+            nanos: count * 999_999_999,
+        };
+        assert_eq!(sum.mean(u64::MAX), Duration::MAX);
     }
 }

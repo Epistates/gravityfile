@@ -38,7 +38,7 @@ pub enum Permission {
 }
 
 /// Configuration for plugin sandboxing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// Paths the plugin is allowed to read from.
     pub allowed_read_paths: Vec<PathBuf>,
@@ -199,7 +199,7 @@ impl SandboxConfig {
         };
         self.allowed_read_paths
             .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter_map(|p| dunce::canonicalize(p).ok())
             .any(|allowed| normalized.starts_with(&allowed))
     }
 
@@ -220,7 +220,7 @@ impl SandboxConfig {
         };
         self.allowed_write_paths
             .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter_map(|p| dunce::canonicalize(p).ok())
             .any(|allowed| normalized.starts_with(&allowed))
     }
 
@@ -230,14 +230,14 @@ impl SandboxConfig {
     /// the caller to deny access (safe default).
     fn normalize_path(&self, path: &std::path::Path) -> Option<PathBuf> {
         // Try canonicalizing directly first (works for existing paths)
-        if let Ok(c) = std::fs::canonicalize(path) {
+        if let Ok(c) = dunce::canonicalize(path) {
             return Some(c);
         }
 
         // If it doesn't exist, try canonicalizing the parent and joining the
         // final component. This handles writes to new files inside existing dirs.
         if let Some(parent) = path.parent()
-            && let Ok(c) = std::fs::canonicalize(parent)
+            && let Ok(c) = dunce::canonicalize(parent)
             && let Some(name) = path.file_name()
         {
             return Some(c.join(name));
@@ -255,82 +255,3 @@ impl SandboxConfig {
         self.allowed_commands.contains("*") || self.allowed_commands.contains(command)
     }
 }
-
-/// Sandbox violation that occurred during plugin execution.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct SandboxViolation {
-    /// Type of violation.
-    pub kind: ViolationKind,
-
-    /// Description of what was attempted.
-    pub description: String,
-
-    /// Path involved (if applicable).
-    pub path: Option<PathBuf>,
-
-    /// Command involved (if applicable).
-    pub command: Option<String>,
-}
-
-/// Types of sandbox violations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ViolationKind {
-    /// Attempted to read from disallowed path.
-    ReadDenied,
-
-    /// Attempted to write to disallowed path.
-    WriteDenied,
-
-    /// Attempted to execute disallowed command.
-    ExecuteDenied,
-
-    /// Attempted network access when not allowed.
-    NetworkDenied,
-
-    /// Attempted to access environment when not allowed.
-    EnvDenied,
-
-    /// Exceeded memory limit.
-    MemoryExceeded,
-
-    /// Exceeded execution timeout.
-    TimeoutExceeded,
-
-    /// Attempted to read file larger than limit.
-    FileTooLarge,
-}
-
-impl std::fmt::Display for SandboxViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
-            ViolationKind::ReadDenied => {
-                write!(f, "Read denied: {}", self.description)
-            }
-            ViolationKind::WriteDenied => {
-                write!(f, "Write denied: {}", self.description)
-            }
-            ViolationKind::ExecuteDenied => {
-                write!(f, "Execute denied: {}", self.description)
-            }
-            ViolationKind::NetworkDenied => {
-                write!(f, "Network access denied")
-            }
-            ViolationKind::EnvDenied => {
-                write!(f, "Environment access denied")
-            }
-            ViolationKind::MemoryExceeded => {
-                write!(f, "Memory limit exceeded")
-            }
-            ViolationKind::TimeoutExceeded => {
-                write!(f, "Execution timeout exceeded")
-            }
-            ViolationKind::FileTooLarge => {
-                write!(f, "File too large: {}", self.description)
-            }
-        }
-    }
-}
-
-impl std::error::Error for SandboxViolation {}

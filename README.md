@@ -1,99 +1,240 @@
 # gravityfile
 
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Crates.io](https://img.shields.io/crates/v/gravityfile.svg)](https://crates.io/crates/gravityfile)
-[![Built With Ratatui](https://img.shields.io/badge/Built_With_Ratatui-000?logo=ratatui&logoColor=fff)](https://ratatui.rs/)
 
-> "Where mass accumulates, attention should follow."
+See where your disk space went, then do something about it. `grav` is a fast
+disk usage analyzer and a keyboard-driven file explorer in one terminal app,
+with a scriptable CLI for reports.
 
-**gravityfile** is a high-performance, file system explorer and analyzer. Built for modern terminal power users, it combines the speed of parallelized Rust with a visually stunning and highly intuitive TUI.
+<img src="assets/video.gif" alt="gravityfile terminal interface" style="width: 100%; max-width: 100%;"/>
 
-<img src="assets/video.gif" alt="gravityfile" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
+- **Fast, exact scanning.** A parallel scanner whose totals match `du`: disk
+  usage by default, hard links counted once, directories including their own
+  blocks. Comparable to `dust` in speed and memory on large trees.
+- **Three views of the same tree:** an expandable tree, Miller columns, and a
+  treemap, plus duplicate-file and file-age views.
+- **A real file manager:** copy, move, rename (including bulk rename in your
+  editor), archives, and delete to the system Trash. Moves, copies, renames and
+  new files can be undone, as can deletions on Linux and Windows. Overwritten
+  files go to the Trash rather than being destroyed.
+- **Previews** with syntax highlighting, hex view, archive listings and images.
+- **Git status** for every file.
+- **Reports for scripts:** `scan`, `duplicates`, `age` and `export` emit
+  versioned JSON with explicit completeness and meaningful exit codes.
+- **Lua plugins**, each in its own supervised process.
 
-## 🚀 SOTA Performance
+## Install
 
-- **Parallel Scanning**: Traverses directories at ~500,000 files per second using `jwalk`.
-- **Duplicate Hashing**: 3-phase BLAKE3 algorithm (Size -> Partial -> Full) to minimize I/O overhead.
-- **Memory Optimization**: ~120MB per 1M nodes using `CompactString` and boxing strategies.
-- **Asynchronous Architecture**: Non-blocking TUI using `tokio` and MPSC event loops.
+Prebuilt binaries for macOS, Linux (glibc and static musl) and Windows are
+attached to each [GitHub release](https://github.com/epistates/gravityfile/releases),
+with installers:
 
-## ✨ Core Features
-
-- **Multi-View Navigation**: Seamlessly switch between **Tree**, **Miller Columns** (Ranger-style), and **Interactive Treemaps**.
-- **Deep Analysis**: Integrated **Duplicate Finder** and **Age Distribution** reports.
-- **Safe Operations**: Copy, move, and rename with a robust **Undo System**. Deletions default to system Trash.
-- **Git Integration**: Real-time indicators for modified, staged, and untracked files.
-- **Visual Mode**: Vim-style range selection (`V`) and bulk operations.
-- **Extensible Plugin System**: Customize functionality using **Lua** or **Rhai**.
-- **Modern UI**: Full dark/light theme support, glassmorphism-inspired aesthetics, and smooth animations.
-
-## 🔌 Plugin System
-
-gravityfile is designed to be fully extensible. You can write your own hooks, actions, and previewers.
-
-```lua
--- Respond to scan completion in Lua
-function on_scan_complete(self, hook)
-    gf.notify(string.format("Scan complete: %d files", hook.tree.stats.total_files))
-end
+```sh
+# macOS and Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/epistates/gravityfile/releases/latest/download/gravityfile-installer.sh | sh
 ```
 
-See [**PLUGINS.md**](docs/PLUGINS.md) for the full API reference.
-
-## 🛠️ Installation
-
-### From crates.io
-
-```bash
-cargo install gravityfile
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/epistates/gravityfile/releases/latest/download/gravityfile-installer.ps1 | iex"
 ```
 
-### From source
+Every archive carries build provenance; check one with
+`gh attestation verify <archive> --repo epistates/gravityfile`.
 
-```bash
-git clone https://github.com/epistates/gravityfile
-cd gravityfile
-cargo install --path .
+Or build it with Cargo, which needs Rust 1.90 or newer:
+
+```sh
+cargo install --locked gravityfile
 ```
 
-This installs both `gravityfile` and the short alias `grav`.
+Either way you get the `grav` binary.
 
-## 📖 Documentation
+## Use
 
-- [**User Guide**](#tui-keybindings) - Essential keybindings and usage.
-- [**Plugin Development**](docs/PLUGINS.md) - Extend gravityfile with Lua or Rhai.
-- [**Architecture Deep-Dive**](docs/ARCHITECTURE.md) - Understanding the technical design.
+```sh
+grav                     # explore the current directory
+grav ~/Downloads --scan  # explore and start a full scan right away
+grav scan ~              # largest entries in your home directory
+grav scan / -d 2 -n 10   # two levels deep, ten entries per directory
+grav scan ~ --top 20     # the twenty largest files anywhere
+grav scan ~ --by-type    # space by file extension
+grav duplicates ~/Photos --min-size 1MB
+grav age ~/work --stale 6mo
+```
 
-## ⌨️ TUI Keybindings
+Sizes use decimal units (`1 kB = 1000 B`, like Finder); add `--binary` for
+`KiB`, `MiB`. The explorer shows disk usage; `-A` or the `b` key switches to
+file lengths without rescanning. Every report command accepts the same scan
+options:
+
+| Option | Effect |
+|---|---|
+| `-A`, `--apparent-size` | Count file lengths instead of disk usage |
+| `-l`, `--count-links` | Count every hard link to a file |
+| `-L`, `--follow-symlinks` | Follow symbolic links |
+| `--cross-fs` | Descend into other filesystems |
+| `--no-hidden` | Skip dotfiles |
+| `-e`, `--exclude GLOB` | Skip matching names or paths (repeatable) |
+| `-j`, `--threads N` | Scanning threads |
+| `--git` | Annotate entries with Git status |
+
+### Shell integration
+
+`grav init` prints a `grav` shell function that changes your shell to the
+directory you were in when you quit the explorer:
+
+```sh
+eval "$(command grav init zsh)"     # ~/.zshrc
+eval "$(command grav init bash)"    # ~/.bashrc
+command grav init fish | source     # ~/.config/fish/config.fish
+```
+
+Completions: `grav completions <bash|zsh|fish|elvish|powershell>`.
+
+### Explorer keys
 
 | Key | Action |
-|-----|--------|
-| `j`/`k` | Move Up/Down |
-| `h`/`l` | Collapse/Expand |
-| `Enter` | Drill Into Directory |
-| `v` | Cycle Layout (Tree -> Miller -> Treemap) |
-| `Space` | Mark Item |
-| `V` | Visual Mode (Range Select) |
-| `y`/`x`/`p` | Yank / Cut / Paste |
-| `d` / `D` | Delete (Trash) |
-| `Ctrl-z` | Undo Last Operation |
-| `/` | Fuzzy Search |
-| `:` | Command Palette |
-| `?` | Show Help |
+| --- | --- |
+| `j` / `k` | Move down / up |
+| `h` / `l` | Collapse / expand |
+| `Enter` / `Backspace` | Enter directory / go back |
+| `v` | Switch between tree and Miller columns |
+| `Tab` | Switch explorer, duplicates, age, errors and treemap views |
+| `Space` / `V` | Mark item / range selection |
+| `y` / `x` / `p` | Copy / cut / paste |
+| `d` / `D` | Delete through Trash |
+| `Ctrl-z` | Undo |
+| `/` / `:` | Search / command palette |
+| `P` | Cycle preview mode |
+| `?` / `q` | Help / quit |
 
----
+`?` lists every binding in effect, including your own.
 
-## 🏗️ Technical Stack
+Search (`/`) is fuzzy by default, with fzf syntax (`^start`, `end$`, `!not`,
+`'exact`). Filters narrow it: `size>100mb`, `size<=1kb`, `age>30d`, `age<1w`,
+`type:f,d,l` and `ext:log,tmp`. A query of filters alone lists the largest
+matches, so `size>1gb type:f` finds the biggest files under the view.
 
-- **UI Framework**: [Ratatui](https://ratatui.rs/)
-- **Runtime**: [Tokio](https://tokio.rs/)
-- **Serialization**: [Serde](https://serde.rs/)
-- **Hashing**: [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)
-- **Plugin Runtimes**: `mlua`, `rhai`
+### Key bindings
 
-## ⚖️ License
+`keymap.toml` in the config directory adds bindings and replaces existing
+ones for the same keys:
 
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
+```toml
+[[keymap]]
+on = "<C-n>"
+run = "move_down"
 
----
-*Built with ❤️ by the Epistates team.*
+[[keymap]]
+on = ["d", "D"]
+run = "none"      # unbind
+```
+
+A key is one character (`j`, `G`, `?`) or a name in angle brackets, with
+optional `C-`, `S-` and `A-` modifiers: `<Enter>`, `<Esc>`, `<Tab>`, `<S-Tab>`,
+`<Backspace>`, `<Delete>`, `<Space>`, `<Up>`, `<PageDown>`, `<Home>`, `<F5>`,
+`<C-u>`, `<lt>` for `<`. Mistakes are reported at startup and the rest of the
+file still applies. Dialogs such as the delete confirmation keep their own keys.
+
+Actions:
+
+- Navigation: `move_down`, `move_up`, `move_left`, `move_right`, `top`,
+  `bottom`, `page_up`, `page_down`, `enter`, `back`, `toggle_expand`, `go_to`,
+  `search`
+- Selection: `toggle_mark`, `visual`, `clear_marks`
+- Files: `yank`, `cut`, `paste`, `delete`, `rename`, `create_file`,
+  `create_directory`, `take`, `undo`
+- View: `next_view`, `prev_view`, `toggle_layout`, `toggle_size_mode`,
+  `toggle_details`, `cycle_preview`, `preview_down`, `preview_up`, `sort`,
+  `reverse_sort`, `refresh`, `toggle_theme`
+- Tabs: `new_tab`, `close_tab`, `next_tab`, `prev_tab`, `tab_1` to `tab_9`
+- Bookmarks: `set_bookmark`, `jump_to_bookmark`, `bookmarks`
+- General: `command`, `settings`, `help`, `cancel`, `quit`, `force_quit`
+
+Bulk rename and the text editor use `VISUAL` or `EDITOR`; GUI editors must wait
+for the file to close (for example `code --wait`).
+
+Themes: `gestalt` (the default), `latte` for light terminals, `nord`,
+`dracula`, and `ansi`, which uses the terminal's own 16 colours and is chosen
+automatically where 24-bit colour is unavailable. `t` cycles through them;
+set one with `theme = "nord"` in `settings.toml` or from the settings screen
+(`,`).
+
+Settings and plugins live in `~/.config/gravityfile` (`%AppData%\gravityfile` on
+Windows), or under `$GRAVITYFILE_HOME/config` when that variable is set.
+
+### Snapshots
+
+Save a scan and look at it later, or somewhere else. Any command that takes a
+directory also takes a snapshot, and ncdu dumps work too:
+
+```sh
+grav export / -o root.json.zst          # complete scan, zstd-compressed
+grav scan root.json.zst -d 3            # report on it without rescanning
+grav root.json.zst                      # browse it in the explorer, read-only
+grav scan root.json.zst -A              # switch to apparent sizes, instantly
+ssh server 'ncdu -xo- /' > server.json  # a dump from a machine without grav
+grav scan server.json
+grav export ~ -f ncdu -o home.json      # for ncdu -f or gdu -f
+```
+
+`grav diff` shows what changed between two scans, largest changes first:
+
+```sh
+grav diff home.json                     # since the snapshot, against the disk today
+grav diff january.json june.json -d 3   # between two snapshots, three levels deep
+grav diff ~/old-copy ~/proj             # two directories, scanned now
+```
+
+A directory compared with a snapshot is scanned with the snapshot's scope
+(hidden files, excludes, links), so the diff shows changes on disk rather than
+differences in what was counted. Entries are compared by size.
+
+The explorer records each full scan's totals, and `grav scan PATH --record`
+adds one, for example from cron. `grav history PATH` shows the trend, with
+the top-level entry that changed most; `grav history --all` lists every
+recorded directory. The explorer's header shows the change since the last
+scan of the same place. Set `record_history = false` in `settings.toml` to
+stop recording.
+
+The explorer opens a snapshot read-only: browsing, search, the treemap,
+size toggling and age analysis work from the record, while file
+operations, rescans and duplicate detection, which need the files
+themselves, are turned off.
+
+## Reports and automation
+
+```sh
+grav scan . -f json | jq '.data.entries[0]'
+grav duplicates /data -f json --strict > duplicates.json
+```
+
+JSON output always carries a `schema_version`, the scan scope, and a `status`
+saying whether anything could not be read. With `--strict`, incomplete results
+exit with status 3. See [reports](docs/REPORTS.md) for the format, exit codes,
+and how unusual file names are encoded.
+
+## Plugins
+
+Lua plugins react to scans, navigation, file operations and analysis, show
+messages in the status line, and can refuse a delete. Each runs in its own
+worker process with deadlines and bounded messages, in the background so it
+never holds up the explorer; a stuck or crashed plugin is stopped without
+affecting it. Plugins cannot write files or run programs and read only below
+the scanned directory, but this is not operating-system confinement. See
+[plugins](docs/PLUGINS.md).
+
+## Development
+
+```sh
+just test    # cargo nextest across the workspace
+just ci      # lint, tests, docs, MSRV, cargo-deny, terminal smoke test
+```
+
+[Architecture](docs/ARCHITECTURE.md) describes the crates.
+
+## License
+
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.

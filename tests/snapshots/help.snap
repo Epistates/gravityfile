@@ -1,0 +1,45 @@
+---
+source: tests/snapshots.rs
+description: grav --help
+expression: run(args)
+---
+exit: 0
+--- stdout
+A state-of-the-art file system analyzer with TUI
+
+Usage: grav [OPTIONS] [PATH]
+       grav <COMMAND>
+
+Commands:
+  scan         Show what takes up space, largest first
+  duplicates   Find files with identical contents
+  age          Break files down by age and find stale directories
+  diff         Show what grew, shrank, appeared or went between two scans
+  history      Show how a directory's size changed across recorded scans
+  export       Write a complete scan as a JSON snapshot
+  init         Print shell integration that follows the explorer's directory on exit
+  completions  Print shell completions
+  help         Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [PATH]  Directory to open in the explorer, or a snapshot to browse [default: current directory]
+
+Options:
+  -s, --scan             Start a full scan as soon as the explorer opens
+  -A, --apparent-size    Show file lengths instead of disk usage (toggle with `b`)
+      --cwd-file <FILE>  Write the explorer's directory at exit to FILE (see `grav init`)
+      --print-cwd        Print the explorer's directory at exit
+  -h, --help             Print help
+  -V, --version          Print version
+
+Global options:
+      --color <WHEN>     When to use colour [default: auto] [possible values: auto, always, never]
+      --binary           Show sizes in powers of 1024 (KiB, MiB) instead of 1000 (kB, MB)
+      --log-file <FILE>  Append diagnostic logs to FILE (filter with RUST_LOG) [env:
+                         GRAVITYFILE_LOG_FILE]
+
+Run `grav` with no command to open the explorer.
+
+Exit status: 0 success, 1 error, 2 usage error, 3 incomplete results with
+--strict, 130 interrupted.
+--- stderr

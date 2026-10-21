@@ -1,114 +1,45 @@
 # gravityfile-scan
 
-High-performance parallel file system scanner for gravityfile.
+The directory scanner behind [gravityfile](https://github.com/epistates/gravityfile),
+plus readers and writers for saved scans.
 
-This crate provides the scanning engine that traverses directories and builds the file tree structure used by other gravityfile components.
+This crate exists for the `grav` binary and its sibling crates. Its API
+follows their needs and can change in any minor release.
 
-## Features
-
-- **Parallel Traversal** - Uses jwalk for multi-threaded directory scanning
-- **Progress Updates** - Subscribe to real-time scan progress via broadcast channels
-- **Hardlink Detection** - Tracks inodes to avoid double-counting hardlinked files
-- **Cross-Filesystem Support** - Optionally traverse mount points
-- **Ignore Patterns** - Skip directories matching configured patterns
-- **Size Aggregation** - Automatically calculates directory sizes from contents
-
-## Usage
-
-### Basic Scan
-
-```rust
-use gravityfile_scan::{JwalkScanner, ScanConfig};
-
-let config = ScanConfig::new("/path/to/scan");
-let scanner = JwalkScanner::new();
-let tree = scanner.scan(&config)?;
-
-println!("Total size: {} bytes", tree.total_size());
-println!("Total files: {}", tree.total_files());
-println!("Total directories: {}", tree.total_dirs());
-```
-
-### With Progress Updates
+- `JwalkScanner` walks a directory in parallel and builds a
+  `gravityfile_core::FileTree`. Sizes are allocated blocks by default or
+  apparent lengths on request, hard links count once, and a directory's size
+  covers its whole subtree even when a depth limit drops its children.
+  Unreadable entries become warnings instead of errors. Progress is
+  broadcast to subscribers, and a `CancellationToken` stops the scan.
+- `snapshot::read` opens a saved scan: a `grav export` snapshot or an
+  `ncdu -o` / `gdu -o` dump, either optionally zstd-compressed.
+- `ncdu::write` writes a tree as an ncdu dump, so `ncdu -f` can browse it.
+  Both ncdu directions stream and handle names that are not UTF-8.
+- `quick_list` lists one directory without descending, for interactive use.
 
 ```rust
-use gravityfile_scan::{JwalkScanner, ScanConfig, ScanProgress};
+use gravityfile_scan::snapshot::{self, ImportOptions};
+use gravityfile_scan::{JwalkScanner, ScanConfig, ncdu};
+use tokio_util::sync::CancellationToken;
 
-let scanner = JwalkScanner::new();
-let mut progress_rx = scanner.subscribe();
+let dir = tempfile::tempdir()?;
+std::fs::write(dir.path().join("app.log"), vec![0; 10_000])?;
 
-// Spawn task to handle progress
-tokio::spawn(async move {
-    while let Ok(progress) = progress_rx.recv().await {
-        println!(
-            "Scanned {} files, {} dirs ({} bytes)",
-            progress.files_scanned,
-            progress.dirs_scanned,
-            progress.bytes_scanned
-        );
-    }
-});
+let mut config = ScanConfig::new(dir.path());
+config.apparent_size = true;
+let tree = JwalkScanner::new().scan(&config, CancellationToken::new())?;
+assert_eq!(tree.total_files(), 1);
+assert_eq!(tree.root.children[0].size, 10_000);
 
-let config = ScanConfig::new("/path/to/scan");
-let tree = scanner.scan(&config)?;
+let mut dump = Vec::new();
+ncdu::write(&tree, &mut dump)?;
+let options = ImportOptions { apparent: true, ..Default::default() };
+let restored = snapshot::read_from(dump.as_slice(), &options)?;
+assert_eq!(restored.root.children[0].size, 10_000);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-### Custom Configuration
+## Licence
 
-```rust
-use gravityfile_scan::{JwalkScanner, ScanConfig};
-
-let config = ScanConfig::builder()
-    .root("/path/to/scan")
-    .max_depth(Some(5))           // Limit depth
-    .include_hidden(false)         // Skip hidden files
-    .follow_symlinks(false)        // Don't follow symlinks
-    .cross_filesystems(false)      // Stay on same filesystem
-    .ignore_patterns(vec![
-        ".git".into(),
-        "node_modules".into(),
-        "target".into(),
-    ])
-    .threads(0)                    // 0 = auto-detect CPU count
-    .apparent_size(false)          // Use disk usage, not apparent size
-    .build()?;
-
-let scanner = JwalkScanner::new();
-let tree = scanner.scan(&config)?;
-```
-
-## Output Structure
-
-The scanner produces a `FileTree` containing:
-
-- **root** - Root `FileNode` with nested children
-- **root_path** - Canonical path that was scanned
-- **stats** - Summary statistics (total size, file count, etc.)
-- **warnings** - Non-fatal issues encountered during scan
-- **scan_duration** - How long the scan took
-- **config** - Configuration used for the scan
-
-Children are automatically sorted by size (largest first) for efficient display.
-
-## Performance
-
-- Uses rayon thread pool via jwalk for parallel directory traversal
-- Hardlink tracking uses DashMap for lock-free concurrent access
-- Progress updates are batched (every 1000 files) to reduce overhead
-- Memory-efficient: only stores aggregated tree, not individual paths
-
-## Re-exports
-
-This crate re-exports common types from `gravityfile-core` for convenience:
-
-```rust
-use gravityfile_scan::{
-    FileNode, FileTree, NodeId, NodeKind,
-    ScanConfig, ScanError, ScanWarning,
-    Timestamps, TreeStats, WarningKind,
-};
-```
-
-## License
-
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+MIT or Apache-2.0, at your option.

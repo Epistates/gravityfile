@@ -1,23 +1,162 @@
-//! Color theme for the TUI.
+//! Colour themes.
 //!
-//! Provides a comprehensive theming system with dark and light themes,
-//! using a semantic color palette based on Tailwind CSS colors.
+//! A theme is built from a small semantic [`Palette`], as in carwash, so both
+//! tools offer the same named themes. Backgrounds stay the terminal's own,
+//! and truecolour palettes fall back to the terminal's 16 colours when it
+//! cannot show 24-bit colour.
 
 use ratatui::style::{Color, Modifier, Style};
 
-/// Theme variant (dark or light).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemeVariant {
-    #[default]
-    Dark,
-    Light,
+/// The semantic colours a theme is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub name: &'static str,
+    pub text: Color,
+    pub subtle: Color,
+    pub muted: Color,
+    /// Highlighted rows, header and footer.
+    pub surface: Color,
+    pub border: Color,
+    pub accent: Color,
+    pub accent2: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub info: Color,
+    /// Text drawn on a cell filled with a status or size colour.
+    pub ink: Color,
+    pub truecolor: bool,
 }
 
-/// Color theme for the TUI.
+const fn rgb(hex: u32) -> Color {
+    Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+impl Palette {
+    /// Catppuccin Mocha.
+    pub const GESTALT: Self = Self {
+        name: "gestalt",
+        text: rgb(0xcdd6f4),
+        subtle: rgb(0xa6adc8),
+        muted: rgb(0x6c7086),
+        surface: rgb(0x313244),
+        border: rgb(0x45475a),
+        accent: rgb(0xb4befe),
+        accent2: rgb(0xcba6f7),
+        success: rgb(0xa6e3a1),
+        warning: rgb(0xf9e2af),
+        error: rgb(0xf38ba8),
+        info: rgb(0x89b4fa),
+        ink: rgb(0x11111b),
+        truecolor: true,
+    };
+
+    /// Catppuccin Latte, for light terminals.
+    pub const LATTE: Self = Self {
+        name: "latte",
+        text: rgb(0x4c4f69),
+        subtle: rgb(0x6c6f85),
+        muted: rgb(0x9ca0b0),
+        surface: rgb(0xccd0da),
+        border: rgb(0xbcc0cc),
+        accent: rgb(0x7287fd),
+        accent2: rgb(0x8839ef),
+        success: rgb(0x40a02b),
+        warning: rgb(0xdf8e1d),
+        error: rgb(0xd20f39),
+        info: rgb(0x1e66f5),
+        ink: rgb(0xeff1f5),
+        truecolor: true,
+    };
+
+    pub const NORD: Self = Self {
+        name: "nord",
+        text: rgb(0xeceff4),
+        subtle: rgb(0xd8dee9),
+        muted: rgb(0x616e88),
+        surface: rgb(0x3b4252),
+        border: rgb(0x434c5e),
+        accent: rgb(0x88c0d0),
+        accent2: rgb(0x81a1c1),
+        success: rgb(0xa3be8c),
+        warning: rgb(0xebcb8b),
+        error: rgb(0xbf616a),
+        info: rgb(0x5e81ac),
+        ink: rgb(0x2e3440),
+        truecolor: true,
+    };
+
+    pub const DRACULA: Self = Self {
+        name: "dracula",
+        text: rgb(0xf8f8f2),
+        subtle: rgb(0xd6d6d0),
+        muted: rgb(0x6272a4),
+        surface: rgb(0x44475a),
+        border: rgb(0x44475a),
+        accent: rgb(0xbd93f9),
+        accent2: rgb(0xff79c6),
+        success: rgb(0x50fa7b),
+        warning: rgb(0xf1fa8c),
+        error: rgb(0xff5555),
+        info: rgb(0x8be9fd),
+        ink: rgb(0x282a36),
+        truecolor: true,
+    };
+
+    /// The terminal's own 16 colours.
+    pub const ANSI: Self = Self {
+        name: "ansi",
+        text: Color::Reset,
+        subtle: Color::Gray,
+        muted: Color::DarkGray,
+        surface: Color::DarkGray,
+        border: Color::DarkGray,
+        accent: Color::Cyan,
+        accent2: Color::Magenta,
+        success: Color::Green,
+        warning: Color::Yellow,
+        error: Color::Red,
+        info: Color::Blue,
+        ink: Color::Black,
+        truecolor: false,
+    };
+
+    /// Every palette, in the order `t` cycles through them.
+    pub const ALL: [Self; 5] = [
+        Self::GESTALT,
+        Self::LATTE,
+        Self::NORD,
+        Self::DRACULA,
+        Self::ANSI,
+    ];
+
+    /// The palette called `name`; `dark` and `light` name the defaults.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "dark" => Some(Self::GESTALT),
+            "light" => Some(Self::LATTE),
+            _ => Self::ALL.into_iter().find(|palette| palette.name == name),
+        }
+    }
+}
+
+/// Whether the terminal advertises 24-bit colour.
+fn supports_truecolor() -> bool {
+    std::env::var("COLORTERM").is_ok_and(|value| value == "truecolor" || value == "24bit")
+        || std::env::var("TERM_PROGRAM").is_ok_and(|value| {
+            matches!(
+                value.as_str(),
+                "iTerm.app" | "WezTerm" | "ghostty" | "vscode" | "WarpTerminal"
+            )
+        })
+}
+
+/// Styles for every part of the interface, derived from a [`Palette`].
 #[derive(Debug, Clone)]
 pub struct Theme {
-    /// Current theme variant.
-    pub variant: ThemeVariant,
+    /// The theme asked for, which `t` cycles from even when the terminal
+    /// shows it as `ansi`.
+    pub name: &'static str,
 
     // Base colors
     pub background: Color,
@@ -40,6 +179,8 @@ pub struct Theme {
     pub warning: Color,
     pub error: Color,
     pub info: Color,
+    /// Text on a cell filled with a status or size colour.
+    pub ink: Color,
 
     // UI elements
     pub border: Style,
@@ -54,27 +195,15 @@ pub struct Theme {
     pub symlink: Style,
     pub executable: Style,
 
-    // Progress
-    pub progress_bar: Style,
-    pub progress_bg: Style,
-
     // Header/Footer
     pub header: Style,
     pub footer: Style,
 
-    // Footer keybinding hints (polished pill/badge style)
+    // Footer keybinding hints (pill/badge style)
     pub help_key_bg: Color,
     pub help_key_fg: Color,
     pub help_desc_fg: Color,
     pub footer_bg: Color,
-
-    // Command palette
-    pub command_prompt: Style,
-    pub command_input: Style,
-    pub command_cursor: Style,
-
-    // Marked items
-    pub marked: Style,
 
     // Git status colors
     pub git_modified: Color,
@@ -85,187 +214,86 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Dark theme using a slate-based palette.
+    /// The theme called `name`, if there is one, adjusted to the terminal:
+    /// a truecolour palette becomes `ansi` where 24-bit colour is missing.
+    pub fn named(name: &str) -> Option<Self> {
+        let palette = Palette::named(name)?;
+        let shown = if palette.truecolor && !supports_truecolor() {
+            Palette::ANSI
+        } else {
+            palette
+        };
+        Some(Self {
+            name: palette.name,
+            ..Self::from_palette(shown)
+        })
+    }
+
+    /// The default dark theme, Gestalt.
     pub fn dark() -> Self {
-        // Slate palette (Tailwind CSS)
-        let slate_50 = Color::Rgb(248, 250, 252);
-        let slate_100 = Color::Rgb(241, 245, 249);
-        let slate_300 = Color::Rgb(203, 213, 225);
-        let slate_400 = Color::Rgb(148, 163, 184);
-        let slate_500 = Color::Rgb(100, 116, 139);
-        let slate_600 = Color::Rgb(71, 85, 105);
-        let slate_700 = Color::Rgb(51, 65, 85);
-        let slate_800 = Color::Rgb(30, 41, 59);
-        let slate_900 = Color::Rgb(15, 23, 42);
+        Self::from_palette(Palette::GESTALT)
+    }
 
-        // Accent colors (Tailwind CSS)
-        let blue_400 = Color::Rgb(96, 165, 250);
-        let blue_500 = Color::Rgb(59, 130, 246);
-        let green_500 = Color::Rgb(34, 197, 94);
-        let yellow_500 = Color::Rgb(234, 179, 8);
-        let orange_500 = Color::Rgb(249, 115, 22);
-        let red_500 = Color::Rgb(239, 68, 68);
-        let cyan_400 = Color::Rgb(34, 211, 238);
-        let amber_500 = Color::Rgb(245, 158, 11);
+    /// The next theme in [`Palette::ALL`].
+    pub fn next(&self) -> Self {
+        let index = Palette::ALL
+            .iter()
+            .position(|palette| palette.name == self.name)
+            .map_or(0, |index| (index + 1) % Palette::ALL.len());
+        Self::named(Palette::ALL[index].name).unwrap_or_else(Self::dark)
+    }
 
+    /// Every style, derived from `palette`.
+    pub fn from_palette(palette: Palette) -> Self {
+        let p = palette;
         Self {
-            variant: ThemeVariant::Dark,
-            background: slate_900,
-            foreground: slate_100,
-            muted: slate_500,
+            name: palette.name,
+            background: Color::Reset,
+            foreground: p.text,
+            muted: p.muted,
 
             selected: Style::new()
-                .bg(slate_700)
-                .fg(slate_50)
+                .bg(p.surface)
+                .fg(p.text)
                 .add_modifier(Modifier::BOLD),
-            hover: Style::new().bg(slate_800),
+            hover: Style::new().bg(p.surface),
 
-            size_huge: red_500,
-            size_large: orange_500,
-            size_medium: yellow_500,
-            size_small: green_500,
-            size_tiny: slate_600,
+            size_huge: p.error,
+            size_large: p.warning,
+            size_medium: p.success,
+            size_small: p.info,
+            size_tiny: p.muted,
 
-            success: green_500,
-            warning: yellow_500,
-            error: red_500,
-            info: blue_400,
+            success: p.success,
+            warning: p.warning,
+            error: p.error,
+            info: p.info,
+            ink: p.ink,
 
-            border: Style::new().fg(slate_600),
-            title: Style::new().fg(blue_400).add_modifier(Modifier::BOLD),
-            help_key: Style::new().fg(blue_400).add_modifier(Modifier::BOLD),
-            help_desc: Style::new().fg(slate_400),
+            border: Style::new().fg(p.border),
+            title: Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
+            help_key: Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
+            help_desc: Style::new().fg(p.subtle),
 
-            tree_lines: Style::new().fg(slate_600),
-            directory: Style::new().fg(blue_500).add_modifier(Modifier::BOLD),
-            file: Style::new().fg(slate_300),
-            symlink: Style::new().fg(cyan_400),
-            executable: Style::new().fg(green_500),
+            tree_lines: Style::new().fg(p.muted),
+            directory: Style::new().fg(p.info).add_modifier(Modifier::BOLD),
+            file: Style::new().fg(p.text),
+            symlink: Style::new().fg(p.accent2),
+            executable: Style::new().fg(p.success),
 
-            progress_bar: Style::new().fg(blue_500),
-            progress_bg: Style::new().fg(slate_700),
+            header: Style::new().bg(p.surface).fg(p.text),
+            footer: Style::new().bg(p.surface).fg(p.subtle),
 
-            header: Style::new().bg(slate_800).fg(slate_100),
-            footer: Style::new().bg(slate_800).fg(slate_400),
+            help_key_bg: p.border,
+            help_key_fg: p.accent,
+            help_desc_fg: p.subtle,
+            footer_bg: p.surface,
 
-            // Footer keybinding hints - polished pill/badge style
-            help_key_bg: slate_700,
-            help_key_fg: blue_400,
-            help_desc_fg: slate_400,
-            footer_bg: slate_800,
-
-            command_prompt: Style::new().fg(blue_400).add_modifier(Modifier::BOLD),
-            command_input: Style::new().fg(slate_100),
-            command_cursor: Style::new().add_modifier(Modifier::REVERSED),
-
-            marked: Style::new().fg(amber_500).add_modifier(Modifier::BOLD),
-
-            // Git status colors
-            git_modified: orange_500,
-            git_staged: green_500,
-            git_untracked: Color::Rgb(167, 139, 250), // Purple
-            git_ignored: slate_500,
-            git_conflict: red_500,
-        }
-    }
-
-    /// Light theme using a slate-based palette.
-    pub fn light() -> Self {
-        // Slate palette (Tailwind CSS)
-        let slate_50 = Color::Rgb(248, 250, 252);
-        let slate_100 = Color::Rgb(241, 245, 249);
-        let slate_200 = Color::Rgb(226, 232, 240);
-        let slate_400 = Color::Rgb(148, 163, 184);
-        let slate_500 = Color::Rgb(100, 116, 139);
-        let slate_600 = Color::Rgb(71, 85, 105);
-        let slate_700 = Color::Rgb(51, 65, 85);
-        let slate_800 = Color::Rgb(30, 41, 59);
-        let slate_900 = Color::Rgb(15, 23, 42);
-
-        // Accent colors (Tailwind CSS - darker variants for light theme)
-        let blue_600 = Color::Rgb(37, 99, 235);
-        let blue_700 = Color::Rgb(29, 78, 216);
-        let green_600 = Color::Rgb(22, 163, 74);
-        let yellow_600 = Color::Rgb(202, 138, 4);
-        let orange_600 = Color::Rgb(234, 88, 12);
-        let red_600 = Color::Rgb(220, 38, 38);
-        let cyan_600 = Color::Rgb(8, 145, 178);
-        let amber_600 = Color::Rgb(217, 119, 6);
-
-        Self {
-            variant: ThemeVariant::Light,
-            background: slate_50,
-            foreground: slate_900,
-            muted: slate_500,
-
-            selected: Style::new()
-                .bg(slate_200)
-                .fg(slate_900)
-                .add_modifier(Modifier::BOLD),
-            hover: Style::new().bg(slate_100),
-
-            size_huge: red_600,
-            size_large: orange_600,
-            size_medium: yellow_600,
-            size_small: green_600,
-            size_tiny: slate_400,
-
-            success: green_600,
-            warning: yellow_600,
-            error: red_600,
-            info: blue_600,
-
-            border: Style::new().fg(slate_400),
-            title: Style::new().fg(blue_700).add_modifier(Modifier::BOLD),
-            help_key: Style::new().fg(blue_700).add_modifier(Modifier::BOLD),
-            help_desc: Style::new().fg(slate_600),
-
-            tree_lines: Style::new().fg(slate_400),
-            directory: Style::new().fg(blue_700).add_modifier(Modifier::BOLD),
-            file: Style::new().fg(slate_700),
-            symlink: Style::new().fg(cyan_600),
-            executable: Style::new().fg(green_600),
-
-            progress_bar: Style::new().fg(blue_600),
-            progress_bg: Style::new().fg(slate_200),
-
-            header: Style::new().bg(slate_100).fg(slate_800),
-            footer: Style::new().bg(slate_100).fg(slate_600),
-
-            // Footer keybinding hints - polished pill/badge style
-            help_key_bg: slate_200,
-            help_key_fg: blue_700,
-            help_desc_fg: slate_600,
-            footer_bg: slate_100,
-
-            command_prompt: Style::new().fg(blue_700).add_modifier(Modifier::BOLD),
-            command_input: Style::new().fg(slate_900),
-            command_cursor: Style::new().add_modifier(Modifier::REVERSED),
-
-            marked: Style::new().fg(amber_600).add_modifier(Modifier::BOLD),
-
-            // Git status colors
-            git_modified: orange_600,
-            git_staged: green_600,
-            git_untracked: Color::Rgb(124, 58, 237), // Purple
-            git_ignored: slate_400,
-            git_conflict: red_600,
-        }
-    }
-
-    /// Create theme from variant.
-    pub fn from_variant(variant: ThemeVariant) -> Self {
-        match variant {
-            ThemeVariant::Dark => Self::dark(),
-            ThemeVariant::Light => Self::light(),
-        }
-    }
-
-    /// Toggle between dark and light themes.
-    pub fn toggle(&self) -> Self {
-        match self.variant {
-            ThemeVariant::Dark => Self::light(),
-            ThemeVariant::Light => Self::dark(),
+            git_modified: p.warning,
+            git_staged: p.success,
+            git_untracked: p.accent2,
+            git_ignored: p.muted,
+            git_conflict: p.error,
         }
     }
 
@@ -320,5 +348,37 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::dark()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_palette_is_reachable_by_name_and_by_cycling() {
+        for palette in Palette::ALL {
+            assert_eq!(Palette::named(palette.name), Some(palette));
+        }
+        assert_eq!(Palette::named("dark"), Some(Palette::GESTALT));
+        assert_eq!(Palette::named("light"), Some(Palette::LATTE));
+        assert_eq!(Palette::named("solarized"), None);
+
+        let mut theme = Theme::from_palette(Palette::ANSI);
+        let mut seen = Vec::new();
+        for _ in 0..Palette::ALL.len() {
+            theme = theme.next();
+            seen.push(theme.name);
+        }
+        // Even where every palette shows as ansi, cycling visits them all.
+        let names: Vec<_> = Palette::ALL.iter().map(|palette| palette.name).collect();
+        assert_eq!(seen, names);
+    }
+
+    #[test]
+    fn backgrounds_are_the_terminals_own() {
+        for palette in Palette::ALL {
+            assert_eq!(Theme::from_palette(palette).background, Color::Reset);
+        }
     }
 }

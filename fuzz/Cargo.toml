@@ -1,0 +1,30 @@
+[package]
+name = "gravityfile-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not part of the main workspace: building needs nightly and libFuzzer.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gravityfile-core = { path = "../crates/gravityfile-core" }
+gravityfile-scan = { path = "../crates/gravityfile-scan" }
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "units"
+path = "fuzz_targets/units.rs"
+test = false
+doc = false
+bench = false

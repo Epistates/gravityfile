@@ -1,6 +1,6 @@
 //! Application state types and enums.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -8,8 +8,10 @@ use strum::{Display, EnumIter, FromRepr, IntoEnumIterator};
 
 use gravityfile_analyze::{AgeReport, DuplicateReport};
 use gravityfile_core::FileTree;
-use gravityfile_ops::{Conflict, OperationProgress, OperationType};
+use gravityfile_ops::{ConflictRequest, OperationProgress, OperationType};
 use gravityfile_scan::ScanProgress;
+
+use crate::ui::{MillerState, TreeState, TreemapState};
 
 /// Application mode representing the current UI state.
 /// Note: Scanning is NOT a mode - scanning happens in the background
@@ -29,6 +31,10 @@ pub enum AppMode {
     Copying,
     /// Move operation in progress.
     Moving,
+    /// Undo is running, including while cancellation is being completed.
+    Undoing,
+    /// A single-entry creation or rename is awaiting its worker result.
+    UpdatingEntry,
     /// Renaming a file or directory (text input mode).
     Renaming,
     /// Creating a new file (text input mode).
@@ -53,13 +59,16 @@ pub enum AppMode {
     BookmarkList,
     /// Confirming bulk rename changes.
     ConfirmBulkRename,
+    /// A bulk rename is running to completion or rollback.
+    BulkRenaming,
     /// Visual selection mode (vim-style range selection).
     Visual,
     Quit,
 }
 
 /// Layout mode for the explorer view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LayoutMode {
     /// Tree view (default, current behavior).
     #[default]
@@ -74,6 +83,14 @@ impl LayoutMode {
         match self {
             Self::Tree => Self::Miller,
             Self::Miller => Self::Tree,
+        }
+    }
+
+    /// The name used in settings.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Miller => "miller",
         }
     }
 }
@@ -101,18 +118,6 @@ impl VisualState {
         let start = self.anchor.min(self.cursor);
         let end = self.anchor.max(self.cursor);
         (start, end)
-    }
-
-    /// Check if an index is within the selection range.
-    pub fn is_selected(&self, index: usize) -> bool {
-        let (start, end) = self.selection_range();
-        index >= start && index <= end
-    }
-
-    /// Get the number of selected items.
-    pub fn selection_count(&self) -> usize {
-        let (start, end) = self.selection_range();
-        end - start + 1
     }
 
     /// Move the cursor up.
@@ -200,11 +205,6 @@ impl ClipboardState {
     /// Check if the clipboard is empty.
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()
-    }
-
-    /// Get the number of items in the clipboard.
-    pub fn len(&self) -> usize {
-        self.paths.len()
     }
 }
 
@@ -323,6 +323,7 @@ pub struct DeletionProgress {
 
 impl DeletionProgress {
     /// Create new deletion progress.
+    #[cfg(test)]
     pub fn new(total: usize) -> Self {
         Self {
             total,
@@ -346,36 +347,76 @@ impl DeletionProgress {
 /// Result from a background scan operation.
 pub enum ScanResult {
     Progress(ScanProgress),
-    #[allow(dead_code)] // For future real-time warning streaming
-    Warning(gravityfile_core::ScanWarning),
-    /// Partial tree snapshot for real-time updates during scanning.
-    PartialTree(FileTree),
     ScanComplete(Result<FileTree, gravityfile_scan::ScanError>),
     AnalysisComplete {
         duplicates: DuplicateReport,
         age_report: AgeReport,
+        /// Per-group root count and validated path ordering, prepared off-thread.
+        duplicate_scope: (PathBuf, Vec<(usize, bool)>),
     },
+    AnalysisFailed(String),
+    AnalysisCancelled,
     /// Progress update during deletion.
     DeletionProgress(DeletionProgress),
     /// Deletion completed.
     DeletionComplete {
-        deleted: usize,
+        mode: gravityfile_ops::DeleteMode,
+        /// Paths that were removed.
+        deleted: Vec<PathBuf>,
         failed: usize,
         bytes_freed: u64,
+        errors: Vec<gravityfile_ops::OperationError>,
     },
     /// Progress update during file operations (copy/move/etc).
     OperationProgress(OperationProgress),
     /// A conflict was encountered during file operation.
-    OperationConflict(Conflict),
+    OperationConflict(ConflictRequest),
+    /// Create-and-enter completed: true means this task created the directory.
+    TakeComplete {
+        path: PathBuf,
+        result: Result<bool, String>,
+    },
+    /// Bulk rename completed or failed after rollback attempts.
+    BulkRenameComplete(Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String>),
     /// File operation completed.
     OperationComplete {
+        cancelled: bool,
         operation_type: OperationType,
         succeeded: usize,
         failed: usize,
+        skipped: usize,
         bytes_processed: u64,
-        /// OPTIONAL: Information for the undo log.
+        errors: Vec<gravityfile_ops::OperationError>,
+        /// Information for the undo log.
         undo_info: Option<gravityfile_ops::UndoableOperation>,
+        /// Items an undo could not reverse, to push back for a retry.
+        undo_remaining: Option<gravityfile_ops::UndoEntry>,
+        /// Paths whose contents may have changed, to refresh in the tree.
+        touched: Vec<PathBuf>,
     },
+}
+
+/// The state of one changed path, scanned again.
+pub struct Refreshed {
+    pub path: PathBuf,
+    /// `None` when the path no longer exists.
+    pub entry: Result<Option<gravityfile_scan::ScannedEntry>, String>,
+}
+
+/// What a directory listing was read for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListingFor {
+    /// The entries of a directory the tree has not read yet.
+    Children,
+    /// The Miller parent column at the scan root.
+    Parent,
+}
+
+/// A directory listed off the UI thread.
+pub struct Listed {
+    pub dir: PathBuf,
+    pub purpose: ListingFor,
+    pub result: Result<FileTree, String>,
 }
 
 /// Information about the currently selected item.
@@ -390,17 +431,6 @@ pub struct SelectedInfo {
     pub is_dir: bool,
 }
 
-/// A pending file operation waiting for conflict resolution.
-#[derive(Debug, Clone)]
-pub enum PendingOperation {
-    /// Paste operation (copy or move).
-    Paste {
-        sources: Vec<PathBuf>,
-        destination: PathBuf,
-        mode: ClipboardMode,
-    },
-}
-
 /// State for the duplicates view with expandable groups.
 #[derive(Debug, Clone, Default)]
 pub struct DuplicatesViewState {
@@ -411,8 +441,6 @@ pub struct DuplicatesViewState {
     /// When a group is expanded, the selected file index within that group (0 = group header).
     /// Key is group index, value is selected item (0 = header, 1..=n = files).
     pub selected_in_group: std::collections::HashMap<usize, usize>,
-    /// Scroll offset for the view.
-    pub scroll_offset: usize,
 }
 
 impl DuplicatesViewState {
@@ -508,208 +536,146 @@ impl DuplicatesViewState {
             group.paths.get(selected - 1)
         }
     }
-
-    /// Get all file paths in the selected group (for bulk operations).
-    pub fn selected_group_paths<'a>(
-        &self,
-        groups: &'a [&gravityfile_analyze::DuplicateGroup],
-    ) -> Option<&'a [PathBuf]> {
-        groups.get(self.selected_group).map(|g| g.paths.as_slice())
-    }
 }
 
-/// A single tab representing an independent directory exploration context.
-#[derive(Debug, Clone)]
-pub struct Tab {
-    /// Unique identifier for this tab.
-    pub id: usize,
-    /// Display label for the tab (typically the directory name).
-    pub label: String,
-    /// Root path being explored in this tab.
-    pub path: PathBuf,
-    /// Current view root (may be different from path after drilling down).
+/// A place in a tab's back/forward history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visit {
+    /// The directory viewed.
+    pub dir: PathBuf,
+    /// The selected entry. Kept as a path rather than a row so returning
+    /// finds it in any layout, and after the listing has changed.
+    pub selected: Option<PathBuf>,
+    /// The directories expanded in the tree layout.
+    pub expanded: HashSet<PathBuf>,
+}
+
+/// What one tab is looking at and how it got there. The active tab's
+/// navigation is owned by the app; [`TabManager`] keeps the others.
+#[derive(Debug, Clone, Default)]
+pub struct Navigation {
+    /// The directory being viewed.
     pub view_root: PathBuf,
-    /// Navigation history for back navigation.
-    pub history: Vec<(PathBuf, usize, std::collections::HashSet<PathBuf>)>,
+    /// Selection, scroll and expanded directories in the tree layout.
+    pub tree_state: TreeState,
+    /// Selection and scroll in the Miller layout.
+    pub miller_state: MillerState,
+    /// Selection in the treemap.
+    pub treemap_state: TreemapState,
+    /// Earlier places, most recent last.
+    pub back: Vec<Visit>,
+    /// Places left by going back, most recent last.
+    pub forward: Vec<Visit>,
 }
 
-impl Tab {
-    /// Create a new tab for a given path.
-    pub fn new(id: usize, path: PathBuf) -> Self {
-        let label = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
-
+impl Navigation {
+    /// Start viewing `view_root` with it expanded and no history.
+    pub fn new(view_root: PathBuf) -> Self {
         Self {
-            id,
-            label,
-            path: path.clone(),
-            view_root: path,
-            history: Vec::new(),
+            tree_state: TreeState::new(view_root.clone()),
+            view_root,
+            ..Self::default()
         }
     }
 
-    /// Get a short label for display (truncated if too long).
-    pub fn short_label(&self, max_len: usize) -> String {
-        if self.label.len() <= max_len {
-            self.label.clone()
-        } else {
-            format!("{}…", &self.label[..max_len.saturating_sub(1)])
-        }
+    /// The tab label: the viewed directory's name.
+    pub fn label(&self) -> String {
+        self.view_root
+            .file_name()
+            .unwrap_or(self.view_root.as_os_str())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
-/// Manager for multiple tabs.
+/// The open directory tabs. The active tab's [`Navigation`] is held by the
+/// app and swapped back in here when another tab becomes active, so each tab
+/// keeps its own place, selection and history.
 #[derive(Debug)]
 pub struct TabManager {
-    /// All open tabs.
-    tabs: Vec<Tab>,
-    /// Index of the currently active tab.
+    /// One entry per tab; the active tab's entry is a placeholder.
+    stashed: Vec<Navigation>,
+    /// Index of the active tab.
     active: usize,
-    /// Next tab ID to assign.
-    next_id: usize,
-    /// Maximum number of tabs allowed.
+    /// Maximum number of tabs.
     max_tabs: usize,
 }
 
-impl Default for TabManager {
-    fn default() -> Self {
-        Self::new(10)
-    }
-}
-
 impl TabManager {
-    /// Create a new tab manager with a maximum tab limit.
+    /// One tab, the active one, whose navigation the caller holds.
     pub fn new(max_tabs: usize) -> Self {
         Self {
-            tabs: Vec::new(),
+            stashed: vec![Navigation::default()],
             active: 0,
-            next_id: 0,
             max_tabs,
         }
     }
 
-    /// Create a tab manager with an initial tab.
-    pub fn with_initial_tab(path: PathBuf, max_tabs: usize) -> Self {
-        let mut manager = Self::new(max_tabs);
-        manager.new_tab(path);
-        manager
-    }
-
-    /// Get the number of open tabs.
+    /// The number of open tabs.
     pub fn len(&self) -> usize {
-        self.tabs.len()
+        self.stashed.len()
     }
 
-    /// Check if there are no tabs.
-    pub fn is_empty(&self) -> bool {
-        self.tabs.is_empty()
-    }
-
-    /// Get the active tab index.
+    /// The active tab's index.
     pub fn active_index(&self) -> usize {
         self.active
     }
 
-    /// Get a reference to the active tab.
-    pub fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.get(self.active)
+    /// Every tab's label, in order, taking the active one from `current`.
+    pub fn labels(&self, current: &Navigation) -> Vec<String> {
+        (0..self.stashed.len())
+            .map(|index| {
+                if index == self.active {
+                    current.label()
+                } else {
+                    self.stashed[index].label()
+                }
+            })
+            .collect()
     }
 
-    /// Get a mutable reference to the active tab.
-    pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
-        self.tabs.get_mut(self.active)
-    }
-
-    /// Get all tabs.
-    pub fn tabs(&self) -> &[Tab] {
-        &self.tabs
-    }
-
-    /// Create a new tab with the given path.
-    /// Returns true if the tab was created, false if at max capacity.
-    pub fn new_tab(&mut self, path: PathBuf) -> bool {
-        if self.tabs.len() >= self.max_tabs {
+    /// Open a tab showing `navigation` and make it active. Returns false at
+    /// the tab limit.
+    pub fn open(&mut self, current: &mut Navigation, navigation: Navigation) -> bool {
+        if self.stashed.len() >= self.max_tabs {
             return false;
         }
+        self.stashed.push(navigation);
+        self.switch(current, self.stashed.len() - 1)
+    }
 
-        let tab = Tab::new(self.next_id, path);
-        self.next_id += 1;
-        self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+    /// Close the active tab and activate its neighbour. Returns false for the
+    /// last tab.
+    pub fn close_active(&mut self, current: &mut Navigation) -> bool {
+        if self.stashed.len() <= 1 {
+            return false;
+        }
+        self.stashed.remove(self.active);
+        self.active = self.active.min(self.stashed.len() - 1);
+        std::mem::swap(current, &mut self.stashed[self.active]);
         true
     }
 
-    /// Close the active tab.
-    /// Returns true if a tab was closed, false if it's the last tab.
-    pub fn close_active_tab(&mut self) -> bool {
-        if self.tabs.len() <= 1 {
+    /// Make tab `index` active. Returns whether the active tab changed.
+    pub fn switch(&mut self, current: &mut Navigation, index: usize) -> bool {
+        if index == self.active || index >= self.stashed.len() {
             return false;
         }
-
-        self.tabs.remove(self.active);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        }
+        std::mem::swap(current, &mut self.stashed[self.active]);
+        self.active = index;
+        std::mem::swap(current, &mut self.stashed[self.active]);
         true
     }
 
-    /// Close a tab by index.
-    pub fn close_tab(&mut self, index: usize) -> bool {
-        if self.tabs.len() <= 1 || index >= self.tabs.len() {
-            return false;
-        }
-
-        self.tabs.remove(index);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        } else if self.active > index {
-            self.active -= 1;
-        }
-        true
+    /// Activate the next tab, wrapping around.
+    pub fn next(&mut self, current: &mut Navigation) -> bool {
+        self.switch(current, (self.active + 1) % self.stashed.len())
     }
 
-    /// Switch to the next tab.
-    pub fn next_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
-        }
-    }
-
-    /// Switch to the previous tab.
-    pub fn prev_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active = if self.active == 0 {
-                self.tabs.len() - 1
-            } else {
-                self.active - 1
-            };
-        }
-    }
-
-    /// Switch to a specific tab by index.
-    pub fn switch_to(&mut self, index: usize) {
-        if index < self.tabs.len() {
-            self.active = index;
-        }
-    }
-
-    /// Switch to a tab by number (1-indexed, for Alt+1 through Alt+9).
-    pub fn switch_to_number(&mut self, number: usize) {
-        if number > 0 && number <= self.tabs.len() {
-            self.active = number - 1;
-        }
-    }
-
-    /// Duplicate the active tab (open same directory in new tab).
-    pub fn duplicate_active_tab(&mut self) -> bool {
-        if let Some(tab) = self.active_tab() {
-            let path = tab.view_root.clone();
-            self.new_tab(path)
-        } else {
-            false
-        }
+    /// Activate the previous tab, wrapping around.
+    pub fn prev(&mut self, current: &mut Navigation) -> bool {
+        let count = self.stashed.len();
+        self.switch(current, (self.active + count - 1) % count)
     }
 }
 
@@ -724,19 +690,20 @@ pub struct Bookmarks {
 impl Bookmarks {
     /// Create bookmarks with sensible defaults.
     pub fn with_defaults() -> Self {
+        use gravityfile_core::paths;
         let mut marks = HashMap::new();
-        if let Some(home) = dirs::home_dir() {
-            marks.insert('h', home);
-        }
         marks.insert('r', PathBuf::from("/"));
-        if let Some(config) = dirs::config_dir() {
+        if let Some(config) = paths::config_root() {
             marks.insert('c', config);
         }
-        if let Some(downloads) = dirs::download_dir() {
-            marks.insert('d', downloads);
-        }
-        if let Some(documents) = dirs::document_dir() {
-            marks.insert('o', documents);
+        if let Some(home) = paths::home() {
+            for (key, name) in [('d', "Downloads"), ('o', "Documents")] {
+                let directory = home.join(name);
+                if directory.is_dir() {
+                    marks.insert(key, directory);
+                }
+            }
+            marks.insert('h', home);
         }
         Self { marks }
     }
@@ -808,16 +775,6 @@ impl BookmarkListState {
             self.selected += 1;
         }
     }
-
-    /// Get the number of entries.
-    pub fn len(&self) -> usize {
-        self.entries_count
-    }
-
-    /// Check if empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries_count == 0
-    }
 }
 
 /// A single rename operation in bulk rename.
@@ -836,8 +793,6 @@ pub struct BulkRenameState {
     pub entries: Vec<RenameEntry>,
     /// Currently selected entry in the confirmation modal.
     pub selected: usize,
-    /// Scroll offset for display.
-    pub offset: usize,
     /// Error message if validation failed.
     pub error: Option<String>,
 }
@@ -862,14 +817,8 @@ impl BulkRenameState {
         Self {
             entries,
             selected: 0,
-            offset: 0,
             error: None,
         }
-    }
-
-    /// Get the number of entries.
-    pub fn len(&self) -> usize {
-        self.entries.len()
     }
 
     /// Check if empty.
@@ -902,21 +851,8 @@ impl BulkRenameState {
             }
             seen_names.insert(entry.new_name.clone());
 
-            // Validate the new name
-            if entry.new_name.is_empty() {
-                self.error = Some("Empty name is not allowed".to_string());
-                return false;
-            }
-            if entry.new_name.contains('/') || entry.new_name.contains('\0') {
-                self.error = Some(format!("Invalid characters in: {}", entry.new_name));
-                return false;
-            }
-            if entry.new_name == "." || entry.new_name == ".." {
-                self.error = Some(format!("Reserved name: {}", entry.new_name));
-                return false;
-            }
-            if entry.new_name.len() > 255 {
-                self.error = Some(format!("Name too long: {}", entry.new_name));
+            if let Err(error) = gravityfile_ops::validate_filename(&entry.new_name) {
+                self.error = Some(format!("{}: {error}", entry.new_name));
                 return false;
             }
         }
@@ -929,12 +865,16 @@ impl BulkRenameState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserSettings {
+    /// Descendant-entry budget for quick listings and recursive scans.
+    /// None preserves unlimited traversal; zero permits an empty scope.
+    #[serde(default)]
+    pub max_scan_entries: Option<u64>,
     /// Whether to automatically start scanning on startup.
     pub scan_on_startup: bool,
     /// Show hidden files by default.
     pub show_hidden: bool,
-    /// Default layout mode.
-    pub default_layout: String,
+    /// Layout the explorer opens in.
+    pub default_layout: LayoutMode,
     /// File opener configuration.
     pub openers: FileOpeners,
     /// Editor configuration for opensesame.
@@ -943,17 +883,44 @@ pub struct UserSettings {
     /// Directory bookmarks.
     #[serde(default = "Bookmarks::with_defaults")]
     pub bookmarks: Bookmarks,
+    /// Render image files in the preview pane using the terminal's graphics
+    /// protocol.
+    ///
+    /// Enabling this costs one capability query at startup. Terminals answer it
+    /// in microseconds, but one that never answers delays the first frame by
+    /// the query timeout, so this can be turned off.
+    #[serde(default = "default_true")]
+    pub image_previews: bool,
+    /// Colour theme: gestalt, latte, nord, dracula or ansi.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Record each full scan's totals for `grav history` and the header's
+    /// change since last time.
+    #[serde(default = "default_true")]
+    pub record_history: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_theme() -> String {
+    crate::theme::Palette::GESTALT.name.to_string()
 }
 
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
+            max_scan_entries: None,
             scan_on_startup: true, // Enabled by default
             show_hidden: false,
-            default_layout: "tree".to_string(),
+            default_layout: LayoutMode::Tree,
             openers: FileOpeners::default(),
             editor: opensesame::EditorConfig::default(),
             bookmarks: Bookmarks::with_defaults(),
+            image_previews: true,
+            theme: default_theme(),
+            record_history: true,
         }
     }
 }
@@ -987,32 +954,95 @@ impl Default for FileOpeners {
 impl UserSettings {
     /// Get the config file path.
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("gravityfile").join("settings.toml"))
+        // Unit tests must never read or write the user's real settings.
+        if cfg!(test) {
+            return None;
+        }
+        gravityfile_core::paths::Dirs::discover().map(|dirs| dirs.settings_file())
     }
 
-    /// Load settings from disk, or return defaults.
-    pub fn load() -> Self {
-        Self::config_path()
-            .and_then(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|content| toml::from_str(&content).ok())
-            .unwrap_or_default()
+    /// Load settings, using defaults when no settings file exists.
+    /// Other read and parse failures are returned to the caller.
+    pub fn try_load() -> std::io::Result<Self> {
+        let Some(path) = Self::config_path() else {
+            return Ok(Self::default());
+        };
+        Self::load_from(&path).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })
     }
 
-    /// Save settings to disk.
+    fn load_from(path: &std::path::Path) -> std::io::Result<Self> {
+        let Some(content) = crate::config::read(path)? else {
+            return Ok(Self::default());
+        };
+        toml::from_str(&content)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Sync a private sibling file, atomically replace settings, and on Unix sync
+    /// the containing directory. A post-replacement sync error explicitly reports
+    /// that settings were installed but durability is uncertain.
+    /// Existing file permissions are not preserved; Unix files are private (0600).
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::config_path().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "No config directory")
         })?;
+        self.save_to(&path)
+    }
 
-        // Create parent directory if needed
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.save_to_with_directory_sync(path, sync_settings_directory)
+    }
 
+    fn save_to_with_directory_sync(
+        &self,
+        path: &std::path::Path,
+        sync_directory: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if content.len() as u64 > crate::config::MAX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "settings exceed 1 MiB",
+            ));
+        }
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut staged = tempfile::Builder::new()
+            .prefix(".gravityfile-settings-")
+            .tempfile_in(parent)?;
+        staged.write_all(content.as_bytes())?;
+        staged.as_file().sync_all()?;
+        staged.persist(path).map_err(|error| error.error)?;
+        sync_directory(parent).map_err(|error| {
+            std::io::Error::new(error.kind(), format!(
+                "Settings installed, but directory sync failed; durability is uncertain: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+}
 
-        std::fs::write(&path, content)
+fn sync_settings_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+            .open(path)?
+            .sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -1039,7 +1069,7 @@ impl SettingsState {
 
     /// Number of settings items.
     pub fn item_count(&self) -> usize {
-        3 // scan_on_startup, show_hidden, default_layout
+        4 // scan_on_startup, show_hidden, default_layout, theme
     }
 
     /// Move selection up.
@@ -1069,11 +1099,16 @@ impl SettingsState {
             }
             2 => {
                 // Cycle layout mode
-                self.settings.default_layout = match self.settings.default_layout.as_str() {
-                    "tree" => "miller".to_string(),
-                    "miller" => "tree".to_string(),
-                    _ => "tree".to_string(),
-                };
+                self.settings.default_layout = self.settings.default_layout.toggle();
+                self.dirty = true;
+            }
+            3 => {
+                let palettes = crate::theme::Palette::ALL;
+                let next = palettes
+                    .iter()
+                    .position(|palette| palette.name == self.settings.theme)
+                    .map_or(0, |index| (index + 1) % palettes.len());
+                self.settings.theme = palettes[next].name.to_string();
                 self.dirty = true;
             }
             _ => {}
@@ -1083,7 +1118,227 @@ impl SettingsState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saved_entry_budget_roundtrips_without_changing_legacy_defaults() {
+        use super::UserSettings;
+        assert_eq!(
+            toml::from_str::<UserSettings>("").unwrap().max_scan_entries,
+            None
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for limit in [0, 1, 100_000] {
+            let settings = UserSettings {
+                max_scan_entries: Some(limit),
+                ..UserSettings::default()
+            };
+            settings.save_to(&path).unwrap();
+            assert_eq!(
+                UserSettings::load_from(&path).unwrap().max_scan_entries,
+                Some(limit)
+            );
+        }
+        assert!(toml::from_str::<UserSettings>("max_scan_entries = -1").is_err());
+    }
+    #[test]
+    fn tab_labels_fit_terminal_columns_without_unicode_panics() {
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+        for label in [
+            "",
+            "documents",
+            "éééééé",
+            "日本語資料",
+            "🗂️📁📂",
+            "👩‍💻🇺🇸1️⃣",
+            "e\u{301}e\u{301}",
+        ] {
+            for width in 0..=32 {
+                for slice in [
+                    crate::ui::truncate_to_width(label, width),
+                    crate::ui::truncate_left_to_width(label, width),
+                ] {
+                    assert!(slice.width() <= width);
+                    let boundaries: Vec<_> = label
+                        .grapheme_indices(true)
+                        .map(|(index, _)| index)
+                        .chain(std::iter::once(label.len()))
+                        .collect();
+                    let start = slice.as_ptr() as usize - label.as_ptr() as usize;
+                    assert!(boundaries.contains(&start));
+                    assert!(boundaries.contains(&(start + slice.len())));
+                }
+                assert!(crate::ui::fit_left_to_width(label, width).width() <= width);
+                let shortened = crate::ui::fit_to_width(label, width);
+                assert!(shortened.width() <= width, "{label:?}, width {width}");
+                if label.width() <= width {
+                    assert_eq!(shortened, label);
+                }
+                if width == 0 {
+                    assert!(shortened.is_empty());
+                }
+            }
+        }
+    }
     use super::*;
+
+    #[test]
+    fn settings_load_missing_defaults_and_existing_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        assert!(UserSettings::load_from(&path).unwrap().scan_on_startup);
+        std::fs::write(&path, "scan_on_startup = false\nimage_previews = false\n").unwrap();
+        let settings = UserSettings::load_from(&path).unwrap();
+        assert!(!settings.scan_on_startup);
+        assert!(!settings.image_previews);
+    }
+
+    #[test]
+    fn settings_load_rejects_invalid_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for content in [b"scan_on_startup = [".as_slice(), &[0xff]] {
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(
+                UserSettings::load_from(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::config::MAX_BYTES + 1).unwrap();
+        assert_eq!(
+            UserSettings::load_from(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(UserSettings::load_from(directory.path()).is_err());
+    }
+
+    #[test]
+    fn settings_oversized_save_preserves_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, b"original").unwrap();
+        let settings = UserSettings {
+            openers: FileOpeners {
+                md: "x".repeat(crate::config::MAX_BYTES as usize),
+                ..FileOpeners::default()
+            },
+            ..UserSettings::default()
+        };
+        assert_eq!(
+            settings.save_to(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_load_accepts_regular_symlink_and_rejects_fifo() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&target, "image_previews = false\n").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(!UserSettings::load_from(&path).unwrap().image_previews);
+        let fifo = directory.path().join("fifo");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `native` is a valid, NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            UserSettings::load_from(&fifo).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn settings_save_creates_parents_and_replaces_complete_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config/settings.toml");
+        UserSettings::default().save_to(&path).unwrap();
+        let settings = UserSettings {
+            scan_on_startup: false,
+            default_layout: LayoutMode::Miller,
+            ..UserSettings::default()
+        };
+        settings.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("default_layout = \"miller\""), "{saved}");
+        let restored: UserSettings = toml::from_str(&saved).unwrap();
+        assert!(!restored.scan_on_startup);
+        assert_eq!(restored.default_layout, LayoutMode::Miller);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn settings_publication_failure_preserves_destination_and_removes_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("existing"), b"preserve me").unwrap();
+        assert!(UserSettings::default().save_to(&path).is_err());
+        assert_eq!(
+            std::fs::read(path.join("existing")).unwrap(),
+            b"preserve me"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn settings_directory_sync_failure_reports_installed_document_and_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        UserSettings::default().save_to(&path).unwrap();
+        let settings = UserSettings {
+            scan_on_startup: false,
+            ..UserSettings::default()
+        };
+        let error = settings
+            .save_to_with_directory_sync(&path, |parent| {
+                assert_eq!(parent, directory.path());
+                assert!(!UserSettings::load_from(&path).unwrap().scan_on_startup);
+                Err(std::io::Error::other("injected sync failure"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("Settings installed"));
+        assert!(error.to_string().contains("durability is uncertain"));
+        assert!(!UserSettings::load_from(&path).unwrap().scan_on_startup);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        settings.save_to(&path).unwrap();
+        assert!(!UserSettings::load_from(&path).unwrap().scan_on_startup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_directory_sync_rejects_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(sync_settings_directory(&file).is_err());
+        sync_settings_directory(directory.path()).unwrap();
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_save_replaces_leaf_symlink_with_private_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        UserSettings::default().save_to(&path).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn test_visual_state_creation() {
@@ -1102,29 +1357,6 @@ mod tests {
 
         state.cursor = 2;
         assert_eq!(state.selection_range(), (2, 5));
-    }
-
-    #[test]
-    fn test_visual_state_is_selected() {
-        let mut state = VisualState::new(3);
-        state.cursor = 7;
-
-        assert!(!state.is_selected(0));
-        assert!(!state.is_selected(2));
-        assert!(state.is_selected(3));
-        assert!(state.is_selected(5));
-        assert!(state.is_selected(7));
-        assert!(!state.is_selected(8));
-    }
-
-    #[test]
-    fn test_visual_state_selection_count() {
-        let mut state = VisualState::new(3);
-        state.cursor = 7;
-        assert_eq!(state.selection_count(), 5); // 3, 4, 5, 6, 7
-
-        state.cursor = 3;
-        assert_eq!(state.selection_count(), 1); // just 3
     }
 
     #[test]

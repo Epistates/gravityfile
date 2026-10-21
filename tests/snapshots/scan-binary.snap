@@ -1,0 +1,15 @@
+---
+source: tests/snapshots.rs
+description: grav scan --binary before.json
+expression: run(args)
+---
+exit: 0
+--- stdout
+/srv/data  19.3 MiB
+7 files, 2 directories, from a snapshot taken [TIME]
+
+ 11.4 MiB   59.3%  backup.tar.gz
+ 6.97 MiB   36.1%  photos/
+  912 KiB    4.6%  code/
+ 4.00 KiB    0.0%  README
+--- stderr

@@ -1,0 +1,41 @@
+{
+  "buckets": [
+    {
+      "name": "older",
+      "max_age": {
+        "secs": 31536000,
+        "nanos": 0
+      },
+      "file_count": 1,
+      "total_size": 9007199254740993,
+      "largest_files": [
+        [
+          "data/a",
+          9007199254740993,
+          {
+            "secs_since_epoch": 1700000000,
+            "nanos_since_epoch": 123456789
+          }
+        ]
+      ]
+    }
+  ],
+  "stale_directories": [
+    {
+      "path": "data",
+      "size": 9007199254740993,
+      "newest_file_age": {
+        "secs": 86400,
+        "nanos": 42
+      },
+      "file_count": 1
+    }
+  ],
+  "total_files": 1,
+  "total_size": 9007199254740993,
+  "average_age": {
+    "secs": 86400,
+    "nanos": 42
+  },
+  "median_age_bucket": "older"
+}
