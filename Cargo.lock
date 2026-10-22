@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-analyze"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "derive_builder",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "compact_str 0.10.0",
  "derive_builder",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-ops"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bzip2",
  "dunce",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-plugin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dunce",
  "gravityfile-core",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-scan"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "dunce",
  "git2",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "gravityfile-tui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bzip2",
  "chrono",

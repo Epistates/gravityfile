@@ -141,15 +141,19 @@ mod platform {
         };
         // SAFETY: both C strings are NUL-terminated and outlive the call.
         let result = unsafe {
+            // The system call itself: musl, which the static Linux build
+            // uses, has no renameat2 wrapper. A kernel without the call
+            // reports ENOSYS, which falls back below.
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     libc::AT_FDCWD,
                     source.as_ptr(),
                     libc::AT_FDCWD,
                     destination.as_ptr(),
                     libc::RENAME_NOREPLACE,
-                )
+                ) as libc::c_int
             }
             #[cfg(target_vendor = "apple")]
             {
