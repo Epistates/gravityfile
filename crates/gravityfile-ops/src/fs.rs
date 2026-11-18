@@ -299,6 +299,30 @@ pub(crate) fn symlink(target: &Path, source: &Path, destination: &Path) -> io::R
     }
 }
 
+// filetime 0.2.30 deprecates its setters in favor of `std::fs::set_times` and
+// `std::fs::set_times_nofollow`, which are stable only from Rust 1.100. Switch
+// these two helpers to std once the MSRV reaches it.
+
+/// Give `path` the access and modification times recorded in `metadata`.
+#[allow(deprecated)]
+pub(crate) fn set_times(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    filetime::set_file_times(
+        path,
+        filetime::FileTime::from_last_access_time(metadata),
+        filetime::FileTime::from_last_modification_time(metadata),
+    )
+}
+
+/// Like [`set_times`], but sets the times of a symlink itself.
+#[allow(deprecated)]
+pub(crate) fn set_symlink_times(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    filetime::set_symlink_file_times(
+        path,
+        filetime::FileTime::from_last_access_time(metadata),
+        filetime::FileTime::from_last_modification_time(metadata),
+    )
+}
+
 /// Reserve an owner-only directory beside `sibling`, on the same filesystem,
 /// so its contents can later be published with a single rename.
 pub(crate) fn staging_dir(sibling: &Path, prefix: &str) -> io::Result<tempfile::TempDir> {

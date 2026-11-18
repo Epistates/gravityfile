@@ -146,11 +146,7 @@ impl<'a> Transfer<'a> {
         crate::fs::symlink(&target, source, destination)?;
         if self.preserve.times {
             let metadata = fs::symlink_metadata(source)?;
-            filetime::set_symlink_file_times(
-                destination,
-                filetime::FileTime::from_last_access_time(&metadata),
-                filetime::FileTime::from_last_modification_time(&metadata),
-            )?;
+            crate::fs::set_symlink_times(destination, &metadata)?;
         }
         Ok(())
     }
@@ -252,11 +248,7 @@ impl<'a> Transfer<'a> {
                 copy_xattrs(&source_dir, &directory);
             }
             if self.preserve.times {
-                let _ = filetime::set_file_times(
-                    &directory,
-                    filetime::FileTime::from_last_access_time(&metadata),
-                    filetime::FileTime::from_last_modification_time(&metadata),
-                );
+                let _ = crate::fs::set_times(&directory, &metadata);
             }
             if let Err(error) = fs::set_permissions(&directory, metadata.permissions()) {
                 self.record(&directory, format!("cannot restore permissions: {error}"));
@@ -320,11 +312,7 @@ impl<'a> Transfer<'a> {
             copy_xattrs(source, destination);
         }
         if self.preserve.times {
-            filetime::set_file_times(
-                destination,
-                filetime::FileTime::from_last_access_time(metadata),
-                filetime::FileTime::from_last_modification_time(metadata),
-            )?;
+            crate::fs::set_times(destination, metadata)?;
         }
         Ok(())
     }

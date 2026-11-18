@@ -150,6 +150,9 @@ async fn copy_directory_preserves_nested_contents_and_reports_created_path() {
     assert_eq!(complete.bytes_processed, 19);
 }
 
+// `filetime::set_file_mtime` is deprecated in favor of `std::fs::set_times`,
+// which needs Rust 1.100; the MSRV is 1.90.
+#[allow(deprecated)]
 #[tokio::test]
 async fn copy_preserves_file_and_directory_modification_times() {
     let tmp = TempDir::new().unwrap();
