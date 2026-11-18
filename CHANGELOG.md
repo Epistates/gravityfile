@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `gravityfile-ops` no longer pulls in `serde_json` as a normal dependency.
+  Only its tests use it, and Cargo's `unused_dependencies` lint warned about
+  it on every build.
+
 ## [0.4.2] - 2026-11-18
 
 A dependency and security release. There are no changes to `grav`'s
