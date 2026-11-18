@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-18
+
+A dependency and security release. There are no changes to `grav`'s
+behavior or to the public API.
+
+### Security
+
+- `libz-sys` is updated to 1.1.33, past RUSTSEC-2026-0544 (a heap buffer
+  overflow) and RUSTSEC-2026-0418 (the build script leaked environment
+  variables into the build directory). It reaches grav through `git2`.
+- `zstd` is updated to 0.14.4, with `zstd-safe` 8.3.0 and `zstd-sys` 2.1.3,
+  past the memory-safety advisories RUSTSEC-2026-0391 and RUSTSEC-2026-0395
+  to -0406 (use-after-free, double free, out-of-bounds reads, uninitialized
+  memory and a heap overflow) and RUSTSEC-2026-0410.
+- `zip` is updated to 9.7, `rustix` to 1.1.6, and every other compatible
+  dependency to its latest version.
+
+### Changed
+
+- The workspace uses Cargo's resolver 3, which keeps dependency updates
+  within the minimum supported Rust version (1.90).
+- `deny.toml` ignores RUSTSEC-2026-0543 (`chrono` is unmaintained), with the
+  reason recorded. `chrono` is used directly and a move to `jiff` or `time`
+  has not been qualified.
+- `filetime` stays at 0.2.29: 0.2.30 deprecates its API on Rust 1.99 and
+  later, and CI builds with warnings denied.
+
 ## [0.4.1] - 2026-10-20
 
 The release binaries for 0.4.0, which were never published because the
@@ -482,7 +509,8 @@ that release.
 - `gravityfile age [PATH]` - Analyze file ages
 - `gravityfile export [PATH]` - Export scan results to JSON
 
-[Unreleased]: https://github.com/epistates/gravityfile/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/epistates/gravityfile/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/epistates/gravityfile/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/epistates/gravityfile/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/epistates/gravityfile/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/epistates/gravityfile/releases/tag/v0.3.0
