@@ -13,7 +13,6 @@ tokio-util.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
-filetime.workspace = true
 tempfile.workspace = true
 trash.workspace = true
 reflink-copy.workspace = true

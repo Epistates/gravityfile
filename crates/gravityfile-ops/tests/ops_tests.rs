@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use filetime::FileTime;
 use gravityfile_ops::{
     ConflictResolution, CreateResult, OperationComplete, OperationType, RenameResult,
     ReplacePolicy, TransferOptions, TransferResult, UndoComplete, UndoEntry, UndoResult,
@@ -150,19 +149,24 @@ async fn copy_directory_preserves_nested_contents_and_reports_created_path() {
     assert_eq!(complete.bytes_processed, 19);
 }
 
-// `filetime::set_file_mtime` is deprecated in favor of `std::fs::set_times`,
-// which needs Rust 1.100; the MSRV is 1.90.
-#[allow(deprecated)]
+fn unix_time(seconds: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+fn set_mtime(path: impl AsRef<std::path::Path>, time: SystemTime) {
+    fs::set_times(path, fs::FileTimes::new().set_modified(time)).unwrap();
+}
+
 #[tokio::test]
 async fn copy_preserves_file_and_directory_modification_times() {
     let tmp = TempDir::new().unwrap();
     let source = tmp.path().join("source");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("dated.txt"), "dated").unwrap();
-    let file_time = FileTime::from_unix_time(1_000_000, 0);
-    let dir_time = FileTime::from_unix_time(1_000_100, 0);
-    filetime::set_file_mtime(source.join("dated.txt"), file_time).unwrap();
-    filetime::set_file_mtime(&source, dir_time).unwrap();
+    let file_time = unix_time(1_000_000);
+    let dir_time = unix_time(1_000_100);
+    set_mtime(source.join("dated.txt"), file_time);
+    set_mtime(&source, dir_time);
     let destination = tmp.path().join("destination");
 
     let (complete, _, _) = wait_for_transfer(start_copy(
@@ -174,9 +178,45 @@ async fn copy_preserves_file_and_directory_modification_times() {
     .await;
 
     assert!(complete.is_success(), "{complete:?}");
-    let mtime = |path: PathBuf| FileTime::from_last_modification_time(&fs::metadata(path).unwrap());
+    let mtime = |path: PathBuf| fs::metadata(path).unwrap().modified().unwrap();
     assert_eq!(mtime(destination.join("source/dated.txt")), file_time);
     assert_eq!(mtime(destination.join("source")), dir_time);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_preserves_symlink_times_without_touching_the_target() {
+    let tmp = TempDir::new().unwrap();
+    let source = tmp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    let target = tmp.path().join("target.txt");
+    fs::write(&target, "target").unwrap();
+    let target_time = unix_time(2_000_000);
+    set_mtime(&target, target_time);
+    let link = source.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link_time = unix_time(1_500_000);
+    fs::set_times_nofollow(&link, fs::FileTimes::new().set_modified(link_time)).unwrap();
+    let destination = tmp.path().join("destination");
+
+    let (complete, _, _) = wait_for_transfer(start_copy(
+        vec![source],
+        destination.clone(),
+        options(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    assert!(complete.is_success(), "{complete:?}");
+    let copied = destination.join("source/link");
+    assert_eq!(
+        fs::symlink_metadata(&copied).unwrap().modified().unwrap(),
+        link_time
+    );
+    assert_eq!(
+        fs::metadata(&target).unwrap().modified().unwrap(),
+        target_time
+    );
 }
 
 #[cfg(unix)]

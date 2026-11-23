@@ -5,7 +5,7 @@ members = ["crates/gravityfile-*"]
 [workspace.package]
 version = "0.4.2"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/gravityfile"
 keywords = ["disk", "usage", "analyzer", "tui", "cli"]
@@ -53,7 +53,6 @@ tempfile = "3"
 dunce = "1"
 insta ={ version = "1.49", features = ["filters"] }
 libc = "0.2"
-filetime = "0.2"
 
 # Internal crates
 gravityfile-core = { version = "0.4.2", path = "crates/gravityfile-core" }
