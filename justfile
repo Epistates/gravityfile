@@ -58,8 +58,8 @@ semver:
 # CHANGELOG.md, run this, merge to main, then push the tag `vX.Y.Z`. The
 # Release workflow builds the binaries, creates the GitHub release, then
 # publishes every crate to crates.io through Trusted Publishing
-# (.github/workflows/publish-crates.yml). Don't publish by hand first: the
-# workflow's `cargo publish` fails on a version that already exists.
+# (.github/workflows/publish-crates.yml). It skips any crate already on
+# crates.io at that version, so a re-run of a failed publish continues.
 publish-check:
     cargo publish --workspace --dry-run --locked
 
