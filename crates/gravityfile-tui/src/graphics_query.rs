@@ -25,8 +25,13 @@ pub(crate) fn query_picker() -> std::io::Result<Picker> {
             _ => {}
         }
     }
-    // This constructor preserves environment/tmux handling without spawning a
-    // stdio query thread. It is the upstream API for an already known font size.
+    // ratatui-image deprecates `from_fontsize` in favour of `from_query_stdio`
+    // or `halfblocks`, and neither fits here. `from_query_stdio` queries on a
+    // detached thread that keeps reading stdin after its timeout, swallowing
+    // keystrokes, and turns raw mode off whenever it finishes. `halfblocks`
+    // gives up Kitty, Sixel and iTerm2 images. We've already queried the
+    // terminal above, and `from_fontsize` is the only constructor that takes
+    // the font size we found while keeping its tmux and iTerm2 detection.
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font.into());
     if !matches!(picker.protocol_type(), ProtocolType::Iterm2)
