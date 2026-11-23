@@ -1889,7 +1889,7 @@ mod tests {
         let tree = gravityfile_scan::JwalkScanner::new()
             .scan(&config, CancellationToken::new())
             .expect("scan the fixture");
-        app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+        app.handle_scan_result(ScanResult::ScanComplete(Ok(Box::new(tree))));
         // `ScanComplete` schedules a background scan-complete hook; the tests
         // never poll for it, and the app state is already final here.
         app.scan_rx = None;
@@ -2127,7 +2127,7 @@ mod tests {
                     CancellationToken::new(),
                 )
                 .unwrap();
-            app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+            app.handle_scan_result(ScanResult::ScanComplete(Ok(Box::new(tree))));
             app.scan_rx = None;
             app.layout_mode = LayoutMode::Miller;
             app.select_entry(Some(&archive));
@@ -3251,7 +3251,7 @@ mod tests {
         );
         tree.remeasure(true, true);
         let mut app = App::with_config(root_path.clone(), crate::TuiConfig::default());
-        app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+        app.handle_scan_result(ScanResult::ScanComplete(Ok(Box::new(tree))));
         app.scan_rx = None;
         app.nav.tree_state.expand(&root_path.join("dir-000"));
         app.update_cached_tree_len();
@@ -4082,7 +4082,7 @@ mod tests {
         edited.settings.scan_on_startup = !edited.settings.scan_on_startup;
         app.settings_state = Some(edited);
         app.error = Some("Cannot load settings; using defaults".into());
-        app.handle_scan_result(ScanResult::ScanComplete(Ok(tree)));
+        app.handle_scan_result(ScanResult::ScanComplete(Ok(Box::new(tree))));
         assert_eq!(app.mode, AppMode::Settings);
         assert!(app.settings_state.as_ref().unwrap().dirty);
         assert_eq!(

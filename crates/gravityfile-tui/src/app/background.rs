@@ -386,6 +386,7 @@ impl App {
                 self.scan_progress = Some(progress);
             }
             ScanResult::ScanComplete(Ok(tree)) => {
+                let tree = *tree;
                 let root_path = tree.root_path.clone();
                 let scan_path = root_path.clone();
                 let total_files = tree.stats.total_files;

@@ -53,7 +53,9 @@ pub fn start_scan(
 
         // Cancel progress task and send final result
         progress_task.abort();
-        let _ = tx.send(ScanResult::ScanComplete(result)).await;
+        let _ = tx
+            .send(ScanResult::ScanComplete(result.map(Box::new)))
+            .await;
     });
 
     rx

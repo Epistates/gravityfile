@@ -379,6 +379,7 @@ impl App {
         let apparent = self.apparent_size;
         let list = move || {
             let result = quick_list_with_settings(&dir, &settings, apparent)
+                .map(Box::new)
                 .map_err(|error| format!("Cannot list {}: {error}", dir.display()));
             Listed {
                 dir,
@@ -403,7 +404,7 @@ impl App {
     pub(super) fn finish_listing(&mut self, listed: Listed) {
         self.listings.remove(&(listed.purpose, listed.dir.clone()));
         let mut listing = match listed.result {
-            Ok(listing) => listing,
+            Ok(listing) => *listing,
             Err(error) => {
                 if listed.purpose == ListingFor::Children {
                     self.error = Some(error);
