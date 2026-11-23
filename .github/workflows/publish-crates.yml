@@ -32,9 +32,52 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
-      - run: cargo publish --workspace --locked
+      # `cargo publish --workspace` refuses to start if any crate's version is
+      # already on crates.io, so after a partial failure a re-run would publish
+      # nothing. Publishing only the crates crates.io doesn't have yet lets a
+      # re-run pick up where the last attempt stopped.
+      - name: Publish the crates that crates.io doesn't have yet
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Whether crates.io's index lists $1 at version $2. A crate the index
+          # has never seen answers 404; any other failure stops the job.
+          on_crates_io() {
+            local name path reply code
+            name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+            case ${#name} in
+              1) path="1/$name" ;;
+              2) path="2/$name" ;;
+              3) path="3/${name:0:1}/$name" ;;
+              *) path="${name:0:2}/${name:2:2}/$name" ;;
+            esac
+            if ! reply=$(curl -sSL --retry 3 -H 'Cache-Control: no-cache' \
+                -w '\n%{http_code}' "https://index.crates.io/$path"); then
+              echo "::error::Couldn't reach the crates.io index for $1."
+              exit 1
+            fi
+            code=${reply##*$'\n'}
+            case $code in
+              200) jq -e --arg v "$2" 'select(.vers == $v)' <<<"${reply%$'\n'*}" >/dev/null ;;
+              404) return 1 ;;
+              *) echo "::error::The crates.io index answered $code for $1."; exit 1 ;;
+            esac
+          }
+          packages=()
+          while read -r name version; do
+            if on_crates_io "$name" "$version"; then
+              echo "::notice::$name $version is already on crates.io; skipping it."
+            else
+              packages+=(--package "$name")
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.publish == null) | "\(.name) \(.version)"')
+          if [ ${#packages[@]} -eq 0 ]; then
+            echo "::notice::Every crate is already on crates.io at this version."
+            exit 0
+          fi
+          cargo publish --locked "${packages[@]}"
