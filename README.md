@@ -51,6 +51,12 @@ cargo install --locked gravityfile
 
 Either way you get the `grav` binary.
 
+gravityfile is an application, shipped mainly as the prebuilt binaries above,
+and its library crates exist to serve it. Building from source therefore
+tracks recent stable Rust: the minimum version rises when the standard library
+or a dependency gives a reason to, and each rise is noted in the
+[changelog](CHANGELOG.md).
+
 ## Use
 
 ```sh
