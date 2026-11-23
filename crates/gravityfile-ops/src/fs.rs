@@ -299,28 +299,25 @@ pub(crate) fn symlink(target: &Path, source: &Path, destination: &Path) -> io::R
     }
 }
 
-// filetime 0.2.30 deprecates its setters in favor of `std::fs::set_times` and
-// `std::fs::set_times_nofollow`, which are stable only from Rust 1.100. Switch
-// these two helpers to std once the MSRV reaches it.
+/// The modification time recorded in `metadata`, and its access time where the
+/// platform records one. A missing access time is left untouched on the target
+/// rather than failing the copy.
+fn recorded_times(metadata: &fs::Metadata) -> io::Result<fs::FileTimes> {
+    let times = fs::FileTimes::new().set_modified(metadata.modified()?);
+    Ok(match metadata.accessed() {
+        Ok(accessed) => times.set_accessed(accessed),
+        Err(_) => times,
+    })
+}
 
 /// Give `path` the access and modification times recorded in `metadata`.
-#[allow(deprecated)]
 pub(crate) fn set_times(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    filetime::set_file_times(
-        path,
-        filetime::FileTime::from_last_access_time(metadata),
-        filetime::FileTime::from_last_modification_time(metadata),
-    )
+    fs::set_times(path, recorded_times(metadata)?)
 }
 
 /// Like [`set_times`], but sets the times of a symlink itself.
-#[allow(deprecated)]
 pub(crate) fn set_symlink_times(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    filetime::set_symlink_file_times(
-        path,
-        filetime::FileTime::from_last_access_time(metadata),
-        filetime::FileTime::from_last_modification_time(metadata),
-    )
+    fs::set_times_nofollow(path, recorded_times(metadata)?)
 }
 
 /// Reserve an owner-only directory beside `sibling`, on the same filesystem,

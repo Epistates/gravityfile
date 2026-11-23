@@ -43,7 +43,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/epistates/gravityf
 Every archive carries build provenance; check one with
 `gh attestation verify <archive> --repo epistates/gravityfile`.
 
-Or build it with Cargo, which needs Rust 1.90 or newer:
+Or build it with Cargo, which needs Rust 1.99 or newer:
 
 ```sh
 cargo install --locked gravityfile

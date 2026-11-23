@@ -7,11 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Building gravityfile from source, or depending on its crates, now needs
+  Rust 1.99 or newer (previously 1.90). Run `rustup update` if your
+  toolchain is older. Prebuilt binaries are unaffected.
+- Copies preserve file, directory and symlink times through the standard
+  library, and `gravityfile-ops` no longer depends on `filetime`.
+- Every dependency is updated to its latest release, including `zip` 9.8,
+  `mlua` 0.12.3 and `clap` 4.6.9.
+
 ### Fixed
 
-- `gravityfile-ops` no longer pulls in `serde_json` as a normal dependency.
-  Only its tests use it, and Cargo's `unused_dependencies` lint warned about
-  it on every build.
+- `gravityfile-ops` no longer lists `serde_json` as a normal dependency.
+  Only its tests use it.
 
 ## [0.4.2] - 2026-11-18
 

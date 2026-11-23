@@ -37,25 +37,14 @@ static ACTIVE_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 struct WorkerPermit;
 impl WorkerPermit {
     fn acquire() -> PluginResult<Self> {
-        // A compare-exchange loop rather than `fetch_update`, which newer Rust
-        // deprecates in favour of `try_update`, unavailable at our MSRV.
-        let mut count = ACTIVE_WORKERS.load(Ordering::Acquire);
-        loop {
-            if count >= MAX_WORKERS {
-                return Err(PluginError::ConfigError {
-                    message: "maximum of 32 concurrent plugin workers reached".into(),
-                });
-            }
-            match ACTIVE_WORKERS.compare_exchange_weak(
-                count,
-                count + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(Self),
-                Err(actual) => count = actual,
-            }
-        }
+        ACTIVE_WORKERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_WORKERS).then_some(count + 1)
+            })
+            .map(|_| Self)
+            .map_err(|_| PluginError::ConfigError {
+                message: format!("maximum of {MAX_WORKERS} concurrent plugin workers reached"),
+            })
     }
 }
 impl Drop for WorkerPermit {

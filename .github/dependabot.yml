@@ -5,12 +5,6 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    ignore:
-      # 0.2.30 deprecates its API on Rust 1.99+ in favour of std::fs::set_times,
-      # which needs 1.99; the MSRV is 1.90 and CI builds with -D warnings.
-      # Lift this when the MSRV reaches 1.99 and gravityfile-ops moves to std.
-      - dependency-name: filetime
-        versions: [">= 0.2.30"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -1290,7 +1290,6 @@ version = "0.4.2"
 dependencies = [
  "bzip2",
  "dunce",
- "filetime",
  "flate2",
  "libc",
  "reflink-copy",
