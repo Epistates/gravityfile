@@ -100,7 +100,7 @@ impl Harness {
                 CancellationToken::new(),
             )
             .expect("scan the fixture");
-        app.handle_scan_result(super::ScanResult::ScanComplete(Ok(tree)));
+        app.handle_scan_result(super::ScanResult::ScanComplete(Ok(Box::new(tree))));
         let mut harness = Self {
             app,
             terminal: Terminal::new(TestBackend::new(width, height)).expect("test terminal"),

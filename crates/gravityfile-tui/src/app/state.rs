@@ -347,7 +347,8 @@ impl DeletionProgress {
 /// Result from a background scan operation.
 pub enum ScanResult {
     Progress(ScanProgress),
-    ScanComplete(Result<FileTree, gravityfile_scan::ScanError>),
+    /// The tree is boxed: it is far larger than the other messages.
+    ScanComplete(Result<Box<FileTree>, gravityfile_scan::ScanError>),
     AnalysisComplete {
         duplicates: DuplicateReport,
         age_report: AgeReport,
@@ -416,7 +417,8 @@ pub enum ListingFor {
 pub struct Listed {
     pub dir: PathBuf,
     pub purpose: ListingFor,
-    pub result: Result<FileTree, String>,
+    /// Boxed for the same reason as [`ScanResult::ScanComplete`].
+    pub result: Result<Box<FileTree>, String>,
 }
 
 /// Information about the currently selected item.
